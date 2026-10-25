@@ -5822,10 +5822,13 @@ struct IntervalCost {
     double end_ms[5]{};            // leitura de volta, frame anterior, texturas pendentes, envio de texturas, DrawFrame
     double draw_frame[7]{};        // dentro do DrawFrame: pipelines, lock, fence, acquire, gravacao, submit, present
     double end_kind[kHitchKinds]{};
+    double gpu_ms = 0; // Fase 75: GPU do quadro que este intervalo esperou (o anterior)
 };
 struct HitchMinute {
     u64 frames = 0, over25 = 0, over50 = 0;
-    double worst = 0, slow_ms = 0, game_ms = 0;
+    u64 gpu_over = 0; // Fase 75: quadros com GPU acima de 16,7 ms
+    double worst = 0, slow_ms = 0, game_ms = 0, worst_gpu = 0;
+    double all_ms = 0, all_submit = 0, all_record = 0, all_gpu = 0; // Fase 75: todos os quadros (para as medias)
     IntervalCost slow; // soma dos intervalos acima de 25 ms
 };
 IntervalCost g_iv;
@@ -5846,6 +5849,7 @@ void TakeHitchKinds(double* into) {
 
 void AddCost(IntervalCost& to, const IntervalCost& from) {
     to.submit_ms += from.submit_ms;
+    to.gpu_ms += from.gpu_ms;
     for (int k = 0; k < kHitchKinds; ++k) {
         to.submit_kind[k] += from.submit_kind[k];
         to.end_kind[k] += from.end_kind[k];
@@ -5871,7 +5875,9 @@ void PrintHitchMinute(const char* tag, double t, double span_s, const HitchMinut
                 "extrator %.0f, DMA %.0f, geometria %.0f, alvos %.0f, pares prontos %.0f, traducao na hora %.0f, lock %.0f, nao atribuido %.0f)"
                 ", fim do frame %.0f (leitura de volta %.0f, frame anterior %.0f, texturas pendentes %.0f, envio %.0f, DrawFrame %.0f: "
                 "espera de pipelines %.0f, lock %.0f, fence %.0f, acquire %.0f, gravacao %.0f, submit %.0f, present %.0f; categorias no fim %.0f)"
-                " | threads de trabalho no periodo: destile %.0f, texturas %.0f, pipelines %.0f, lock %.0f ms\n",
+                " | threads de trabalho no periodo: destile %.0f, texturas %.0f, pipelines %.0f, lock %.0f ms"
+                " | GPU: %" PRIu64 " quadros acima de 16,7 ms, pior %.1f ms, nos quadros lentos %.0f ms"
+                " | media por quadro: %.2f ms (Submit %.2f, gravacao %.2f, GPU %.2f)\n",
                 tag, t, m.frames, m.over25, per_min, m.over50, m.worst, m.slow_ms, m.game_ms, c.submit_ms, c.submit_kind[0], c.submit_kind[1],
                 c.submit_kind[3], c.submit_kind[2], c.submit_kind[4], c.submit_kind[5], c.submit_kind[6], c.submit_kind[7], c.submit_kind[8],
                 c.submit_kind[9], c.submit_kind[10], std::max(0.0, c.submit_ms - categorized), end_total, c.end_ms[0], c.end_ms[1], c.end_ms[2],
@@ -5885,7 +5891,9 @@ void PrintHitchMinute(const char* tag, double t, double span_s, const HitchMinut
                     return s;
                 }(),
                 worker_ns[render::HitchClock::kDetile] / 1e6, worker_ns[render::HitchClock::kTexture] / 1e6,
-                worker_ns[render::HitchClock::kPipeline] / 1e6, worker_ns[render::HitchClock::kLock] / 1e6);
+                worker_ns[render::HitchClock::kPipeline] / 1e6, worker_ns[render::HitchClock::kLock] / 1e6, m.gpu_over, m.worst_gpu, c.gpu_ms,
+                m.frames ? m.all_ms / m.frames : 0.0, m.frames ? m.all_submit / m.frames : 0.0, m.frames ? m.all_record / m.frames : 0.0,
+                m.frames ? m.all_gpu / m.frames : 0.0);
 }
 
 // No comeco de cada SubmitAndFlip: fecha o intervalo anterior.
@@ -5895,6 +5903,12 @@ void CloseHitchInterval(std::chrono::steady_clock::time_point now) {
     if (g_iv_start.time_since_epoch().count()) {
         const double interval = std::chrono::duration<double, std::milli>(now - g_iv_start).count();
         ++g_minute.frames;
+        g_minute.all_ms += interval;
+        g_minute.all_submit += g_iv.submit_ms;
+        g_minute.all_record += g_iv.draw_frame[4];
+        g_minute.all_gpu += g_iv.gpu_ms;
+        g_minute.gpu_over += g_iv.gpu_ms > 16.7;
+        g_minute.worst_gpu = std::max(g_minute.worst_gpu, g_iv.gpu_ms);
         if (interval > 25.0) {
             ++g_minute.over25;
             g_minute.over50 += interval > 50.0;
@@ -5927,6 +5941,12 @@ void CloseHitchInterval(std::chrono::steady_clock::time_point now) {
         g_minutes_total.frames += g_minute.frames;
         g_minutes_total.over25 += g_minute.over25;
         g_minutes_total.over50 += g_minute.over50;
+        g_minutes_total.gpu_over += g_minute.gpu_over;
+        g_minutes_total.all_ms += g_minute.all_ms;
+        g_minutes_total.all_submit += g_minute.all_submit;
+        g_minutes_total.all_record += g_minute.all_record;
+        g_minutes_total.all_gpu += g_minute.all_gpu;
+        g_minutes_total.worst_gpu = std::max(g_minutes_total.worst_gpu, g_minute.worst_gpu);
         g_minutes_total.worst = std::max(g_minutes_total.worst, g_minute.worst);
         g_minutes_total.slow_ms += g_minute.slow_ms;
         g_minutes_total.game_ms += g_minute.game_ms;
@@ -5937,7 +5957,8 @@ void CloseHitchInterval(std::chrono::steady_clock::time_point now) {
 }
 
 // Depois do DrawFrame: etapas do fim do frame e as categorias que rodaram nele.
-void NoteFrameEnd(const double end_ms[5], const double draw_frame[7]) {
+void NoteFrameEnd(const double end_ms[5], const double draw_frame[7], double gpu_ms) {
+    g_iv.gpu_ms = gpu_ms; // Fase 75
     for (int i = 0; i < 5; ++i) {
         g_iv.end_ms[i] += end_ms[i];
     }
@@ -6179,16 +6200,16 @@ HLE_IMPL(int, sceGnmSubmitAndFlipCommandBuffers, u32 count, const u32* const* dc
         end_lap(4);
         double df[7];
         renderer.LastDrawFrameTimes(df);
-        NoteFrameEnd(end_ms, df); // Fase 69
+        NoteFrameEnd(end_ms, df, renderer.LastGpuFrameMs()); // Fase 69 / 75
         if (const double total = end_ms[0] + end_ms[1] + end_ms[2] + end_ms[3] + end_ms[4]; total > 40.0) {
             static u32 logged = 0;
             if (logged++ < 400) {
                 const auto t0 = HitchEpoch(); // Fase 59: mesmo relogio do [ENGASGO]
                 std::printf("[QUADRO-LENTO] t=%.1fs fim do frame %.1f ms: leitura de volta %.1f, frame anterior %.1f, texturas pendentes %.1f, "
                             "envio de texturas %.1f, DrawFrame %.1f (pipelines %.1f, lock %.1f, fence %.1f, acquire %.1f, gravacao %.1f, "
-                            "submit %.1f, present %.1f)\n",
+                            "submit %.1f, present %.1f) | GPU do quadro anterior %.1f ms\n",
                             std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count(), total, end_ms[0], end_ms[1], end_ms[2],
-                            end_ms[3], end_ms[4], df[0], df[1], df[2], df[3], df[4], df[5], df[6]);
+                            end_ms[3], end_ms[4], df[0], df[1], df[2], df[3], df[4], df[5], df[6], renderer.LastGpuFrameMs());
             }
         }
         ++g_cache_frame;
@@ -6576,6 +6597,12 @@ void PrintStats() {
             all.frames += g_minute.frames;
             all.over25 += g_minute.over25;
             all.over50 += g_minute.over50;
+            all.gpu_over += g_minute.gpu_over;
+            all.all_ms += g_minute.all_ms;
+            all.all_submit += g_minute.all_submit;
+            all.all_record += g_minute.all_record;
+            all.all_gpu += g_minute.all_gpu;
+            all.worst_gpu = std::max(all.worst_gpu, g_minute.worst_gpu);
             all.worst = std::max(all.worst, g_minute.worst);
             all.slow_ms += g_minute.slow_ms;
             all.game_ms += g_minute.game_ms;

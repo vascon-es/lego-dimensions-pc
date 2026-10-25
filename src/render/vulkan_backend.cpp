@@ -69,7 +69,8 @@ std::atomic<u64> g_validation_errors{0}, g_validation_warnings{0};
     X(vkUpdateDescriptorSets) X(vkCmdBindDescriptorSets) X(vkCmdPipelineBarrier)                   \
     X(vkCmdCopyBufferToImage) X(vkQueueWaitIdle) X(vkResetDescriptorPool) X(vkCmdCopyImageToBuffer) X(vkCmdClearAttachments) X(vkCmdCopyImage) \
     X(vkCmdSetCullMode) X(vkCmdSetFrontFace) X(vkCmdSetDepthTestEnable) X(vkCmdSetDepthWriteEnable) X(vkCmdSetDepthCompareOp)    \
-    X(vkCmdSetStencilTestEnable) X(vkCmdSetStencilOp) X(vkCreatePipelineCache) X(vkDestroyPipelineCache) X(vkGetPipelineCacheData)
+    X(vkCmdSetStencilTestEnable) X(vkCmdSetStencilOp) X(vkCreatePipelineCache) X(vkDestroyPipelineCache) X(vkGetPipelineCacheData) \
+    X(vkCreateQueryPool) X(vkDestroyQueryPool) X(vkCmdResetQueryPool) X(vkCmdWriteTimestamp) X(vkGetQueryPoolResults)
 
 #define DECLARE(name) PFN_##name name = nullptr;
 struct Functions {
@@ -216,6 +217,13 @@ struct State {
     std::atomic<u64> textured_draws{0};
     bool memory_budget = false; // Fase 59: VK_EXT_memory_budget ligado
     double draw_frame_ms[8] = {}; // Fase 59: etapas do ultimo DrawFrame (ver LastDrawFrameTimes)
+    // Fase 75: tempo de GPU de cada quadro (timestamp no comeco e no fim do command buffer do frame). A espera
+    // "frame anterior" do [QUADRO-LENTO] dominava os quadros lentos de um jogador (RX 9070 XT, 5 h): este numero
+    // diz se a GPU demorou mesmo naquele quadro. LD_GPU_TIME=0 desliga.
+    VkQueryPool timestamps = VK_NULL_HANDLE;
+    double timestamp_period_ns = 0;
+    bool timestamps_written = false;
+    std::atomic<double> last_gpu_ms{0};
     // ---- shaders do jogo (Fase 19) ----
     bool game_shaders = false; // o dispositivo foi criado com os recursos que os modulos pedem
     bool validation = false;
@@ -898,6 +906,18 @@ bool CreateFrameObjects() {
     result = vk.vkAllocateCommandBuffers(g.device, &allocate, &g.command);
     if (result != VK_SUCCESS) {
         return Fail("vkAllocateCommandBuffers", result);
+    }
+    // Fase 75: dois timestamps por quadro (so ha um quadro em voo: a fence do frame anterior e esperada antes)
+    if (const char* env = std::getenv("LD_GPU_TIME"); !(env && env[0] == '0') && g.properties.limits.timestampComputeAndGraphics &&
+                                                       g.properties.limits.timestampPeriod > 0) {
+        VkQueryPoolCreateInfo query{VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
+        query.queryType = VK_QUERY_TYPE_TIMESTAMP;
+        query.queryCount = 2;
+        if (vk.vkCreateQueryPool(g.device, &query, nullptr, &g.timestamps) == VK_SUCCESS) {
+            g.timestamp_period_ns = g.properties.limits.timestampPeriod;
+        } else {
+            g.timestamps = VK_NULL_HANDLE;
+        }
     }
     VkSemaphoreCreateInfo semaphore{VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO};
     VkFenceCreateInfo fence{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
@@ -3350,6 +3370,11 @@ void DestroyAll() {
     if (g.device) {
         vk.vkDeviceWaitIdle(g.device);
         DestroyPipelines();
+        if (g.timestamps) { // Fase 75
+            vk.vkDestroyQueryPool(g.device, g.timestamps, nullptr);
+            g.timestamps = VK_NULL_HANDLE;
+            g.timestamps_written = false;
+        }
         if (g_vk_cache) { // Fase 70
             vk.vkDestroyPipelineCache(g.device, g_vk_cache, nullptr);
             g_vk_cache = VK_NULL_HANDLE;
@@ -3810,11 +3835,22 @@ bool VulkanRenderer::DrawFrame(u64 display_address) {
     }
     vk.vkResetFences(g.device, 1, &g.in_flight);
     lap(3);
+    if (g.timestamps && g.timestamps_written) { // Fase 75: o frame anterior ja terminou (fence esperada acima)
+        u64 stamps[2] = {};
+        if (vk.vkGetQueryPoolResults(g.device, g.timestamps, 0, 2, sizeof(stamps), stamps, sizeof(u64), VK_QUERY_RESULT_64_BIT) == VK_SUCCESS &&
+            stamps[1] >= stamps[0]) {
+            g.last_gpu_ms = (stamps[1] - stamps[0]) * g.timestamp_period_ns / 1e6;
+        }
+    }
 
     vk.vkResetCommandBuffer(g.command, 0);
     VkCommandBufferBeginInfo begin{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
     begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
     vk.vkBeginCommandBuffer(g.command, &begin);
+    if (g.timestamps) {
+        vk.vkCmdResetQueryPool(g.command, g.timestamps, 0, 2);
+        vk.vkCmdWriteTimestamp(g.command, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, g.timestamps, 0);
+    }
     vk.vkResetDescriptorPool(g.device, g.frame_pool, 0); // o frame anterior ja terminou (fence)
     const u32 upload_half = g.frame_half; // Fase 59: metade do staging que este frame envia
     RecordFrameUploads(g.command); // Fase 39: texturas criadas / reescritas desde o ultimo frame
@@ -4366,6 +4402,10 @@ bool VulkanRenderer::DrawFrame(u64 display_address) {
     g.peak_index_bytes = std::max(g.peak_index_bytes, g.frame_index_bytes);
     g.peak_storage_bytes = std::max(g.peak_storage_bytes, g.frame_storage_bytes);
     g.frame_vertex_bytes = g.frame_index_bytes = g.frame_storage_bytes = 0;
+    if (g.timestamps) {
+        vk.vkCmdWriteTimestamp(g.command, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, g.timestamps, 1);
+        g.timestamps_written = true;
+    }
     vk.vkEndCommandBuffer(g.command);
 
     const VkPipelineStageFlags wait_stage = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
@@ -5396,6 +5436,10 @@ void VulkanRenderer::DiscardPreparedTexture(u64 prepared) {
 u32 VulkanRenderer::TexturesCreated() const {
     const TimedLock lock(g.mutex);
     return g.textures.empty() ? 0 : static_cast<u32>(g.textures.size() - 1); // sem contar o branco
+}
+
+double VulkanRenderer::LastGpuFrameMs() const {
+    return g.last_gpu_ms.load(); // Fase 75: GPU do ultimo quadro terminado (0 = sem timestamps)
 }
 
 void VulkanRenderer::LastDrawFrameTimes(double out[7]) const {

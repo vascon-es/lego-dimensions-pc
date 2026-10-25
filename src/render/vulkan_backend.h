@@ -353,6 +353,7 @@ public:
     u32 PrewarmPipelines();
     void BenchPipelines(const std::string& path); // Fase 53: so medicao (LD_PIPE_BENCH)
     void PrewarmProgress(u32* done, u32* total) const;
+    double LastGpuFrameMs() const;                               // Fase 75: tempo de GPU do ultimo quadro terminado
     void SavePipelineCache(const char* reason);                 // Fase 70: grava o cache de pipelines do Vulkan (arquivo temporario + troca)
     void SetCurrentLevel(const std::string& name);              // Fase 72: o jogo comecou a carregar esta area
     void PrewarmPriorityProgress(u32* done, u32* total) const; // Fase 72: so os pipelines da area prioritaria
