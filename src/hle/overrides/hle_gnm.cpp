@@ -5047,11 +5047,19 @@ void ProcessCommandBuffer(const u32* cmd, u64 size_bytes, u64 release_event) {
     }
 }
 
+// Fase 69: tempo de todos os Submits (com e sem flip) desde o ultimo fechamento de intervalo ([ENGASGOS-MIN])
+std::atomic<u64> g_submit_all_ns{0};
+
 int Submit(u32 count, const u32* const* dcb_addrs, const u32* dcb_sizes, const u32* const* ccb_addrs,
            const u32* ccb_sizes) {
     static perf::Counter perf_counter("Gnm Submit (parser PM4)");
     const perf::Scope perf_scope(perf_counter);
-    std::lock_guard lock(g_mutex);
+    render::MarkRenderThread(); // Fase 69: o tempo desta thread e o que trava o quadro
+    struct SubmitTimer {
+        std::chrono::steady_clock::time_point start = std::chrono::steady_clock::now();
+        ~SubmitTimer() { g_submit_all_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count(); }
+    } submit_timer;
+    const render::TimedLock lock(g_mutex);
     // Fase 28: as regioes de memoria consultadas valem pelo Submit inteiro. Sem isto cada shader
     // novo pagava dois VirtualQuery (~1 ms no total), e uma troca de cena traz mais de cem.
     const RegionCacheScope region_cache;
@@ -5480,7 +5488,10 @@ bool LiveCompileNow(u64 vs_address, u64 ps_address, u64 signature, GamePairInfo*
     live.text = SnapshotText(snapshot->second);
     live.job = MakePairJob(*info, info, true);
     ++g_pairs_live_requested;
-    RunLiveCompiler({live});
+    {
+        const render::HitchClock hitch(render::HitchClock::kLive); // Fase 69: antes nao caia em categoria nenhuma
+        RunLiveCompiler({live});
+    }
     GamePairInfo result;
     result.canon_signature = live.job.canon;
     result.vformats = live.job.vformats;
@@ -5799,6 +5810,143 @@ std::chrono::steady_clock::time_point HitchEpoch() {
     return epoch;
 }
 
+// Fase 69: para onde foi o tempo de cada intervalo entre flips (o que o jogador ve como quadro). O intervalo
+// que comeca num SubmitAndFlip vai ate o proximo e tem: os Submits da thread de render (por categoria do
+// HitchClock + o que nenhuma categoria cobre), o fim do frame (etapas do [QUADRO-LENTO] e do DrawFrame) e o
+// resto, que e o proprio jogo na CPU. Uma linha [ENGASGOS-MIN] por minuto (--hitch-log ou LD_HITCH_MIN=1)
+// soma so os intervalos acima de 25 ms; o fim da sessao traz a soma da sessao inteira.
+constexpr int kHitchKinds = render::HitchClock::kKinds;
+struct IntervalCost {
+    double submit_ms = 0;          // todos os Submits (com e sem flip) da thread de render
+    double submit_kind[kHitchKinds]{};
+    double end_ms[5]{};            // leitura de volta, frame anterior, texturas pendentes, envio de texturas, DrawFrame
+    double draw_frame[7]{};        // dentro do DrawFrame: pipelines, lock, fence, acquire, gravacao, submit, present
+    double end_kind[kHitchKinds]{};
+};
+struct HitchMinute {
+    u64 frames = 0, over25 = 0, over50 = 0;
+    double worst = 0, slow_ms = 0, game_ms = 0;
+    IntervalCost slow; // soma dos intervalos acima de 25 ms
+};
+IntervalCost g_iv;
+HitchMinute g_minute, g_minutes_total;
+std::chrono::steady_clock::time_point g_iv_start{}, g_minute_start{};
+u64 g_minute_worker_ns[kHitchKinds]{};
+
+// Le e zera as categorias da thread de render (elas tambem vao para o total da sessao).
+void TakeHitchKinds(double* into) {
+    for (int k = 0; k < kHitchKinds; ++k) {
+        const double ms = render::HitchClock::ns[k].exchange(0) / 1e6;
+        const u32 n = render::HitchClock::count[k].exchange(0);
+        g_hitch.kind_ms[k] += ms;
+        g_hitch.kind_count[k] += n;
+        into[k] += ms;
+    }
+}
+
+void AddCost(IntervalCost& to, const IntervalCost& from) {
+    to.submit_ms += from.submit_ms;
+    for (int k = 0; k < kHitchKinds; ++k) {
+        to.submit_kind[k] += from.submit_kind[k];
+        to.end_kind[k] += from.end_kind[k];
+    }
+    for (int i = 0; i < 5; ++i) {
+        to.end_ms[i] += from.end_ms[i];
+    }
+    for (int i = 0; i < 7; ++i) {
+        to.draw_frame[i] += from.draw_frame[i];
+    }
+}
+
+void PrintHitchMinute(const char* tag, double t, double span_s, const HitchMinute& m, const u64* worker_ns) {
+    const IntervalCost& c = m.slow;
+    double categorized = 0;
+    for (int k = 0; k < kHitchKinds; ++k) {
+        categorized += c.submit_kind[k];
+    }
+    const double end_total = c.end_ms[0] + c.end_ms[1] + c.end_ms[2] + c.end_ms[3] + c.end_ms[4];
+    const double per_min = span_s > 0 ? m.over25 * 60.0 / span_s : 0;
+    std::printf("[%s] t=%.0fs: %" PRIu64 " quadros, %" PRIu64 " acima de 25 ms (%.1f por minuto; %" PRIu64 " acima de 50 ms), pior %.1f ms"
+                " | nos quadros acima de 25 ms (%.0f ms): jogo %.0f, Submit %.0f (pipelines %.0f, texturas %.0f, destile %.0f, pares %.0f, "
+                "extrator %.0f, DMA %.0f, geometria %.0f, alvos %.0f, pares prontos %.0f, traducao na hora %.0f, lock %.0f, nao atribuido %.0f)"
+                ", fim do frame %.0f (leitura de volta %.0f, frame anterior %.0f, texturas pendentes %.0f, envio %.0f, DrawFrame %.0f: "
+                "espera de pipelines %.0f, lock %.0f, fence %.0f, acquire %.0f, gravacao %.0f, submit %.0f, present %.0f; categorias no fim %.0f)"
+                " | threads de trabalho no periodo: destile %.0f, texturas %.0f, pipelines %.0f, lock %.0f ms\n",
+                tag, t, m.frames, m.over25, per_min, m.over50, m.worst, m.slow_ms, m.game_ms, c.submit_ms, c.submit_kind[0], c.submit_kind[1],
+                c.submit_kind[3], c.submit_kind[2], c.submit_kind[4], c.submit_kind[5], c.submit_kind[6], c.submit_kind[7], c.submit_kind[8],
+                c.submit_kind[9], c.submit_kind[10], std::max(0.0, c.submit_ms - categorized), end_total, c.end_ms[0], c.end_ms[1], c.end_ms[2],
+                c.end_ms[3], c.end_ms[4], c.draw_frame[0], c.draw_frame[1], c.draw_frame[2], c.draw_frame[3], c.draw_frame[4], c.draw_frame[5],
+                c.draw_frame[6],
+                [&] {
+                    double s = 0;
+                    for (int k = 0; k < kHitchKinds; ++k) {
+                        s += c.end_kind[k];
+                    }
+                    return s;
+                }(),
+                worker_ns[render::HitchClock::kDetile] / 1e6, worker_ns[render::HitchClock::kTexture] / 1e6,
+                worker_ns[render::HitchClock::kPipeline] / 1e6, worker_ns[render::HitchClock::kLock] / 1e6);
+}
+
+// No comeco de cada SubmitAndFlip: fecha o intervalo anterior.
+void CloseHitchInterval(std::chrono::steady_clock::time_point now) {
+    TakeHitchKinds(g_iv.submit_kind); // Submits sem flip e o que mais rodou na thread de render desde o fim do frame
+    g_iv.submit_ms += g_submit_all_ns.exchange(0) / 1e6;
+    if (g_iv_start.time_since_epoch().count()) {
+        const double interval = std::chrono::duration<double, std::milli>(now - g_iv_start).count();
+        ++g_minute.frames;
+        if (interval > 25.0) {
+            ++g_minute.over25;
+            g_minute.over50 += interval > 50.0;
+            g_minute.worst = std::max(g_minute.worst, interval);
+            g_minute.slow_ms += interval;
+            const double end_total = g_iv.end_ms[0] + g_iv.end_ms[1] + g_iv.end_ms[2] + g_iv.end_ms[3] + g_iv.end_ms[4];
+            g_minute.game_ms += std::max(0.0, interval - g_iv.submit_ms - end_total);
+            AddCost(g_minute.slow, g_iv);
+        }
+    } else {
+        g_minute_start = now;
+        for (int k = 0; k < kHitchKinds; ++k) {
+            g_minute_worker_ns[k] = render::HitchClock::worker_ns[k].load();
+        }
+    }
+    g_iv = IntervalCost{};
+    g_iv_start = now;
+    const double span = std::chrono::duration<double>(now - g_minute_start).count();
+    if (span >= 60.0) {
+        u64 worker[kHitchKinds];
+        for (int k = 0; k < kHitchKinds; ++k) {
+            const u64 total = render::HitchClock::worker_ns[k].load();
+            worker[k] = total - g_minute_worker_ns[k];
+            g_minute_worker_ns[k] = total;
+        }
+        static const bool minute_env = std::getenv("LD_HITCH_MIN") != nullptr; // Fase 69: so o resumo por minuto
+        if (minute_env || g_hitch_log.load(std::memory_order_relaxed)) {
+            PrintHitchMinute("ENGASGOS-MIN", std::chrono::duration<double>(now - HitchEpoch()).count(), span, g_minute, worker);
+        }
+        g_minutes_total.frames += g_minute.frames;
+        g_minutes_total.over25 += g_minute.over25;
+        g_minutes_total.over50 += g_minute.over50;
+        g_minutes_total.worst = std::max(g_minutes_total.worst, g_minute.worst);
+        g_minutes_total.slow_ms += g_minute.slow_ms;
+        g_minutes_total.game_ms += g_minute.game_ms;
+        AddCost(g_minutes_total.slow, g_minute.slow);
+        g_minute = HitchMinute{};
+        g_minute_start = now;
+    }
+}
+
+// Depois do DrawFrame: etapas do fim do frame e as categorias que rodaram nele.
+void NoteFrameEnd(const double end_ms[5], const double draw_frame[7]) {
+    for (int i = 0; i < 5; ++i) {
+        g_iv.end_ms[i] += end_ms[i];
+    }
+    for (int i = 0; i < 7; ++i) {
+        g_iv.draw_frame[i] += draw_frame[i];
+    }
+    TakeHitchKinds(g_iv.end_kind);
+}
+
 void NoteFrameHitch(std::chrono::steady_clock::time_point submit_start) {
     (void)HitchEpoch(); // o relogio comeca no primeiro quadro
     const auto now = std::chrono::steady_clock::now();
@@ -5810,6 +5958,7 @@ void NoteFrameHitch(std::chrono::steady_clock::time_point submit_start) {
         kind_count[k] = render::HitchClock::count[k].exchange(0);
         g_hitch.kind_ms[k] += kind_ms[k];
         g_hitch.kind_count[k] += kind_count[k];
+        g_iv.submit_kind[k] += kind_ms[k]; // Fase 69
     }
     double lap_ms[4];
     const double ticks_per_ms = TicksPerNs() * 1e6; // Fase 59: os laps estao em ciclos
@@ -5845,12 +5994,14 @@ void NoteFrameHitch(std::chrono::steady_clock::time_point submit_start) {
                     "(destile %u/%.1f ms), pares %u/%.1f ms, extrator %u/%.1f ms, DMA %u/%.1f ms | etapas do draw: estado %.1f, par %.1f, recursos %.1f, fila %.1f ms"
                     " | geometria nova %u/%.1f ms, alvos novos %u/%.1f ms, pares do pacote %u/%.1f ms"
                     " | par: busca %.1f, retrato %.1f; recursos: geometria %.1f, constantes %.1f, texturas %.1f ms"
-                    " | na hora: %u texturas novas %.1f ms, %u lineares conferidas %.1f ms\n",
+                    " | na hora: %u texturas novas %.1f ms, %u lineares conferidas %.1f ms"
+                    " | traducao na hora %u/%.1f ms, lock %u/%.1f ms\n", // Fase 69
                     std::chrono::duration<double>(now - hitch_epoch).count(), g_hitch.frames, interval_ms, submit_ms, kind_count[0],
                     kind_ms[0], kind_count[1], kind_ms[1], kind_count[3], kind_ms[3], kind_count[2], kind_ms[2], kind_count[4], kind_ms[4], kind_count[5], kind_ms[5],
                     lap_ms[0], lap_ms[1], lap_ms[2], lap_ms[3], kind_count[6], kind_ms[6], kind_count[7], kind_ms[7], kind_count[8], kind_ms[8],
                     sub_ms[0], sub_ms[1], sub_ms[2], sub_ms[3], sub_ms[4], g_tex_inline_count, g_tex_inline_ms, g_tex_inline_checks,
-                    g_tex_inline_check_ms);
+                    g_tex_inline_check_ms, kind_count[render::HitchClock::kLive], kind_ms[render::HitchClock::kLive],
+                    kind_count[render::HitchClock::kLock], kind_ms[render::HitchClock::kLock]);
     }
     g_tex_inline_count = g_tex_inline_checks = 0;
     g_tex_inline_ms = g_tex_inline_check_ms = 0;
@@ -5902,6 +6053,7 @@ HLE_IMPL(int, sceGnmSubmitAndFlipCommandBuffers, u32 count, const u32* const* dc
     HLE_QUIET("%u buffers, flip handle=%u buffer=%u modo=%u arg=%" PRId64, count, video_out_handle, buffer_index,
               flip_mode, flip_arg);
     const auto submit_start = std::chrono::steady_clock::now();
+    CloseHitchInterval(submit_start); // Fase 69
     g_last_flip_submit_ms = NowMs(); // Fase 59
     ++g_flip_submits;
     static std::once_flag stall_once;
@@ -6025,9 +6177,10 @@ HLE_IMPL(int, sceGnmSubmitAndFlipCommandBuffers, u32 count, const u32* const* dc
         videoout::QueueStatsOverlay(); // Fase 65: contador de FPS / info por cima do quadro
         renderer.DrawFrame(videoout::BufferAddress(static_cast<int>(buffer_index)));
         end_lap(4);
+        double df[7];
+        renderer.LastDrawFrameTimes(df);
+        NoteFrameEnd(end_ms, df); // Fase 69
         if (const double total = end_ms[0] + end_ms[1] + end_ms[2] + end_ms[3] + end_ms[4]; total > 40.0) {
-            double df[7];
-            renderer.LastDrawFrameTimes(df);
             static u32 logged = 0;
             if (logged++ < 400) {
                 const auto t0 = HitchEpoch(); // Fase 59: mesmo relogio do [ENGASGO]
@@ -6073,7 +6226,7 @@ HLE_IMPL(int, sceGnmSubmitAndFlipCommandBuffers, u32 count, const u32* const* dc
         }
     }
     {
-        std::lock_guard lock(g_mutex);
+        const render::TimedLock lock(g_mutex); // Fase 69
         EndFrame();
         if (++g_window_frames >= kWindowFrames) {
             const double seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - g_epoch).count();
@@ -6129,7 +6282,7 @@ HLE_IMPL(int, sceGnmAddEqEvent, equeue::Handle queue, u64 id, void* udata) {
     if (!equeue::Register(queue, id, equeue::kFilterGraphicsCore, udata)) {
         return static_cast<int>(0x80020009); // EBADF
     }
-    std::lock_guard lock(g_mutex);
+    const render::TimedLock lock(g_mutex); // Fase 69
     g_listeners.push_back({queue, id});
     return err::OK;
 }
@@ -6138,7 +6291,7 @@ HLE_OVERRIDE(sceGnmAddEqEvent);
 HLE_IMPL(int, sceGnmDeleteEqEvent, equeue::Handle queue, u64 id) {
     HLE_TRACE("id=0x%" PRIx64, id);
     equeue::Unregister(queue, id, equeue::kFilterGraphicsCore);
-    std::lock_guard lock(g_mutex);
+    const render::TimedLock lock(g_mutex); // Fase 69
     std::erase_if(g_listeners, [&](const EopListener& l) { return l.queue == queue && l.id == id; });
     return err::OK;
 }
@@ -6170,7 +6323,7 @@ int MapQueue(u32 pipe_id, u32 queue_id, const u32* ring, u32 ring_dwords, u32* r
     if (pipe_id > 6 || queue_id > 7 || !ring || !read_ptr || !ring_dwords) {
         return static_cast<int>(0x80D11000 | 0xFF); // parametro invalido
     }
-    std::lock_guard lock(g_mutex);
+    const render::TimedLock lock(g_mutex); // Fase 69
     const u32 vqid = g_next_vqid++;
     g_queues[vqid] = {ring, ring_dwords, read_ptr, 0};
     *read_ptr = 0;
@@ -6196,7 +6349,7 @@ HLE_OVERRIDE(sceGnmMapComputeQueueWithPriority);
 
 HLE_IMPL(int, sceGnmUnmapComputeQueue, u32 vqid) {
     HLE_TRACE("vqid %u", vqid);
-    std::lock_guard lock(g_mutex);
+    const render::TimedLock lock(g_mutex); // Fase 69
     return g_queues.erase(vqid) ? err::OK : -1;
 }
 HLE_OVERRIDE(sceGnmUnmapComputeQueue);
@@ -6205,7 +6358,7 @@ HLE_OVERRIDE(sceGnmUnmapComputeQueue);
 // novo na hora e avanca o ponteiro de leitura que o jogo consulta.
 HLE_IMPL(void, sceGnmDingDong, u32 vqid, u32 next_offset) {
     HLE_QUIET("vqid %u ate %u", vqid, next_offset);
-    std::lock_guard lock(g_mutex);
+    const render::TimedLock lock(g_mutex); // Fase 69
     const auto it = g_queues.find(vqid);
     if (it == g_queues.end()) {
         return;
@@ -6314,6 +6467,9 @@ const char* OpcodeName(u32 opcode) {
 // Chamado no resumo final: o que o jogo mandou para a "GPU".
 void PrintStats() {
     FlushFileWrites(); // Fase 45: o que ainda estava na fila do gravador
+    if (auto& renderer = render::VulkanRenderer::Instance(); renderer.Active()) {
+        renderer.SavePipelineCache("saida do jogo"); // Fase 70: fechar a janela encerra o processo sem o Shutdown
+    }
     std::printf("  Fase 45 (extrator): %" PRIu64 " no caminho frio (%" PRIu64 " pela busca lenta, %" PRIu64 " repetidos) | cabecalho %.0f ms, busca lenta %.0f ms, hash %.0f ms, resto %.0f ms | %" PRIu64 " gravacoes em segundo plano\n",
                 g_extract_cold, g_extract_slow, g_extract_dup, g_extract_ms[0], g_extract_ms[1], g_extract_ms[2], g_extract_ms[3],
                 g_file_writes.load());
@@ -6415,6 +6571,22 @@ void PrintStats() {
                     PRIu64 " em %.0f ms | pares (arquivo + modulos) %" PRIu64 " em %.0f ms | extrator (shader novo) %" PRIu64 " em %.0f ms\n",
                     g_hitch.kind_count[0], g_hitch.kind_ms[0], g_hitch.kind_count[1], g_hitch.kind_ms[1], g_hitch.kind_count[3],
                     g_hitch.kind_ms[3], g_hitch.kind_count[2], g_hitch.kind_ms[2], g_hitch.kind_count[4], g_hitch.kind_ms[4]);
+        { // Fase 69: o resumo por minuto da sessao inteira (inclui o minuto incompleto do fim)
+            HitchMinute all = g_minutes_total;
+            all.frames += g_minute.frames;
+            all.over25 += g_minute.over25;
+            all.over50 += g_minute.over50;
+            all.worst = std::max(all.worst, g_minute.worst);
+            all.slow_ms += g_minute.slow_ms;
+            all.game_ms += g_minute.game_ms;
+            AddCost(all.slow, g_minute.slow);
+            u64 worker[kHitchKinds];
+            for (int k = 0; k < kHitchKinds; ++k) {
+                worker[k] = render::HitchClock::worker_ns[k].load();
+            }
+            const double span = std::chrono::duration<double>(std::chrono::steady_clock::now() - HitchEpoch()).count();
+            PrintHitchMinute("ENGASGOS-SESSAO", span, span, all, worker);
+        }
         {
             u32 warm_done = 0, warm_total = 0;
             renderer.PrewarmProgress(&warm_done, &warm_total);
@@ -6958,7 +7130,7 @@ void SetVulkanDraws(bool enabled) {
 
 // Pede um dump do frame que estiver na tela aos `seconds` de execucao.
 void AddFrameDumpAt(u32 seconds) {
-    std::lock_guard lock(g_mutex);
+    const render::TimedLock lock(g_mutex); // Fase 69
     g_forced_dumps_ms.push_back(seconds * 1000ll);
 }
 
@@ -6988,7 +7160,7 @@ void SetCutsceneWatchdog(u32 seconds) {
 
 // Liga o dump de telas paradas; `directory` recebe um .txt por tela e as texturas brutas.
 void SetFrameDumpDirectory(const std::filesystem::path& directory) {
-    std::lock_guard lock(g_mutex);
+    const render::TimedLock lock(g_mutex); // Fase 69
     g_dump_dir = directory;
 }
 

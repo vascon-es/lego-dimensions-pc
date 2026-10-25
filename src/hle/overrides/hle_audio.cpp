@@ -1324,7 +1324,16 @@ void PrintNgs2VoiceReport() {
 
 void PrintNgs2Stats() {
     PrintAudioStats();
-    std::lock_guard lock(g_voice_mutex);
+    // Fase 70b: no fechamento pela janela outra thread pode estar presa com o mutex das vozes; esperar por ele
+    // travava a saida (o processo ficava aberto). Tenta por ate 1 s e, sem ele, pula este resumo.
+    std::unique_lock lock(g_voice_mutex, std::defer_lock);
+    for (int i = 0; i < 100 && !lock.try_lock(); ++i) {
+        Sleep(10);
+    }
+    if (!lock.owns_lock()) {
+        std::printf("Ngs2 vozes : (resumo pulado: estado das vozes ocupado no fechamento)\n");
+        return;
+    }
     const VoiceStats& st = g_voice_stats;
     std::printf("Ngs2 vozes : relogio virtual %s; %llu consultas de estado, %llu PLAY, %llu STOP, %llu terminaram sozinhas, "
                 "pico de %llu ativas; %llu blocos (%.1f MiB), %llu dimensionados pelos bytes, %llu underruns de stream\n",

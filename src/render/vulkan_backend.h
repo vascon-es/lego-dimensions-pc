@@ -7,6 +7,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <mutex>
 #include <string>
 #include <vector>
 
@@ -14,19 +15,60 @@
 
 namespace render {
 
+// Fase 69: a thread que processa os pacotes do jogo e grava o frame (marcada no Submit). So o tempo dela
+// trava o quadro; o das threads de textura / pipeline / pares corre em paralelo.
+inline thread_local bool t_render_thread = false;
+inline void MarkRenderThread() { t_render_thread = true; }
+
 // Fase 28: de onde vem os engasgos. Cada categoria soma o tempo gasto desde o ultimo flip; quem
 // fecha o frame (sceGnmSubmitAndFlipCommandBuffers) le e zera.
+// Fase 69: so a thread de render entra em ns/count (antes a leitura/destile e o envio das threads de textura
+// caiam nas mesmas categorias e pareciam engasgo); as outras threads vao para worker_ns/worker_count.
+// +kLive (tradutor de shaders rodando na hora, Fase 56) e kLock (espera por um mutex do backend, TimedLock).
 struct HitchClock {
-    enum Kind { kPipeline, kTexture, kPair, kDetile, kExtract, kDma, kGeometry, kTarget, kReady, kKinds }; // Fase 59: +geometria, alvos, pares prontos
+    enum Kind { kPipeline, kTexture, kPair, kDetile, kExtract, kDma, kGeometry, kTarget, kReady, kLive, kLock, kKinds }; // Fase 59: +geometria, alvos, pares prontos
     static inline std::atomic<u64> ns[kKinds]{};
     static inline std::atomic<u32> count[kKinds]{};
+    static inline std::atomic<u64> worker_ns[kKinds]{};
+    static inline std::atomic<u64> worker_count[kKinds]{};
     Kind kind;
     std::chrono::steady_clock::time_point start = std::chrono::steady_clock::now();
     explicit HitchClock(Kind k) : kind(k) {}
-    ~HitchClock() {
-        ns[kind] += std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count();
-        ++count[kind];
+    ~HitchClock() { Add(kind, std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count()); }
+    static void Add(Kind kind, u64 elapsed_ns) {
+        if (t_render_thread) {
+            ns[kind] += elapsed_ns;
+            ++count[kind];
+        } else {
+            worker_ns[kind] += elapsed_ns;
+            ++worker_count[kind];
+        }
     }
+};
+
+// Fase 69: lock de um mutex compartilhado com as threads de trabalho (g.mutex, bibliotecas, pool de texturas).
+// Tenta sem esperar; so quando outra thread esta com ele a espera e cronometrada (HitchClock::kLock).
+class TimedLock {
+public:
+    explicit TimedLock(std::mutex& mutex) : lock_(mutex, std::try_to_lock) {
+        if (!lock_.owns_lock()) {
+            const auto start = std::chrono::steady_clock::now();
+            lock_.lock();
+            HitchClock::Add(HitchClock::kLock,
+                            std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count());
+        }
+    }
+    TimedLock(const TimedLock&) = delete;
+    TimedLock& operator=(const TimedLock&) = delete;
+    void unlock() { lock_.unlock(); }
+    void lock() {
+        const auto start = std::chrono::steady_clock::now();
+        lock_.lock();
+        HitchClock::Add(HitchClock::kLock, std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count());
+    }
+
+private:
+    std::unique_lock<std::mutex> lock_;
 };
 
 // Um draw do jogo ja traduzido para o que o backend sabe desenhar (Fase 17): geometria com
@@ -311,6 +353,7 @@ public:
     u32 PrewarmPipelines();
     void BenchPipelines(const std::string& path); // Fase 53: so medicao (LD_PIPE_BENCH)
     void PrewarmProgress(u32* done, u32* total) const;
+    void SavePipelineCache(const char* reason); // Fase 70: grava o cache de pipelines do Vulkan (arquivo temporario + troca)
 
     // Cor de limpeza (padrao desde a Fase 17: cinza bem escuro, para a geometria se destacar).
     void SetClearColor(float r, float g, float b, float a);
