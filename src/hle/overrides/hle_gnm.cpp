@@ -7051,6 +7051,22 @@ void GetLoadingStatus(LoadingStatus* out) {
     out->aot_total = g_ready_total.load();
     out->aot_finished = g_ready_finished.load();
     render::VulkanRenderer::Instance().PrewarmProgress(&out->pipelines_done, &out->pipelines_total);
+    // Fase 72: a tela de carregamento espera so os pipelines da tela de abertura e das areas de entrada / ultima da
+    // sessao anterior (o resto continua na fila, abaixo do normal). Sem sessao anterior registrada, espera tudo.
+    // Medido na RX 6600 com o cache do driver vazio: 49,3 s -> 6,2 s, sem quadro esperando pipeline no jogo.
+    // LD_PREWARM_GATE=tudo volta a esperar todos.
+    static const bool area_gate = [] {
+        const char* env = std::getenv("LD_PREWARM_GATE");
+        return !(env && !std::strcmp(env, "tudo"));
+    }();
+    if (area_gate) {
+        u32 done = 0, total = 0;
+        render::VulkanRenderer::Instance().PrewarmPriorityProgress(&done, &total);
+        if (total) {
+            out->pipelines_done = done;
+            out->pipelines_total = total;
+        }
+    }
 }
 
 // Texto curto para o titulo da janela enquanto o aquecimento roda ("" quando nao ha o que mostrar).

@@ -2771,6 +2771,8 @@ struct PipelineJob {
     bool prewarm = false; // veio do arquivo: nao regrava, e conta no progresso
     bool fast = false;    // Fase 56: pedido por um frame: sai sem otimizacao (~1,5x mais rapido) ...
     bool upgrade = false; // ... e depois este job, em segundo plano, troca pela versao otimizada
+    u32 level = 0;         // Fase 72: area em que o pipeline foi usado pela primeira vez (0 = desconhecida)
+    bool priority = false; // Fase 72: aquecimento da area atual / da ultima sessao: prioridade normal e na frente
 };
 // Fase 56: pipelines trocados pela versao otimizada. So sao destruidos quando nenhum frame em voo pode
 // mais usar (3 frames depois). Protegido por g.mutex.
@@ -2785,6 +2787,147 @@ std::string g_pipeline_state_path;
 std::mutex g_pipeline_file_mutex;
 std::unordered_set<u64> g_pipeline_saved; // hashes ja presentes no arquivo (protegido por g_pipeline_file_mutex)
 std::atomic<u32> g_prewarm_total{0}, g_prewarm_done{0};
+
+// ---- Fase 72: aquecimento por area ----
+// O radar avisa quando o jogo carrega uma area (\levels\...\<nome>\<nome>.txt). Por 2 min depois disso, cada
+// pipeline usado pela primeira vez ganha essa area (pipeline_levels.txt: "<hash> <area>", e "ultima <area>" a cada
+// troca; a base distribuida e pipeline_levels_base.txt). No aquecimento, os pipelines da ultima area da sessao
+// anterior (e da tela de abertura) vao na frente, na prioridade normal; o resto abaixo do normal. Quando o jogo
+// carrega uma area, o que dela ainda estiver na fila passa para a frente. LD_PREWARM_GATE=area faz a tela de
+// carregamento do port esperar so pelos prioritarios (o resto termina com o jogo ja rodando; um pipeline que
+// faltar no uso ainda espera ate 400 ms, sem sumir objeto). Padrao: espera tudo, como antes.
+std::mutex g_level_mutex;
+std::vector<std::string> g_level_names{""}; // id -> nome (0 = sem area)
+std::unordered_map<std::string, u32> g_level_ids;
+std::atomic<u32> g_current_level{0};
+std::unordered_map<u64, u32> g_pipeline_level;      // hash da chave -> area (g_level_mutex)
+std::vector<std::pair<u64, u32>> g_level_pending;   // a gravar (hash 0 = linha "ultima"); g_level_mutex
+std::unordered_set<u64> g_level_noted;              // ja visto nesta sessao (so a thread de render)
+std::atomic<u32> g_level_note_until{0};             // frame_serial ate onde o primeiro uso e anotado
+std::unordered_set<u32> g_priority_levels;          // g_level_mutex
+std::atomic<u32> g_prewarm_priority_total{0}, g_prewarm_priority_done{0};
+std::atomic<bool> g_priority_from_session{false}; // ha areas de uma sessao anterior (a trava por area vale)
+std::atomic<bool> g_level_writing{false};
+std::chrono::steady_clock::time_point g_level_written_at{};
+bool g_levels_loaded = false; // g_level_mutex
+
+// Com g_level_mutex.
+u32 LevelIdLocked(const std::string& name) {
+    if (name.empty()) {
+        return 0;
+    }
+    const auto [it, added] = g_level_ids.emplace(name, static_cast<u32>(g_level_names.size()));
+    if (added) {
+        g_level_names.push_back(name);
+    }
+    return it->second;
+}
+
+std::filesystem::path LevelsPath(const char* file) {
+    return std::filesystem::path(GameSpirvDirectory()) / file;
+}
+
+// Uma vez, antes do primeiro aquecimento: base distribuida e depois o arquivo do jogador (vale a primeira area).
+void LoadPipelineLevels() {
+    std::lock_guard lock(g_level_mutex);
+    if (g_levels_loaded || GameSpirvDirectory().empty()) {
+        return;
+    }
+    g_levels_loaded = true;
+    std::string last;                // ultima area da sessao anterior
+    std::vector<std::string> entry;  // as 3 primeiras areas depois da abertura na sessao anterior (por onde o save entra)
+    bool in_session = false;
+    u32 entries = 0;
+    for (const char* file : {"pipeline_levels_base.txt", "pipeline_levels.txt"}) {
+        std::ifstream in(LevelsPath(file));
+        std::string line;
+        while (std::getline(in, line)) {
+            while (!line.empty() && (line.back() == '\r' || line.back() == ' ')) {
+                line.pop_back();
+            }
+            if (line == "sessao") { // uma sessao nova comecou: a entrada e a primeira area dela
+                in_session = true;
+                entry.clear();
+                continue;
+            }
+            const size_t space = line.find(' ');
+            if (line.empty() || line[0] == '#' || space == std::string::npos) {
+                continue;
+            }
+            const std::string name = line.substr(space + 1);
+            if (line.compare(0, space, "ultima") == 0) {
+                last = name;
+                if (in_session && entry.size() < 3 && name != "loading_screen_startup" &&
+                    std::find(entry.begin(), entry.end(), name) == entry.end()) {
+                    entry.push_back(name);
+                }
+                continue;
+            }
+            const u64 hash = std::strtoull(line.c_str(), nullptr, 16);
+            if (hash && g_pipeline_level.emplace(hash, LevelIdLocked(name)).second) {
+                ++entries;
+            }
+        }
+    }
+    g_priority_levels.insert(LevelIdLocked("loading_screen_startup"));
+    std::string named = "tela de abertura";
+    g_priority_from_session = !last.empty();
+    entry.push_back(last);
+    for (const std::string& name : entry) {
+        if (!name.empty() && g_priority_levels.insert(LevelIdLocked(name)).second) {
+            named += " + " + name;
+        }
+    }
+    std::printf("[PIPELINES] areas: %u pipelines com area conhecida, %zu areas; prioridade no aquecimento: %s\n", entries, g_level_names.size() - 1,
+                named.c_str());
+}
+
+// Thread de render (GetGamePipeline, com g.mutex), so na janela de 2 min depois de uma troca de area.
+void NotePipelineLevel(u64 hash) {
+    if (!g_level_noted.insert(hash).second) {
+        return;
+    }
+    std::lock_guard lock(g_level_mutex);
+    const u32 level = g_current_level.load();
+    if (level && g_pipeline_level.emplace(hash, level).second) {
+        g_level_pending.emplace_back(hash, level);
+    }
+}
+
+// Fim do DrawFrame: grava as anotacoes novas em segundo plano, no maximo a cada 2 s.
+void FlushLevelNotes() {
+    if (g_level_writing.load() || std::chrono::steady_clock::now() - g_level_written_at < std::chrono::seconds(2)) {
+        return;
+    }
+    std::vector<std::string> lines;
+    {
+        std::lock_guard lock(g_level_mutex);
+        if (g_level_pending.empty()) {
+            return;
+        }
+        for (const auto& [hash, level] : g_level_pending) {
+            char text[32];
+            if (hash == 1 && !level) {
+                lines.push_back("sessao\n");
+                continue;
+            }
+            std::snprintf(text, sizeof(text), hash ? "%llx " : "ultima ", static_cast<unsigned long long>(hash));
+            lines.push_back(text + g_level_names[level] + "\n");
+        }
+        g_level_pending.clear();
+    }
+    g_level_written_at = std::chrono::steady_clock::now();
+    g_level_writing = true;
+    std::thread([lines = std::move(lines)] {
+        if (std::FILE* f = _wfopen(LevelsPath("pipeline_levels.txt").c_str(), L"a")) {
+            for (const std::string& line : lines) {
+                std::fputs(line.c_str(), f);
+            }
+            std::fclose(f);
+        }
+        g_level_writing = false;
+    }).detach();
+}
 
 u64 HashPipelineKey(const std::vector<u32>& key) {
     u64 key_hash = 0xcbf29ce484222325ull ^ key.size();
@@ -2873,7 +3016,7 @@ void PipelineWorker() {
         }
         // Fase 59: so o pipeline que um frame espera roda na prioridade normal; versao otimizada (troca),
         // aquecimento e pedidos sem pressa ficam abaixo do normal e nao disputam a CPU com o jogo.
-        const bool urgent = job.fast || (!job.upgrade && !job.prewarm);
+        const bool urgent = job.fast || (!job.upgrade && !job.prewarm) || job.priority; // Fase 72: area atual
         SetThreadPriority(GetCurrentThread(), urgent ? THREAD_PRIORITY_NORMAL : THREAD_PRIORITY_BELOW_NORMAL);
         g_pipeline_flags = job.fast ? VK_PIPELINE_CREATE_DISABLE_OPTIMIZATION_BIT : 0; // Fase 56
         if (!job.vs || !job.ps) {
@@ -2904,6 +3047,7 @@ void PipelineWorker() {
         }
         if (job.prewarm) {
             ++g_prewarm_done;
+            g_prewarm_priority_done += job.priority; // Fase 72
         } else if (pipeline) {
             SavePipelineState(job.hash, job.key);
         }
@@ -2969,6 +3113,9 @@ VkPipeline GetGamePipeline(const GameDraw& draw, const State::GamePair& pair, St
     const u64 key_hash = HashPipelineKey(key);
     if (key_out) {
         *key_out = key_hash;
+    }
+    if (g.frame_serial < g_level_note_until.load(std::memory_order_relaxed)) {
+        NotePipelineLevel(key_hash); // Fase 72
     }
     if (const auto found = g.game_pipelines.find(key_hash); found != g.game_pipelines.end()) {
         if (found->second || !g_pipeline_failed_at.count(key_hash) || g.frame_serial - g_pipeline_failed_at[key_hash] < 300) {
@@ -4275,6 +4422,7 @@ bool VulkanRenderer::DrawFrame(u64 display_address) {
     }
     lap(6);
     MaybeSavePipelineCache(g_prewarm_total.load() && g_prewarm_done.load() >= g_prewarm_total.load()); // Fase 70
+    FlushLevelNotes(); // Fase 72
     if (result == VK_ERROR_OUT_OF_DATE_KHR || result == VK_SUBOPTIMAL_KHR) {
         // apresentou (SUBOPTIMAL) ou nao (OUT_OF_DATE); de todo modo o swapchain e refeito
         const bool was_shown = result == VK_SUBOPTIMAL_KHR;
@@ -5416,6 +5564,7 @@ u32 VulkanRenderer::PrewarmPipelines() {
     if (g_pipeline_state_path.empty() || !g.active || !g_async_pipelines.load()) {
         return 0;
     }
+    LoadPipelineLevels(); // Fase 72
     std::lock_guard waiting_lock(g_prewarm_waiting_mutex);
     std::vector<std::vector<u32>> records;
     records.swap(g_prewarm_waiting);
@@ -5476,12 +5625,19 @@ u32 VulkanRenderer::PrewarmPipelines() {
         }
     }
     u32 queued = 0;
+    std::vector<PipelineJob> first, rest; // Fase 72: area prioritaria na frente da fila
     for (const std::vector<u32>& key : records) {
         PipelineJob job;
         if (!JobFromKey(key, job)) {
             continue; // linha de outra versao do formato
         }
         job.prewarm = true;
+        {
+            std::lock_guard level_lock(g_level_mutex);
+            const auto level = g_pipeline_level.find(job.hash);
+            job.level = level == g_pipeline_level.end() ? 0 : level->second;
+            job.priority = job.level && g_priority_levels.count(job.level);
+        }
         {
             const TimedLock lock(g.mutex);
             const auto pair = g.game_pairs.find(job.draw.pair);
@@ -5498,16 +5654,68 @@ u32 VulkanRenderer::PrewarmPipelines() {
             job.fs_lib = pair->second.fs_lib;
             job.layout = pair->second.layout;
         }
-        {
-            std::lock_guard lock(g_pipeline_mutex);
-            EnsurePipelineWorkers();
-            g_pipeline_jobs.push_back(std::move(job));
-        }
-        g_pipeline_cv.notify_one();
+        g_prewarm_priority_total += job.priority;
+        (job.priority ? first : rest).push_back(std::move(job));
         ++g_prewarm_total;
         ++queued;
     }
+    if (queued) {
+        std::lock_guard lock(g_pipeline_mutex);
+        EnsurePipelineWorkers();
+        for (PipelineJob& job : first) {
+            g_pipeline_jobs.push_back(std::move(job));
+        }
+        for (PipelineJob& job : rest) {
+            g_pipeline_jobs.push_back(std::move(job));
+        }
+    }
+    g_pipeline_cv.notify_all();
     return queued;
+}
+
+// Fase 72: o jogo comecou a carregar uma area (radar). Anota o primeiro uso dos pipelines por 2 min e passa para a
+// frente da fila, na prioridade normal, o que do aquecimento for desta area e ainda nao foi criado.
+void VulkanRenderer::SetCurrentLevel(const std::string& name) {
+    u32 level = 0;
+    {
+        std::lock_guard lock(g_level_mutex);
+        level = LevelIdLocked(name);
+        if (level == g_current_level.load()) {
+            return;
+        }
+        g_current_level = level;
+        static bool session_marked = false;
+        if (!session_marked) {
+            session_marked = true;
+            g_level_pending.emplace_back(1, 0); // linha "sessao": a primeira area depois dela e a de entrada
+        }
+        g_level_pending.emplace_back(0, level); // linha "ultima <area>"
+    }
+    g_level_note_until = g.frame_serial + 7200;
+    u32 moved = 0;
+    {
+        std::lock_guard lock(g_pipeline_mutex);
+        std::stable_partition(g_pipeline_jobs.begin(), g_pipeline_jobs.end(), [&](PipelineJob& job) {
+            if (!job.prewarm) {
+                return true; // pedidos de frames continuam na frente
+            }
+            if (job.level == level) {
+                if (!job.priority) {
+                    job.priority = true;
+                    ++moved;
+                }
+                return true;
+            }
+            return false;
+        });
+    }
+    std::printf("[PIPELINES] area %s: %u pipelines do aquecimento dela passaram para a frente da fila\n", name.c_str(), moved);
+}
+
+// Fase 72: progresso so dos pipelines prioritarios (LD_PREWARM_GATE=area).
+void VulkanRenderer::PrewarmPriorityProgress(u32* done, u32* total) const {
+    *done = g_prewarm_priority_done.load();
+    *total = g_priority_from_session.load() ? g_prewarm_priority_total.load() : 0; // sem sessao anterior: 0 = espera tudo
 }
 
 // Linha do arquivo de estados -> job (sem os modulos do par). Falso se for de outra versao do formato.

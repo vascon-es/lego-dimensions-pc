@@ -15,6 +15,9 @@ uso:
       invalidas); --sem tira o que ja esta em BASE (para mandar so as novas)
   python tools/pipeline_states.py conferir ARQUIVO [ARQUIVO ...]
       conta linhas validas, repetidas e invalidas
+  python tools/pipeline_states.py areas -o SAIDA ARQUIVO [ARQUIVO ...]
+      Fase 72: junta arquivos pipeline_levels ("<hash> <area>"; vale a primeira area de cada hash; as linhas
+      "ultima <area>" sao de cada jogador e nao entram)
 """
 import argparse
 import os
@@ -111,6 +114,42 @@ def write_file(path, keys):
     os.replace(temp, path)
 
 
+def read_levels(path):
+    """[(hash, area)] de um arquivo pipeline_levels (sem as linhas "ultima")."""
+    out = []
+    with open(path, encoding='utf-8', errors='replace') as f:
+        for line in f:
+            parts = line.strip().split(' ', 1)
+            if len(parts) != 2 or parts[0].startswith('#') or parts[0] == 'ultima':
+                continue
+            try:
+                h = int(parts[0], 16)
+            except ValueError:
+                continue
+            if h and parts[1] and ' ' not in parts[1]:
+                out.append((h, parts[1]))
+    return out
+
+
+def merge_levels(paths):
+    seen, out = set(), []
+    for path in paths:
+        for h, area in read_levels(path):
+            if h not in seen:
+                seen.add(h)
+                out.append((h, area))
+    return out
+
+
+def write_levels(path, entries):
+    temp = path + '.novo'
+    with open(temp, 'w', encoding='utf-8', newline='\n') as f:
+        f.write('# ld-pipeline-levels 1\n')
+        for h, area in entries:
+            f.write('%x %s\n' % (h, area))
+    os.replace(temp, path)
+
+
 def main():
     parser = argparse.ArgumentParser(description='receitas de pipeline do LEGO Dimensions PC')
     sub = parser.add_subparsers(dest='cmd', required=True)
@@ -120,7 +159,15 @@ def main():
     j.add_argument('arquivos', nargs='+')
     c = sub.add_parser('conferir')
     c.add_argument('arquivos', nargs='+')
+    a = sub.add_parser('areas')
+    a.add_argument('-o', '--saida', required=True)
+    a.add_argument('arquivos', nargs='+')
     args = parser.parse_args()
+    if args.cmd == 'areas':
+        entries = merge_levels([p for p in args.arquivos if os.path.isfile(p)])
+        write_levels(args.saida, entries)
+        print('%s: %d pipelines com area, %d areas' % (args.saida, len(entries), len({a for _, a in entries})))
+        return 0
     if args.cmd == 'juntar':
         keys, stats = merge([a for a in args.arquivos if os.path.isfile(a)], args.sem)
         for path, version, total, new in stats:
