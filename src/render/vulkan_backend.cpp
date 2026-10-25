@@ -2818,6 +2818,10 @@ void SavePipelineState(u64 hash, const std::vector<u32>& key) {
     std::lock_guard file_lock(g_pipeline_file_mutex);
     if (g_pipeline_saved.insert(hash).second) {
         if (std::FILE* f = std::fopen(g_pipeline_state_path.c_str(), "a")) {
+            std::fseek(f, 0, SEEK_END);
+            if (std::ftell(f) == 0) {
+                std::fprintf(f, "# ld-pipeline-states 2\n"); // Fase 71: arquivo novo comeca com a versao do formato
+            }
             for (const u32 word : key) {
                 std::fprintf(f, "%x ", word);
             }
@@ -5417,22 +5421,57 @@ u32 VulkanRenderer::PrewarmPipelines() {
     records.swap(g_prewarm_waiting);
     {
         std::lock_guard file_lock(g_pipeline_file_mutex);
-        std::ifstream in(g_pipeline_state_path);
-        std::string line;
-        while (std::getline(in, line)) {
-            std::vector<u32> key;
-            const char* p = line.c_str();
-            char* end = nullptr;
-            for (;;) {
-                const unsigned long value = std::strtoul(p, &end, 16);
-                if (end == p) {
-                    break;
+        // Fase 71: a base distribuida com o port (refeita a cada versao por tools/pipeline_states.py) e depois o
+        // arquivo do jogador. O hash da chave tira os repetidos; o que ja esta na base nao e gravado de novo no do
+        // jogador. Linhas # sao comentarios; "# ld-pipeline-states N" com N diferente de 2 = formato de outra
+        // versao, arquivo ignorado. LD_PIPE_BASE=0 ignora a base.
+        static const bool use_base = [] {
+            const char* env = std::getenv("LD_PIPE_BASE");
+            return !(env && env[0] == '0');
+        }();
+        std::vector<std::string> paths;
+        if (use_base) {
+            paths.push_back((std::filesystem::path(g_pipeline_state_path).parent_path() / "pipeline_states_base.txt").string());
+        }
+        paths.push_back(g_pipeline_state_path);
+        for (const std::string& path : paths) {
+            std::ifstream in(path);
+            std::string line;
+            u32 read = 0, added = 0;
+            bool first = true;
+            while (std::getline(in, line)) {
+                if (first && line.rfind("# ld-pipeline-states", 0) == 0) {
+                    first = false;
+                    if (std::atoi(line.c_str() + 20) != 2) {
+                        std::printf("[PIPELINES] %s: formato de estados desconhecido (%s), ignorado\n", path.c_str(), line.c_str());
+                        break;
+                    }
+                    continue;
                 }
-                key.push_back(static_cast<u32>(value));
-                p = end;
+                first = false;
+                if (line.empty() || line[0] == '#') {
+                    continue;
+                }
+                std::vector<u32> key;
+                const char* p = line.c_str();
+                char* end = nullptr;
+                for (;;) {
+                    const unsigned long value = std::strtoul(p, &end, 16);
+                    if (end == p) {
+                        break;
+                    }
+                    key.push_back(static_cast<u32>(value));
+                    p = end;
+                }
+                ++read;
+                if (key.size() >= 13 && g_pipeline_saved.insert(HashPipelineKey(key)).second) {
+                    records.push_back(std::move(key));
+                    ++added;
+                }
             }
-            if (key.size() >= 13 && g_pipeline_saved.insert(HashPipelineKey(key)).second) {
-                records.push_back(std::move(key));
+            static std::unordered_set<std::string> logged;
+            if (read && logged.insert(path).second) {
+                std::printf("[PIPELINES] estados de %s: %u linhas, %u novas\n", std::filesystem::path(path).filename().string().c_str(), read, added);
             }
         }
     }
