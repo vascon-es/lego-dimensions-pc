@@ -5049,12 +5049,15 @@ void ProcessCommandBuffer(const u32* cmd, u64 size_bytes, u64 release_event) {
 
 // Fase 69: tempo de todos os Submits (com e sem flip) desde o ultimo fechamento de intervalo ([ENGASGOS-MIN])
 std::atomic<u64> g_submit_all_ns{0};
+double WaitRenderThreadIdle(); // Fase 76 (definida mais abaixo)
+double g_render_wait_pending_ms = 0; // Fase 76: espera pela thread de render ainda nao somada a um intervalo
 
 int Submit(u32 count, const u32* const* dcb_addrs, const u32* dcb_sizes, const u32* const* ccb_addrs,
            const u32* ccb_sizes) {
     static perf::Counter perf_counter("Gnm Submit (parser PM4)");
     const perf::Scope perf_scope(perf_counter);
     render::MarkRenderThread(); // Fase 69: o tempo desta thread e o que trava o quadro
+    g_render_wait_pending_ms += WaitRenderThreadIdle(); // Fase 76: o quadro anterior termina antes de mexer no estado
     struct SubmitTimer {
         std::chrono::steady_clock::time_point start = std::chrono::steady_clock::now();
         ~SubmitTimer() { g_submit_all_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count(); }
@@ -5823,6 +5826,8 @@ struct IntervalCost {
     double draw_frame[7]{};        // dentro do DrawFrame: pipelines, lock, fence, acquire, gravacao, submit, present
     double end_kind[kHitchKinds]{};
     double gpu_ms = 0; // Fase 75: GPU do quadro que este intervalo esperou (o anterior)
+    double render_wait = 0; // Fase 76: a thread do jogo esperando a thread de render (antes do Submit)
+    bool threaded = false;  // Fase 76: fim do frame na thread de render (nao conta no tempo da thread do jogo)
 };
 struct HitchMinute {
     u64 frames = 0, over25 = 0, over50 = 0;
@@ -5850,6 +5855,7 @@ void TakeHitchKinds(double* into) {
 void AddCost(IntervalCost& to, const IntervalCost& from) {
     to.submit_ms += from.submit_ms;
     to.gpu_ms += from.gpu_ms;
+    to.render_wait += from.render_wait;
     for (int k = 0; k < kHitchKinds; ++k) {
         to.submit_kind[k] += from.submit_kind[k];
         to.end_kind[k] += from.end_kind[k];
@@ -5877,7 +5883,8 @@ void PrintHitchMinute(const char* tag, double t, double span_s, const HitchMinut
                 "espera de pipelines %.0f, lock %.0f, fence %.0f, acquire %.0f, gravacao %.0f, submit %.0f, present %.0f; categorias no fim %.0f)"
                 " | threads de trabalho no periodo: destile %.0f, texturas %.0f, pipelines %.0f, lock %.0f ms"
                 " | GPU: %" PRIu64 " quadros acima de 16,7 ms, pior %.1f ms, nos quadros lentos %.0f ms"
-                " | media por quadro: %.2f ms (Submit %.2f, gravacao %.2f, GPU %.2f)\n",
+                " | media por quadro: %.2f ms (Submit %.2f, gravacao %.2f, GPU %.2f)"
+                " | espera pela thread de render: %.0f ms nos quadros lentos\n",
                 tag, t, m.frames, m.over25, per_min, m.over50, m.worst, m.slow_ms, m.game_ms, c.submit_ms, c.submit_kind[0], c.submit_kind[1],
                 c.submit_kind[3], c.submit_kind[2], c.submit_kind[4], c.submit_kind[5], c.submit_kind[6], c.submit_kind[7], c.submit_kind[8],
                 c.submit_kind[9], c.submit_kind[10], std::max(0.0, c.submit_ms - categorized), end_total, c.end_ms[0], c.end_ms[1], c.end_ms[2],
@@ -5893,13 +5900,15 @@ void PrintHitchMinute(const char* tag, double t, double span_s, const HitchMinut
                 worker_ns[render::HitchClock::kDetile] / 1e6, worker_ns[render::HitchClock::kTexture] / 1e6,
                 worker_ns[render::HitchClock::kPipeline] / 1e6, worker_ns[render::HitchClock::kLock] / 1e6, m.gpu_over, m.worst_gpu, c.gpu_ms,
                 m.frames ? m.all_ms / m.frames : 0.0, m.frames ? m.all_submit / m.frames : 0.0, m.frames ? m.all_record / m.frames : 0.0,
-                m.frames ? m.all_gpu / m.frames : 0.0);
+                m.frames ? m.all_gpu / m.frames : 0.0, c.render_wait);
 }
 
 // No comeco de cada SubmitAndFlip: fecha o intervalo anterior.
 void CloseHitchInterval(std::chrono::steady_clock::time_point now) {
     TakeHitchKinds(g_iv.submit_kind); // Submits sem flip e o que mais rodou na thread de render desde o fim do frame
     g_iv.submit_ms += g_submit_all_ns.exchange(0) / 1e6;
+    g_iv.render_wait += g_render_wait_pending_ms; // Fase 76
+    g_render_wait_pending_ms = 0;
     if (g_iv_start.time_since_epoch().count()) {
         const double interval = std::chrono::duration<double, std::milli>(now - g_iv_start).count();
         ++g_minute.frames;
@@ -5915,7 +5924,8 @@ void CloseHitchInterval(std::chrono::steady_clock::time_point now) {
             g_minute.worst = std::max(g_minute.worst, interval);
             g_minute.slow_ms += interval;
             const double end_total = g_iv.end_ms[0] + g_iv.end_ms[1] + g_iv.end_ms[2] + g_iv.end_ms[3] + g_iv.end_ms[4];
-            g_minute.game_ms += std::max(0.0, interval - g_iv.submit_ms - end_total);
+            // Fase 76: com a thread de render o fim do frame corre em paralelo; na thread do jogo fica a espera por ela
+            g_minute.game_ms += std::max(0.0, interval - g_iv.submit_ms - (g_iv.threaded ? g_iv.render_wait : end_total));
             AddCost(g_minute.slow, g_iv);
         }
     } else {
@@ -6060,82 +6070,24 @@ void StallWatchThread() {
     }
 }
 
-HLE_IMPL(int, sceGnmSubmitCommandBuffers, u32 count, const u32* const* dcb_addrs, const u32* dcb_sizes,
-         const u32* const* ccb_addrs, const u32* ccb_sizes) {
-    HLE_QUIET("%u buffers", count);
-    return Submit(count, dcb_addrs, dcb_sizes, ccb_addrs, ccb_sizes);
+// ================= Fase 76: fim do frame numa thread propria =================
+// O fim do frame (leituras de volta dos alvos minusculos, espera das texturas do quadro, envio, DrawFrame: gravacao,
+// submit e o present FIFO, que espera o VSync) rodava na thread do jogo, dentro do SubmitAndFlip. Agora ele roda numa
+// thread de render e o jogo volta a montar o proximo quadro na hora; o flip do jogo (SubmitFlip) continua sendo
+// enfileirado so depois do present, como antes. Para o estado do quadro (filas de draws, aneis, alvos, texturas) nada
+// muda de ordem: todo Submit seguinte (com ou sem flip) espera a thread de render terminar o quadro anterior antes de
+// mexer em qualquer coisa. Desligado por padrao: na RX 6600 / Ryzen 5 5600X nenhuma cena testada e limitada por CPU
+// (Vorton fica em 60 fps mesmo com o processo preso a 2 processadores logicos), entao o ganho nao foi medido; nos testes
+// os dois caminhos deram os mesmos numeros. LD_RENDER_THREAD=1 liga (para medir em cenas de ~6000 draws).
+bool RenderThreadEnabled() {
+    static const bool enabled = [] {
+        const char* env = std::getenv("LD_RENDER_THREAD");
+        return env && env[0] == '1';
+    }();
+    return enabled;
 }
-HLE_OVERRIDE(sceGnmSubmitCommandBuffers);
 
-// buffer_index, flip_mode e flip_arg chegam pela pilha.
-HLE_IMPL(int, sceGnmSubmitAndFlipCommandBuffers, u32 count, const u32* const* dcb_addrs, const u32* dcb_sizes,
-         const u32* const* ccb_addrs, const u32* ccb_sizes, u32 video_out_handle, u32 buffer_index, u32 flip_mode,
-         s64 flip_arg) {
-    HLE_QUIET("%u buffers, flip handle=%u buffer=%u modo=%u arg=%" PRId64, count, video_out_handle, buffer_index,
-              flip_mode, flip_arg);
-    const auto submit_start = std::chrono::steady_clock::now();
-    CloseHitchInterval(submit_start); // Fase 69
-    g_last_flip_submit_ms = NowMs(); // Fase 59
-    ++g_flip_submits;
-    static std::once_flag stall_once;
-    std::call_once(stall_once, [] {
-        if (g_stall_stacks.load()) {
-            std::thread(StallWatchThread).detach();
-        }
-    });
-    static const bool dbg_cb = std::getenv("LD_DBG_CB") != nullptr; // DIAGNOSTICO Fase 60
-    auto dbg_cb_check = [](const char* when) {
-        std::lock_guard lock(g_dbg_cb_mutex);
-        std::map<std::tuple<u64, u64, u32, u32>, std::pair<u32, u32>> groups; // (VS, PS, estagio, binding) -> (mudaram, total)
-        u32 changed = 0, printed = 0;
-        std::vector<u8> now;
-        for (const auto& e : g_dbg_cb) {
-            now.resize(e.bytes);
-            const bool same = SafeCopy(now.data(), e.address, e.bytes) && !std::memcmp(now.data(), e.data.data(), e.bytes);
-            auto& g = groups[{e.vs, e.ps, e.stage, e.binding}];
-            ++g.second;
-            if (!same) {
-                ++g.first;
-                ++changed;
-                if (printed < 30) {
-                    ++printed;
-                    u32 first = 0;
-                    while (first + 4 <= e.bytes && !std::memcmp(now.data() + first, e.data.data() + first, 4)) {
-                        first += 4;
-                    }
-                    const u32 row = std::min(first & ~15u, (e.bytes & ~15u) - 16);
-                    const float* a = reinterpret_cast<const float*>(e.data.data() + row);
-                    const float* b = reinterpret_cast<const float*>(now.data() + row);
-                    std::printf("[DBG-CB] %s: par %016llx %016llx est %u b%u src %u end 0x%llx %u bytes, 1o byte diferente %u | copia %g %g %g %g -> agora %g %g %g %g\n",
-                                when, static_cast<unsigned long long>(e.vs), static_cast<unsigned long long>(e.ps), e.stage, e.binding, e.source,
-                                static_cast<unsigned long long>(e.address), e.bytes, first, a[0], a[1], a[2], a[3], b[0], b[1], b[2], b[3]);
-                }
-            }
-        }
-        u32 group_changed = 0;
-        for (const auto& [key, g] : groups) {
-            group_changed += g.first != 0;
-        }
-        std::printf("[DBG-CB] %s: %zu buffers copiados, %u mudaram depois da copia (%u de %zu grupos)\n", when, g_dbg_cb.size(), changed,
-                    group_changed, groups.size());
-    };
-    if (dbg_cb && !g_dbg_cb.empty()) {
-        dbg_cb_check("um frame depois");
-        g_dbg_cb.clear();
-    }
-    g_dbg_cb_record = dbg_cb && g_texture_frame % 600 == 300;
-    const int result = Submit(count, dcb_addrs, dcb_sizes, ccb_addrs, ccb_sizes);
-    if (g_dbg_cb_record) {
-        g_dbg_cb_record = false;
-        dbg_cb_check("fim do Submit");
-    }
-    if (result != err::OK) {
-        return result;
-    }
-    NoteFrameHitch(submit_start);
-    // Frame do Vulkan, logo depois de os pacotes PM4 serem processados na CPU: por enquanto so
-    // limpa a tela e apresenta. O swapchain e FIFO, entao esta chamada espera o VSync real do
-    // monitor, e o flip do jogo so e enfileirado (SubmitFlip, abaixo) depois da apresentacao.
+void RunFrameEnd(u32 buffer_index) {
     if (auto& renderer = render::VulkanRenderer::Instance(); renderer.Active()) {
         static perf::Counter perf_counter("Vulkan DrawFrame (limpa + apresenta)");
         const perf::Scope perf_scope(perf_counter);
@@ -6246,6 +6198,146 @@ HLE_IMPL(int, sceGnmSubmitAndFlipCommandBuffers, u32 count, const u32* const* dc
             last_pipes = pipes;
         }
     }
+}
+
+struct FrameEndJob {
+    u32 handle, buffer_index, flip_mode;
+    s64 flip_arg;
+};
+std::mutex g_rt_mutex;
+std::condition_variable g_rt_cv;
+std::optional<FrameEndJob> g_rt_job;
+bool g_rt_busy = false; // g_rt_mutex
+
+void RenderThreadMain() {
+    render::MarkRenderThread(); // o tempo dela tambem trava o quadro (HitchClock)
+    for (;;) {
+        FrameEndJob job;
+        {
+            std::unique_lock lock(g_rt_mutex);
+            g_rt_cv.wait(lock, [] { return g_rt_job.has_value(); });
+            job = *g_rt_job;
+            g_rt_job.reset();
+        }
+        RunFrameEnd(job.buffer_index);
+        videoout::SubmitFlip(static_cast<int>(job.handle), static_cast<int>(job.buffer_index), static_cast<int>(job.flip_mode), job.flip_arg);
+        {
+            std::lock_guard lock(g_rt_mutex);
+            g_rt_busy = false;
+        }
+        g_rt_cv.notify_all();
+    }
+}
+
+void QueueFrameEnd(const FrameEndJob& job) {
+    static std::once_flag started;
+    std::call_once(started, [] { std::thread(RenderThreadMain).detach(); });
+    {
+        std::lock_guard lock(g_rt_mutex);
+        g_rt_job = job;
+        g_rt_busy = true;
+    }
+    g_rt_cv.notify_all();
+}
+
+// Antes de qualquer Submit: o quadro anterior tem de ter terminado na thread de render. Devolve o tempo esperado (ms).
+double WaitRenderThreadIdle() {
+    if (!RenderThreadEnabled()) {
+        return 0;
+    }
+    std::unique_lock lock(g_rt_mutex);
+    if (!g_rt_busy) {
+        return 0;
+    }
+    const auto start = std::chrono::steady_clock::now();
+    g_rt_cv.wait(lock, [] { return !g_rt_busy; });
+    return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+}
+
+HLE_IMPL(int, sceGnmSubmitCommandBuffers, u32 count, const u32* const* dcb_addrs, const u32* dcb_sizes,
+         const u32* const* ccb_addrs, const u32* ccb_sizes) {
+    HLE_QUIET("%u buffers", count);
+    return Submit(count, dcb_addrs, dcb_sizes, ccb_addrs, ccb_sizes);
+}
+HLE_OVERRIDE(sceGnmSubmitCommandBuffers);
+
+// buffer_index, flip_mode e flip_arg chegam pela pilha.
+HLE_IMPL(int, sceGnmSubmitAndFlipCommandBuffers, u32 count, const u32* const* dcb_addrs, const u32* dcb_sizes,
+         const u32* const* ccb_addrs, const u32* ccb_sizes, u32 video_out_handle, u32 buffer_index, u32 flip_mode,
+         s64 flip_arg) {
+    HLE_QUIET("%u buffers, flip handle=%u buffer=%u modo=%u arg=%" PRId64, count, video_out_handle, buffer_index,
+              flip_mode, flip_arg);
+    g_render_wait_pending_ms += WaitRenderThreadIdle(); // Fase 76: antes de fechar a conta do quadro anterior
+    const auto submit_start = std::chrono::steady_clock::now();
+    CloseHitchInterval(submit_start); // Fase 69
+    g_last_flip_submit_ms = NowMs(); // Fase 59
+    ++g_flip_submits;
+    static std::once_flag stall_once;
+    std::call_once(stall_once, [] {
+        if (g_stall_stacks.load()) {
+            std::thread(StallWatchThread).detach();
+        }
+    });
+    static const bool dbg_cb = std::getenv("LD_DBG_CB") != nullptr; // DIAGNOSTICO Fase 60
+    auto dbg_cb_check = [](const char* when) {
+        std::lock_guard lock(g_dbg_cb_mutex);
+        std::map<std::tuple<u64, u64, u32, u32>, std::pair<u32, u32>> groups; // (VS, PS, estagio, binding) -> (mudaram, total)
+        u32 changed = 0, printed = 0;
+        std::vector<u8> now;
+        for (const auto& e : g_dbg_cb) {
+            now.resize(e.bytes);
+            const bool same = SafeCopy(now.data(), e.address, e.bytes) && !std::memcmp(now.data(), e.data.data(), e.bytes);
+            auto& g = groups[{e.vs, e.ps, e.stage, e.binding}];
+            ++g.second;
+            if (!same) {
+                ++g.first;
+                ++changed;
+                if (printed < 30) {
+                    ++printed;
+                    u32 first = 0;
+                    while (first + 4 <= e.bytes && !std::memcmp(now.data() + first, e.data.data() + first, 4)) {
+                        first += 4;
+                    }
+                    const u32 row = std::min(first & ~15u, (e.bytes & ~15u) - 16);
+                    const float* a = reinterpret_cast<const float*>(e.data.data() + row);
+                    const float* b = reinterpret_cast<const float*>(now.data() + row);
+                    std::printf("[DBG-CB] %s: par %016llx %016llx est %u b%u src %u end 0x%llx %u bytes, 1o byte diferente %u | copia %g %g %g %g -> agora %g %g %g %g\n",
+                                when, static_cast<unsigned long long>(e.vs), static_cast<unsigned long long>(e.ps), e.stage, e.binding, e.source,
+                                static_cast<unsigned long long>(e.address), e.bytes, first, a[0], a[1], a[2], a[3], b[0], b[1], b[2], b[3]);
+                }
+            }
+        }
+        u32 group_changed = 0;
+        for (const auto& [key, g] : groups) {
+            group_changed += g.first != 0;
+        }
+        std::printf("[DBG-CB] %s: %zu buffers copiados, %u mudaram depois da copia (%u de %zu grupos)\n", when, g_dbg_cb.size(), changed,
+                    group_changed, groups.size());
+    };
+    if (dbg_cb && !g_dbg_cb.empty()) {
+        dbg_cb_check("um frame depois");
+        g_dbg_cb.clear();
+    }
+    g_dbg_cb_record = dbg_cb && g_texture_frame % 600 == 300;
+    const int result = Submit(count, dcb_addrs, dcb_sizes, ccb_addrs, ccb_sizes);
+    if (g_dbg_cb_record) {
+        g_dbg_cb_record = false;
+        dbg_cb_check("fim do Submit");
+    }
+    if (result != err::OK) {
+        return result;
+    }
+    NoteFrameHitch(submit_start);
+    // Frame do Vulkan, logo depois de os pacotes PM4 serem processados na CPU: por enquanto so
+    // limpa a tela e apresenta. O swapchain e FIFO, entao esta chamada espera o VSync real do
+    // monitor, e o flip do jogo so e enfileirado (SubmitFlip, abaixo) depois da apresentacao.
+    // Fase 76: com a thread de render, o fim do frame (leituras de volta, texturas pendentes, DrawFrame com o present e o
+    // flip) roda nela e o jogo volta a montar o proximo quadro na hora. O proximo Submit espera essa thread terminar.
+    const bool threaded = RenderThreadEnabled() && render::VulkanRenderer::Instance().Active() &&
+                          videoout::CheckFlip(static_cast<int>(video_out_handle), static_cast<int>(buffer_index)) == err::OK;
+    if (!threaded) {
+        RunFrameEnd(buffer_index);
+    }
     {
         const render::TimedLock lock(g_mutex); // Fase 69
         EndFrame();
@@ -6268,6 +6360,11 @@ HLE_IMPL(int, sceGnmSubmitAndFlipCommandBuffers, u32 count, const u32* const* dc
             g_window_had_dump = false;
             g_window_draws = g_window_frames = g_window_packets = 0;
         }
+    }
+    if (threaded) {
+        g_iv.threaded = true;
+        QueueFrameEnd({video_out_handle, buffer_index, flip_mode, flip_arg});
+        return err::OK;
     }
     return videoout::SubmitFlip(static_cast<int>(video_out_handle), static_cast<int>(buffer_index),
                                 static_cast<int>(flip_mode), flip_arg);
@@ -6379,6 +6476,7 @@ HLE_OVERRIDE(sceGnmUnmapComputeQueue);
 // novo na hora e avanca o ponteiro de leitura que o jogo consulta.
 HLE_IMPL(void, sceGnmDingDong, u32 vqid, u32 next_offset) {
     HLE_QUIET("vqid %u ate %u", vqid, next_offset);
+    WaitRenderThreadIdle(); // Fase 76: a fila de compute tambem le / escreve o estado do quadro
     const render::TimedLock lock(g_mutex); // Fase 69
     const auto it = g_queues.find(vqid);
     if (it == g_queues.end()) {

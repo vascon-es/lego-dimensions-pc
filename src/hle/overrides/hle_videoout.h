@@ -26,6 +26,7 @@ void SetWindowEnabled(bool enabled);
 // Enfileira um flip; ele e concluido no proximo VSync (respeitando sceVideoOutSetFlipRate),
 // quando o status e atualizado e o evento de flip e disparado nas equeues registradas.
 int SubmitFlip(int handle, int buffer_index, int flip_mode, s64 flip_arg);
+int CheckFlip(int handle, int buffer_index); // Fase 76
 
 // Endereco do buffer de video registrado com este indice (0 se nao existe): e o alvo de render
 // que o jogo esta mandando exibir.
