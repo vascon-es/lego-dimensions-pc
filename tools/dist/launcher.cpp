@@ -37,7 +37,7 @@ namespace {
 constexpr int kW = 980, kH = 890, kHero = 330; // Fase 61: arte 50 mais baixa para a linha de resolucao / idioma; Fase 65: +50 para a linha do contador / apelidos
 constexpr UINT WM_APP_LINE = WM_APP + 1, WM_APP_DONE = WM_APP + 2;
 enum Id { kGameEdit = 100, kGameBrowse, kDlcEdit, kDlcBrowse, kPrepare, kPlay, kFps, kConsole, kLog, kPatchEdit, kPatchBrowse, kFullscreen,
-          kResolution, kLanguage, kSkipCutscenes, kUpdate, kIcons, kTransfer, kMods, kOverlay, kNames, kPkg };
+          kResolution, kLanguage, kSkipCutscenes, kUpdate, kIcons, kTransfer, kMods, kOverlay, kNames, kPkg, kGpl };
 
 HWND g_main, g_game, g_patch, g_dlc, g_log, g_prepare, g_play, g_fps, g_console, g_fullscreen, g_focus;
 HWND g_resolution, g_language, g_skip, g_update; // Fase 61
@@ -45,6 +45,7 @@ HWND g_icons; // Fase 62
 HWND g_mods;  // Fase 64
 HWND g_overlay, g_names_button; // Fase 65: contador de FPS / info, apelidos dos jogadores
 HWND g_pkg; // Fase 68: extrair PKGs
+HWND g_gpl; // Fase 74: bibliotecas de pipeline (GPL)
 
 // Fase 61: o que o processo em segundo plano esta fazendo (preparar, procurar atualizacao, atualizar; Fase 68: extrair PKGs)
 enum class Task { kPrepare, kCheck, kUpdate, kPkg } g_task = Task::kPrepare;
@@ -77,6 +78,20 @@ const IconChoice kIconChoices[] = {
     {L"360", L"Xbox 360", L"Xbox 360"},             {L"xboxone", L"Xbox One", L"Xbox One"}, {L"wiiu", L"Wii U", L"Wii U"},
 };
 std::wstring g_icons_value = L"auto";
+// Fase 74: bibliotecas de pipeline do Vulkan (GPL). Automatico = o port decide pelo fabricante (NVIDIA / Intel sim, AMD nao).
+const IconChoice kGplChoices[] = {
+    {L"auto", L"Autom\u00e1tico", L"Automatic"}, {L"ligado", L"Ligado", L"On"}, {L"desligado", L"Desligado", L"Off"},
+};
+std::wstring g_gpl_value = L"auto";
+
+const IconChoice& CurrentGpl() {
+    for (const IconChoice& choice : kGplChoices) {
+        if (g_gpl_value == choice.code) {
+            return choice;
+        }
+    }
+    return kGplChoices[0];
+}
 
 const IconChoice& CurrentIcons() {
     for (const IconChoice& choice : kIconChoices) {
@@ -356,6 +371,7 @@ void SaveSettings() {
     WriteIni(L"telacheia", ui::Checked(g_fullscreen) ? L"1" : L"0");
     WriteIni(L"resolucao", g_res_value);
     WriteIni(L"icones", g_icons_value);
+    WriteIni(L"gpl", g_gpl_value); // Fase 74
     WriteIni(L"idioma", g_lang_value);
     WriteIni(L"pularcenas", ui::Checked(g_skip) ? L"1" : L"0");
     WriteIni(L"contador", ui::Checked(g_overlay) ? L"1" : L"0"); // Fase 65
@@ -377,6 +393,8 @@ void UpdateChoiceLabels() {
     InvalidateRect(g_resolution, nullptr, FALSE);
     InvalidateRect(g_language, nullptr, FALSE);
     InvalidateRect(g_icons, nullptr, FALSE);
+    SetWindowTextW(g_gpl, (L"GPL:  " + std::wstring(ui::T(CurrentGpl().pt, CurrentGpl().en)) + L"  \u25be").c_str()); // Fase 74
+    InvalidateRect(g_gpl, nullptr, FALSE);
 }
 
 // Menu suspenso logo abaixo do botao; devolve o indice escolhido ou -1.
@@ -422,6 +440,25 @@ void PickIcons() { // Fase 62
     const int picked = PopupChoice(g_icons, items, current);
     if (picked >= 0) {
         g_icons_value = kIconChoices[picked].code;
+        UpdateChoiceLabels();
+        SaveSettings();
+    }
+}
+
+void PickGpl() { // Fase 74
+    std::vector<std::wstring> items;
+    int current = 0;
+    for (const IconChoice& choice : kGplChoices) {
+        if (g_gpl_value == choice.code) {
+            current = static_cast<int>(items.size());
+        }
+        items.push_back(std::wstring(ui::T(choice.pt, choice.en)) +
+                        (std::wstring(choice.code) == L"auto" ? ui::T(L"   (NVIDIA / Intel ligado, AMD desligado)", L"   (NVIDIA / Intel on, AMD off)")
+                                                              : L""));
+    }
+    const int picked = PopupChoice(g_gpl, items, current);
+    if (picked >= 0) {
+        g_gpl_value = kGplChoices[picked].code;
         UpdateChoiceLabels();
         SaveSettings();
     }
@@ -1179,6 +1216,9 @@ void RunGame() {
     }
     command += L" --resolution " + g_res_value; // Fase 61: tamanho da janela
     command += L" --button-icons " + g_icons_value; // Fase 62
+    if (g_gpl_value != L"auto") {
+        command += g_gpl_value == L"ligado" ? L" --gpl" : L" --no-gpl"; // Fase 74
+    }
     if (g_lang_value != L"auto") {
         command += L" --lang " + g_lang_value; // Fase 61: idioma do jogo (e do port)
     }
@@ -1257,6 +1297,7 @@ void CreateControls() {
                            S(kHero + 284), S(380), S(40), kOverlay, g_small, ui::kPanel);
     g_names_button = ui::Button(g_main, ui::T(L"Apelidos dos jogadores...", L"Player nicknames..."), ui::Style::kSecondary, S(506), S(kHero + 284),
                                 S(250), S(40), kNames, g_small, ui::kPanel);
+    g_gpl = ui::Button(g_main, L"", ui::Style::kSecondary, S(764), S(kHero + 284), S(168), S(40), kGpl, g_small, ui::kPanel); // Fase 74
     g_fps = ui::Button(g_main, L"60 FPS", ui::Style::kToggle, S(40), S(kH - 74), S(140), S(40), kFps, g_font);
     g_console = ui::Button(g_main, ui::T(L"Mostrar console", L"Show console"), ui::Style::kToggle, S(196), S(kH - 74), S(200), S(40), kConsole, g_font);
     g_fullscreen = ui::Button(g_main, ui::T(L"Tela cheia", L"Fullscreen"), ui::Style::kToggle, S(408), S(kH - 74), S(140), S(40), kFullscreen, g_font);
@@ -1321,6 +1362,8 @@ void LoadSettings() {
     ui::SetChecked(g_overlay, ReadIni(L"contador", L"0") == L"1"); // Fase 65
     g_icons_value = ReadIni(L"icones", L"auto"); // Fase 62
     g_icons_value = CurrentIcons().code;
+    g_gpl_value = ReadIni(L"gpl", L"auto"); // Fase 74
+    g_gpl_value = CurrentGpl().code;
     g_res_value = ReadIni(L"resolucao", L"1280x720");
     if (std::find(std::begin(kResolutions), std::end(kResolutions), g_res_value) == std::end(kResolutions)) {
         g_res_value = L"1280x720";
@@ -1415,6 +1458,9 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             break;
         case kResolution:
             PickResolution();
+            break;
+        case kGpl:
+            PickGpl();
             break;
         case kIcons:
             PickIcons();

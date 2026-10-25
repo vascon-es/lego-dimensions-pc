@@ -596,7 +596,11 @@ bool PickPhysicalDevice() {
 // graphicsPipelineLibrary no dispositivo, sem usar, ja deixa a tela preta e o frame em ~380 ms de GPU
 // (testado isolando cada parte; a validacao do Vulkan nao acusa nada). O extended_dynamic_state3
 // sozinho nao causa isso. Conferir de novo quando o driver for atualizado.
-bool g_gpl_wanted = false;
+// Fase 74: tres estados. Automatico (padrao): ligado em NVIDIA (0x10DE) e Intel (0x8086), onde as bibliotecas sao o
+// caminho recomendado pelos drivers; desligado na AMD (o problema acima) e em outros fabricantes. --gpl / --no-gpl
+// (o launcher passa a escolha dele) e LD_GPL=1 / 0 forcam. NVIDIA e Intel NAO foram testadas em hardware real.
+int g_gpl_mode = -1; // -1 automatico, 0 desligado, 1 ligado
+const char* g_gpl_reason = "";
 
 bool CreateDevice() {
     const float priority = 1.0f;
@@ -681,7 +685,17 @@ bool CreateDevice() {
         want13.shaderDemoteToHelperInvocation = VK_TRUE;
         info.pNext = &want;
     }
-    g.gpl = g_gpl_wanted && g.game_shaders && has_gpl && has_pipeline_library && has_eds3 && have_gpl.graphicsPipelineLibrary &&
+    int gpl_mode = g_gpl_mode;
+    if (const char* env = std::getenv("LD_GPL"); gpl_mode < 0 && env && env[0]) {
+        gpl_mode = env[0] != '0';
+    }
+    const u32 vendor = g.properties.vendorID;
+    const bool gpl_wanted = gpl_mode >= 0 ? gpl_mode == 1 : vendor == 0x10DE || vendor == 0x8086;
+    g_gpl_reason = gpl_mode >= 0     ? (gpl_mode ? "forcado ligado" : "forcado desligado")
+                   : gpl_wanted       ? "automatico: NVIDIA / Intel"
+                   : vendor == 0x1002 ? "automatico: AMD (tela preta no driver 26.6.1)"
+                                      : "automatico: fabricante nao testado";
+    g.gpl = gpl_wanted && g.game_shaders && has_gpl && has_pipeline_library && has_eds3 && have_gpl.graphicsPipelineLibrary &&
             have_eds3.extendedDynamicState3DepthClampEnable && fast_linking;
     if (g.gpl) {
         extensions[info.enabledExtensionCount++] = VK_KHR_PIPELINE_LIBRARY_EXTENSION_NAME;
@@ -716,8 +730,8 @@ bool CreateDevice() {
         }
         std::printf("[VULKAN] DIAGNOSTICO: recurso '%s' ligado no dispositivo (sem uso)\n", test);
     }
-    std::printf("[VULKAN] bibliotecas de pipeline (GPL): %s (extensao %s, recurso %s, link rapido %s, depth clamp dinamico %s)\n",
-                g.gpl ? "LIGADAS" : "desligadas", has_gpl ? "sim" : "nao", have_gpl.graphicsPipelineLibrary ? "sim" : "nao",
+    std::printf("[VULKAN] bibliotecas de pipeline (GPL): %s, %s (extensao %s, recurso %s, link rapido %s, depth clamp dinamico %s)\n",
+                g.gpl ? "LIGADAS" : "desligadas", g_gpl_reason, has_gpl ? "sim" : "nao", have_gpl.graphicsPipelineLibrary ? "sim" : "nao",
                 fast_linking ? "sim" : "nao", have_eds3.extendedDynamicState3DepthClampEnable ? "sim" : "nao");
     // Fase 54: marcadores de draw e relatorio de falha do dispositivo (diagnostico de GPU travada)
     if (has_marker && !std::getenv("LD_NO_GPU_MARKERS")) {
@@ -5912,7 +5926,7 @@ void VulkanRenderer::SetSyncPipelines(bool enabled, double budget_ms) {
 }
 
 void VulkanRenderer::SetGpl(bool enabled) {
-    g_gpl_wanted = enabled;
+    g_gpl_mode = enabled ? 1 : 0; // Fase 74: escolha explicita (linha de comando / launcher)
 }
 
 VulkanRenderer::GplStats VulkanRenderer::GetGplStats() const {
