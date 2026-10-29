@@ -335,6 +335,7 @@ void PrintSummary() {
 }
 
 void Shutdown(int exit_code) {
+    std::setvbuf(stdout, nullptr, _IONBF, 0); // Fase 70b: se algo travar no resumo, o log mostra ate onde foi
     FlushGameText();
     PrintSummary();
     std::fflush(stdout);

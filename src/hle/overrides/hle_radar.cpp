@@ -11,6 +11,7 @@
 #include <vector>
 
 #include "hle/hle_log.h"
+#include "render/vulkan_backend.h"
 
 namespace hle::radar {
 
@@ -95,6 +96,22 @@ Pack LoadPack(const std::string& name) {
 
 } // namespace
 
+// Fase 72: "\\levels\\...\\<area>\\<area>.txt" (tambem dentro de \\additionalcontent\\...): o jogo comecou a carregar
+// esta area. Devolve o nome, ou "".
+std::string AreaName(const std::string& lower_name) {
+    if (lower_name.find("\\levels\\") == std::string::npos || lower_name.size() < 5 || lower_name.compare(lower_name.size() - 4, 4, ".txt") != 0) {
+        return {};
+    }
+    const size_t slash = lower_name.rfind('\\');
+    const size_t parent = slash == std::string::npos || slash == 0 ? std::string::npos : lower_name.rfind('\\', slash - 1);
+    if (parent == std::string::npos) {
+        return {};
+    }
+    const std::string stem = lower_name.substr(slash + 1, lower_name.size() - slash - 5);
+    const std::string dir = lower_name.substr(parent + 1, slash - parent - 1);
+    return stem == dir && dir != "levels" ? stem : std::string(); // levels\levels.txt e a lista de fases, nao uma area
+}
+
 bool IsScreenFile(const std::string& lower_name) {
     for (const char* needle : {".gsc", ".txt", ".csv", ".lip", "screen"}) {
         if (lower_name.find(needle) != std::string::npos) {
@@ -135,6 +152,7 @@ void OnRead(const std::string& guest_path, s64 offset, u64 size) {
         return;
     }
     std::vector<std::string> screen_lines;
+    std::vector<std::string> areas; // Fase 72
     {
         std::lock_guard lock(g_mutex);
         if (g_index_dir.empty()) {
@@ -169,6 +187,9 @@ void OnRead(const std::string& guest_path, s64 offset, u64 size) {
                 c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
             }
             const bool screen = IsScreenFile(lower);
+            if (std::string area = AreaName(lower); !area.empty()) {
+                areas.push_back(std::move(area)); // Fase 72
+            }
             if (g_log) {
                 std::fprintf(g_log, "%8.2f\t%s\t%s\t%s\n", now, screen ? "TELA" : "-", name.c_str(), entry->name.c_str());
             }
@@ -197,6 +218,9 @@ void OnRead(const std::string& guest_path, s64 offset, u64 size) {
     }
     for (const std::string& line : screen_lines) {
         log::Raw(">>> [SCREEN RADAR] Loading: %s <<<", line.c_str());
+    }
+    for (const std::string& area : areas) {
+        render::VulkanRenderer::Instance().SetCurrentLevel(area); // Fase 72: prioridade do aquecimento desta area
     }
 }
 

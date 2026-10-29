@@ -113,7 +113,21 @@ def stage():
     copy_tree(os.path.join(PYTHON, 'Lib'), S('tools', 'python', 'Lib'), skip_dirs=PY_SKIP_DIRS)
     # dados do port (sem nada do jogo)
     copy(R('assets', 'portal.json'), S('assets', 'portal.json'))
-    copy(R('assets', 'shaders_spv', 'pipeline_states.txt'), S('assets', 'shaders_spv', 'pipeline_states.txt'))
+    # Fase 71: receitas de pipeline. A base distribuida = a base anterior + o que a pasta de desenvolvimento aprendeu
+    # (sem repetidos); o pipeline_states.txt do jogador nao vai no pacote (o port cria o dele, so com o que faltar).
+    spec = importlib.util.spec_from_file_location('pipeline_states', R('tools', 'pipeline_states.py'))
+    states = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(states)
+    base = R('assets', 'shaders_spv', 'pipeline_states_base.txt')
+    keys, _ = states.merge([p for p in (base, R('assets', 'shaders_spv', 'pipeline_states.txt')) if os.path.isfile(p)])
+    states.write_file(base, keys)
+    print('receitas de pipeline: %d chaves na base' % len(keys))
+    copy(base, S('assets', 'shaders_spv', 'pipeline_states_base.txt'))
+    levels = R('assets', 'shaders_spv', 'pipeline_levels_base.txt')  # Fase 72: area de cada pipeline
+    entries = states.merge_levels([p for p in (levels, R('assets', 'shaders_spv', 'pipeline_levels.txt')) if os.path.isfile(p)])
+    states.write_levels(levels, entries)
+    print('areas dos pipelines: %d' % len(entries))
+    copy(levels, S('assets', 'shaders_spv', 'pipeline_levels_base.txt'))
     copy(R('assets', 'shaders_spv', 'pair_warm.tsv'), S('assets', 'shaders_spv', 'pair_warm.tsv'))
     for d in ('shaders_aot', 'decrypted_elfs', 'dumped_shaders', 'savedata0', 'temp0', 'download0', os.path.join('shaders_spv', 'pairs')):
         keep(S('assets', d))

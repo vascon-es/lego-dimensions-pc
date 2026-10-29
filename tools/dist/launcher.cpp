@@ -38,7 +38,7 @@ namespace {
 constexpr int kW = 760, kH = 730, kHero = 140;
 constexpr UINT WM_APP_LINE = WM_APP + 1, WM_APP_DONE = WM_APP + 2;
 enum Id { kGameEdit = 100, kGameBrowse, kDlcEdit, kDlcBrowse, kPrepare, kPlay, kFps, kConsole, kLog, kPatchEdit, kPatchBrowse, kFullscreen,
-          kResolution, kLanguage, kSkipCutscenes, kUpdate, kIcons, kTransfer, kMods, kOverlay, kNames, kPkg, kSettings, kTools, kDetails, kToypad, kShortcut, kOpenToypad };
+          kResolution, kLanguage, kSkipCutscenes, kUpdate, kIcons, kTransfer, kMods, kOverlay, kNames, kPkg, kSettings, kTools, kDetails, kToypad, kShortcut, kOpenToypad, kGpl };
 
 HWND g_main, g_game, g_patch, g_dlc, g_log, g_prepare, g_play, g_fps, g_console, g_fullscreen, g_focus;
 HWND g_resolution, g_language, g_skip, g_update; // Fase 61
@@ -55,6 +55,7 @@ std::wstring Utf8ToWide(const std::string& text);
 
 HWND g_pkg; // Fase 68: extrair PKGs
 HWND g_toypad; // Abrir com LegoToypad
+HWND g_gpl; // Fase 74: bibliotecas de pipeline (GPL)
 
 // Fase 61: o que o processo em segundo plano esta fazendo (preparar, procurar atualizacao, atualizar; Fase 68: extrair PKGs)
 enum class Task { kPrepare, kCheck, kUpdate, kPkg } g_task = Task::kPrepare;
@@ -87,6 +88,20 @@ const IconChoice kIconChoices[] = {
     {L"360", L"Xbox 360", L"Xbox 360"},             {L"xboxone", L"Xbox One", L"Xbox One"}, {L"wiiu", L"Wii U", L"Wii U"},
 };
 std::wstring g_icons_value = L"auto";
+// Fase 74: bibliotecas de pipeline do Vulkan (GPL). Automatico = o port decide pelo fabricante (NVIDIA / Intel sim, AMD nao).
+const IconChoice kGplChoices[] = {
+    {L"auto", L"Autom\u00e1tico", L"Automatic"}, {L"ligado", L"Ligado", L"On"}, {L"desligado", L"Desligado", L"Off"},
+};
+std::wstring g_gpl_value = L"auto";
+
+const IconChoice& CurrentGpl() {
+    for (const IconChoice& choice : kGplChoices) {
+        if (g_gpl_value == choice.code) {
+            return choice;
+        }
+    }
+    return kGplChoices[0];
+}
 
 const IconChoice& CurrentIcons() {
     for (const IconChoice& choice : kIconChoices) {
@@ -222,7 +237,7 @@ void Paint(HDC target) {
 }
 
 void LayoutPage(bool resize) {
-    const int settings_ids[]={kGameEdit,kGameBrowse,kPatchEdit,kPatchBrowse,kDlcEdit,kDlcBrowse,kResolution,kLanguage,kIcons,kFps,kConsole,kFullscreen,kSkipCutscenes,kOverlay,kNames,kToypad};
+    const int settings_ids[]={kGameEdit,kGameBrowse,kPatchEdit,kPatchBrowse,kDlcEdit,kDlcBrowse,kResolution,kLanguage,kIcons,kFps,kConsole,kFullscreen,kSkipCutscenes,kOverlay,kNames,kToypad,kGpl};
     for(int id:settings_ids)ShowWindow(GetDlgItem(g_main,id),g_settings_page?SW_SHOW:SW_HIDE);
     for(int id:{kPlay,kMods,kTools,kDetails})ShowWindow(GetDlgItem(g_main,id),g_settings_page?SW_HIDE:SW_SHOW);
     ShowWindow(g_log,!g_settings_page&&g_show_details?SW_SHOW:SW_HIDE);
@@ -382,6 +397,7 @@ void SaveSettings() {
     WriteIni(L"telacheia", ui::Checked(g_fullscreen) ? L"1" : L"0");
     WriteIni(L"resolucao", g_res_value);
     WriteIni(L"icones", g_icons_value);
+    WriteIni(L"gpl", g_gpl_value); // Fase 74
     WriteIni(L"idioma", g_lang_value);
     WriteIni(L"pularcenas", ui::Checked(g_skip) ? L"1" : L"0");
     WriteIni(L"contador", ui::Checked(g_overlay) ? L"1" : L"0"); // Fase 65
@@ -404,6 +420,8 @@ void UpdateChoiceLabels() {
     InvalidateRect(g_resolution, nullptr, FALSE);
     InvalidateRect(g_language, nullptr, FALSE);
     InvalidateRect(g_icons, nullptr, FALSE);
+    SetWindowTextW(g_gpl, (L"GPL:  " + std::wstring(ui::T(CurrentGpl().pt, CurrentGpl().en)) + L"  \u25be").c_str()); // Fase 74
+    InvalidateRect(g_gpl, nullptr, FALSE);
 }
 
 // Menu suspenso logo abaixo do botao; devolve o indice escolhido ou -1.
@@ -456,6 +474,25 @@ void PickIcons() { // Fase 62
         const std::wstring icon_name = ui::T(CurrentIcons().pt, CurrentIcons().en);
         AppendLog(ui::Pt() ? (L"Ícones alterados para " + icon_name + L" (salvo! Não precisa Preparar novamente).")
                            : (L"Icons changed to " + icon_name + L" (saved! No need to click Prepare again)."));
+    }
+}
+
+void PickGpl() { // Fase 74
+    std::vector<std::wstring> items;
+    int current = 0;
+    for (const IconChoice& choice : kGplChoices) {
+        if (g_gpl_value == choice.code) {
+            current = static_cast<int>(items.size());
+        }
+        items.push_back(std::wstring(ui::T(choice.pt, choice.en)) +
+                        (std::wstring(choice.code) == L"auto" ? ui::T(L"   (NVIDIA / Intel ligado, AMD desligado)", L"   (NVIDIA / Intel on, AMD off)")
+                                                              : L""));
+    }
+    const int picked = PopupChoice(g_gpl, items, current);
+    if (picked >= 0) {
+        g_gpl_value = kGplChoices[picked].code;
+        UpdateChoiceLabels();
+        SaveSettings();
     }
 }
 
@@ -1255,6 +1292,9 @@ void RunGame() {
     }
     command += L" --resolution " + g_res_value; // Fase 61: tamanho da janela
     command += L" --button-icons " + g_icons_value; // Fase 62
+    if (g_gpl_value != L"auto") {
+        command += g_gpl_value == L"ligado" ? L" --gpl" : L" --no-gpl"; // Fase 74
+    }
     AppendLog(ui::Pt() ? (L"Iniciando em " + g_res_value + (ui::Checked(g_fullscreen) ? L" (Tela Cheia)..." : L" (Janela)..."))
                        : (L"Starting at " + g_res_value + (ui::Checked(g_fullscreen) ? L" (Fullscreen)..." : L" (Windowed)...")));
     if (g_lang_value != L"auto") {
@@ -1471,6 +1511,7 @@ void CreateControls() {
     g_overlay=ui::Button(g_main,L"Performance (F10)",ui::Style::kToggle,S(266),S(558),S(228),S(42),kOverlay,g_small);
     g_names_button=ui::Button(g_main,L"Player nicknames...",ui::Style::kSecondary,S(508),S(558),S(228),S(42),kNames,g_small);
     g_toypad=ui::Button(g_main,L"Start Toypad with game",ui::Style::kToggle,S(24),S(614),S(228),S(42),kToypad,g_small);
+    g_gpl=ui::Button(g_main,L"",ui::Style::kSecondary,S(266),S(614),S(228),S(42),kGpl,g_small); // Fase 74
     ui::Button(g_main,L"Open Toypad",ui::Style::kSecondary,0,0,1,1,kOpenToypad,g_font);
     ui::Button(g_main,L"Create shortcut",ui::Style::kSecondary,0,0,1,1,kShortcut,g_font);
     g_version=ReadVersion();
@@ -1535,6 +1576,8 @@ void LoadSettings() {
     ui::SetChecked(g_toypad, ReadIni(L"toypad_auto", L"0") == L"1");
     g_icons_value = ReadIni(L"icones", L"auto"); // Fase 62
     g_icons_value = CurrentIcons().code;
+    g_gpl_value = ReadIni(L"gpl", L"auto"); // Fase 74
+    g_gpl_value = CurrentGpl().code;
     g_res_value = ReadIni(L"resolucao", L"1920x1080");
     if (std::find(std::begin(kResolutions), std::end(kResolutions), g_res_value) == std::end(kResolutions)) {
         g_res_value = L"1920x1080";
@@ -1682,6 +1725,9 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             break;
         case kResolution:
             PickResolution();
+            break;
+        case kGpl:
+            PickGpl();
             break;
         case kIcons:
             PickIcons();

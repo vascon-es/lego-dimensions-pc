@@ -1148,6 +1148,15 @@ u64 BufferAddress(int buffer_index) {
     return buffer_index >= 0 && buffer_index < static_cast<int>(g_buffers.size()) ? reinterpret_cast<u64>(g_buffers[buffer_index]) : 0;
 }
 
+// Fase 76: as mesmas conferencias do SubmitFlip, sem enfileirar (o flip vai depois, pela thread de render).
+int CheckFlip(int handle, int buffer_index) {
+    if (handle != kHandle) {
+        return kErrorInvalidHandle;
+    }
+    std::lock_guard lock(g_mutex);
+    return buffer_index < -1 || buffer_index >= static_cast<int>(g_buffers.size()) ? kErrorInvalidValue : err::OK;
+}
+
 int SubmitFlip(int handle, int buffer_index, int flip_mode, s64 flip_arg) {
     if (handle != kHandle) {
         return kErrorInvalidHandle;

@@ -10,6 +10,7 @@
 #include <condition_variable>
 #include <deque>
 #include <map>
+#include <memory>
 #include <thread>
 #include <unordered_map>
 #include <unordered_set>
@@ -18,6 +19,8 @@
 #include <vector>
 
 #include <windows.h>
+
+#include <io.h> // Fase 70: _commit
 
 #define VK_NO_PROTOTYPES
 #define VK_USE_PLATFORM_WIN32_KHR
@@ -67,7 +70,8 @@ std::atomic<u64> g_validation_errors{0}, g_validation_warnings{0};
     X(vkUpdateDescriptorSets) X(vkCmdBindDescriptorSets) X(vkCmdPipelineBarrier)                   \
     X(vkCmdCopyBufferToImage) X(vkQueueWaitIdle) X(vkResetDescriptorPool) X(vkCmdCopyImageToBuffer) X(vkCmdClearAttachments) X(vkCmdCopyImage) \
     X(vkCmdSetCullMode) X(vkCmdSetFrontFace) X(vkCmdSetDepthTestEnable) X(vkCmdSetDepthWriteEnable) X(vkCmdSetDepthCompareOp)    \
-    X(vkCmdSetStencilTestEnable) X(vkCmdSetStencilOp)
+    X(vkCmdSetStencilTestEnable) X(vkCmdSetStencilOp) \
+    X(vkCreateQueryPool) X(vkDestroyQueryPool) X(vkCmdResetQueryPool) X(vkCmdWriteTimestamp) X(vkGetQueryPoolResults)
 
 #define DECLARE(name) PFN_##name name = nullptr;
 struct Functions {
@@ -205,8 +209,6 @@ struct State {
     std::vector<TempStaging> temp_staging;
     std::vector<TempStaging> staging_pool;
     std::mutex staging_pool_mutex;
-    VkPipelineCache pipeline_cache = VK_NULL_HANDLE;
-    std::filesystem::path pipeline_cache_path;
     struct PendingUpload {
         VkBuffer source = VK_NULL_HANDLE; // Fase 59: buffer temporario (staging do frame cheio); nulo = staging do frame
         VkImage image = VK_NULL_HANDLE;
@@ -220,6 +222,13 @@ struct State {
     std::atomic<u64> textured_draws{0};
     bool memory_budget = false; // Fase 59: VK_EXT_memory_budget ligado
     double draw_frame_ms[8] = {}; // Fase 59: etapas do ultimo DrawFrame (ver LastDrawFrameTimes)
+    // Fase 75: tempo de GPU de cada quadro (timestamp no comeco e no fim do command buffer do frame). A espera
+    // "frame anterior" do [QUADRO-LENTO] dominava os quadros lentos de um jogador (RX 9070 XT, 5 h): este numero
+    // diz se a GPU demorou mesmo naquele quadro. LD_GPU_TIME=0 desliga.
+    VkQueryPool timestamps = VK_NULL_HANDLE;
+    double timestamp_period_ns = 0;
+    bool timestamps_written = false;
+    std::atomic<double> last_gpu_ms{0};
     // ---- shaders do jogo (Fase 19) ----
     bool game_shaders = false; // o dispositivo foi criado com os recursos que os modulos pedem
     bool validation = false;
@@ -399,6 +408,9 @@ struct State {
     std::atomic<u32> last_frame_draws{0};
     u32 pipelines_created = 0;
 } g;
+
+VkResult QueueWaitIdle(); // Fase 70b: fila do Vulkan com mutex proprio (ver g_queue_mutex)
+VkResult QueueSubmit(u32 count, const VkSubmitInfo* submits, VkFence fence);
 
 constexpr u64 kVertexRingBytes = 256ull << 20; // a cena 3D copia os vertices de cada draw (Fase 20)
 constexpr u64 kIndexRingBytes = 128ull << 20; // Fase 54f: 64 -> 128 MiB (metade por frame)
@@ -597,102 +609,12 @@ bool PickPhysicalDevice() {
 // graphicsPipelineLibrary no dispositivo, sem usar, ja deixa a tela preta e o frame em ~380 ms de GPU
 // (testado isolando cada parte; a validacao do Vulkan nao acusa nada). O extended_dynamic_state3
 // sozinho nao causa isso. Conferir de novo quando o driver for atualizado.
-bool g_gpl_wanted = false;
+// Fase 74: tres estados. Automatico (padrao): ligado em NVIDIA (0x10DE) e Intel (0x8086), onde as bibliotecas sao o
+// caminho recomendado pelos drivers; desligado na AMD (o problema acima) e em outros fabricantes. --gpl / --no-gpl
+// (o launcher passa a escolha dele) e LD_GPL=1 / 0 forcam. NVIDIA e Intel NAO foram testadas em hardware real.
+int g_gpl_mode = -1; // -1 automatico, 0 desligado, 1 ligado
+const char* g_gpl_reason = "";
 
-
-struct VkPipelineCacheHeaderVersionOne {
-    uint32_t headerSize;
-    VkPipelineCacheHeaderVersion headerVersion; // VK_PIPELINE_CACHE_HEADER_VERSION_ONE = 1
-    uint32_t vendorID;
-    uint32_t deviceID;
-    uint8_t pipelineCacheUUID[VK_UUID_SIZE];
-};
-
-void LoadPipelineCache() {
-    if (g.pipeline_cache) return;
-    std::filesystem::path path = g.pipeline_cache_path;
-    if (path.empty()) {
-        path = std::filesystem::path(render::GameSpirvDirectory().empty() ? "assets/shaders_spv" : render::GameSpirvDirectory()) / "vk_pipeline_cache.bin";
-        g.pipeline_cache_path = path;
-    }
-    std::vector<u8> cache_data;
-    bool valid = false;
-    std::error_code ec;
-    if (std::filesystem::exists(path, ec)) {
-        if (std::ifstream in(path, std::ios::binary | std::ios::ate); in.is_open()) {
-            const auto size = static_cast<size_t>(in.tellg());
-            if (size >= sizeof(VkPipelineCacheHeaderVersionOne)) {
-                cache_data.resize(size);
-                in.seekg(0, std::ios::beg);
-                in.read(reinterpret_cast<char*>(cache_data.data()), size);
-                VkPipelineCacheHeaderVersionOne header{};
-                std::memcpy(&header, cache_data.data(), sizeof(header));
-                if (header.headerSize >= sizeof(VkPipelineCacheHeaderVersionOne) &&
-                    header.headerVersion == VK_PIPELINE_CACHE_HEADER_VERSION_ONE &&
-                    header.vendorID == g.properties.vendorID &&
-                    header.deviceID == g.properties.deviceID &&
-                    std::memcmp(header.pipelineCacheUUID, g.properties.pipelineCacheUUID, VK_UUID_SIZE) == 0) {
-                    valid = true;
-                    std::printf("[PIPELINE-CACHE] Carregado cache em disco: %zu bytes (vendor=0x%x, device=0x%x)\n",
-                                size, header.vendorID, header.deviceID);
-                } else {
-                    std::printf("[PIPELINE-CACHE] Descartando cache incompativel (arq: ven=0x%x dev=0x%x vs gpu: ven=0x%x dev=0x%x)\n",
-                                header.vendorID, header.deviceID, g.properties.vendorID, g.properties.deviceID);
-                    cache_data.clear();
-                }
-            }
-        }
-    }
-    VkPipelineCacheCreateInfo info{VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO};
-    if (valid && !cache_data.empty()) {
-        info.initialDataSize = cache_data.size();
-        info.pInitialData = cache_data.data();
-    }
-    VkResult result = vk.vkCreatePipelineCache(g.device, &info, nullptr, &g.pipeline_cache);
-    if (result != VK_SUCCESS && valid) {
-        info.initialDataSize = 0;
-        info.pInitialData = nullptr;
-        result = vk.vkCreatePipelineCache(g.device, &info, nullptr, &g.pipeline_cache);
-    }
-    if (result == VK_SUCCESS) {
-        std::printf("[PIPELINE-CACHE] VkPipelineCache ativo (valido=%d)\n", valid);
-    } else {
-        std::printf("[PIPELINE-CACHE] Falha ao criar VkPipelineCache: %d\n", result);
-        g.pipeline_cache = VK_NULL_HANDLE;
-    }
-}
-
-static std::mutex g_pipeline_cache_save_mutex;
-
-void SavePipelineCache() {
-    std::lock_guard lock(g_pipeline_cache_save_mutex);
-    if (!g.device || !g.pipeline_cache || !vk.vkGetPipelineCacheData) {
-        return;
-    }
-    size_t size = 0;
-    if (vk.vkGetPipelineCacheData(g.device, g.pipeline_cache, &size, nullptr) != VK_SUCCESS || size <= sizeof(VkPipelineCacheHeaderVersionOne)) {
-        return;
-    }
-    std::vector<u8> data(size);
-    if (vk.vkGetPipelineCacheData(g.device, g.pipeline_cache, &size, data.data()) != VK_SUCCESS) {
-        return;
-    }
-    std::filesystem::path path = g.pipeline_cache_path;
-    if (path.empty()) {
-        path = std::filesystem::path(render::GameSpirvDirectory().empty() ? "assets/shaders_spv" : render::GameSpirvDirectory()) / "vk_pipeline_cache.bin";
-        g.pipeline_cache_path = path;
-    }
-    std::error_code ec;
-    std::filesystem::create_directories(path.parent_path(), ec);
-    std::filesystem::path tmp_path = path;
-    tmp_path += ".tmp";
-    if (std::ofstream out(tmp_path, std::ios::binary); out.is_open()) {
-        out.write(reinterpret_cast<const char*>(data.data()), data.size());
-        out.close();
-        std::filesystem::rename(tmp_path, path, ec);
-        std::printf("[PIPELINE-CACHE] Salvo cache em disco: %zu bytes em %s\n", data.size(), path.string().c_str());
-    }
-}
 
 bool CreateDevice() {
     const float priority = 1.0f;
@@ -777,7 +699,17 @@ bool CreateDevice() {
         want13.shaderDemoteToHelperInvocation = VK_TRUE;
         info.pNext = &want;
     }
-    g.gpl = g_gpl_wanted && g.game_shaders && has_gpl && has_pipeline_library && has_eds3 && have_gpl.graphicsPipelineLibrary &&
+    int gpl_mode = g_gpl_mode;
+    if (const char* env = std::getenv("LD_GPL"); gpl_mode < 0 && env && env[0]) {
+        gpl_mode = env[0] != '0';
+    }
+    const u32 vendor = g.properties.vendorID;
+    const bool gpl_wanted = gpl_mode >= 0 ? gpl_mode == 1 : vendor == 0x10DE || vendor == 0x8086;
+    g_gpl_reason = gpl_mode >= 0     ? (gpl_mode ? "forced on" : "forced off")
+                   : gpl_wanted       ? "automatic: NVIDIA / Intel"
+                   : vendor == 0x1002 ? "automatic: AMD (black screen on driver 26.6.1)"
+                                      : "automatic: untested vendor";
+    g.gpl = gpl_wanted && g.game_shaders && has_gpl && has_pipeline_library && has_eds3 && have_gpl.graphicsPipelineLibrary &&
             have_eds3.extendedDynamicState3DepthClampEnable && fast_linking;
     if (g.gpl) {
         extensions[info.enabledExtensionCount++] = VK_KHR_PIPELINE_LIBRARY_EXTENSION_NAME;
@@ -812,8 +744,8 @@ bool CreateDevice() {
         }
         std::printf("[VULKAN] DIAGNOSTIC: feature '%s' enabled on device (unused)\n", test);
     }
-    std::printf("[VULKAN] pipeline libraries (GPL): %s (extension %s, feature %s, fast link %s, dynamic depth clamp %s)\n",
-                g.gpl ? "LIGADAS" : "desligadas", has_gpl ? "yes" : "no", have_gpl.graphicsPipelineLibrary ? "yes" : "no",
+    std::printf("[VULKAN] pipeline libraries (GPL): %s, %s (extension %s, feature %s, fast link %s, dynamic depth clamp %s)\n",
+                g.gpl ? "ON" : "off", g_gpl_reason, has_gpl ? "yes" : "no", have_gpl.graphicsPipelineLibrary ? "yes" : "no",
                 fast_linking ? "yes" : "no", have_eds3.extendedDynamicState3DepthClampEnable ? "yes" : "no");
     // Fase 54: marcadores de draw e relatorio de falha do dispositivo (diagnostico de GPU travada)
     if (has_marker && !std::getenv("LD_NO_GPU_MARKERS")) {
@@ -855,7 +787,6 @@ bool CreateDevice() {
         return Fail("Vulkan device function missing");
     }
     vk.vkGetDeviceQueue(g.device, g.queue_family, 0, &g.queue);
-    LoadPipelineCache();
     if (g.gpl) {
         g.set_depth_clamp = reinterpret_cast<PFN_vkCmdSetDepthClampEnableEXT>(vk.vkGetDeviceProcAddr(g.device, "vkCmdSetDepthClampEnableEXT"));
         g.gpl = g.set_depth_clamp != nullptr;
@@ -989,6 +920,18 @@ bool CreateFrameObjects() {
     result = vk.vkAllocateCommandBuffers(g.device, &allocate, &g.command);
     if (result != VK_SUCCESS) {
         return Fail("vkAllocateCommandBuffers", result);
+    }
+    // Fase 75: dois timestamps por quadro (so ha um quadro em voo: a fence do frame anterior e esperada antes)
+    if (const char* env = std::getenv("LD_GPU_TIME"); !(env && env[0] == '0') && g.properties.limits.timestampComputeAndGraphics &&
+                                                       g.properties.limits.timestampPeriod > 0) {
+        VkQueryPoolCreateInfo query{VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
+        query.queryType = VK_QUERY_TYPE_TIMESTAMP;
+        query.queryCount = 2;
+        if (vk.vkCreateQueryPool(g.device, &query, nullptr, &g.timestamps) == VK_SUCCESS) {
+            g.timestamp_period_ns = g.properties.limits.timestampPeriod;
+        } else {
+            g.timestamps = VK_NULL_HANDLE;
+        }
     }
     VkSemaphoreCreateInfo semaphore{VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO};
     VkFenceCreateInfo fence{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
@@ -1551,7 +1494,7 @@ void GrowPoolAhead(u32 type) { // com g_texture_pool.mutex
         allocate.memoryTypeIndex = type;
         VkDeviceMemory memory = VK_NULL_HANDLE;
         if (g.device && vk.vkAllocateMemory(g.device, &allocate, nullptr, &memory) == VK_SUCCESS) {
-            std::lock_guard lock(g_texture_pool.mutex);
+            const TimedLock lock(g_texture_pool.mutex);
             TexturePool::Chunk chunk;
             chunk.type = type;
             chunk.memory = memory;
@@ -1567,7 +1510,7 @@ bool PoolAllocate(const VkMemoryRequirements& requirements, u32 type, u32* chunk
     if (requirements.size > kTexturePoolChunk || std::getenv("LD_NO_TEXTURE_POOL")) {
         return false;
     }
-    std::lock_guard lock(g_texture_pool.mutex);
+    const TimedLock lock(g_texture_pool.mutex);
     for (u32 c = 0; c < g_texture_pool.chunks.size(); ++c) {
         TexturePool::Chunk& chunk = g_texture_pool.chunks[c];
         if (chunk.type == type && PoolTake(chunk, requirements, offset_out)) {
@@ -1605,7 +1548,7 @@ bool PoolAllocate(const VkMemoryRequirements& requirements, u32 type, u32* chunk
 }
 
 void PoolFree(u32 chunk_index, u64 offset, u64 size) {
-    std::lock_guard lock(g_texture_pool.mutex);
+    const TimedLock lock(g_texture_pool.mutex);
     if (chunk_index >= g_texture_pool.chunks.size() || !size) {
         return;
     }
@@ -1814,13 +1757,13 @@ bool FinishTexture(u64 key, const TextureData& data, State::Texture& texture) {
     submit.pCommandBuffers = &g.upload_command;
     // Fase 54e: espera o frame em voo terminar antes da copia propria (com esta espera a cutscene da casa
     // dos Simpsons deixou de derrubar o driver) e confere se o que ja estava na fila terminou bem.
-    const VkResult before = vk.vkQueueWaitIdle(g.queue);
+    const VkResult before = QueueWaitIdle();
     if (before != VK_SUCCESS) {
         std::printf("[GPU HANG] queue already returned %s BEFORE immediate texture upload 0x%llx%s", ResultName(before),
                     static_cast<unsigned long long>(key), "\n");
     }
-    vk.vkQueueSubmit(g.queue, 1, &submit, VK_NULL_HANDLE);
-    CheckImmediateUpload(before == VK_SUCCESS ? vk.vkQueueWaitIdle(g.queue) : VK_SUCCESS, "nova", key, data.width, data.height, data.depth,
+    QueueSubmit(1, &submit, VK_NULL_HANDLE);
+    CheckImmediateUpload(before == VK_SUCCESS ? QueueWaitIdle() : VK_SUCCESS, "nova", key, data.width, data.height, data.depth,
                          layers, levels, static_cast<u32>(data.format), data.bytes, regions);
     }
     (void)cube;
@@ -1876,6 +1819,206 @@ void DestroyPipelines() {
     }
     g.pipelines.clear();
     g.queue_draws.clear(); // os draws na fila apontam para pipelines que deixaram de existir
+}
+
+// ---- Fase 70: cache de pipelines do Vulkan em disco ----
+// O driver da AMD ja guarda os pipelines compilados, mas pelo caminho do .exe: outra pasta, outro nome ou
+// o cache do driver limpo e a tela de carregamento recompila os ~14 mil pipelines do aquecimento (49 s no
+// lugar de 6 s na RX 6600, medido na Fase 69). Este cache e do port (assets\shaders_spv\vk_pipeline_cache.bin; a 1.8.3 tinha um sempre ligado, sem cabecalho proprio, que este substitui):
+// lido na abertura, passado a todo vkCreateGraphicsPipelines (inclusive bibliotecas GPL) e salvo quando o
+// aquecimento termina, a cada 5 min com pipelines novos e na saida, sempre por arquivo temporario + troca
+// (uma sessao que caiu no meio nao estraga o arquivo). Cabecalho proprio (marca, versao, fabricante,
+// dispositivo, versao do driver, tamanho e FNV-1a dos dados) alem do cabecalho do Vulkan (fabricante,
+// dispositivo, UUID do cache): qualquer diferenca descarta o arquivo. LD_PIPELINE_CACHE=0 desliga.
+VkPipelineCache g_vk_cache = VK_NULL_HANDLE;
+// Fase 70b: a fila do Vulkan (submit, espera, present) tem um mutex proprio, tomado sempre depois do g.mutex
+// quando os dois sao necessarios. Assim o present do frame roda sem o g.mutex.
+std::mutex g_queue_mutex;
+std::mutex g_vk_cache_save_mutex;
+std::atomic<u64> g_vk_cache_new{0};     // pipelines criados desde o ultimo salvamento
+std::atomic<bool> g_vk_cache_saving{false};
+u64 g_vk_cache_loaded_bytes = 0;
+std::chrono::steady_clock::time_point g_vk_cache_saved_at{};
+bool g_vk_cache_saved_after_prewarm = false;
+
+struct PipelineCacheFileHeader {
+    u32 magic = 0x4350444C; // "LDPC"
+    u32 version = 1;
+    u32 vendor = 0, device = 0, driver = 0, reserved = 0;
+    u64 bytes = 0, checksum = 0;
+};
+
+u64 Fnv1a64(const u8* data, size_t size) {
+    u64 hash = 1469598103934665603ull;
+    for (size_t i = 0; i < size; ++i) {
+        hash = (hash ^ data[i]) * 1099511628211ull;
+    }
+    return hash;
+}
+
+std::string g_vk_cache_path; // SetPipelineCacheFile; vazio = assets\shaders_spv\vk_pipeline_cache.bin
+
+std::filesystem::path PipelineCachePath() {
+    return g_vk_cache_path.empty() ? std::filesystem::path(GameSpirvDirectory()) / "vk_pipeline_cache.bin" : std::filesystem::path(g_vk_cache_path);
+}
+
+// Depois do CreateDevice. Le e confere o arquivo; sem arquivo valido, o cache comeca vazio.
+void CreatePipelineCache() {
+    g_vk_cache_loaded_bytes = 0;
+    // Medido na RX 6600 (driver 26.6.1): com um VkPipelineCache do app, o driver da AMD deixa de usar o
+    // cache proprio dele. Aquecimento quente 5,8 s -> 27 s (com o arquivo cheio, 171 MB) e o frio nao melhora
+    // (49 s -> 48,6 s: as entradas nao valem para outro .exe, o arquivo so dobrou). Por isso desligado na AMD
+    // por padrao; ligado nos outros fabricantes. LD_PIPELINE_CACHE=1 / 0 forca.
+    const char* env = std::getenv("LD_PIPELINE_CACHE");
+    const bool amd = g.properties.vendorID == 0x1002;
+    const bool wanted = env && env[0] ? env[0] != '0' : !amd;
+    if (!wanted || GameSpirvDirectory().empty()) {
+        std::printf("[PIPELINE-CACHE] off%s\n", GameSpirvDirectory().empty() ? " (no data folder)"
+                                                     : env && env[0]              ? " (LD_PIPELINE_CACHE=0)"
+                                                                                  : " (AMD: the driver's own cache is faster; LD_PIPELINE_CACHE=1 turns it on)");
+        return;
+    }
+    std::vector<u8> data;
+    const char* why = "no file";
+    if (std::FILE* f = _wfopen(PipelineCachePath().c_str(), L"rb")) {
+        PipelineCacheFileHeader header;
+        const PipelineCacheFileHeader expected{0x4350444C, 1, g.properties.vendorID, g.properties.deviceID, g.properties.driverVersion};
+        if (std::fread(&header, sizeof(header), 1, f) != 1 || header.magic != expected.magic || header.version != expected.version) {
+            why = "unknown format, discarded";
+        } else if (header.vendor != expected.vendor || header.device != expected.device || header.driver != expected.driver) {
+            why = "from another GPU or driver, discarded";
+        } else if (header.bytes < 32 || header.bytes > (2ull << 30)) {
+            why = "invalid size, discarded";
+        } else {
+            data.resize(header.bytes);
+            if (std::fread(data.data(), 1, data.size(), f) != data.size() || Fnv1a64(data.data(), data.size()) != header.checksum) {
+                why = "corrupted (checksum mismatch), discarded";
+                data.clear();
+            } else {
+                // cabecalho do Vulkan: tamanho, versao 1, fabricante, dispositivo, UUID
+                u32 vk_header[4];
+                std::memcpy(vk_header, data.data(), sizeof(vk_header));
+                if (vk_header[0] < 32 || vk_header[1] != VK_PIPELINE_CACHE_HEADER_VERSION_ONE || vk_header[2] != g.properties.vendorID ||
+                    vk_header[3] != g.properties.deviceID ||
+                    std::memcmp(data.data() + 16, g.properties.pipelineCacheUUID, VK_UUID_SIZE) != 0) {
+                    why = "driver cache UUID changed, discarded";
+                    data.clear();
+                } else {
+                    why = nullptr;
+                }
+            }
+        }
+        std::fclose(f);
+        if (why) {
+            data.clear();
+        }
+    }
+    VkPipelineCacheCreateInfo info{VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO};
+    info.initialDataSize = data.size();
+    info.pInitialData = data.empty() ? nullptr : data.data();
+    VkResult result = vk.vkCreatePipelineCache(g.device, &info, nullptr, &g_vk_cache);
+    if (result != VK_SUCCESS && !data.empty()) { // o driver recusou os dados: comeca vazio
+        why = "rejected by the driver, discarded";
+        data.clear();
+        info.initialDataSize = 0;
+        info.pInitialData = nullptr;
+        result = vk.vkCreatePipelineCache(g.device, &info, nullptr, &g_vk_cache);
+    }
+    if (result != VK_SUCCESS) {
+        g_vk_cache = VK_NULL_HANDLE;
+        std::printf("[PIPELINE-CACHE] vkCreatePipelineCache failed (%s): continuing without cache\n", ResultName(result));
+        return;
+    }
+    g_vk_cache_loaded_bytes = data.size();
+    g_vk_cache_saved_at = std::chrono::steady_clock::now();
+    if (why) {
+        std::printf("[PIPELINE-CACHE] starting empty: %s\n", why);
+    } else {
+        std::printf("[PIPELINE-CACHE] %.1f MB read from %s\n", data.size() / 1048576.0, PipelineCachePath().string().c_str());
+    }
+}
+
+// Grava o cache (qualquer thread). Arquivo temporario + MoveFileEx: o anterior so e trocado com o novo inteiro.
+bool SavePipelineCacheFile(const char* reason) {
+    if (!g_vk_cache || !g.device) {
+        return false;
+    }
+    std::lock_guard lock(g_vk_cache_save_mutex);
+    const auto start = std::chrono::steady_clock::now();
+    const u64 created = g_vk_cache_new.exchange(0);
+    size_t size = 0;
+    if (vk.vkGetPipelineCacheData(g.device, g_vk_cache, &size, nullptr) != VK_SUCCESS || size < 32) {
+        return false;
+    }
+    std::vector<u8> data(size);
+    if (vk.vkGetPipelineCacheData(g.device, g_vk_cache, &size, data.data()) != VK_SUCCESS) {
+        return false;
+    }
+    data.resize(size);
+    PipelineCacheFileHeader header{0x4350444C, 1, g.properties.vendorID, g.properties.deviceID, g.properties.driverVersion};
+    header.bytes = data.size();
+    header.checksum = Fnv1a64(data.data(), data.size());
+    const std::filesystem::path path = PipelineCachePath();
+    std::filesystem::path temp = path;
+    temp += L".novo";
+    bool ok = false;
+    if (std::FILE* f = _wfopen(temp.c_str(), L"wb")) {
+        ok = std::fwrite(&header, sizeof(header), 1, f) == 1 && std::fwrite(data.data(), 1, data.size(), f) == data.size() && std::fflush(f) == 0 &&
+             _commit(_fileno(f)) == 0;
+        ok = std::fclose(f) == 0 && ok;
+    }
+    ok = ok && MoveFileExW(temp.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH);
+    if (!ok) {
+        DeleteFileW(temp.c_str());
+        g_vk_cache_new += created;
+    }
+    g_vk_cache_saved_at = std::chrono::steady_clock::now();
+    std::printf("[PIPELINE-CACHE] %s (%s): %.1f MB, %llu new pipelines since the last save, %.0f ms\n", ok ? "saved" : "NOT saved", reason,
+                data.size() / 1048576.0, static_cast<unsigned long long>(created),
+                std::chrono::duration<double, std::milli>(g_vk_cache_saved_at - start).count());
+    return ok;
+}
+
+// Thread de render, no fim do DrawFrame: salva em segundo plano quando o aquecimento termina e a cada 5 min.
+void MaybeSavePipelineCache(bool prewarm_finished) {
+    if (!g_vk_cache || g_vk_cache_saving.load() || !g_vk_cache_new.load()) {
+        return;
+    }
+    const char* reason = nullptr;
+    if (prewarm_finished && !g_vk_cache_saved_after_prewarm) {
+        g_vk_cache_saved_after_prewarm = true;
+        reason = "prewarm finished";
+    } else if (std::chrono::steady_clock::now() - g_vk_cache_saved_at > std::chrono::minutes(5)) {
+        reason = "5 min";
+        g_vk_cache_saved_at = std::chrono::steady_clock::now();
+    }
+    if (reason) {
+        g_vk_cache_saving = true;
+        std::thread([reason] {
+            SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+            SavePipelineCacheFile(reason);
+            g_vk_cache_saving = false;
+        }).detach();
+    }
+}
+
+VkResult QueueWaitIdle() {
+    std::lock_guard lock(g_queue_mutex);
+    return vk.vkQueueWaitIdle(g.queue);
+}
+
+VkResult QueueSubmit(u32 count, const VkSubmitInfo* submits, VkFence fence) {
+    std::lock_guard lock(g_queue_mutex);
+    return vk.vkQueueSubmit(g.queue, count, submits, fence);
+}
+
+// Todo pipeline grafico do port passa por aqui (com o cache, se houver).
+VkResult CreateGraphicsPipeline(const VkGraphicsPipelineCreateInfo* info, VkPipeline* pipeline) {
+    const VkResult result = vk.vkCreateGraphicsPipelines(g.device, g_vk_cache, 1, info, nullptr, pipeline);
+    if (result == VK_SUCCESS) {
+        ++g_vk_cache_new;
+    }
+    return result;
 }
 
 // Pipeline base: sem cull, blend alfa padrao (ou desligado), viewport e scissor dinamicos, e a
@@ -1961,7 +2104,7 @@ VkPipeline GetPipeline(const DrawCall& draw) {
     rendering.pColorAttachmentFormats = &g.format.format;
     info.pNext = &rendering;
     VkPipeline pipeline = VK_NULL_HANDLE;
-    const VkResult result = vk.vkCreateGraphicsPipelines(g.device, g.pipeline_cache, 1, &info, nullptr, &pipeline);
+    const VkResult result = CreateGraphicsPipeline(&info, &pipeline);
     if (result != VK_SUCCESS) {
         Fail("vkCreateGraphicsPipelines", result);
         return VK_NULL_HANDLE;
@@ -2112,7 +2255,7 @@ void PrewarmTargetPool() {
         if (vk.vkAllocateMemory(g.device, &allocate, nullptr, &memory) != VK_SUCCESS) {
             break;
         }
-        std::lock_guard lock(g_texture_pool.mutex);
+        const TimedLock lock(g_texture_pool.mutex);
         TexturePool::Chunk chunk;
         chunk.type = type;
         chunk.memory = memory;
@@ -2317,8 +2460,8 @@ bool CreateFallbackViews() {
     VkSubmitInfo submit{VK_STRUCTURE_TYPE_SUBMIT_INFO};
     submit.commandBufferCount = 1;
     submit.pCommandBuffers = &g.upload_command;
-    vk.vkQueueSubmit(g.queue, 1, &submit, VK_NULL_HANDLE);
-    vk.vkQueueWaitIdle(g.queue);
+    QueueSubmit(1, &submit, VK_NULL_HANDLE);
+    QueueWaitIdle();
     const struct {
         u32 image;
         VkImageViewType type;
@@ -2482,7 +2625,7 @@ VkPipeline CreateShaderLibrary(VkShaderModule module, bool vertex, VkPipelineLay
     }
     info.pDynamicState = &dynamic;
     VkPipeline library = VK_NULL_HANDLE;
-    if (vk.vkCreateGraphicsPipelines(g.device, g.pipeline_cache, 1, &info, nullptr, &library) != VK_SUCCESS) {
+    if (CreateGraphicsPipeline(&info, &library) != VK_SUCCESS) {
         library = VK_NULL_HANDLE;
     }
     return library;
@@ -2505,7 +2648,7 @@ VkPipeline VertexInputLibrary(const VkPipelineVertexInputStateCreateInfo& vertex
     info.pVertexInputState = &vertex_input;
     info.pInputAssemblyState = &assembly;
     VkPipeline library = VK_NULL_HANDLE;
-    if (vk.vkCreateGraphicsPipelines(g.device, g.pipeline_cache, 1, &info, nullptr, &library) != VK_SUCCESS) {
+    if (CreateGraphicsPipeline(&info, &library) != VK_SUCCESS) {
         library = VK_NULL_HANDLE;
     }
     g_vertex_libs[key] = library;
@@ -2537,7 +2680,7 @@ VkPipeline OutputLibrary(const VkPipelineColorBlendStateCreateInfo& blend, const
     info.pMultisampleState = &multisample;
     info.pDynamicState = &dynamic;
     VkPipeline library = VK_NULL_HANDLE;
-    if (vk.vkCreateGraphicsPipelines(g.device, g.pipeline_cache, 1, &info, nullptr, &library) != VK_SUCCESS) {
+    if (CreateGraphicsPipeline(&info, &library) != VK_SUCCESS) {
         library = VK_NULL_HANDLE;
     }
     g_output_libs[key] = library;
@@ -2660,7 +2803,7 @@ VkPipeline BuildGamePipeline(const GameDraw& draw, VkShaderModule vs, VkShaderMo
     const auto start = std::chrono::steady_clock::now();
     if (vs_lib && fs_lib) {
         // Fase 41: ligacao rapida das bibliotecas (o driver ja compilou os shaders quando o par carregou)
-        std::lock_guard lock(g_lib_mutex);
+        const TimedLock lock(g_lib_mutex);
         const VkPipeline libraries[4] = {VertexInputLibrary(vertex_input, assembly), vs_lib, fs_lib, OutputLibrary(blend, multisample, rendering)};
         if (libraries[0] && libraries[3]) {
             VkPipelineLibraryCreateInfoKHR link{VK_STRUCTURE_TYPE_PIPELINE_LIBRARY_CREATE_INFO_KHR};
@@ -2668,7 +2811,7 @@ VkPipeline BuildGamePipeline(const GameDraw& draw, VkShaderModule vs, VkShaderMo
             link.pLibraries = libraries;
             VkGraphicsPipelineCreateInfo linked{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO, &link};
             linked.layout = layout;
-            if (vk.vkCreateGraphicsPipelines(g.device, g.pipeline_cache, 1, &linked, nullptr, &pipeline) != VK_SUCCESS) {
+            if (CreateGraphicsPipeline(&linked, &pipeline) != VK_SUCCESS) {
                 pipeline = VK_NULL_HANDLE;
             }
         }
@@ -2685,7 +2828,7 @@ VkPipeline BuildGamePipeline(const GameDraw& draw, VkShaderModule vs, VkShaderMo
         }
         ++g_gpl_stats.link_failures; // cai no pipeline monolitico abaixo
     }
-    const VkResult result = vk.vkCreateGraphicsPipelines(g.device, g.pipeline_cache, 1, &info, nullptr, &pipeline);
+    const VkResult result = CreateGraphicsPipeline(&info, &pipeline);
     if (result != VK_SUCCESS) {
         Fail("vkCreateGraphicsPipelines (game shaders)", result);
         pipeline = VK_NULL_HANDLE;
@@ -2693,7 +2836,7 @@ VkPipeline BuildGamePipeline(const GameDraw& draw, VkShaderModule vs, VkShaderMo
     const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
     std::printf("[DIAG-PIPE] thread=%lu Monolithic compile: %.3f ms (hash=%016llx, fast=%d, ok=%d)\n",
                 GetCurrentThreadId(), ms, static_cast<unsigned long long>(draw.pair), g_pipeline_flags != 0, pipeline != VK_NULL_HANDLE);
-    std::lock_guard lock(g_lib_mutex);
+    const TimedLock lock(g_lib_mutex);
     ++g_gpl_stats.monolithic;
     g_gpl_stats.monolithic_ms += ms;
     g_gpl_stats.monolithic_worst_ms = std::max(g_gpl_stats.monolithic_worst_ms, ms);
@@ -2714,6 +2857,8 @@ struct PipelineJob {
     bool prewarm = false; // veio do arquivo: nao regrava, e conta no progresso
     bool fast = false;    // Fase 56: pedido por um frame: sai sem otimizacao (~1,5x mais rapido) ...
     bool upgrade = false; // ... e depois este job, em segundo plano, troca pela versao otimizada
+    u32 level = 0;         // Fase 72: area em que o pipeline foi usado pela primeira vez (0 = desconhecida)
+    bool priority = false; // Fase 72: aquecimento da area atual / da ultima sessao: prioridade normal e na frente
 };
 // Fase 56: pipelines trocados pela versao otimizada. So sao destruidos quando nenhum frame em voo pode
 // mais usar (3 frames depois). Protegido por g.mutex.
@@ -2728,6 +2873,147 @@ std::string g_pipeline_state_path;
 std::mutex g_pipeline_file_mutex;
 std::unordered_set<u64> g_pipeline_saved; // hashes ja presentes no arquivo (protegido por g_pipeline_file_mutex)
 std::atomic<u32> g_prewarm_total{0}, g_prewarm_done{0};
+
+// ---- Fase 72: aquecimento por area ----
+// O radar avisa quando o jogo carrega uma area (\levels\...\<nome>\<nome>.txt). Por 2 min depois disso, cada
+// pipeline usado pela primeira vez ganha essa area (pipeline_levels.txt: "<hash> <area>", e "ultima <area>" a cada
+// troca; a base distribuida e pipeline_levels_base.txt). No aquecimento, os pipelines da ultima area da sessao
+// anterior (e da tela de abertura) vao na frente, na prioridade normal; o resto abaixo do normal. Quando o jogo
+// carrega uma area, o que dela ainda estiver na fila passa para a frente. LD_PREWARM_GATE=area faz a tela de
+// carregamento do port esperar so pelos prioritarios (o resto termina com o jogo ja rodando; um pipeline que
+// faltar no uso ainda espera ate 400 ms, sem sumir objeto). Padrao: espera tudo, como antes.
+std::mutex g_level_mutex;
+std::vector<std::string> g_level_names{""}; // id -> nome (0 = sem area)
+std::unordered_map<std::string, u32> g_level_ids;
+std::atomic<u32> g_current_level{0};
+std::unordered_map<u64, u32> g_pipeline_level;      // hash da chave -> area (g_level_mutex)
+std::vector<std::pair<u64, u32>> g_level_pending;   // a gravar (hash 0 = linha "ultima"); g_level_mutex
+std::unordered_set<u64> g_level_noted;              // ja visto nesta sessao (so a thread de render)
+std::atomic<u32> g_level_note_until{0};             // frame_serial ate onde o primeiro uso e anotado
+std::unordered_set<u32> g_priority_levels;          // g_level_mutex
+std::atomic<u32> g_prewarm_priority_total{0}, g_prewarm_priority_done{0};
+std::atomic<bool> g_priority_from_session{false}; // ha areas de uma sessao anterior (a trava por area vale)
+std::atomic<bool> g_level_writing{false};
+std::chrono::steady_clock::time_point g_level_written_at{};
+bool g_levels_loaded = false; // g_level_mutex
+
+// Com g_level_mutex.
+u32 LevelIdLocked(const std::string& name) {
+    if (name.empty()) {
+        return 0;
+    }
+    const auto [it, added] = g_level_ids.emplace(name, static_cast<u32>(g_level_names.size()));
+    if (added) {
+        g_level_names.push_back(name);
+    }
+    return it->second;
+}
+
+std::filesystem::path LevelsPath(const char* file) {
+    return std::filesystem::path(GameSpirvDirectory()) / file;
+}
+
+// Uma vez, antes do primeiro aquecimento: base distribuida e depois o arquivo do jogador (vale a primeira area).
+void LoadPipelineLevels() {
+    std::lock_guard lock(g_level_mutex);
+    if (g_levels_loaded || GameSpirvDirectory().empty()) {
+        return;
+    }
+    g_levels_loaded = true;
+    std::string last;                // ultima area da sessao anterior
+    std::vector<std::string> entry;  // as 3 primeiras areas depois da abertura na sessao anterior (por onde o save entra)
+    bool in_session = false;
+    u32 entries = 0;
+    for (const char* file : {"pipeline_levels_base.txt", "pipeline_levels.txt"}) {
+        std::ifstream in(LevelsPath(file));
+        std::string line;
+        while (std::getline(in, line)) {
+            while (!line.empty() && (line.back() == '\r' || line.back() == ' ')) {
+                line.pop_back();
+            }
+            if (line == "sessao") { // uma sessao nova comecou: a entrada e a primeira area dela
+                in_session = true;
+                entry.clear();
+                continue;
+            }
+            const size_t space = line.find(' ');
+            if (line.empty() || line[0] == '#' || space == std::string::npos) {
+                continue;
+            }
+            const std::string name = line.substr(space + 1);
+            if (line.compare(0, space, "ultima") == 0) {
+                last = name;
+                if (in_session && entry.size() < 3 && name != "loading_screen_startup" &&
+                    std::find(entry.begin(), entry.end(), name) == entry.end()) {
+                    entry.push_back(name);
+                }
+                continue;
+            }
+            const u64 hash = std::strtoull(line.c_str(), nullptr, 16);
+            if (hash && g_pipeline_level.emplace(hash, LevelIdLocked(name)).second) {
+                ++entries;
+            }
+        }
+    }
+    g_priority_levels.insert(LevelIdLocked("loading_screen_startup"));
+    std::string named = "startup screen";
+    g_priority_from_session = !last.empty();
+    entry.push_back(last);
+    for (const std::string& name : entry) {
+        if (!name.empty() && g_priority_levels.insert(LevelIdLocked(name)).second) {
+            named += " + " + name;
+        }
+    }
+    std::printf("[PIPELINES] areas: %u pipelines with a known area, %zu areas; prewarm priority: %s\n", entries, g_level_names.size() - 1,
+                named.c_str());
+}
+
+// Thread de render (GetGamePipeline, com g.mutex), so na janela de 2 min depois de uma troca de area.
+void NotePipelineLevel(u64 hash) {
+    if (!g_level_noted.insert(hash).second) {
+        return;
+    }
+    std::lock_guard lock(g_level_mutex);
+    const u32 level = g_current_level.load();
+    if (level && g_pipeline_level.emplace(hash, level).second) {
+        g_level_pending.emplace_back(hash, level);
+    }
+}
+
+// Fim do DrawFrame: grava as anotacoes novas em segundo plano, no maximo a cada 2 s.
+void FlushLevelNotes() {
+    if (g_level_writing.load() || std::chrono::steady_clock::now() - g_level_written_at < std::chrono::seconds(2)) {
+        return;
+    }
+    std::vector<std::string> lines;
+    {
+        std::lock_guard lock(g_level_mutex);
+        if (g_level_pending.empty()) {
+            return;
+        }
+        for (const auto& [hash, level] : g_level_pending) {
+            char text[32];
+            if (hash == 1 && !level) {
+                lines.push_back("sessao\n");
+                continue;
+            }
+            std::snprintf(text, sizeof(text), hash ? "%llx " : "ultima ", static_cast<unsigned long long>(hash));
+            lines.push_back(text + g_level_names[level] + "\n");
+        }
+        g_level_pending.clear();
+    }
+    g_level_written_at = std::chrono::steady_clock::now();
+    g_level_writing = true;
+    std::thread([lines = std::move(lines)] {
+        if (std::FILE* f = _wfopen(LevelsPath("pipeline_levels.txt").c_str(), L"a")) {
+            for (const std::string& line : lines) {
+                std::fputs(line.c_str(), f);
+            }
+            std::fclose(f);
+        }
+        g_level_writing = false;
+    }).detach();
+}
 
 u64 HashPipelineKey(const std::vector<u32>& key) {
     u64 key_hash = 0xcbf29ce484222325ull ^ key.size();
@@ -2765,6 +3051,10 @@ void SavePipelineState(u64 hash, const std::vector<u32>& key) {
     std::lock_guard file_lock(g_pipeline_file_mutex);
     if (g_pipeline_saved.insert(hash).second) {
         if (std::FILE* f = std::fopen(g_pipeline_state_path.c_str(), "a")) {
+            std::fseek(f, 0, SEEK_END);
+            if (std::ftell(f) == 0) {
+                std::fprintf(f, "# ld-pipeline-states 2\n"); // Fase 71: arquivo novo comeca com a versao do formato
+            }
             for (const u32 word : key) {
                 std::fprintf(f, "%x ", word);
             }
@@ -2817,7 +3107,7 @@ void PipelineWorker() {
         }
         // Fase 59: so o pipeline que um frame espera roda na prioridade normal; versao otimizada (troca),
         // aquecimento e pedidos sem pressa ficam abaixo do normal e nao disputam a CPU com o jogo.
-        const bool urgent = job.fast || (!job.upgrade && !job.prewarm);
+        const bool urgent = job.fast || (!job.upgrade && !job.prewarm) || job.priority; // Fase 72: area atual
         SetThreadPriority(GetCurrentThread(), urgent ? THREAD_PRIORITY_NORMAL : THREAD_PRIORITY_BELOW_NORMAL);
         g_pipeline_flags = (job.fast || job.prewarm) ? VK_PIPELINE_CREATE_DISABLE_OPTIMIZATION_BIT : 0;
         if (!job.vs || !job.ps) {
@@ -2829,7 +3119,7 @@ void PipelineWorker() {
         g_pipeline_flags = 0;
         if (job.upgrade) { // Fase 56: versao otimizada pronta: troca (a rapida sai de uso aos poucos)
             if (pipeline) {
-                std::lock_guard lock(g.mutex);
+                const TimedLock lock(g.mutex);
                 VkPipeline& slot = g.game_pipelines[job.hash];
                 if (slot) {
                     g_retired_pipelines.push_back({slot, g.frame_serial});
@@ -2848,11 +3138,12 @@ void PipelineWorker() {
         }
         if (job.prewarm) {
             ++g_prewarm_done;
+            g_prewarm_priority_done += job.priority; // Fase 72
         } else if (pipeline) {
             SavePipelineState(job.hash, job.key);
         }
         {
-            std::lock_guard lock(g.mutex);
+            const TimedLock lock(g.mutex);
             g.game_pipelines[job.hash] = pipeline; // falha tambem fica guardada: nao tenta de novo a cada draw
             if (!pipeline) {
                 // Fase 55: antes a falha ficava para sempre (o material sumia ate fechar o jogo; cabecas
@@ -2913,6 +3204,9 @@ VkPipeline GetGamePipeline(const GameDraw& draw, const State::GamePair& pair, St
     const u64 key_hash = HashPipelineKey(key);
     if (key_out) {
         *key_out = key_hash;
+    }
+    if (g.frame_serial < g_level_note_until.load(std::memory_order_relaxed)) {
+        NotePipelineLevel(key_hash); // Fase 72
     }
     if (const auto found = g.game_pipelines.find(key_hash); found != g.game_pipelines.end()) {
         if (found->second || !g_pipeline_failed_at.count(key_hash) || g.frame_serial - g_pipeline_failed_at[key_hash] < 300) {
@@ -2992,7 +3286,7 @@ void WaitFramePipelines() {
     if (g_burst_wait_ms > budget) {
         std::unordered_set<u64> pending;
         {
-            std::lock_guard lock(g.mutex);
+            const TimedLock lock(g.mutex);
             for (const auto& draw : g.queue_game) {
                 if (!draw.pipeline && draw.pipeline_key && !g.game_pipelines.count(draw.pipeline_key)) {
                     pending.insert(draw.pipeline_key);
@@ -3001,7 +3295,7 @@ void WaitFramePipelines() {
         }
         if (pending.size() >= g_burst_threshold) {
             budget = g_burst_wait_ms;
-            std::lock_guard lock(g.mutex);
+            const TimedLock lock(g.mutex);
             ++g_sync_stats.burst_frames;
         }
     }
@@ -3011,7 +3305,7 @@ void WaitFramePipelines() {
         u32 missing = 0;
         u64 seen = 0;
         {
-            std::lock_guard lock(g.mutex);
+            const TimedLock lock(g.mutex);
             for (const auto& draw : g.queue_game) {
                 if (!draw.pipeline && draw.pipeline_key && !g.game_pipelines.count(draw.pipeline_key)) {
                     ++missing;
@@ -3032,7 +3326,7 @@ void WaitFramePipelines() {
             std::printf("[DIAG-PIPE-WAIT] thread=%lu frame waited=%.2f ms (budget=%.1f ms)\n",
                         GetCurrentThreadId(), ms, budget);
         }
-        std::lock_guard lock(g.mutex);
+        const TimedLock lock(g.mutex);
         g_sync_stats.total_ms += ms;
         g_sync_stats.worst_single_ms = std::max(g_sync_stats.worst_single_ms, ms);
         g_sync_frame_ms += ms;
@@ -3137,6 +3431,15 @@ void DestroyAll() {
     if (g.device) {
         vk.vkDeviceWaitIdle(g.device);
         DestroyPipelines();
+        if (g.timestamps) { // Fase 75
+            vk.vkDestroyQueryPool(g.device, g.timestamps, nullptr);
+            g.timestamps = VK_NULL_HANDLE;
+            g.timestamps_written = false;
+        }
+        if (g_vk_cache) { // Fase 70
+            vk.vkDestroyPipelineCache(g.device, g_vk_cache, nullptr);
+            g_vk_cache = VK_NULL_HANDLE;
+        }
         for (auto& [key, texture] : g.textures) {
             if (texture.array_view) vk.vkDestroyImageView(g.device, texture.array_view, nullptr);
         if (texture.face_view) vk.vkDestroyImageView(g.device, texture.face_view, nullptr);
@@ -3147,7 +3450,7 @@ void DestroyAll() {
         g.textures.clear();
         g.texture_bytes = 0;
         {
-            std::lock_guard pool_lock(g_texture_pool.mutex); // Fase 59
+            const TimedLock pool_lock(g_texture_pool.mutex); // Fase 59
             for (auto& chunk : g_texture_pool.chunks) {
                 vk.vkFreeMemory(g.device, chunk.memory, nullptr);
             }
@@ -3233,11 +3536,6 @@ void DestroyAll() {
         if (g.image_available) vk.vkDestroySemaphore(g.device, g.image_available, nullptr);
         if (g.pool) vk.vkDestroyCommandPool(g.device, g.pool, nullptr);
         if (g.swapchain) vk.vkDestroySwapchainKHR(g.device, g.swapchain, nullptr);
-        SavePipelineCache();
-        if (g.pipeline_cache) {
-            vk.vkDestroyPipelineCache(g.device, g.pipeline_cache, nullptr);
-            g.pipeline_cache = VK_NULL_HANDLE;
-        }
         {
             std::lock_guard pool_lock(g.staging_pool_mutex);
             for (auto& s : g.staging_pool) {
@@ -3303,7 +3601,7 @@ VulkanRenderer& VulkanRenderer::Instance() {
 }
 
 bool VulkanRenderer::Initialize(void* hwnd) {
-    std::lock_guard lock(g.mutex);
+    const TimedLock lock(g.mutex);
     if (g.active) {
         return true;
     }
@@ -3320,6 +3618,7 @@ bool VulkanRenderer::Initialize(void* hwnd) {
         g.error = error;
         return false;
     }
+    CreatePipelineCache(); // Fase 70
     g.active = true;
     g_prepare_open = true;
     return true;
@@ -3516,7 +3815,7 @@ bool VulkanRenderer::DrawFrame(u64 display_address) {
     }
     WaitFramePipelines(); // Fase 45: sem g.mutex (as threads de pipeline precisam dele para entregar)
     lap(0);
-    std::lock_guard lock(g.mutex);
+    TimedLock lock(g.mutex);
     lap(1);
     for (State::QueuedGame& draw : g.queue_game) { // Fase 45: pendentes que ficaram prontos
         for (u32 i = 0; i < draw.image_count && draw.pending_images; ++i) {
@@ -3615,11 +3914,22 @@ bool VulkanRenderer::DrawFrame(u64 display_address) {
     }
     vk.vkResetFences(g.device, 1, &g.in_flight);
     lap(3);
+    if (g.timestamps && g.timestamps_written) { // Fase 75: o frame anterior ja terminou (fence esperada acima)
+        u64 stamps[2] = {};
+        if (vk.vkGetQueryPoolResults(g.device, g.timestamps, 0, 2, sizeof(stamps), stamps, sizeof(u64), VK_QUERY_RESULT_64_BIT) == VK_SUCCESS &&
+            stamps[1] >= stamps[0]) {
+            g.last_gpu_ms = (stamps[1] - stamps[0]) * g.timestamp_period_ns / 1e6;
+        }
+    }
 
     vk.vkResetCommandBuffer(g.command, 0);
     VkCommandBufferBeginInfo begin{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
     begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
     vk.vkBeginCommandBuffer(g.command, &begin);
+    if (g.timestamps) {
+        vk.vkCmdResetQueryPool(g.command, g.timestamps, 0, 2);
+        vk.vkCmdWriteTimestamp(g.command, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, g.timestamps, 0);
+    }
     vk.vkResetDescriptorPool(g.device, g.frame_pool, 0); // o frame anterior ja terminou (fence)
     const u32 upload_half = g.frame_half; // Fase 59: metade do staging que este frame envia
     RecordFrameUploads(g.command); // Fase 39: texturas criadas / reescritas desde o ultimo frame
@@ -4171,6 +4481,10 @@ bool VulkanRenderer::DrawFrame(u64 display_address) {
     g.peak_index_bytes = std::max(g.peak_index_bytes, g.frame_index_bytes);
     g.peak_storage_bytes = std::max(g.peak_storage_bytes, g.frame_storage_bytes);
     g.frame_vertex_bytes = g.frame_index_bytes = g.frame_storage_bytes = 0;
+    if (g.timestamps) {
+        vk.vkCmdWriteTimestamp(g.command, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, g.timestamps, 1);
+        g.timestamps_written = true;
+    }
     vk.vkEndCommandBuffer(g.command);
 
     const VkPipelineStageFlags wait_stage = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
@@ -4192,7 +4506,7 @@ bool VulkanRenderer::DrawFrame(u64 display_address) {
         }
     }
     lap(4);
-    result = vk.vkQueueSubmit(g.queue, 1, &submit, g.in_flight);
+    result = QueueSubmit(1, &submit, g.in_flight);
     lap(5);
     if (result == VK_SUCCESS) {
         g.immediate_since_frame = 0; // Fase 54e
@@ -4210,7 +4524,7 @@ bool VulkanRenderer::DrawFrame(u64 display_address) {
     if (g.static_reset) {
         // O buffer estatico encheu: espera este frame terminar de le-lo e recomeca do zero. A
         // geracao avanca, e quem guardou posicoes (o cache do GnmDriver) as descarta.
-        vk.vkQueueWaitIdle(g.queue);
+        QueueWaitIdle();
         g.statics.head = 0;
         g.static_reset = false;
         ++g.static_generation;
@@ -4222,8 +4536,26 @@ bool VulkanRenderer::DrawFrame(u64 display_address) {
     present.swapchainCount = 1;
     present.pSwapchains = &g.swapchain;
     present.pImageIndices = &image_index;
-    result = vk.vkQueuePresentKHR(g.queue, &present);
+    // Fase 70b: o present (FIFO: pode esperar o VSync e depender da thread da janela) roda sem o g.mutex. Antes
+    // as threads de pipeline / textura esperavam por ele a cada quadro para entregar o resultado, e fechar a janela
+    // com o present preso podia travar a saida. LD_PRESENT_LOCK=1 volta ao jeito antigo.
+    static const bool present_locked = [] {
+        const char* env = std::getenv("LD_PRESENT_LOCK");
+        return env && env[0] == '1';
+    }();
+    if (!present_locked) {
+        lock.unlock();
+    }
+    {
+        std::lock_guard queue_lock(g_queue_mutex);
+        result = vk.vkQueuePresentKHR(g.queue, &present);
+    }
+    if (!present_locked) {
+        lock.lock();
+    }
     lap(6);
+    MaybeSavePipelineCache(g_prewarm_total.load() && g_prewarm_done.load() >= g_prewarm_total.load()); // Fase 70
+    FlushLevelNotes(); // Fase 72
     if (result == VK_ERROR_OUT_OF_DATE_KHR || result == VK_SUBOPTIMAL_KHR) {
         // apresentou (SUBOPTIMAL) ou nao (OUT_OF_DATE); de todo modo o swapchain e refeito
         const bool was_shown = result == VK_SUBOPTIMAL_KHR;
@@ -4302,7 +4634,7 @@ bool VulkanRenderer::GameShadersSupported() const {
 }
 
 bool VulkanRenderer::HasGamePair(u64 key) const {
-    std::lock_guard lock(g.mutex);
+    const TimedLock lock(g.mutex);
     return g.game_pairs.count(key) != 0;
 }
 
@@ -4422,7 +4754,7 @@ bool ResolvePairModulesLocked(u64 key, State::GamePair& pair) {
 // Sem g.mutex (threads de pipeline).
 bool ResolvePairModules(u64 key, VkShaderModule* vs_out, VkShaderModule* ps_out) {
     {
-        std::lock_guard lock(g.mutex);
+        const TimedLock lock(g.mutex);
         const auto pair = g.game_pairs.find(key);
         if (pair == g.game_pairs.end()) {
             return false;
@@ -4443,7 +4775,7 @@ bool ResolvePairModules(u64 key, VkShaderModule* vs_out, VkShaderModule* ps_out)
         ++g_lazy_modules_failed;
         return false;
     }
-    std::lock_guard lock(g.mutex);
+    const TimedLock lock(g.mutex);
     if (const auto pair = g.game_pairs.find(key); pair != g.game_pairs.end()) {
         pair->second.vs = vs;
         pair->second.ps = ps;
@@ -4462,7 +4794,7 @@ void VulkanRenderer::SetModuleLoader(ModuleLoader loader) {
 
 bool VulkanRenderer::RegisterGamePairLazy(u64 key, const std::vector<GamePairLayout::Binding>& bindings) {
     {
-        std::lock_guard lock(g.mutex);
+        const TimedLock lock(g.mutex);
         if (!g.active || !g.game_shaders || g.gpl || !g_module_loader) { // GPL compila os modulos no registro
             return false;
         }
@@ -4475,7 +4807,7 @@ bool VulkanRenderer::RegisterGamePairLazy(u64 key, const std::vector<GamePairLay
     if (!SharedLayouts(bindings, &pair.set_layout, &pair.layout)) {
         return false;
     }
-    std::lock_guard lock(g.mutex);
+    const TimedLock lock(g.mutex);
     g.game_pairs.emplace(key, std::move(pair));
     return true;
 }
@@ -4489,7 +4821,7 @@ bool VulkanRenderer::RegisterGamePair(u64 key, const GamePairLayout& layout) {
     // Fase 29: chamado pela thread de carga. Os modulos e layouts sao criados SEM o g.mutex (a
     // thread de render o usa em cada draw); o lock so cobre a consulta e a insercao no mapa.
     {
-        std::lock_guard lock(g.mutex);
+        const TimedLock lock(g.mutex);
         if (!g.active || !g.game_shaders || layout.vs_spirv.size() < 5 || layout.ps_spirv.size() < 5) {
             return false;
         }
@@ -4511,7 +4843,7 @@ bool VulkanRenderer::RegisterGamePair(u64 key, const GamePairLayout& layout) {
         pair.vs_lib = CreateShaderLibrary(pair.vs, true, pair.layout);
         pair.fs_lib = CreateShaderLibrary(pair.ps, false, pair.layout);
         const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
-        std::lock_guard lock(g_lib_mutex);
+        const TimedLock lock(g_lib_mutex);
         if (pair.vs_lib && pair.fs_lib) {
             g_gpl_stats.shader_libs += 2;
             g_gpl_stats.shader_lib_ms += ms;
@@ -4523,13 +4855,13 @@ bool VulkanRenderer::RegisterGamePair(u64 key, const GamePairLayout& layout) {
             pair.vs_lib = pair.fs_lib = VK_NULL_HANDLE; // o par usa o pipeline monolitico
         }
     }
-    std::lock_guard lock(g.mutex);
+    const TimedLock lock(g.mutex);
     g.game_pairs[key] = std::move(pair);
     return true;
 }
 
 bool VulkanRenderer::QueueGameDraw(const GameDraw& draw) {
-    std::lock_guard lock(g.mutex);
+    const TimedLock lock(g.mutex);
     if (!g.active || !g.game_shaders || g.queue_game.size() >= kMaxDrawsPerFrame || draw.attribute_count > 16 || draw.binding_count > 8 ||
         draw.buffer_count > 24 || draw.image_count > 16 || draw.sampler_count > 16 || draw.color_count > 8 ||
         (!draw.color_count && !draw.has_depth) || static_cast<u32>(draw.primitive) > DrawCall::kPointList) {
@@ -4739,7 +5071,7 @@ bool VulkanRenderer::QueueGameDraw(const GameDraw& draw) {
 }
 
 u64 VulkanRenderer::StaticUpload(const void* data, u64 bytes) {
-    std::lock_guard lock(g.mutex);
+    const TimedLock lock(g.mutex);
     if (!g.active || !data || !bytes || g.static_reset) {
         return ~0ull;
     }
@@ -4758,17 +5090,17 @@ u32 VulkanRenderer::StaticGeneration() const {
 }
 
 u64 VulkanRenderer::StaticBytes() const {
-    std::lock_guard lock(g.mutex);
+    const TimedLock lock(g.mutex);
     return g.statics.head;
 }
 
 u32 VulkanRenderer::RenderTargets() const {
-    std::lock_guard lock(g.mutex);
+    const TimedLock lock(g.mutex);
     return static_cast<u32>(g.targets.size());
 }
 
 void VulkanRenderer::RequestReadback(u64 address, u32 width, u32 height) {
-    std::lock_guard lock(g.mutex);
+    const TimedLock lock(g.mutex);
     for (u32 i = 0; i < g.readback_count; ++i) {
         if (g.readbacks[i].address == address) {
             if (!g.readbacks[i].pending) {
@@ -4784,7 +5116,7 @@ void VulkanRenderer::RequestReadback(u64 address, u32 width, u32 height) {
 }
 
 u32 VulkanRenderer::CollectReadbacks(ReadbackSink sink) {
-    std::lock_guard lock(g.mutex);
+    const TimedLock lock(g.mutex);
     if (!g.active || !g.readback.mapped) {
         return 0;
     }
@@ -4810,7 +5142,7 @@ u32 VulkanRenderer::CollectReadbacks(ReadbackSink sink) {
 }
 
 bool VulkanRenderer::HasRenderTarget(u64 address) const {
-    std::lock_guard lock(g.mutex);
+    const TimedLock lock(g.mutex);
     return g.target_by_address.count(address) != 0;
 }
 
@@ -4831,7 +5163,7 @@ u64 VulkanRenderer::FeedbackSkipped() const {
 }
 
 void VulkanRenderer::PipelineFailures(u64* failures, u64* retries) const {
-    std::lock_guard lock(g.mutex);
+    const TimedLock lock(g.mutex);
     *failures = g_pipeline_failures;
     *retries = g_pipeline_retries;
 }
@@ -4855,12 +5187,12 @@ u64 VulkanRenderer::GameDraws() const {
 }
 
 u32 VulkanRenderer::GamePairs() const {
-    std::lock_guard lock(g.mutex);
+    const TimedLock lock(g.mutex);
     return static_cast<u32>(g.game_pairs.size());
 }
 
 u32 VulkanRenderer::GamePipelines() const {
-    std::lock_guard lock(g.mutex);
+    const TimedLock lock(g.mutex);
     return static_cast<u32>(g.game_pipelines.size());
 }
 
@@ -4877,7 +5209,7 @@ u64 VulkanRenderer::ValidationWarnings() const {
 }
 
 bool VulkanRenderer::QueueDraw(const DrawCall& draw) {
-    std::lock_guard lock(g.mutex);
+    const TimedLock lock(g.mutex);
     if (!g.active || g.views.empty() || g.queue_draws.size() >= kMaxDrawsPerFrame || !draw.vertex_data || !draw.vertex_count ||
         !draw.stride || draw.primitive > DrawCall::kQuadList) {
         return false;
@@ -4915,12 +5247,12 @@ bool VulkanRenderer::QueueDraw(const DrawCall& draw) {
 }
 
 bool VulkanRenderer::HasTexture(u64 key) const {
-    std::lock_guard lock(g.mutex);
+    const TimedLock lock(g.mutex);
     return g.textures.count(key) != 0;
 }
 
 bool VulkanRenderer::UpdateTexture(u64 key, const TextureData& data) {
-    std::lock_guard lock(g.mutex);
+    const TimedLock lock(g.mutex);
     const auto found = g.textures.find(key);
     if (!g.active || !key || found == g.textures.end() || !data.data) {
         return false;
@@ -4944,7 +5276,7 @@ bool VulkanRenderer::UpdateTexture(u64 key, const TextureData& data) {
         }
     }
     ++g_upload_stats.immediate;
-    const VkResult before = vk.vkQueueWaitIdle(g.queue); // o frame anterior ainda pode estar amostrando a imagem
+    const VkResult before = QueueWaitIdle(); // o frame anterior ainda pode estar amostrando a imagem
     if (before != VK_SUCCESS) {
         std::printf("[GPU HANG] queue already returned %s BEFORE immediate texture reupload 0x%llx%s", ResultName(before),
                     static_cast<unsigned long long>(key), "\n");
@@ -4982,15 +5314,15 @@ bool VulkanRenderer::UpdateTexture(u64 key, const TextureData& data) {
     VkSubmitInfo submit{VK_STRUCTURE_TYPE_SUBMIT_INFO};
     submit.commandBufferCount = 1;
     submit.pCommandBuffers = &g.upload_command;
-    vk.vkQueueSubmit(g.queue, 1, &submit, VK_NULL_HANDLE);
-    CheckImmediateUpload(before == VK_SUCCESS ? vk.vkQueueWaitIdle(g.queue) : VK_SUCCESS, "reescrita", key, texture.width, texture.height,
+    QueueSubmit(1, &submit, VK_NULL_HANDLE);
+    CheckImmediateUpload(before == VK_SUCCESS ? QueueWaitIdle() : VK_SUCCESS, "reescrita", key, texture.width, texture.height,
                          texture.depth, texture.layers, texture.levels, static_cast<u32>(data.format), data.bytes, regions);
     return true;
 }
 
 bool VulkanRenderer::UploadTexture(u64 key, const TextureData& texture, u64 prepared) {
     std::unique_ptr<State::Texture> objects(reinterpret_cast<State::Texture*>(prepared));
-    std::lock_guard lock(g.mutex);
+    const TimedLock lock(g.mutex);
     if (!g.active || !key) {
         if (objects) {
             DestroyTextureObjects(*objects);
@@ -5044,7 +5376,7 @@ bool UploadThroughTempStaging(u64 key, const TextureData& data, std::unique_ptr<
     if (ok) {
         std::memcpy(mapped, data.data, data.bytes);
     }
-    std::lock_guard lock(g.mutex);
+    const TimedLock lock(g.mutex);
     auto drop_temp = [&] {
         if (temp.buffer) vk.vkDestroyBuffer(g.device, temp.buffer, nullptr);
         if (temp.memory) vk.vkFreeMemory(g.device, temp.memory, nullptr);
@@ -5092,7 +5424,7 @@ bool VulkanRenderer::UploadTextureFromWorker(u64 key, const TextureData& data, u
     u32 half = 0;
     bool use_temp = false;
     {
-        std::lock_guard lock(g.mutex);
+        const TimedLock lock(g.mutex);
         if (!g.active || !key || !objects || g.textures.size() >= kMaxTextures) {
             if (objects) {
                 DestroyTextureObjects(*objects);
@@ -5116,7 +5448,7 @@ bool VulkanRenderer::UploadTextureFromWorker(u64 key, const TextureData& data, u
         return UploadThroughTempStaging(key, data, std::move(objects));
     }
     {
-        std::lock_guard lock(g.mutex);
+        const TimedLock lock(g.mutex);
         if (!g.active) {
             DestroyTextureObjects(*objects);
             return false;
@@ -5151,7 +5483,7 @@ bool VulkanRenderer::UploadTextureFromWorker(u64 key, const TextureData& data, u
     }
     std::memcpy(g.frame_staging.mapped + base, data.data, data.bytes);
     g.staging_inflight[half].fetch_sub(1, std::memory_order_release);
-    std::lock_guard lock(g.mutex);
+    const TimedLock lock(g.mutex);
     if (!g.active) {
         return false;
     }
@@ -5181,8 +5513,12 @@ void VulkanRenderer::DiscardPreparedTexture(u64 prepared) {
 }
 
 u32 VulkanRenderer::TexturesCreated() const {
-    std::lock_guard lock(g.mutex);
+    const TimedLock lock(g.mutex);
     return g.textures.empty() ? 0 : static_cast<u32>(g.textures.size() - 1); // sem contar o branco
+}
+
+double VulkanRenderer::LastGpuFrameMs() const {
+    return g.last_gpu_ms.load(); // Fase 75: GPU do ultimo quadro terminado (0 = sem timestamps)
 }
 
 void VulkanRenderer::LastDrawFrameTimes(double out[7]) const {
@@ -5244,7 +5580,7 @@ u32 VulkanRenderer::PipelinesCreated() const {
 }
 
 u32 VulkanRenderer::CheckGameShaderModules(const std::string& directory, u32* total) {
-    std::lock_guard lock(g.mutex);
+    const TimedLock lock(g.mutex);
     u32 accepted = 0, files = 0;
     std::error_code ec;
     if (g.active) {
@@ -5278,11 +5614,12 @@ u32 VulkanRenderer::CheckGameShaderModules(const std::string& directory, u32* to
 
 void VulkanRenderer::Shutdown() {
     StopPipelineWorker(); // antes do lock: a thread de pipelines pega o g.mutex para entregar o resultado
+    SavePipelineCacheFile("saida"); // Fase 70
     g_prepare_open = false; // Fase 45: nenhuma textura nova criada fora do lock depois daqui
     while (g_prepare_inflight.load()) {
         std::this_thread::yield();
     }
-    std::lock_guard lock(g.mutex);
+    const TimedLock lock(g.mutex);
     DestroyAll();
 }
 
@@ -5298,12 +5635,13 @@ void VulkanRenderer::RequestSwapchainRebuild() {
     g.swapchain_dirty.store(true, std::memory_order_relaxed);
 }
 
+// Chamado ao fechar a janela (1.8.3): o mesmo salvamento com espera limitada da Fase 70.
 void VulkanRenderer::SavePipelineCache() {
-    render::SavePipelineCache();
+    SavePipelineCache("window closed");
 }
 
 std::string VulkanRenderer::Describe() const {
-    std::lock_guard lock(g.mutex);
+    const TimedLock lock(g.mutex);
     if (!g.active) {
         return "Vulkan inactive: " + (g.error.empty() ? std::string("not initialized") : g.error);
     }
@@ -5329,17 +5667,45 @@ void VulkanRenderer::SetPipelineStateFile(const std::string& path) {
 }
 
 void VulkanRenderer::SetPipelineCacheFile(const std::string& path) {
-    g.pipeline_cache_path = path;
+    g_vk_cache_path = path; // Fase 70: o arquivo do cache (antes de Initialize)
 }
 
+// --prewarm-only (Preparar): grava o cache depois do aquecimento. Com o cache desligado (padrao na AMD) o aquecimento
+// ainda vale: o driver guarda os pipelines no cache dele.
 void VulkanRenderer::SaveDiskPipelineCache() {
-    SavePipelineCache();
+    if (g_vk_cache) {
+        SavePipelineCacheFile("prewarm-only");
+    }
 }
 
 void VulkanRenderer::LoadDiskPipelineCache() {
-    LoadPipelineCache();
+    if (!g_vk_cache && g.device) {
+        CreatePipelineCache();
+    }
 }
 
+
+// Fase 70: salva o cache de pipelines agora (saida do jogo pela janela, que nao passa pelo Shutdown).
+// Roda numa thread propria com espera de ate 5 s: chamada pela thread da janela, o driver pode estar preso
+// num present que depende dessa mesma janela (o fechamento travava). Se nao der tempo, fica o ultimo
+// salvamento periodico; o arquivo antigo so e trocado por um novo inteiro.
+void VulkanRenderer::SavePipelineCache(const char* reason) {
+    if (!g_vk_cache) {
+        return;
+    }
+    auto done = std::make_shared<std::atomic<bool>>(false);
+    std::thread([reason, done] {
+        SavePipelineCacheFile(reason);
+        *done = true;
+    }).detach();
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (!*done && std::chrono::steady_clock::now() < deadline) {
+        Sleep(10);
+    }
+    if (!*done) {
+        std::printf("[PIPELINE-CACHE] exit save did not finish in 5 s: keeping the last saved file\n");
+    }
+}
 
 void VulkanRenderer::PrewarmProgress(u32* done, u32* total) const {
     *done = g_prewarm_done.load();
@@ -5366,31 +5732,68 @@ u32 VulkanRenderer::PrewarmPipelines() {
     if (!g.active || !g_async_pipelines.load()) {
         return 0;
     }
+    LoadPipelineLevels(); // Fase 72
     std::lock_guard waiting_lock(g_prewarm_waiting_mutex);
     std::vector<std::vector<u32>> records;
     records.swap(g_prewarm_waiting);
     {
         std::lock_guard file_lock(g_pipeline_file_mutex);
-        std::ifstream in(g_pipeline_state_path);
-        std::string line;
-        while (std::getline(in, line)) {
-            std::vector<u32> key;
-            const char* p = line.c_str();
-            char* end = nullptr;
-            for (;;) {
-                const unsigned long value = std::strtoul(p, &end, 16);
-                if (end == p) {
-                    break;
+        // Fase 71: a base distribuida com o port (refeita a cada versao por tools/pipeline_states.py) e depois o
+        // arquivo do jogador. O hash da chave tira os repetidos; o que ja esta na base nao e gravado de novo no do
+        // jogador. Linhas # sao comentarios; "# ld-pipeline-states N" com N diferente de 2 = formato de outra
+        // versao, arquivo ignorado. LD_PIPE_BASE=0 ignora a base.
+        static const bool use_base = [] {
+            const char* env = std::getenv("LD_PIPE_BASE");
+            return !(env && env[0] == '0');
+        }();
+        std::vector<std::string> paths;
+        if (use_base) {
+            paths.push_back((std::filesystem::path(g_pipeline_state_path).parent_path() / "pipeline_states_base.txt").string());
+        }
+        paths.push_back(g_pipeline_state_path);
+        for (const std::string& path : paths) {
+            std::ifstream in(path);
+            std::string line;
+            u32 read = 0, added = 0;
+            bool first = true;
+            while (std::getline(in, line)) {
+                if (first && line.rfind("# ld-pipeline-states", 0) == 0) {
+                    first = false;
+                    if (std::atoi(line.c_str() + 20) != 2) {
+                        std::printf("[PIPELINES] %s: unknown state file format (%s), skipped\n", path.c_str(), line.c_str());
+                        break;
+                    }
+                    continue;
                 }
-                key.push_back(static_cast<u32>(value));
-                p = end;
+                first = false;
+                if (line.empty() || line[0] == '#') {
+                    continue;
+                }
+                std::vector<u32> key;
+                const char* p = line.c_str();
+                char* end = nullptr;
+                for (;;) {
+                    const unsigned long value = std::strtoul(p, &end, 16);
+                    if (end == p) {
+                        break;
+                    }
+                    key.push_back(static_cast<u32>(value));
+                    p = end;
+                }
+                ++read;
+                if (key.size() >= 13 && g_pipeline_saved.insert(HashPipelineKey(key)).second) {
+                    records.push_back(std::move(key));
+                    ++added;
+                }
             }
-            if (key.size() >= 13 && g_pipeline_saved.insert(HashPipelineKey(key)).second) {
-                records.push_back(std::move(key));
+            static std::unordered_set<std::string> logged;
+            if (read && logged.insert(path).second) {
+                std::printf("[PIPELINES] states from %s: %u lines, %u new\n", std::filesystem::path(path).filename().string().c_str(), read, added);
             }
         }
     }
     u32 queued = 0;
+    std::vector<PipelineJob> first, rest; // Fase 72: area prioritaria na frente da fila
     for (const std::vector<u32>& key : records) {
         PipelineJob job;
         if (!JobFromKey(key, job)) {
@@ -5398,7 +5801,13 @@ u32 VulkanRenderer::PrewarmPipelines() {
         }
         job.prewarm = true;
         {
-            std::lock_guard lock(g.mutex);
+            std::lock_guard level_lock(g_level_mutex);
+            const auto level = g_pipeline_level.find(job.hash);
+            job.level = level == g_pipeline_level.end() ? 0 : level->second;
+            job.priority = job.level && g_priority_levels.count(job.level);
+        }
+        {
+            const TimedLock lock(g.mutex);
             const auto pair = g.game_pairs.find(job.draw.pair);
             if (pair == g.game_pairs.end()) {
                 g_prewarm_waiting.push_back(key); // o par pode chegar depois (pacote AOT)
@@ -5413,16 +5822,68 @@ u32 VulkanRenderer::PrewarmPipelines() {
             job.fs_lib = pair->second.fs_lib;
             job.layout = pair->second.layout;
         }
-        {
-            std::lock_guard lock(g_pipeline_mutex);
-            EnsurePipelineWorkers();
-            g_pipeline_jobs.push_back(std::move(job));
-        }
-        g_pipeline_cv.notify_one();
+        g_prewarm_priority_total += job.priority;
+        (job.priority ? first : rest).push_back(std::move(job));
         ++g_prewarm_total;
         ++queued;
     }
+    if (queued) {
+        std::lock_guard lock(g_pipeline_mutex);
+        EnsurePipelineWorkers();
+        for (PipelineJob& job : first) {
+            g_pipeline_jobs.push_back(std::move(job));
+        }
+        for (PipelineJob& job : rest) {
+            g_pipeline_jobs.push_back(std::move(job));
+        }
+    }
+    g_pipeline_cv.notify_all();
     return queued;
+}
+
+// Fase 72: o jogo comecou a carregar uma area (radar). Anota o primeiro uso dos pipelines por 2 min e passa para a
+// frente da fila, na prioridade normal, o que do aquecimento for desta area e ainda nao foi criado.
+void VulkanRenderer::SetCurrentLevel(const std::string& name) {
+    u32 level = 0;
+    {
+        std::lock_guard lock(g_level_mutex);
+        level = LevelIdLocked(name);
+        if (level == g_current_level.load()) {
+            return;
+        }
+        g_current_level = level;
+        static bool session_marked = false;
+        if (!session_marked) {
+            session_marked = true;
+            g_level_pending.emplace_back(1, 0); // linha "sessao": a primeira area depois dela e a de entrada
+        }
+        g_level_pending.emplace_back(0, level); // linha "ultima <area>"
+    }
+    g_level_note_until = g.frame_serial + 7200;
+    u32 moved = 0;
+    {
+        std::lock_guard lock(g_pipeline_mutex);
+        std::stable_partition(g_pipeline_jobs.begin(), g_pipeline_jobs.end(), [&](PipelineJob& job) {
+            if (!job.prewarm) {
+                return true; // pedidos de frames continuam na frente
+            }
+            if (job.level == level) {
+                if (!job.priority) {
+                    job.priority = true;
+                    ++moved;
+                }
+                return true;
+            }
+            return false;
+        });
+    }
+    std::printf("[PIPELINES] area %s: %u of its prewarm pipelines moved to the front of the queue\n", name.c_str(), moved);
+}
+
+// Fase 72: progresso so dos pipelines prioritarios (LD_PREWARM_GATE=area).
+void VulkanRenderer::PrewarmPriorityProgress(u32* done, u32* total) const {
+    *done = g_prewarm_priority_done.load();
+    *total = g_priority_from_session.load() ? g_prewarm_priority_total.load() : 0; // sem sessao anterior: 0 = espera tudo
 }
 
 // Linha do arquivo de estados -> job (sem os modulos do par). Falso se for de outra versao do formato.
@@ -5533,7 +5994,7 @@ void VulkanRenderer::BenchPipelines(const std::string& path) {
         }
         State::GamePair pair;
         {
-            std::lock_guard lock(g.mutex);
+            const TimedLock lock(g.mutex);
             const auto found = g.game_pairs.find(d.pair);
             if (found == g.game_pairs.end()) {
                 continue;
@@ -5607,30 +6068,30 @@ void VulkanRenderer::SetFastPipelines(bool enabled) {
 }
 
 void VulkanRenderer::FastPipelineStats(u64* fast, u64* upgraded) const {
-    std::lock_guard lock(g.mutex);
+    const TimedLock lock(g.mutex);
     *fast = g_fast_built;
     *upgraded = g_upgraded;
 }
 
 void VulkanRenderer::SetSyncPipelines(bool enabled, double budget_ms) {
-    std::lock_guard lock(g.mutex);
+    const TimedLock lock(g.mutex);
     g_sync_pipelines = enabled;
     g_sync_budget_ms = budget_ms;
 }
 
 void VulkanRenderer::SetGpl(bool enabled) {
-    g_gpl_wanted = enabled;
+    g_gpl_mode = enabled ? 1 : 0; // Fase 74: escolha explicita (linha de comando / launcher)
 }
 
 VulkanRenderer::GplStats VulkanRenderer::GetGplStats() const {
-    std::lock_guard lock(g_lib_mutex);
+    const TimedLock lock(g_lib_mutex);
     VulkanRenderer::GplStats stats = g_gpl_stats;
     stats.active = g.gpl;
     return stats;
 }
 
 VulkanRenderer::UploadStats VulkanRenderer::GetUploadStats() const {
-    std::lock_guard lock(g.mutex);
+    const TimedLock lock(g.mutex);
     return g_upload_stats;
 }
 
@@ -5643,7 +6104,7 @@ u64 VulkanRenderer::DrawsLateTexture() const {
 }
 
 VulkanRenderer::SyncPipelineStats VulkanRenderer::GetSyncPipelineStats() const {
-    std::lock_guard lock(g.mutex);
+    const TimedLock lock(g.mutex);
     return g_sync_stats;
 }
 
@@ -5652,7 +6113,7 @@ u64 VulkanRenderer::AsyncPipelines() const {
 }
 
 void VulkanRenderer::WaitPreviousFrame() {
-    std::lock_guard lock(g.mutex);
+    const TimedLock lock(g.mutex);
     if (g.active && vk.vkWaitForFences(g.device, 1, &g.in_flight, VK_TRUE, 250'000'000ull) == VK_TIMEOUT) {
         NoteGpuTimeout();
     }
@@ -5663,7 +6124,7 @@ u64 VulkanRenderer::FramesSkipped() const {
 }
 
 void VulkanRenderer::SetClearColor(float r, float g_, float b, float a) {
-    std::lock_guard lock(g.mutex);
+    const TimedLock lock(g.mutex);
     g.clear = VkClearColorValue{{r, g_, b, a}};
 }
 
