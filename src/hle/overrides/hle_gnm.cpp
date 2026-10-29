@@ -1882,8 +1882,26 @@ std::atomic<bool> g_texture_refresh{true}; // --no-texture-refresh
 constexpr u64 kTexturePending = ~0ull;
 struct TexTracked {
     u64 sample = 0, next_frame = 0;
+    u32 rewrites = 0; // conferencias seguidas em que o conteudo tinha mudado
 };
 std::unordered_map<u64, TexTracked> g_tex_tracked;
+// Issue #6: texturas lineares grandes que o jogo reescreve sem parar (a tela dos fliperamas da Midway: Spy Hunter e
+// Rampage em 512x480, Super Sprint em 512x384) passam a ser conferidas todo quadro, como as lineares pequenas. Pela
+// amostragem a cada ~30 quadros a tela mostrava buffers antigos misturados (quadro dobrado / borrado).
+std::unordered_set<u64> g_tex_hot_linear;
+constexpr u32 kHotLinearRewrites = 2;
+constexpr u64 kHotLinearMaxTexels = 1u << 20;
+
+// Chamado a cada conferencia por amostragem de uma textura ja enviada.
+void NoteTextureCheck(u64 key, const GuestTexture& texture, TexTracked& state, bool changed) {
+    state.rewrites = changed ? state.rewrites + 1 : 0;
+    if (state.rewrites < kHotLinearRewrites || texture.tiling != 8 ||
+        static_cast<u64>(texture.width) * texture.height * texture.depth > kHotLinearMaxTexels || !g_tex_hot_linear.insert(key).second) {
+        return;
+    }
+    std::printf("[TEXTURE] 0x%llx %ux%u format 0x%x: linear texture rewritten all the time; checked every frame from now on\n",
+                static_cast<unsigned long long>(texture.address), texture.width, texture.height, texture.format);
+}
 // Fase 61 (medicao): texturas lidas na hora pela thread de render neste frame (lineares pequenas novas, conferencia
 // por frame das lineares pequenas, reescritas no modo sem threads). Vai na linha [ENGASGO] e zera a cada frame.
 u32 g_tex_inline_count = 0, g_tex_inline_checks = 0;
@@ -2076,7 +2094,8 @@ u64 EnsureGuestTexture(const GuestTexture& texture) {
         }
     }
     const bool small_linear = texture.tiling == 8 && (static_cast<u64>(texture.width) * texture.height * texture.depth <= (128u << 10) ||
-                                                      texture.format == 0x01 || texture.format == 0x03); // Fase 60: planos de video mudam todo quadro
+                                                      texture.format == 0x01 || texture.format == 0x03 || // Fase 60: planos de video mudam todo quadro
+                                                      (g_tex_hot_linear.count(key) && !g_tex_replacing.count(key))); // Issue #6
     static thread_local PixelVector pixels;
     // Fase 29: as demais texturas sao conferidas por amostragem a cada ~30 frames (nivel 0).
     using Tracked = TexTracked;
@@ -2191,7 +2210,9 @@ u64 EnsureGuestTexture(const GuestTexture& texture) {
             // versao nova no fim do frame, como uma textura nova: nunca sai com a velha (sem pop-in).
             state.next_frame = g_texture_frame + 30;
             u64 sample = 0;
-            if (TextureSample(texture.address, level0_bytes, &sample) && sample != state.sample) {
+            const bool sampled = TextureSample(texture.address, level0_bytes, &sample);
+            NoteTextureCheck(key, texture, state, sampled && sample != state.sample);
+            if (sampled && sample != state.sample) {
                 state.sample = sample;
                 TextureJob job;
                 job.key = key;
@@ -2216,7 +2237,9 @@ u64 EnsureGuestTexture(const GuestTexture& texture) {
         } else if (g_texture_frame >= state.next_frame) {
             state.next_frame = g_texture_frame + 30;
             u64 sample = 0;
-            if (TextureSample(texture.address, level0_bytes, &sample) && sample != state.sample) {
+            const bool sampled = TextureSample(texture.address, level0_bytes, &sample);
+            NoteTextureCheck(key, texture, state, sampled && sample != state.sample);
+            if (sampled && sample != state.sample) {
                 state.sample = sample;
                 render::TextureData data;
                 if (ReadGuestTexture(texture, &pixels, &data) && renderer.UpdateTexture(key, data)) {
