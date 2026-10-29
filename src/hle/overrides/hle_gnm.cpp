@@ -5048,11 +5048,22 @@ void ProcessCommandBuffer(const u32* cmd, u64 size_bytes, u64 release_event) {
     }
 }
 
+// Fase 69: tempo de todos os Submits (com e sem flip) desde o ultimo fechamento de intervalo ([HITCH-MIN])
+std::atomic<u64> g_submit_all_ns{0};
+double WaitRenderThreadIdle(); // Fase 76 (definida mais abaixo)
+double g_render_wait_pending_ms = 0; // Fase 76: espera pela thread de render ainda nao somada a um intervalo
+
 int Submit(u32 count, const u32* const* dcb_addrs, const u32* dcb_sizes, const u32* const* ccb_addrs,
            const u32* ccb_sizes) {
     static perf::Counter perf_counter("Gnm Submit (parser PM4)");
     const perf::Scope perf_scope(perf_counter);
-    std::lock_guard lock(g_mutex);
+    render::MarkRenderThread(); // Fase 69: o tempo desta thread e o que trava o quadro
+    g_render_wait_pending_ms += WaitRenderThreadIdle(); // Fase 76: o quadro anterior termina antes de mexer no estado
+    struct SubmitTimer {
+        std::chrono::steady_clock::time_point start = std::chrono::steady_clock::now();
+        ~SubmitTimer() { g_submit_all_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count(); }
+    } submit_timer;
+    const render::TimedLock lock(g_mutex);
     // Fase 28: as regioes de memoria consultadas valem pelo Submit inteiro. Sem isto cada shader
     // novo pagava dois VirtualQuery (~1 ms no total), e uma troca de cena traz mais de cem.
     const RegionCacheScope region_cache;
@@ -5481,7 +5492,10 @@ bool LiveCompileNow(u64 vs_address, u64 ps_address, u64 signature, GamePairInfo*
     live.text = SnapshotText(snapshot->second);
     live.job = MakePairJob(*info, info, true);
     ++g_pairs_live_requested;
-    RunLiveCompiler({live});
+    {
+        const render::HitchClock hitch(render::HitchClock::kLive); // Fase 69: antes nao caia em categoria nenhuma
+        RunLiveCompiler({live});
+    }
     GamePairInfo result;
     result.canon_signature = live.job.canon;
     result.vformats = live.job.vformats;
@@ -5800,6 +5814,171 @@ std::chrono::steady_clock::time_point HitchEpoch() {
     return epoch;
 }
 
+// Fase 69: para onde foi o tempo de cada intervalo entre flips (o que o jogador ve como quadro). O intervalo
+// que comeca num SubmitAndFlip vai ate o proximo e tem: os Submits da thread de render (por categoria do
+// HitchClock + o que nenhuma categoria cobre), o fim do frame (etapas do [QUADRO-LENTO] e do DrawFrame) e o
+// resto, que e o proprio jogo na CPU. Uma linha [HITCH-MIN] por minuto (--hitch-log ou LD_HITCH_MIN=1)
+// soma so os intervalos acima de 25 ms; o fim da sessao traz a soma da sessao inteira.
+constexpr int kHitchKinds = render::HitchClock::kKinds;
+struct IntervalCost {
+    double submit_ms = 0;          // todos os Submits (com e sem flip) da thread de render
+    double submit_kind[kHitchKinds]{};
+    double end_ms[5]{};            // leitura de volta, frame anterior, texturas pendentes, envio de texturas, DrawFrame
+    double draw_frame[7]{};        // dentro do DrawFrame: pipelines, lock, fence, acquire, gravacao, submit, present
+    double end_kind[kHitchKinds]{};
+    double gpu_ms = 0; // Fase 75: GPU do quadro que este intervalo esperou (o anterior)
+    double render_wait = 0; // Fase 76: a thread do jogo esperando a thread de render (antes do Submit)
+    bool threaded = false;  // Fase 76: fim do frame na thread de render (nao conta no tempo da thread do jogo)
+};
+struct HitchMinute {
+    u64 frames = 0, over25 = 0, over50 = 0;
+    u64 gpu_over = 0; // Fase 75: quadros com GPU acima de 16,7 ms
+    double worst = 0, slow_ms = 0, game_ms = 0, worst_gpu = 0;
+    double all_ms = 0, all_submit = 0, all_record = 0, all_gpu = 0; // Fase 75: todos os quadros (para as medias)
+    IntervalCost slow; // soma dos intervalos acima de 25 ms
+};
+IntervalCost g_iv;
+HitchMinute g_minute, g_minutes_total;
+std::chrono::steady_clock::time_point g_iv_start{}, g_minute_start{};
+u64 g_minute_worker_ns[kHitchKinds]{};
+
+// Le e zera as categorias da thread de render (elas tambem vao para o total da sessao).
+void TakeHitchKinds(double* into) {
+    for (int k = 0; k < kHitchKinds; ++k) {
+        const double ms = render::HitchClock::ns[k].exchange(0) / 1e6;
+        const u32 n = render::HitchClock::count[k].exchange(0);
+        g_hitch.kind_ms[k] += ms;
+        g_hitch.kind_count[k] += n;
+        into[k] += ms;
+    }
+}
+
+void AddCost(IntervalCost& to, const IntervalCost& from) {
+    to.submit_ms += from.submit_ms;
+    to.gpu_ms += from.gpu_ms;
+    to.render_wait += from.render_wait;
+    for (int k = 0; k < kHitchKinds; ++k) {
+        to.submit_kind[k] += from.submit_kind[k];
+        to.end_kind[k] += from.end_kind[k];
+    }
+    for (int i = 0; i < 5; ++i) {
+        to.end_ms[i] += from.end_ms[i];
+    }
+    for (int i = 0; i < 7; ++i) {
+        to.draw_frame[i] += from.draw_frame[i];
+    }
+}
+
+void PrintHitchMinute(const char* tag, double t, double span_s, const HitchMinute& m, const u64* worker_ns) {
+    const IntervalCost& c = m.slow;
+    double categorized = 0;
+    for (int k = 0; k < kHitchKinds; ++k) {
+        categorized += c.submit_kind[k];
+    }
+    const double end_total = c.end_ms[0] + c.end_ms[1] + c.end_ms[2] + c.end_ms[3] + c.end_ms[4];
+    const double per_min = span_s > 0 ? m.over25 * 60.0 / span_s : 0;
+    std::printf("[%s] t=%.0fs: %" PRIu64 " frames, %" PRIu64 " over 25 ms (%.1f per minute; %" PRIu64 " over 50 ms), worst %.1f ms"
+                " | in frames over 25 ms (%.0f ms): game %.0f, Submit %.0f (pipelines %.0f, textures %.0f, detile %.0f, pairs %.0f, "
+                "extractor %.0f, DMA %.0f, geometry %.0f, targets %.0f, pack pairs %.0f, live translation %.0f, lock %.0f, unattributed %.0f)"
+                ", end of frame %.0f (readback %.0f, previous frame %.0f, pending textures %.0f, upload %.0f, DrawFrame %.0f: "
+                "pipeline wait %.0f, lock %.0f, fence %.0f, acquire %.0f, recording %.0f, submit %.0f, present %.0f; categories at end %.0f)"
+                " | worker threads in period: detile %.0f, textures %.0f, pipelines %.0f, lock %.0f ms"
+                " | GPU: %" PRIu64 " frames over 16.7 ms, worst %.1f ms, in slow frames %.0f ms"
+                " | per-frame average: %.2f ms (Submit %.2f, recording %.2f, GPU %.2f)"
+                " | wait for render thread: %.0f ms in slow frames\n",
+                tag, t, m.frames, m.over25, per_min, m.over50, m.worst, m.slow_ms, m.game_ms, c.submit_ms, c.submit_kind[0], c.submit_kind[1],
+                c.submit_kind[3], c.submit_kind[2], c.submit_kind[4], c.submit_kind[5], c.submit_kind[6], c.submit_kind[7], c.submit_kind[8],
+                c.submit_kind[9], c.submit_kind[10], std::max(0.0, c.submit_ms - categorized), end_total, c.end_ms[0], c.end_ms[1], c.end_ms[2],
+                c.end_ms[3], c.end_ms[4], c.draw_frame[0], c.draw_frame[1], c.draw_frame[2], c.draw_frame[3], c.draw_frame[4], c.draw_frame[5],
+                c.draw_frame[6],
+                [&] {
+                    double s = 0;
+                    for (int k = 0; k < kHitchKinds; ++k) {
+                        s += c.end_kind[k];
+                    }
+                    return s;
+                }(),
+                worker_ns[render::HitchClock::kDetile] / 1e6, worker_ns[render::HitchClock::kTexture] / 1e6,
+                worker_ns[render::HitchClock::kPipeline] / 1e6, worker_ns[render::HitchClock::kLock] / 1e6, m.gpu_over, m.worst_gpu, c.gpu_ms,
+                m.frames ? m.all_ms / m.frames : 0.0, m.frames ? m.all_submit / m.frames : 0.0, m.frames ? m.all_record / m.frames : 0.0,
+                m.frames ? m.all_gpu / m.frames : 0.0, c.render_wait);
+}
+
+// No comeco de cada SubmitAndFlip: fecha o intervalo anterior.
+void CloseHitchInterval(std::chrono::steady_clock::time_point now) {
+    TakeHitchKinds(g_iv.submit_kind); // Submits sem flip e o que mais rodou na thread de render desde o fim do frame
+    g_iv.submit_ms += g_submit_all_ns.exchange(0) / 1e6;
+    g_iv.render_wait += g_render_wait_pending_ms; // Fase 76
+    g_render_wait_pending_ms = 0;
+    if (g_iv_start.time_since_epoch().count()) {
+        const double interval = std::chrono::duration<double, std::milli>(now - g_iv_start).count();
+        ++g_minute.frames;
+        g_minute.all_ms += interval;
+        g_minute.all_submit += g_iv.submit_ms;
+        g_minute.all_record += g_iv.draw_frame[4];
+        g_minute.all_gpu += g_iv.gpu_ms;
+        g_minute.gpu_over += g_iv.gpu_ms > 16.7;
+        g_minute.worst_gpu = std::max(g_minute.worst_gpu, g_iv.gpu_ms);
+        if (interval > 25.0) {
+            ++g_minute.over25;
+            g_minute.over50 += interval > 50.0;
+            g_minute.worst = std::max(g_minute.worst, interval);
+            g_minute.slow_ms += interval;
+            const double end_total = g_iv.end_ms[0] + g_iv.end_ms[1] + g_iv.end_ms[2] + g_iv.end_ms[3] + g_iv.end_ms[4];
+            // Fase 76: com a thread de render o fim do frame corre em paralelo; na thread do jogo fica a espera por ela
+            g_minute.game_ms += std::max(0.0, interval - g_iv.submit_ms - (g_iv.threaded ? g_iv.render_wait : end_total));
+            AddCost(g_minute.slow, g_iv);
+        }
+    } else {
+        g_minute_start = now;
+        for (int k = 0; k < kHitchKinds; ++k) {
+            g_minute_worker_ns[k] = render::HitchClock::worker_ns[k].load();
+        }
+    }
+    g_iv = IntervalCost{};
+    g_iv_start = now;
+    const double span = std::chrono::duration<double>(now - g_minute_start).count();
+    if (span >= 60.0) {
+        u64 worker[kHitchKinds];
+        for (int k = 0; k < kHitchKinds; ++k) {
+            const u64 total = render::HitchClock::worker_ns[k].load();
+            worker[k] = total - g_minute_worker_ns[k];
+            g_minute_worker_ns[k] = total;
+        }
+        static const bool minute_env = std::getenv("LD_HITCH_MIN") != nullptr; // Fase 69: so o resumo por minuto
+        if (minute_env || g_hitch_log.load(std::memory_order_relaxed)) {
+            PrintHitchMinute("HITCH-MIN", std::chrono::duration<double>(now - HitchEpoch()).count(), span, g_minute, worker);
+        }
+        g_minutes_total.frames += g_minute.frames;
+        g_minutes_total.over25 += g_minute.over25;
+        g_minutes_total.over50 += g_minute.over50;
+        g_minutes_total.gpu_over += g_minute.gpu_over;
+        g_minutes_total.all_ms += g_minute.all_ms;
+        g_minutes_total.all_submit += g_minute.all_submit;
+        g_minutes_total.all_record += g_minute.all_record;
+        g_minutes_total.all_gpu += g_minute.all_gpu;
+        g_minutes_total.worst_gpu = std::max(g_minutes_total.worst_gpu, g_minute.worst_gpu);
+        g_minutes_total.worst = std::max(g_minutes_total.worst, g_minute.worst);
+        g_minutes_total.slow_ms += g_minute.slow_ms;
+        g_minutes_total.game_ms += g_minute.game_ms;
+        AddCost(g_minutes_total.slow, g_minute.slow);
+        g_minute = HitchMinute{};
+        g_minute_start = now;
+    }
+}
+
+// Depois do DrawFrame: etapas do fim do frame e as categorias que rodaram nele.
+void NoteFrameEnd(const double end_ms[5], const double draw_frame[7], double gpu_ms) {
+    g_iv.gpu_ms = gpu_ms; // Fase 75
+    for (int i = 0; i < 5; ++i) {
+        g_iv.end_ms[i] += end_ms[i];
+    }
+    for (int i = 0; i < 7; ++i) {
+        g_iv.draw_frame[i] += draw_frame[i];
+    }
+    TakeHitchKinds(g_iv.end_kind);
+}
+
 void NoteFrameHitch(std::chrono::steady_clock::time_point submit_start) {
     (void)HitchEpoch(); // o relogio comeca no primeiro quadro
     const auto now = std::chrono::steady_clock::now();
@@ -5811,6 +5990,7 @@ void NoteFrameHitch(std::chrono::steady_clock::time_point submit_start) {
         kind_count[k] = render::HitchClock::count[k].exchange(0);
         g_hitch.kind_ms[k] += kind_ms[k];
         g_hitch.kind_count[k] += kind_count[k];
+        g_iv.submit_kind[k] += kind_ms[k]; // Fase 69
     }
     double lap_ms[4];
     const double ticks_per_ms = TicksPerNs() * 1e6; // Fase 59: os laps estao em ciclos
@@ -5846,12 +6026,14 @@ void NoteFrameHitch(std::chrono::steady_clock::time_point submit_start) {
                     "(detile %u/%.1f ms), pairs %u/%.1f ms, extractor %u/%.1f ms, DMA %u/%.1f ms | draw stages: state %.1f, pair %.1f, resources %.1f, queue %.1f ms"
                     " | new geometry %u/%.1f ms, new targets %u/%.1f ms, pack pairs %u/%.1f ms"
                     " | pair: lookup %.1f, snapshot %.1f; resources: geometry %.1f, constants %.1f, textures %.1f ms"
-                    " | on demand: %u new textures %.1f ms, %u linear checked %.1f ms\n",
+                    " | on demand: %u new textures %.1f ms, %u linear checked %.1f ms"
+                    " | live translation %u/%.1f ms, lock %u/%.1f ms\n", // Fase 69
                     std::chrono::duration<double>(now - hitch_epoch).count(), g_hitch.frames, interval_ms, submit_ms, kind_count[0],
                     kind_ms[0], kind_count[1], kind_ms[1], kind_count[3], kind_ms[3], kind_count[2], kind_ms[2], kind_count[4], kind_ms[4], kind_count[5], kind_ms[5],
                     lap_ms[0], lap_ms[1], lap_ms[2], lap_ms[3], kind_count[6], kind_ms[6], kind_count[7], kind_ms[7], kind_count[8], kind_ms[8],
                     sub_ms[0], sub_ms[1], sub_ms[2], sub_ms[3], sub_ms[4], g_tex_inline_count, g_tex_inline_ms, g_tex_inline_checks,
-                    g_tex_inline_check_ms);
+                    g_tex_inline_check_ms, kind_count[render::HitchClock::kLive], kind_ms[render::HitchClock::kLive],
+                    kind_count[render::HitchClock::kLock], kind_ms[render::HitchClock::kLock]);
     }
     g_tex_inline_count = g_tex_inline_checks = 0;
     g_tex_inline_ms = g_tex_inline_check_ms = 0;
@@ -5889,81 +6071,24 @@ void StallWatchThread() {
     }
 }
 
-HLE_IMPL(int, sceGnmSubmitCommandBuffers, u32 count, const u32* const* dcb_addrs, const u32* dcb_sizes,
-         const u32* const* ccb_addrs, const u32* ccb_sizes) {
-    HLE_QUIET("%u buffers", count);
-    return Submit(count, dcb_addrs, dcb_sizes, ccb_addrs, ccb_sizes);
+// ================= Fase 76: fim do frame numa thread propria =================
+// O fim do frame (leituras de volta dos alvos minusculos, espera das texturas do quadro, envio, DrawFrame: gravacao,
+// submit e o present FIFO, que espera o VSync) rodava na thread do jogo, dentro do SubmitAndFlip. Agora ele roda numa
+// thread de render e o jogo volta a montar o proximo quadro na hora; o flip do jogo (SubmitFlip) continua sendo
+// enfileirado so depois do present, como antes. Para o estado do quadro (filas de draws, aneis, alvos, texturas) nada
+// muda de ordem: todo Submit seguinte (com ou sem flip) espera a thread de render terminar o quadro anterior antes de
+// mexer em qualquer coisa. Desligado por padrao: na RX 6600 / Ryzen 5 5600X nenhuma cena testada e limitada por CPU
+// (Vorton fica em 60 fps mesmo com o processo preso a 2 processadores logicos), entao o ganho nao foi medido; nos testes
+// os dois caminhos deram os mesmos numeros. LD_RENDER_THREAD=1 liga (para medir em cenas de ~6000 draws).
+bool RenderThreadEnabled() {
+    static const bool enabled = [] {
+        const char* env = std::getenv("LD_RENDER_THREAD");
+        return env && env[0] == '1';
+    }();
+    return enabled;
 }
-HLE_OVERRIDE(sceGnmSubmitCommandBuffers);
 
-// buffer_index, flip_mode e flip_arg chegam pela pilha.
-HLE_IMPL(int, sceGnmSubmitAndFlipCommandBuffers, u32 count, const u32* const* dcb_addrs, const u32* dcb_sizes,
-         const u32* const* ccb_addrs, const u32* ccb_sizes, u32 video_out_handle, u32 buffer_index, u32 flip_mode,
-         s64 flip_arg) {
-    HLE_QUIET("%u buffers, flip handle=%u buffer=%u mode=%u arg=%" PRId64, count, video_out_handle, buffer_index,
-              flip_mode, flip_arg);
-    const auto submit_start = std::chrono::steady_clock::now();
-    g_last_flip_submit_ms = NowMs(); // Fase 59
-    ++g_flip_submits;
-    static std::once_flag stall_once;
-    std::call_once(stall_once, [] {
-        if (g_stall_stacks.load()) {
-            std::thread(StallWatchThread).detach();
-        }
-    });
-    static const bool dbg_cb = std::getenv("LD_DBG_CB") != nullptr; // DIAGNOSTICO Fase 60
-    auto dbg_cb_check = [](const char* when) {
-        std::lock_guard lock(g_dbg_cb_mutex);
-        std::map<std::tuple<u64, u64, u32, u32>, std::pair<u32, u32>> groups; // (VS, PS, estagio, binding) -> (mudaram, total)
-        u32 changed = 0, printed = 0;
-        std::vector<u8> now;
-        for (const auto& e : g_dbg_cb) {
-            now.resize(e.bytes);
-            const bool same = SafeCopy(now.data(), e.address, e.bytes) && !std::memcmp(now.data(), e.data.data(), e.bytes);
-            auto& g = groups[{e.vs, e.ps, e.stage, e.binding}];
-            ++g.second;
-            if (!same) {
-                ++g.first;
-                ++changed;
-                if (printed < 30) {
-                    ++printed;
-                    u32 first = 0;
-                    while (first + 4 <= e.bytes && !std::memcmp(now.data() + first, e.data.data() + first, 4)) {
-                        first += 4;
-                    }
-                    const u32 row = std::min(first & ~15u, (e.bytes & ~15u) - 16);
-                    const float* a = reinterpret_cast<const float*>(e.data.data() + row);
-                    const float* b = reinterpret_cast<const float*>(now.data() + row);
-                    std::printf("[DBG-CB] %s: pair %016llx %016llx stage %u b%u src %u address 0x%llx %u bytes, first different byte %u | copy %g %g %g %g -> now %g %g %g %g\n",
-                                when, static_cast<unsigned long long>(e.vs), static_cast<unsigned long long>(e.ps), e.stage, e.binding, e.source,
-                                static_cast<unsigned long long>(e.address), e.bytes, first, a[0], a[1], a[2], a[3], b[0], b[1], b[2], b[3]);
-                }
-            }
-        }
-        u32 group_changed = 0;
-        for (const auto& [key, g] : groups) {
-            group_changed += g.first != 0;
-        }
-        std::printf("[DBG-CB] %s: %zu buffers copied, %u changed after copy (%u of %zu groups)\n", when, g_dbg_cb.size(), changed,
-                    group_changed, groups.size());
-    };
-    if (dbg_cb && !g_dbg_cb.empty()) {
-        dbg_cb_check("one frame later");
-        g_dbg_cb.clear();
-    }
-    g_dbg_cb_record = dbg_cb && g_texture_frame % 600 == 300;
-    const int result = Submit(count, dcb_addrs, dcb_sizes, ccb_addrs, ccb_sizes);
-    if (g_dbg_cb_record) {
-        g_dbg_cb_record = false;
-        dbg_cb_check("end of Submit");
-    }
-    if (result != err::OK) {
-        return result;
-    }
-    NoteFrameHitch(submit_start);
-    // Frame do Vulkan, logo depois de os pacotes PM4 serem processados na CPU: por enquanto so
-    // limpa a tela e apresenta. O swapchain e FIFO, entao esta chamada espera o VSync real do
-    // monitor, e o flip do jogo so e enfileirado (SubmitFlip, abaixo) depois da apresentacao.
+void RunFrameEnd(u32 buffer_index) {
     if (auto& renderer = render::VulkanRenderer::Instance(); renderer.Active()) {
         static perf::Counter perf_counter("Vulkan DrawFrame (clear + present)");
         const perf::Scope perf_scope(perf_counter);
@@ -6026,17 +6151,18 @@ HLE_IMPL(int, sceGnmSubmitAndFlipCommandBuffers, u32 count, const u32* const* dc
         videoout::QueueStatsOverlay(); // Fase 65: contador de FPS / info por cima do quadro
         renderer.DrawFrame(videoout::BufferAddress(static_cast<int>(buffer_index)));
         end_lap(4);
+        double df[7];
+        renderer.LastDrawFrameTimes(df);
+        NoteFrameEnd(end_ms, df, renderer.LastGpuFrameMs()); // Fase 69 / 75
         if (const double total = end_ms[0] + end_ms[1] + end_ms[2] + end_ms[3] + end_ms[4]; total > 40.0) {
-            double df[7];
-            renderer.LastDrawFrameTimes(df);
             static u32 logged = 0;
             if (logged++ < 400) {
                 const auto t0 = HitchEpoch(); // Fase 59: mesmo relogio do [ENGASGO]
                 std::printf("[SLOW-FRAME] t=%.1fs end of frame %.1f ms: readback %.1f, previous frame %.1f, pending textures %.1f, "
                             "texture upload %.1f, DrawFrame %.1f (pipelines %.1f, lock %.1f, fence %.1f, acquire %.1f, recording %.1f, "
-                            "submit %.1f, present %.1f)\n",
+                            "submit %.1f, present %.1f) | GPU of previous frame %.1f ms\n",
                             std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count(), total, end_ms[0], end_ms[1], end_ms[2],
-                            end_ms[3], end_ms[4], df[0], df[1], df[2], df[3], df[4], df[5], df[6]);
+                            end_ms[3], end_ms[4], df[0], df[1], df[2], df[3], df[4], df[5], df[6], renderer.LastGpuFrameMs());
             }
         }
         ++g_cache_frame;
@@ -6073,8 +6199,148 @@ HLE_IMPL(int, sceGnmSubmitAndFlipCommandBuffers, u32 count, const u32* const* dc
             last_pipes = pipes;
         }
     }
+}
+
+struct FrameEndJob {
+    u32 handle, buffer_index, flip_mode;
+    s64 flip_arg;
+};
+std::mutex g_rt_mutex;
+std::condition_variable g_rt_cv;
+std::optional<FrameEndJob> g_rt_job;
+bool g_rt_busy = false; // g_rt_mutex
+
+void RenderThreadMain() {
+    render::MarkRenderThread(); // o tempo dela tambem trava o quadro (HitchClock)
+    for (;;) {
+        FrameEndJob job;
+        {
+            std::unique_lock lock(g_rt_mutex);
+            g_rt_cv.wait(lock, [] { return g_rt_job.has_value(); });
+            job = *g_rt_job;
+            g_rt_job.reset();
+        }
+        RunFrameEnd(job.buffer_index);
+        videoout::SubmitFlip(static_cast<int>(job.handle), static_cast<int>(job.buffer_index), static_cast<int>(job.flip_mode), job.flip_arg);
+        {
+            std::lock_guard lock(g_rt_mutex);
+            g_rt_busy = false;
+        }
+        g_rt_cv.notify_all();
+    }
+}
+
+void QueueFrameEnd(const FrameEndJob& job) {
+    static std::once_flag started;
+    std::call_once(started, [] { std::thread(RenderThreadMain).detach(); });
     {
-        std::lock_guard lock(g_mutex);
+        std::lock_guard lock(g_rt_mutex);
+        g_rt_job = job;
+        g_rt_busy = true;
+    }
+    g_rt_cv.notify_all();
+}
+
+// Antes de qualquer Submit: o quadro anterior tem de ter terminado na thread de render. Devolve o tempo esperado (ms).
+double WaitRenderThreadIdle() {
+    if (!RenderThreadEnabled()) {
+        return 0;
+    }
+    std::unique_lock lock(g_rt_mutex);
+    if (!g_rt_busy) {
+        return 0;
+    }
+    const auto start = std::chrono::steady_clock::now();
+    g_rt_cv.wait(lock, [] { return !g_rt_busy; });
+    return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+}
+
+HLE_IMPL(int, sceGnmSubmitCommandBuffers, u32 count, const u32* const* dcb_addrs, const u32* dcb_sizes,
+         const u32* const* ccb_addrs, const u32* ccb_sizes) {
+    HLE_QUIET("%u buffers", count);
+    return Submit(count, dcb_addrs, dcb_sizes, ccb_addrs, ccb_sizes);
+}
+HLE_OVERRIDE(sceGnmSubmitCommandBuffers);
+
+// buffer_index, flip_mode e flip_arg chegam pela pilha.
+HLE_IMPL(int, sceGnmSubmitAndFlipCommandBuffers, u32 count, const u32* const* dcb_addrs, const u32* dcb_sizes,
+         const u32* const* ccb_addrs, const u32* ccb_sizes, u32 video_out_handle, u32 buffer_index, u32 flip_mode,
+         s64 flip_arg) {
+    HLE_QUIET("%u buffers, flip handle=%u buffer=%u mode=%u arg=%" PRId64, count, video_out_handle, buffer_index,
+              flip_mode, flip_arg);
+    g_render_wait_pending_ms += WaitRenderThreadIdle(); // Fase 76: antes de fechar a conta do quadro anterior
+    const auto submit_start = std::chrono::steady_clock::now();
+    CloseHitchInterval(submit_start); // Fase 69
+    g_last_flip_submit_ms = NowMs(); // Fase 59
+    ++g_flip_submits;
+    static std::once_flag stall_once;
+    std::call_once(stall_once, [] {
+        if (g_stall_stacks.load()) {
+            std::thread(StallWatchThread).detach();
+        }
+    });
+    static const bool dbg_cb = std::getenv("LD_DBG_CB") != nullptr; // DIAGNOSTICO Fase 60
+    auto dbg_cb_check = [](const char* when) {
+        std::lock_guard lock(g_dbg_cb_mutex);
+        std::map<std::tuple<u64, u64, u32, u32>, std::pair<u32, u32>> groups; // (VS, PS, estagio, binding) -> (mudaram, total)
+        u32 changed = 0, printed = 0;
+        std::vector<u8> now;
+        for (const auto& e : g_dbg_cb) {
+            now.resize(e.bytes);
+            const bool same = SafeCopy(now.data(), e.address, e.bytes) && !std::memcmp(now.data(), e.data.data(), e.bytes);
+            auto& g = groups[{e.vs, e.ps, e.stage, e.binding}];
+            ++g.second;
+            if (!same) {
+                ++g.first;
+                ++changed;
+                if (printed < 30) {
+                    ++printed;
+                    u32 first = 0;
+                    while (first + 4 <= e.bytes && !std::memcmp(now.data() + first, e.data.data() + first, 4)) {
+                        first += 4;
+                    }
+                    const u32 row = std::min(first & ~15u, (e.bytes & ~15u) - 16);
+                    const float* a = reinterpret_cast<const float*>(e.data.data() + row);
+                    const float* b = reinterpret_cast<const float*>(now.data() + row);
+                    std::printf("[DBG-CB] %s: pair %016llx %016llx stage %u b%u src %u address 0x%llx %u bytes, first different byte %u | copy %g %g %g %g -> now %g %g %g %g\n",
+                                when, static_cast<unsigned long long>(e.vs), static_cast<unsigned long long>(e.ps), e.stage, e.binding, e.source,
+                                static_cast<unsigned long long>(e.address), e.bytes, first, a[0], a[1], a[2], a[3], b[0], b[1], b[2], b[3]);
+                }
+            }
+        }
+        u32 group_changed = 0;
+        for (const auto& [key, g] : groups) {
+            group_changed += g.first != 0;
+        }
+        std::printf("[DBG-CB] %s: %zu buffers copied, %u changed after copy (%u of %zu groups)\n", when, g_dbg_cb.size(), changed,
+                    group_changed, groups.size());
+    };
+    if (dbg_cb && !g_dbg_cb.empty()) {
+        dbg_cb_check("one frame later");
+        g_dbg_cb.clear();
+    }
+    g_dbg_cb_record = dbg_cb && g_texture_frame % 600 == 300;
+    const int result = Submit(count, dcb_addrs, dcb_sizes, ccb_addrs, ccb_sizes);
+    if (g_dbg_cb_record) {
+        g_dbg_cb_record = false;
+        dbg_cb_check("end of Submit");
+    }
+    if (result != err::OK) {
+        return result;
+    }
+    NoteFrameHitch(submit_start);
+    // Frame do Vulkan, logo depois de os pacotes PM4 serem processados na CPU: por enquanto so
+    // limpa a tela e apresenta. O swapchain e FIFO, entao esta chamada espera o VSync real do
+    // monitor, e o flip do jogo so e enfileirado (SubmitFlip, abaixo) depois da apresentacao.
+    // Fase 76: com a thread de render, o fim do frame (leituras de volta, texturas pendentes, DrawFrame com o present e o
+    // flip) roda nela e o jogo volta a montar o proximo quadro na hora. O proximo Submit espera essa thread terminar.
+    const bool threaded = RenderThreadEnabled() && render::VulkanRenderer::Instance().Active() &&
+                          videoout::CheckFlip(static_cast<int>(video_out_handle), static_cast<int>(buffer_index)) == err::OK;
+    if (!threaded) {
+        RunFrameEnd(buffer_index);
+    }
+    {
+        const render::TimedLock lock(g_mutex); // Fase 69
         EndFrame();
         if (++g_window_frames >= kWindowFrames) {
             const double seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - g_epoch).count();
@@ -6095,6 +6361,11 @@ HLE_IMPL(int, sceGnmSubmitAndFlipCommandBuffers, u32 count, const u32* const* dc
             g_window_had_dump = false;
             g_window_draws = g_window_frames = g_window_packets = 0;
         }
+    }
+    if (threaded) {
+        g_iv.threaded = true;
+        QueueFrameEnd({video_out_handle, buffer_index, flip_mode, flip_arg});
+        return err::OK;
     }
     return videoout::SubmitFlip(static_cast<int>(video_out_handle), static_cast<int>(buffer_index),
                                 static_cast<int>(flip_mode), flip_arg);
@@ -6130,7 +6401,7 @@ HLE_IMPL(int, sceGnmAddEqEvent, equeue::Handle queue, u64 id, void* udata) {
     if (!equeue::Register(queue, id, equeue::kFilterGraphicsCore, udata)) {
         return static_cast<int>(0x80020009); // EBADF
     }
-    std::lock_guard lock(g_mutex);
+    const render::TimedLock lock(g_mutex); // Fase 69
     g_listeners.push_back({queue, id});
     return err::OK;
 }
@@ -6139,7 +6410,7 @@ HLE_OVERRIDE(sceGnmAddEqEvent);
 HLE_IMPL(int, sceGnmDeleteEqEvent, equeue::Handle queue, u64 id) {
     HLE_TRACE("id=0x%" PRIx64, id);
     equeue::Unregister(queue, id, equeue::kFilterGraphicsCore);
-    std::lock_guard lock(g_mutex);
+    const render::TimedLock lock(g_mutex); // Fase 69
     std::erase_if(g_listeners, [&](const EopListener& l) { return l.queue == queue && l.id == id; });
     return err::OK;
 }
@@ -6171,7 +6442,7 @@ int MapQueue(u32 pipe_id, u32 queue_id, const u32* ring, u32 ring_dwords, u32* r
     if (pipe_id > 6 || queue_id > 7 || !ring || !read_ptr || !ring_dwords) {
         return static_cast<int>(0x80D11000 | 0xFF); // parametro invalido
     }
-    std::lock_guard lock(g_mutex);
+    const render::TimedLock lock(g_mutex); // Fase 69
     const u32 vqid = g_next_vqid++;
     g_queues[vqid] = {ring, ring_dwords, read_ptr, 0};
     *read_ptr = 0;
@@ -6197,7 +6468,7 @@ HLE_OVERRIDE(sceGnmMapComputeQueueWithPriority);
 
 HLE_IMPL(int, sceGnmUnmapComputeQueue, u32 vqid) {
     HLE_TRACE("vqid %u", vqid);
-    std::lock_guard lock(g_mutex);
+    const render::TimedLock lock(g_mutex); // Fase 69
     return g_queues.erase(vqid) ? err::OK : -1;
 }
 HLE_OVERRIDE(sceGnmUnmapComputeQueue);
@@ -6206,7 +6477,8 @@ HLE_OVERRIDE(sceGnmUnmapComputeQueue);
 // novo na hora e avanca o ponteiro de leitura que o jogo consulta.
 HLE_IMPL(void, sceGnmDingDong, u32 vqid, u32 next_offset) {
     HLE_QUIET("vqid %u through %u", vqid, next_offset);
-    std::lock_guard lock(g_mutex);
+    WaitRenderThreadIdle(); // Fase 76: a fila de compute tambem le / escreve o estado do quadro
+    const render::TimedLock lock(g_mutex); // Fase 69
     const auto it = g_queues.find(vqid);
     if (it == g_queues.end()) {
         return;
@@ -6315,6 +6587,9 @@ const char* OpcodeName(u32 opcode) {
 // Chamado no resumo final: o que o jogo mandou para a "GPU".
 void PrintStats() {
     FlushFileWrites(); // Fase 45: o que ainda estava na fila do gravador
+    if (auto& renderer = render::VulkanRenderer::Instance(); renderer.Active()) {
+        renderer.SavePipelineCache("game exit"); // Fase 70: fechar a janela encerra o processo sem o Shutdown
+    }
     std::printf("  Phase 45 (extractor): %" PRIu64 " on cold path (%" PRIu64 " via slow lookup, %" PRIu64 " repeats) | header %.0f ms, slow lookup %.0f ms, hash %.0f ms, rest %.0f ms | %" PRIu64 " background recordings\n",
                 g_extract_cold, g_extract_slow, g_extract_dup, g_extract_ms[0], g_extract_ms[1], g_extract_ms[2], g_extract_ms[3],
                 g_file_writes.load());
@@ -6416,6 +6691,28 @@ void PrintStats() {
                     PRIu64 " in %.0f ms | pairs (file + modules) %" PRIu64 " in %.0f ms | extractor (new shader) %" PRIu64 " em %.0f ms\n",
                     g_hitch.kind_count[0], g_hitch.kind_ms[0], g_hitch.kind_count[1], g_hitch.kind_ms[1], g_hitch.kind_count[3],
                     g_hitch.kind_ms[3], g_hitch.kind_count[2], g_hitch.kind_ms[2], g_hitch.kind_count[4], g_hitch.kind_ms[4]);
+        { // Fase 69: o resumo por minuto da sessao inteira (inclui o minuto incompleto do fim)
+            HitchMinute all = g_minutes_total;
+            all.frames += g_minute.frames;
+            all.over25 += g_minute.over25;
+            all.over50 += g_minute.over50;
+            all.gpu_over += g_minute.gpu_over;
+            all.all_ms += g_minute.all_ms;
+            all.all_submit += g_minute.all_submit;
+            all.all_record += g_minute.all_record;
+            all.all_gpu += g_minute.all_gpu;
+            all.worst_gpu = std::max(all.worst_gpu, g_minute.worst_gpu);
+            all.worst = std::max(all.worst, g_minute.worst);
+            all.slow_ms += g_minute.slow_ms;
+            all.game_ms += g_minute.game_ms;
+            AddCost(all.slow, g_minute.slow);
+            u64 worker[kHitchKinds];
+            for (int k = 0; k < kHitchKinds; ++k) {
+                worker[k] = render::HitchClock::worker_ns[k].load();
+            }
+            const double span = std::chrono::duration<double>(std::chrono::steady_clock::now() - HitchEpoch()).count();
+            PrintHitchMinute("HITCH-SESSION", span, span, all, worker);
+        }
         {
             u32 warm_done = 0, warm_total = 0;
             renderer.PrewarmProgress(&warm_done, &warm_total);
@@ -6880,6 +7177,22 @@ void GetLoadingStatus(LoadingStatus* out) {
     out->aot_total = g_ready_total.load();
     out->aot_finished = g_ready_finished.load();
     render::VulkanRenderer::Instance().PrewarmProgress(&out->pipelines_done, &out->pipelines_total);
+    // Fase 72: a tela de carregamento espera so os pipelines da tela de abertura e das areas de entrada / ultima da
+    // sessao anterior (o resto continua na fila, abaixo do normal). Sem sessao anterior registrada, espera tudo.
+    // Medido na RX 6600 com o cache do driver vazio: 49,3 s -> 6,2 s, sem quadro esperando pipeline no jogo.
+    // LD_PREWARM_GATE=tudo volta a esperar todos.
+    static const bool area_gate = [] {
+        const char* env = std::getenv("LD_PREWARM_GATE");
+        return !(env && !std::strcmp(env, "tudo"));
+    }();
+    if (area_gate) {
+        u32 done = 0, total = 0;
+        render::VulkanRenderer::Instance().PrewarmPriorityProgress(&done, &total);
+        if (total) {
+            out->pipelines_done = done;
+            out->pipelines_total = total;
+        }
+    }
 }
 
 // Texto curto para o titulo da janela enquanto o aquecimento roda ("" quando nao ha o que mostrar).
@@ -6959,7 +7272,7 @@ void SetVulkanDraws(bool enabled) {
 
 // Pede um dump do frame que estiver na tela aos `seconds` de execucao.
 void AddFrameDumpAt(u32 seconds) {
-    std::lock_guard lock(g_mutex);
+    const render::TimedLock lock(g_mutex); // Fase 69
     g_forced_dumps_ms.push_back(seconds * 1000ll);
 }
 
@@ -6989,7 +7302,7 @@ void SetCutsceneWatchdog(u32 seconds) {
 
 // Liga o dump de telas paradas; `directory` recebe um .txt por tela e as texturas brutas.
 void SetFrameDumpDirectory(const std::filesystem::path& directory) {
-    std::lock_guard lock(g_mutex);
+    const render::TimedLock lock(g_mutex); // Fase 69
     g_dump_dir = directory;
 }
 
