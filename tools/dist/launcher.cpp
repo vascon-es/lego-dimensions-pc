@@ -13,8 +13,13 @@
 #include <shobjidl.h>
 
 #include <tlhelp32.h>
+#include <xinput.h>
+#include <hidsdi.h>
+#include <setupapi.h>
 
 #include <algorithm>
+#include <atomic>
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <memory>
@@ -27,6 +32,8 @@
 #pragma comment(lib, "shell32.lib")
 #pragma comment(lib, "gdi32.lib")
 #pragma comment(lib, "user32.lib")
+#pragma comment(lib, "hid.lib")
+#pragma comment(lib, "setupapi.lib")
 #pragma comment(linker, "\"/manifestdependency:type='win32' name='Microsoft.Windows.Common-Controls' version='6.0.0.0' "      \
                         "processorArchitecture='amd64' publicKeyToken='6595b64144ccf1df' language='*'\"")
 
@@ -1592,6 +1599,9 @@ void LoadSettings() {
 
 // Hidden, asset-free layout regression. Never loads/saves user settings, starts
 // tools or a game, displays a window, or touches the installed game folder.
+bool PadTarget(HWND h);
+HWND PadNeighbor(HWND from, int dir);
+
 int SelfTest(const fs::path& report) {
     std::vector<std::string> failures;
     auto check=[&](bool ok,const std::string& message){if(!ok)failures.push_back(message);};
@@ -1619,6 +1629,18 @@ int SelfTest(const fs::path& report) {
         check(visible(g_game)==settings,"game folder visibility");
         check(visible(g_log)==(!settings&&details),"log visibility");
         for(int id:{kUpdate,kPkg,kTransfer,kOpenToypad,kShortcut})check(!visible(GetDlgItem(g_main,id)),"tool command leaked onto page");
+        // issue #3: pelo controle, todo botao visivel e alcancavel a partir do primeiro, e nunca se cai num escondido
+        std::vector<HWND> targets;
+        for(const auto& entry:ui::g_buttons)if(PadTarget(entry.first))targets.push_back(entry.first);
+        std::vector<HWND> reached{settings?g_settings:g_play};
+        for(size_t i=0;i<reached.size();++i)
+            for(int dir=0;dir<4;++dir)
+                if(HWND to=PadNeighbor(reached[i],dir)) {
+                    check(PadTarget(to),"gamepad moved to a hidden control");
+                    if(std::find(reached.begin(),reached.end(),to)==reached.end())reached.push_back(to);
+                }
+        check(reached.size()==targets.size(),"gamepad reaches "+std::to_string(reached.size())+" of "+std::to_string(targets.size())+
+                                              " buttons (settings page "+std::to_string(settings)+")");
     };
     layout(false,false);layout(false,true);layout(true,false);
     g_busy=true;LayoutPage();check(!IsWindowEnabled(g_settings)&&!IsWindowEnabled(g_tools)&&!IsWindowEnabled(g_mods),"busy controls enabled");
@@ -1632,6 +1654,251 @@ int SelfTest(const fs::path& report) {
     for(size_t i=0;i<failures.size();++i)out<<(i?",":"")<<'"'<<failures[i]<<'"';
     out<<"]}\n";out.close();
     return failures.empty()?0:1;
+}
+
+// ---- controle no launcher (issue #3) ----
+// XInput (controles de Xbox; o Steam Deck aparece assim pela Steam) e DualShock 4 / DualSense (HID), lidos a cada 16 ms
+// e so com o launcher em primeiro plano (com o jogo aberto na frente, nada acontece). Na janela principal o direcional / analogico leva o foco ao botao
+// mais perto naquela direcao, A clica, B volta das Configuracoes e Start joga. Em menus e caixas de mensagem o controle
+// vira teclado (setas, Enter, Esc), que eles ja entendem.
+constexpr UINT_PTR kPadTimer = 3;
+enum PadDir { kPadNone = -1, kPadUp, kPadDown, kPadLeft, kPadRight };
+WORD g_pad_buttons = 0;
+int g_pad_dir = kPadNone;
+ULONGLONG g_pad_repeat_at = 0;
+using XInputGetStateFn = DWORD(WINAPI*)(DWORD, XINPUT_STATE*);
+XInputGetStateFn g_xinput_get_state = nullptr;
+
+void SonyPadThread();
+
+void LoadXInput() {
+    for (const wchar_t* dll : {L"xinput1_4.dll", L"xinput1_3.dll", L"xinput9_1_0.dll"}) {
+        if (HMODULE module = LoadLibraryW(dll)) {
+            g_xinput_get_state = reinterpret_cast<XInputGetStateFn>(GetProcAddress(module, "XInputGetState"));
+            if (g_xinput_get_state) {
+                break;
+            }
+        }
+    }
+    std::thread(SonyPadThread).detach();
+}
+
+// DualShock 4 / DualSense: o relatorio de entrada lido numa thread, convertido para os bits do XInput.
+std::atomic<WORD> g_sony_buttons{0};
+std::atomic<SHORT> g_sony_lx{0}, g_sony_ly{0};
+
+HANDLE OpenSonyPad(bool* dualsense, DWORD* report_bytes) {
+    GUID hid_guid;
+    HidD_GetHidGuid(&hid_guid);
+    HDEVINFO devices = SetupDiGetClassDevsW(&hid_guid, nullptr, nullptr, DIGCF_PRESENT | DIGCF_DEVICEINTERFACE);
+    if (devices == INVALID_HANDLE_VALUE) {
+        return INVALID_HANDLE_VALUE;
+    }
+    HANDLE found = INVALID_HANDLE_VALUE;
+    SP_DEVICE_INTERFACE_DATA iface{sizeof(iface)};
+    for (DWORD i = 0; found == INVALID_HANDLE_VALUE && SetupDiEnumDeviceInterfaces(devices, nullptr, &hid_guid, i, &iface); ++i) {
+        DWORD size = 0;
+        SetupDiGetDeviceInterfaceDetailW(devices, &iface, nullptr, 0, &size, nullptr);
+        std::vector<BYTE> storage(size);
+        auto* detail = reinterpret_cast<SP_DEVICE_INTERFACE_DETAIL_DATA_W*>(storage.data());
+        detail->cbSize = sizeof(SP_DEVICE_INTERFACE_DETAIL_DATA_W);
+        if (!SetupDiGetDeviceInterfaceDetailW(devices, &iface, detail, size, nullptr, nullptr)) {
+            continue;
+        }
+        HANDLE device = CreateFileW(detail->DevicePath, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING, 0, nullptr);
+        if (device == INVALID_HANDLE_VALUE) {
+            continue;
+        }
+        HIDD_ATTRIBUTES attributes{sizeof(attributes)};
+        const USHORT pid = HidD_GetAttributes(device, &attributes) && attributes.VendorID == 0x054C ? attributes.ProductID : 0;
+        PHIDP_PREPARSED_DATA preparsed = nullptr;
+        HIDP_CAPS caps{};
+        const bool gamepad = pid && HidD_GetPreparsedData(device, &preparsed) && HidP_GetCaps(preparsed, &caps) == HIDP_STATUS_SUCCESS &&
+                             caps.UsagePage == 0x01 && caps.Usage == 0x05;
+        if (preparsed) {
+            HidD_FreePreparsedData(preparsed);
+        }
+        // DualShock 4 (1a e 2a versao, adaptador sem fio), DualSense e DualSense Edge
+        if (gamepad && (pid == 0x05C4 || pid == 0x09CC || pid == 0x0BA0 || pid == 0x0CE6 || pid == 0x0DF2)) {
+            *dualsense = pid == 0x0CE6 || pid == 0x0DF2;
+            *report_bytes = caps.InputReportByteLength;
+            found = device;
+        } else {
+            CloseHandle(device);
+        }
+    }
+    SetupDiDestroyDeviceInfoList(devices);
+    return found;
+}
+
+// USB: 0x01 (DualSense: botoes no byte 8; DualShock 4 e o relatorio simples do Bluetooth: byte 5).
+// Bluetooth completo: 0x11 do DualShock 4 (+2 bytes) e 0x31 do DualSense (+1 byte).
+void ParseSonyReport(const BYTE* r, DWORD n, bool dualsense) {
+    size_t stick = 0, buttons = 0;
+    if (r[0] == 0x01 && n >= 10) {
+        stick = 1;
+        buttons = dualsense && n >= 64 ? 8 : 5;
+    } else if (r[0] == 0x11 && !dualsense && n >= 10) {
+        stick = 3;
+        buttons = 7;
+    } else if (r[0] == 0x31 && dualsense && n >= 12) {
+        stick = 2;
+        buttons = 9;
+    } else {
+        return;
+    }
+    static const WORD kHat[8] = {XINPUT_GAMEPAD_DPAD_UP, XINPUT_GAMEPAD_DPAD_UP | XINPUT_GAMEPAD_DPAD_RIGHT, XINPUT_GAMEPAD_DPAD_RIGHT,
+                                 XINPUT_GAMEPAD_DPAD_DOWN | XINPUT_GAMEPAD_DPAD_RIGHT, XINPUT_GAMEPAD_DPAD_DOWN,
+                                 XINPUT_GAMEPAD_DPAD_DOWN | XINPUT_GAMEPAD_DPAD_LEFT, XINPUT_GAMEPAD_DPAD_LEFT,
+                                 XINPUT_GAMEPAD_DPAD_UP | XINPUT_GAMEPAD_DPAD_LEFT};
+    const BYTE face = r[buttons];
+    WORD out = (face & 0x0F) < 8 ? kHat[face & 0x0F] : 0;
+    if (face & 0x20) out |= XINPUT_GAMEPAD_A;     // cruz
+    if (face & 0x40) out |= XINPUT_GAMEPAD_B;     // circulo
+    if (r[buttons + 1] & 0x20) out |= XINPUT_GAMEPAD_START; // options
+    g_sony_buttons = out;
+    g_sony_lx = static_cast<SHORT>((r[stick] - 128) * 256);
+    g_sony_ly = static_cast<SHORT>((128 - r[stick + 1]) * 256); // no HID o Y cresce para baixo
+}
+
+void SonyPadThread() {
+    for (;;) {
+        bool dualsense = false;
+        DWORD bytes = 0;
+        HANDLE device = OpenSonyPad(&dualsense, &bytes);
+        if (device == INVALID_HANDLE_VALUE) {
+            Sleep(2000);
+            continue;
+        }
+        std::vector<BYTE> report(std::max<DWORD>(bytes, 64));
+        DWORD got = 0;
+        while (ReadFile(device, report.data(), static_cast<DWORD>(report.size()), &got, nullptr)) {
+            ParseSonyReport(report.data(), got, dualsense);
+        }
+        CloseHandle(device); // desconectou
+        g_sony_buttons = 0;
+        g_sony_lx = g_sony_ly = 0;
+    }
+}
+
+void PadKey(WORD vk) {
+    INPUT input[2]{};
+    input[0].type = input[1].type = INPUT_KEYBOARD;
+    input[0].ki.wVk = input[1].ki.wVk = vk;
+    input[1].ki.dwFlags = KEYEVENTF_KEYUP;
+    SendInput(2, input, sizeof(INPUT));
+}
+
+bool PadTarget(HWND h) {
+    return ui::g_buttons.count(h) && (GetWindowLongPtrW(h, GWL_STYLE) & WS_VISIBLE) && IsWindowEnabled(h) && GetParent(h) == g_main;
+}
+
+void PadFocus(HWND h) {
+    SendMessageW(g_main, WM_CHANGEUISTATE, MAKEWPARAM(UIS_CLEAR, UISF_HIDEFOCUS), 0); // mostra o contorno de foco
+    SetFocus(h);
+}
+
+// O botao visivel mais perto na direcao (distancia na direcao + 2x o desvio para o lado); nullptr se nao houver.
+HWND PadNeighbor(HWND from, int dir) {
+    RECT a;
+    GetWindowRect(from, &a);
+    const long ax = (a.left + a.right) / 2, ay = (a.top + a.bottom) / 2;
+    HWND best = nullptr;
+    long best_score = 0;
+    for (const auto& entry : ui::g_buttons) {
+        HWND h = entry.first;
+        if (h == from || !PadTarget(h)) {
+            continue;
+        }
+        RECT b;
+        GetWindowRect(h, &b);
+        const long bx = (b.left + b.right) / 2, by = (b.top + b.bottom) / 2;
+        long along = 0, side = 0;
+        switch (dir) {
+        case kPadUp: along = ay - by; side = bx - ax; break;
+        case kPadDown: along = by - ay; side = bx - ax; break;
+        case kPadLeft: along = ax - bx; side = by - ay; break;
+        default: along = bx - ax; side = by - ay; break;
+        }
+        if (along <= 0) {
+            continue;
+        }
+        const long score = along + 2 * (side < 0 ? -side : side);
+        if (!best || score < best_score) {
+            best = h;
+            best_score = score;
+        }
+    }
+    return best;
+}
+
+void PadMove(int dir) {
+    HWND from = GetFocus();
+    if (!PadTarget(from)) {
+        PadFocus(PadTarget(g_play) ? g_play : g_settings);
+    } else if (HWND to = PadNeighbor(from, dir)) {
+        PadFocus(to);
+    }
+}
+
+void PollPad() {
+    WORD buttons = g_sony_buttons;
+    SHORT lx = g_sony_lx, ly = g_sony_ly;
+    for (DWORD user = 0; g_xinput_get_state && user < 4; ++user) {
+        XINPUT_STATE state{};
+        if (g_xinput_get_state(user, &state) == ERROR_SUCCESS) {
+            buttons |= state.Gamepad.wButtons;
+            if (std::abs(lx) < 8000 && std::abs(ly) < 8000) {
+                lx = state.Gamepad.sThumbLX;
+                ly = state.Gamepad.sThumbLY;
+            }
+        }
+    }
+    DWORD pid = 0;
+    HWND front = GetForegroundWindow();
+    GetWindowThreadProcessId(front, &pid);
+    const WORD pressed = buttons & ~g_pad_buttons;
+    g_pad_buttons = buttons;
+    int dir = kPadNone;
+    constexpr SHORT kStick = 16000;
+    if ((buttons & XINPUT_GAMEPAD_DPAD_UP) || ly > kStick) dir = kPadUp;
+    else if ((buttons & XINPUT_GAMEPAD_DPAD_DOWN) || ly < -kStick) dir = kPadDown;
+    else if ((buttons & XINPUT_GAMEPAD_DPAD_LEFT) || lx < -kStick) dir = kPadLeft;
+    else if ((buttons & XINPUT_GAMEPAD_DPAD_RIGHT) || lx > kStick) dir = kPadRight;
+    const ULONGLONG now = GetTickCount64();
+    bool step = false;
+    if (dir != g_pad_dir) {
+        g_pad_dir = dir;
+        step = dir != kPadNone;
+        g_pad_repeat_at = now + 400;
+    } else if (dir != kPadNone && now >= g_pad_repeat_at) {
+        step = true;
+        g_pad_repeat_at = now + 130;
+    }
+    if (pid != GetCurrentProcessId() || (!step && !pressed)) {
+        return; // o launcher nao esta na frente (o jogo esta): o controle e dele
+    }
+    GUITHREADINFO gui{sizeof(gui)};
+    GetGUIThreadInfo(GetCurrentThreadId(), &gui);
+    if ((gui.flags & (GUI_INMENUMODE | GUI_POPUPMENUMODE)) || front != g_main) { // menu ou caixa de mensagem
+        static const WORD kDirKeys[] = {VK_UP, VK_DOWN, VK_LEFT, VK_RIGHT};
+        if (step) PadKey(kDirKeys[dir]);
+        if (pressed & XINPUT_GAMEPAD_A) PadKey(VK_RETURN);
+        if (pressed & XINPUT_GAMEPAD_B) PadKey(VK_ESCAPE);
+        return;
+    }
+    if (step) {
+        PadMove(dir);
+    }
+    if ((pressed & XINPUT_GAMEPAD_A) && PadTarget(GetFocus())) {
+        SendMessageW(GetFocus(), BM_CLICK, 0, 0);
+    }
+    if ((pressed & XINPUT_GAMEPAD_B) && g_settings_page) {
+        SendMessageW(g_settings, BM_CLICK, 0, 0);
+    }
+    if ((pressed & XINPUT_GAMEPAD_START) && IsWindowVisible(g_play) && IsWindowEnabled(g_play)) {
+        SendMessageW(g_play, BM_CLICK, 0, 0);
+    }
 }
 
 LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
@@ -1830,6 +2097,12 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         }
         UpdateStatus();
         return 0;
+    case WM_TIMER:
+        if (wp == kPadTimer) {
+            PollPad();
+            return 0;
+        }
+        break;
     case WM_CLOSE:
         if (g_busy && MessageBoxW(hwnd, ui::T(L"A preparacao ainda esta rodando. Fechar mesmo assim?", L"The preparation is still running. Close anyway?"), L"LEGO Dimensions PC", MB_YESNO) != IDYES) {
             return 0;
@@ -1901,6 +2174,8 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show) {
     LoadSettings();
     LayoutPage();
     ShowWindow(g_main, show);
+    LoadXInput(); // issue #3: controle no launcher
+    SetTimer(g_main, kPadTimer, 16, nullptr);
     MSG msg;
     while (GetMessageW(&msg, nullptr, 0, 0)) {
         if (!IsDialogMessageW(g_main, &msg)) {

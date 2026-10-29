@@ -248,6 +248,12 @@ inline void DrawButton(const DRAWITEMSTRUCT* item) {
             }
         }
     }
+    if ((item->itemState & ODS_FOCUS) && !(item->itemState & ODS_NOFOCUSRECT)) { // foco pelo teclado / controle
+        Gdiplus::Graphics g(dc);
+        g.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
+        RECT ring{1, 1, local.right - 1, local.bottom - 1};
+        StrokeRound(g, ring, S(9), kAccent, 2.0f);
+    }
     if (info.style == Style::kToggle) {
         RECT tr{S(52), 0, local.right, local.bottom};
         Text(dc, text, tr, info.font, enabled ? kText : kMuted);
