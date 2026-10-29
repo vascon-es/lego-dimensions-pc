@@ -26,6 +26,16 @@ void OnRead(const std::string& guest_path, s64 offset, u64 size);
 // true se o nome casa com o filtro de "tela". `lower_name` em minusculas.
 bool IsScreenFile(const std::string& lower_name);
 
+// Arquivo guardado sem compressao num pacote que o jogo ja leu (o primeiro cujo nome termina em `lower_suffix`).
+// O player de video usa para achar o .mp4: o jogo so passa "myfile.mp4" ao sceAvPlayerAddSource.
+struct StoredFile {
+    std::string guest_pack; // caminho do pacote no jogo ("/addcont15/DLC31.DAT2")
+    std::string name;
+    u64 offset = 0;
+    u64 size = 0;
+};
+bool FindStoredFile(const std::string& lower_suffix, StoredFile* out);
+
 u64 FilesSeen();
 void PrintStats();
 

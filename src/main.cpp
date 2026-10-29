@@ -1009,7 +1009,7 @@ int SelfTest() {
                   << "\\audio\\musica.ogg\t200\t200\t100\t0\n"
                   << "\\stuff\\text\\text.csv\t50\t50\t6000\t0\n";
         }
-        hle::radar::Configure(radar_dir, {});
+        hle::radar::Configure(radar_dir, radar_dir / "radar.log"); // sem log o radar nao faz nada (1.8.3)
         hle::radar::OnRead("/app0/data/chunk1/TESTE.DAT", 5500, 16);  // meio do .gsc
         hle::radar::OnRead("/app0/data/chunk1/TESTE.DAT", 5600, 16);  // o mesmo: nao conta de novo
         const bool radar_one = hle::radar::FilesSeen() == 1;
@@ -1022,6 +1022,11 @@ int SelfTest() {
                   hle::radar::IsScreenFile("\\levels\\frontend\\frontend_dx11.gsc") &&
                   hle::radar::IsScreenFile("\\levels\\loading_screen_startup\\a.led") &&
                   !hle::radar::IsScreenFile("\\audio\\musica.ogg"));
+        // o player de video acha o .mp4 assim: so arquivo guardado sem compressao (o .gsc comprimido nao conta)
+        hle::radar::StoredFile stored;
+        check("Radar: stored (uncompressed) file found by name suffix, with pack path, offset and size",
+              hle::radar::FindStoredFile(".ogg", &stored) && stored.guest_pack == "/app0/data/chunk1/TESTE.DAT" &&
+                  stored.offset == 100 && stored.size == 200 && !hle::radar::FindStoredFile(".gsc", &stored));
         hle::radar::Configure({}, {});
     }
 

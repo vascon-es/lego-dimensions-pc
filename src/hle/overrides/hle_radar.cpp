@@ -19,6 +19,7 @@ namespace {
 
 struct Entry {
     u64 offset;
+    u64 size;   // tamanho do arquivo
     u64 packed; // bytes ocupados no pacote
     std::string name;
     bool seen = false;
@@ -27,6 +28,7 @@ struct Entry {
 struct Pack {
     std::vector<Entry> entries; // ordenado por offset
     u64 seen = 0;
+    std::string guest_path; // por onde o jogo le o pacote ("/addcont15/DLC31.DAT2")
 };
 
 const auto g_epoch = std::chrono::steady_clock::now();
@@ -82,6 +84,7 @@ Pack LoadPack(const std::string& name) {
         }
         Entry entry;
         entry.name = line.substr(0, t1);
+        entry.size = std::strtoull(line.c_str() + t1 + 1, nullptr, 10);
         entry.packed = std::strtoull(line.c_str() + t2 + 1, nullptr, 10);
         entry.offset = std::strtoull(line.c_str() + t3 + 1, nullptr, 10);
         if (entry.name.empty()) {
@@ -164,6 +167,7 @@ void OnRead(const std::string& guest_path, s64 offset, u64 size) {
             if (it->second.entries.empty()) {
                 ++g_packs_without_index;
             }
+            it->second.guest_path = guest_path;
         }
         Pack& pack = it->second;
         const u64 begin = static_cast<u64>(offset);
@@ -222,6 +226,26 @@ void OnRead(const std::string& guest_path, s64 offset, u64 size) {
     for (const std::string& area : areas) {
         render::VulkanRenderer::Instance().SetCurrentLevel(area); // Fase 72: prioridade do aquecimento desta area
     }
+}
+
+bool FindStoredFile(const std::string& lower_suffix, StoredFile* out) {
+    std::lock_guard lock(g_mutex);
+    for (const auto& [name, pack] : g_packs) {
+        for (const Entry& entry : pack.entries) {
+            if (entry.name.size() < lower_suffix.size() || entry.size != entry.packed || !entry.size) {
+                continue;
+            }
+            std::string tail = entry.name.substr(entry.name.size() - lower_suffix.size());
+            for (char& c : tail) {
+                c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+            }
+            if (tail == lower_suffix) {
+                *out = StoredFile{pack.guest_path, entry.name, entry.offset, entry.size};
+                return true;
+            }
+        }
+    }
+    return false;
 }
 
 u64 FilesSeen() {
