@@ -75,7 +75,12 @@ def stage():
     print('port: ' + game)
     copy(game, S('build', 'lego_dimensions.exe'))
     copy(R('build', 'pkg_extractor.exe'), S('build', 'pkg_extractor.exe'))  # Fase 68: botao Extrair PKG do launcher
-    copy(R('tools', 'shader_compiler_tool', 'build', 'shader_compiler_tool.exe'), S('tools', 'shader_compiler_tool', 'build', 'shader_compiler_tool.exe'))
+    # o compilador de shaders precisa do checkout do shadPS4 para compilar; sem o build local vai a copia pronta do repositorio
+    tool = R('tools', 'shader_compiler_tool', 'build', 'shader_compiler_tool.exe')
+    if not os.path.isfile(tool):
+        tool = R('tools', 'shader_compiler_tool', 'prebuilt', 'shader_compiler_tool.exe')
+    print('compilador de shaders: ' + tool)
+    copy(tool, S('tools', 'shader_compiler_tool', 'build', 'shader_compiler_tool.exe'))
     for d in (S('build'), S('tools', 'shader_compiler_tool', 'build')):
         for dll in VC_DLLS:
             copy(os.path.join(REDIST, dll), os.path.join(d, dll))
@@ -94,7 +99,7 @@ def stage():
     copy(R('tools', 'setup', 'ld_transfer.py'), S('tools', 'setup', 'ld_transfer.py'))  # Fase 63: LD PC Transfer
     copy(R('tools', 'setup', 'mods.py'), S('tools', 'setup', 'mods.py'))  # Fase 64: carregador de mods
     # 7-Zip 26.03 (LGPL + restricao do unRAR; License.txt vai junto): abre os .rar v6 / dicionario grande que o tar.exe
-    # do Windows nao abre. Copia oficial em tools\7zip da arvore de desenvolvimento, fora do repositorio, como o Python.
+    # do Windows nao abre. Copia oficial em tools\7zip, no repositorio.
     for f in ('7z.exe', '7z.dll', 'License.txt', 'readme.txt'):
         copy(R('tools', '7zip', f), S('tools', '7zip', f))
     keep(S('mods'))

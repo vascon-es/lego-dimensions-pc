@@ -32,6 +32,3 @@ eboot.bin
 *.log
 launcher.ini
 FASE*.md
-tools/LegoToypad.exe
-
-tools/7zip/
