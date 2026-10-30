@@ -14,6 +14,7 @@ assets/savedata*/*
 assets/temp0/*
 assets/download0/*
 assets/addcont/
+assets/launcher/
 assets/shaders_spv/pairs/*
 assets/shaders_spv/pair_snapshots.txt
 assets/shaders_spv/ui_shader_pairs.tsv

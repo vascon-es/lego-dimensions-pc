@@ -98,6 +98,7 @@ def stage():
     copy(R('tools', 'setup', 'botoes.py'), S('tools', 'setup', 'botoes.py'))  # Fase 62: icones dos botoes de outras plataformas
     copy(R('tools', 'setup', 'ld_transfer.py'), S('tools', 'setup', 'ld_transfer.py'))  # Fase 63: LD PC Transfer
     copy(R('tools', 'setup', 'mods.py'), S('tools', 'setup', 'mods.py'))  # Fase 64: carregador de mods
+    copy(R('tools', 'setup', 'launcher_art.py'), S('tools', 'setup', 'launcher_art.py'))  # 1.8.7: a fonte do jogo para o launcher
     # 7-Zip 26.03 (LGPL + restricao do unRAR; License.txt vai junto): abre os .rar v6 / dicionario grande que o tar.exe
     # do Windows nao abre. Copia oficial em tools\7zip, no repositorio.
     for f in ('7z.exe', '7z.dll', 'License.txt', 'readme.txt'):
