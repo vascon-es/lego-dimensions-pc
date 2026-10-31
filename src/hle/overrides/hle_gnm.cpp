@@ -1892,16 +1892,27 @@ std::unordered_map<u64, TexTracked> g_tex_tracked;
 std::unordered_set<u64> g_tex_hot_linear;
 constexpr u32 kHotLinearRewrites = 2;
 constexpr u64 kHotLinearMaxTexels = 1u << 20;
+// Issue #6 (1.8.7 ainda com o quadro dobrado, e nenhuma textura promovida no log do jogador): a tela pode nao ser linear.
+// Texturas com tiling tambem sao promovidas, mas so ate 512x512 (a conferencia por quadro le e destila a textura inteira).
+constexpr u64 kHotTiledMaxTexels = 512u * 512u;
 
 // Chamado a cada conferencia por amostragem de uma textura ja enviada.
 void NoteTextureCheck(u64 key, const GuestTexture& texture, TexTracked& state, bool changed) {
     state.rewrites = changed ? state.rewrites + 1 : 0;
-    if (state.rewrites < kHotLinearRewrites || texture.tiling != 8 ||
-        static_cast<u64>(texture.width) * texture.height * texture.depth > kHotLinearMaxTexels || !g_tex_hot_linear.insert(key).second) {
+    const u64 texels = static_cast<u64>(texture.width) * texture.height * texture.depth;
+    if (state.rewrites < kHotLinearRewrites || texels > (texture.tiling == 8 ? kHotLinearMaxTexels : kHotTiledMaxTexels) ||
+        !g_tex_hot_linear.insert(key).second) {
         return;
     }
-    std::printf("[TEXTURE] 0x%llx %ux%u format 0x%x: linear texture rewritten all the time; checked every frame from now on\n",
-                static_cast<unsigned long long>(texture.address), texture.width, texture.height, texture.format);
+    std::printf("[TEXTURE] 0x%llx %ux%u format 0x%x tiling %u: texture rewritten all the time; checked every frame from now on\n",
+                static_cast<unsigned long long>(texture.address), texture.width, texture.height, texture.format, texture.tiling);
+}
+
+// Issue #6: o aviso de textura reescrita sai uma vez por textura (antes, so as 30 primeiras da sessao: as da Vorton
+// esgotavam o limite e a tela do fliperama nunca aparecia no log).
+bool FirstRewriteOf(u64 key) {
+    static std::unordered_set<u64> logged;
+    return logged.size() < 400 && logged.insert(key).second;
 }
 // Fase 61 (medicao): texturas lidas na hora pela thread de render neste frame (lineares pequenas novas, conferencia
 // por frame das lineares pequenas, reescritas no modo sem threads). Vai na linha [ENGASGO] e zera a cada frame.
@@ -2094,9 +2105,9 @@ u64 EnsureGuestTexture(const GuestTexture& texture) {
             }
         }
     }
-    const bool small_linear = texture.tiling == 8 && (static_cast<u64>(texture.width) * texture.height * texture.depth <= (128u << 10) ||
-                                                      texture.format == 0x01 || texture.format == 0x03 || // Fase 60: planos de video mudam todo quadro
-                                                      (g_tex_hot_linear.count(key) && !g_tex_replacing.count(key))); // Issue #6
+    const bool small_linear = (texture.tiling == 8 && (static_cast<u64>(texture.width) * texture.height * texture.depth <= (128u << 10) ||
+                                                       texture.format == 0x01 || texture.format == 0x03)) || // Fase 60: planos de video mudam todo quadro
+                              (g_tex_hot_linear.count(key) && !g_tex_replacing.count(key)); // Issue #6 (com ou sem tiling)
     static thread_local PixelVector pixels;
     // Fase 29: as demais texturas sao conferidas por amostragem a cada ~30 frames (nivel 0).
     using Tracked = TexTracked;
@@ -2226,11 +2237,10 @@ u64 EnsureGuestTexture(const GuestTexture& texture) {
                     g_tex_jobs.push_back(std::move(job));
                 }
                 g_tex_cv.notify_one();
-                static u32 logged = 0;
-                if (logged < 30) {
-                    ++logged;
-                    std::printf("[TEXTURE] 0x%llx %ux%u format 0x%x: game rewrote content after first upload; reread by threads\n",
-                                static_cast<unsigned long long>(texture.address), texture.width, texture.height, texture.format);
+                if (FirstRewriteOf(key)) {
+                    std::printf("[TEXTURE] 0x%llx %ux%u format 0x%x tiling %u: game rewrote content after first upload; reread by threads\n",
+                                static_cast<unsigned long long>(texture.address), texture.width, texture.height, texture.format,
+                                texture.tiling);
                 }
                 g_tex_pending_key = key;
                 return kTexturePending;
@@ -2245,11 +2255,10 @@ u64 EnsureGuestTexture(const GuestTexture& texture) {
                 render::TextureData data;
                 if (ReadGuestTexture(texture, &pixels, &data) && renderer.UpdateTexture(key, data)) {
                     ++g_vk_stats.textures_rewritten;
-                    static u32 logged = 0;
-                    if (logged < 30) {
-                        ++logged;
-                        std::printf("[TEXTURE] 0x%llx %ux%u format 0x%x: game rewrote content after first upload; uploaded again\n",
-                                    static_cast<unsigned long long>(texture.address), texture.width, texture.height, texture.format);
+                    if (FirstRewriteOf(key)) {
+                        std::printf("[TEXTURE] 0x%llx %ux%u format 0x%x tiling %u: game rewrote content after first upload; uploaded again\n",
+                                    static_cast<unsigned long long>(texture.address), texture.width, texture.height, texture.format,
+                                    texture.tiling);
                     }
                 }
             }
