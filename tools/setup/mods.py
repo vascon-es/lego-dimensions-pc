@@ -1039,6 +1039,72 @@ def merge_text(base, extras):
     return merged, len(added)
 
 
+def merge_lines(base, versions):
+    """Junta as mudancas de cada versao (ordem = prioridade) sobre o texto base, linha a linha. Devolve (linhas,
+    conflitos): trechos que duas versoes mudam de jeitos diferentes ficam com a de maior prioridade."""
+    import difflib
+    edits = []
+    for order, lines in enumerate(versions):
+        matcher = difflib.SequenceMatcher(None, base, lines, autojunk=False)
+        for tag, i1, i2, j1, j2 in matcher.get_opcodes():
+            if tag != 'equal':
+                edits.append((i1, i2, order, lines[j1:j2]))
+    edits.sort(key=lambda e: (e[0], e[1], e[2]))
+    out, pos, applied, conflicts = [], 0, [], 0
+    for i1, i2, _order, new in edits:
+        if (i1, i2, new) in applied:
+            continue  # a mesma mudanca em dois mods
+        if i1 < pos:
+            conflicts += 1
+            continue
+        out.extend(base[pos:i1])
+        out.extend(new)
+        pos = i2
+        applied.append((i1, i2, new))
+    out.extend(base[pos:])
+    return out, conflicts
+
+
+def merged_mod_texts(anomaly, tocs, packs, cache):
+    """Os pacotes do Anomaly sao lidos em ordem e so o primeiro que tem um arquivo vale: o abilities.txt do LORDVORTECH
+    (connorh315) sumia atras do do BARTVOICE, e o .txt de um personagem do AllWorld escondia o do mod do personagem.
+    Cada .txt que dois ou mais pacotes trazem vira um so, com as mudancas de todos sobre o do jogo, num pacote que
+    entra na frente. Devolve (rotulo, nome, .HDR, .DAT) ou None."""
+    layered = {'\\CHARS\\COLLECTION.TXT'}
+    seen = {}
+    for label, _name, _hdr, dat in anomaly:
+        for row_name, data, packed, _usize in read_pack_files(dat):
+            upper = row_name.upper()
+            if upper.endswith('.TXT') and upper not in layered and not packed:
+                seen.setdefault(upper, (row_name, []))[1].append((label, data))
+    files, notes = [], []
+    for upper, (row_name, versions) in sorted(seen.items()):
+        if len(versions) < 2 or all(v[1] == versions[0][1] for v in versions):
+            continue
+        base = game_file(tocs, packs, upper)
+        if base is None:
+            continue
+        text = base.decode('latin-1')
+        newline = '\r\n' if '\r\n' in text else '\n'
+        lines, conflicts = merge_lines(text.splitlines(), [v[1].decode('latin-1').splitlines() for v in versions])
+        merged = (newline.join(lines) + (newline if text.endswith(('\n', '\r')) else '')).encode('latin-1')
+        files.append((row_name, merged))
+        notes.append('%s (%s%s)' % (os.path.basename(row_name), ', '.join(v[0] for v in versions),
+                                    T(', %d conflito(s): vale o primeiro' % conflicts, ', %d conflict(s): the first wins' % conflicts) if conflicts else ''))
+    if not files:
+        return None
+    hdr_bytes, dat_bytes = build_pack(files)
+    folder = os.path.join(cache, 'anomaly')
+    os.makedirs(folder, exist_ok=True)
+    hdr, dat = os.path.join(folder, 'MODS_JUNTOS.HDR'), os.path.join(folder, 'MODS_JUNTOS.DAT')
+    with open(hdr, 'wb') as f:
+        f.write(hdr_bytes)
+    with open(dat, 'wb') as f:
+        f.write(dat_bytes)
+    say('CONSERTO ' + T('arquivos que mais de um mod muda, juntos: ', 'files changed by more than one mod, merged: ') + '; '.join(notes))
+    return T('mods juntos', 'merged mods'), 'MODS_JUNTOS', hdr, dat
+
+
 def read_ignore(folder):
     """mods\\<mod>\\ignorar.txt: um caminho interno por linha (ex. collectables\\cheats.txt) que o port nao usa do mod."""
     path = os.path.join(folder, 'ignorar.txt')
@@ -1233,17 +1299,37 @@ def prepare(root, app0, patch, mods_dir, cache, addcont, loader='anomaly'):
         # Fase 67: figura desligada no jogo (ex. Lord Vortech) cuja gravacao .bin esta na pasta de mods
         with open(FIGURES_FILE, encoding='utf-8') as f:
             figures = {v['id']: (k, v) for k, v in json.load(f).items() if not k.startswith('_')}
+        def brought_by_mod(char):
+            # o mod original da figura (ex. o LORDVORTECH de connorh315: furtividade, iluminacao e cajado proprios) ja
+            # traz o charcache dela: ele vale, e a figura feita do doador nao entra
+            prefix = '\\CHARCACHE\\%s\\' % char.upper()
+            for mod_label, _name, _hdr, dat in anomaly:
+                try:
+                    if any(row[0].upper().startswith(prefix) for row in nu2toc.read_toc(dat)):
+                        return mod_label
+                except Exception:
+                    pass
+            return None
         for source, label, folder in loose_sources:
             for fid in sorted(figure_tags(folder)):
                 if fid in figures and fid not in enabled_figures:
                     char, info = figures[fid]
-                    made = hidden_figure_pack(char, info, tocs, packs, all_names, cache, [a[3] for a in anomaly])
-                    if made:
+                    original = brought_by_mod(char)
+                    made = None if original else hidden_figure_pack(char, info, tocs, packs, all_names, cache, [a[3] for a in anomaly])
+                    if original:
+                        enabled_figures.add(fid)
+                        say('MOD ' + T('%s: a figura vem do mod %s (a feita do %s fica de fora)' % (info['nome'], original, info['doador']),
+                                       '%s: the figure comes from the %s mod (the one made from %s is left out)' % (info['nome'], original, info['doador'])))
+                    elif made:
                         enabled_figures.add(fid)
                         # na frente dos outros mods: o abilities.txt dele ja traz as linhas deles
                         anomaly.insert(0, (info['nome'], made[0], made[1], made[2]))
                 if fid in enabled_figures:
                     enabled_figures.add(folder)
+    if loader == 'anomaly' and len(anomaly) > 1:
+        joined = merged_mod_texts(anomaly, tocs, packs, cache)
+        if joined:
+            anomaly.insert(0, joined)
     if loader == 'anomaly':
         # O Anomaly le em camadas os stuff\text\text.csv da lista de colisoes de hash do jogo, e essa lista muda com o
         # numero de arquivos: com mods grandes entra tambem o do GAME (textos originais, em ingles), lido depois do do
