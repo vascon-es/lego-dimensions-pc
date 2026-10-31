@@ -135,6 +135,7 @@ struct Status {
 std::wstring g_game_dir, g_patch_dir, g_dlc_dir;
 bool g_opt_fps = true, g_opt_console = false, g_opt_fullscreen = false, g_opt_skip = false, g_opt_overlay = false, g_opt_toypad = false;
 std::wstring g_lang_at_start; // o idioma do launcher mudou nas Configuracoes: ele reabre ao voltar
+std::wstring g_saves_value = L"savedata0"; // pasta dos saves dentro de assets (--saves-dir); savedata0 = os do jogador
 std::deque<std::wstring> g_log_lines; // o que a preparacao / os mods / o jogo disseram (as ultimas linhas)
 
 fs::path Ini() { return g_root / L"launcher.ini"; }
@@ -360,6 +361,7 @@ void SaveSettings() {
     WriteIni(L"pularcenas", g_opt_skip ? L"1" : L"0");
     WriteIni(L"contador", g_opt_overlay ? L"1" : L"0"); // Fase 65
     WriteIni(L"toypad_auto", g_opt_toypad ? L"1" : L"0");
+    WriteIni(L"saves", g_saves_value);
 }
 
 const Language& CurrentLanguage() {
@@ -1223,6 +1225,9 @@ void RunGame() {
             command += L" --player-name " + std::to_wstring(i + 1) + L" " + Quote(names[i]);
         }
     }
+    if (g_saves_value != L"savedata0") {
+        command += L" --saves-dir " + g_saves_value; // outra pasta de saves (ex. o save 100%); a dos seus fica intocada
+    }
     command += L" --hitch-log";
     if (GetEnvironmentVariableW(L"LD_LAUNCHER_SEM_JOGO", nullptr, 0)) { // teste do launcher: faz tudo menos abrir o jogo
         AppendLog(L"[teste] " + command);
@@ -1670,6 +1675,30 @@ std::wstring OnOff(bool on) { return on ? ui::T(L"Ligado", L"On") : ui::T(L"Desl
 void OpenNamesDialog();
 std::vector<std::wstring> ReadPlayerNames();
 
+// As pastas de saves: assets\savedata0 (a do jogador, sempre) e as outras assets\savedata* com um Slot00 dentro
+// (um save 100% convertido pelo LD PC Transfer, por exemplo). As copias de teste do desenvolvimento e os backups
+// que o port faz (savedata_backup_*) ficam de fora.
+std::vector<std::wstring> SaveFolders() {
+    std::vector<std::wstring> folders{L"savedata0"};
+    std::error_code ec;
+    for (fs::directory_iterator it(g_root / L"assets", ec), end; !ec && it != end; it.increment(ec)) {
+        const std::wstring name = it->path().filename().wstring();
+        if (name.rfind(L"savedata", 0) == 0 && name != L"savedata0" && name.find(L"teste") == std::wstring::npos &&
+            name.find(L"bench") == std::wstring::npos && name.find(L"backup") == std::wstring::npos &&
+            fs::is_directory(it->path() / L"Slot00", ec)) {
+            folders.push_back(name);
+        }
+    }
+    return folders;
+}
+
+std::wstring SaveFolderLabel(const std::wstring& folder) {
+    if (folder == L"savedata0") return ui::T(L"Os seus", L"Your saves");
+    std::wstring label = folder.substr(8);
+    while (!label.empty() && (label.front() == L'_' || label.front() == L'-')) label.erase(label.begin());
+    return label == L"100" ? std::wstring(L"Save 100%") : label;
+}
+
 std::vector<Row> Rows() {
     std::vector<Row> rows;
     const auto toggle = [](bool& option) {
@@ -1690,6 +1719,15 @@ std::vector<Row> Rows() {
                     dlcs ? std::to_wstring(dlcs) + ui::T(L" DLCs encontradas. Enter: escolher.", L" DLCs found. Enter: choose.")
                          : ui::T(L"Uma subpasta por DLC (formato addcont do shadPS4).", L"One subfolder per DLC (shadPS4 addcont layout)."),
                     g_dlc_dir.empty() ? ui::T(L"Nenhuma", L"None") : g_dlc_dir, [](int) { BrowseDlc(); }});
+    if (const auto folders = SaveFolders(); folders.size() > 1) {
+        rows.push_back({kTabFiles, RowKind::kChoice, L"Saves",
+                        ui::T(L"Outra pasta em assets\\ (ex. um save 100%). A dos seus saves n\u00e3o muda.",
+                              L"Another folder in assets\\ (e.g. a 100% save). Your own saves stay as they are."),
+                        SaveFolderLabel(g_saves_value), [folders](int step) {
+                            g_saves_value = Step(folders, g_saves_value, step, [](const std::wstring& f) { return f; });
+                            SaveSettings();
+                        }});
+    }
     // Tela
     rows.push_back({kTabDisplay, RowKind::kChoice, ui::T(L"Resolução", L"Resolution"),
                     ui::T(L"Tamanho da janela; o jogo desenha em 1920x1080.", L"Window size; the game renders at 1920x1080."), g_res_value,
@@ -2355,6 +2393,10 @@ void LoadSettings() {
     g_opt_skip = ReadIni(L"pularcenas", L"0") == L"1";
     g_opt_overlay = ReadIni(L"contador", L"0") == L"1"; // Fase 65
     g_opt_toypad = ReadIni(L"toypad_auto", L"0") == L"1";
+    g_saves_value = ReadIni(L"saves", L"savedata0");
+    if (const auto folders = SaveFolders(); std::find(folders.begin(), folders.end(), g_saves_value) == folders.end()) {
+        g_saves_value = L"savedata0";
+    }
     g_icons_value = ReadIni(L"icones", L"auto"); // Fase 62
     g_icons_value = CurrentIcons().code;
     g_gpl_value = ReadIni(L"gpl", L"auto"); // Fase 74
