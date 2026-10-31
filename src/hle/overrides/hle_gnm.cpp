@@ -1384,7 +1384,8 @@ struct VulkanDrawStats {
     u64 game_sent = 0, size = 0, primitive = 0, rect_list = 0, color_mode = 0, no_target = 0, target_format = 0, no_layout = 0,
         unreadable = 0, viewport = 0, game_no_pair = 0, no_hash = 0, game_format = 0, game_layout = 0, game_rejected = 0,
         game_zero_buffers = 0, game_white_images = 0, target_sampled = 0, depth_clears = 0, depth_only = 0, instanced = 0,
-        instanced_step = 0, instanced_expanded = 0; // Fase 44: buffers por instancia expandidos (passo > 1)
+        instanced_step = 0, instanced_expanded = 0, // Fase 44: buffers por instancia expandidos (passo > 1)
+        rebased = 0;                                 // Fase 77: draws com os buffers rebaseados no primeiro vertice
     // cache de geometria (Fase 21): bytes reaproveitados da GPU, enviados ao buffer estatico, copiados para o anel
     u64 cache_hit_bytes = 0, cache_upload_bytes = 0, ring_bytes = 0, cache_hits = 0, cache_uploads = 0, cache_changed = 0,
         cache_rechecks = 0, cache_resets = 0;
@@ -4437,7 +4438,9 @@ void SubmitDrawToVulkan(u32 opcode, const u32* body, u32 body_dwords) {
             }
         }
         const s32 base_vertex = static_cast<s32>(g_ctx_track[0x102]); // VGT_INDX_OFFSET
-        if (max_index > 4'000'000 || base_vertex < 0 || base_vertex > 4'000'000) {
+        // Fase 77: o vertice base passa de 4 milhoes no mar de pecas do Prime Time (malhas no fim de um buffer de
+        // 128 MB); o limite antigo, de 4 milhoes, deixava esses draws de fora. O V# ainda confere a contagem.
+        if (max_index > 4'000'000 || base_vertex < 0 || base_vertex > 64'000'000) {
             ++stats.size;
             return;
         }
@@ -4537,6 +4540,26 @@ void SubmitDrawToVulkan(u32 opcode, const u32* body, u32 body_dwords) {
         const u32 offset = static_cast<u32>(v.address - bindings[b].base);
         bindings[b].end = std::max(bindings[b].end, offset + bytes);
         draw.attributes[draw.attribute_count++] = {attribute.location, format, offset, b};
+    }
+    // Fase 77: malha que comeca longe do inicio do buffer (o mar de pecas do Prime Time, 12 Foundation Prime: 5 draws
+    // com vertice base de 3,7 a 4 milhoes,
+    // 32 bytes por vertice): os buffers por vertice passam a comecar no primeiro vertice usado. Antes a copia ia do
+    // inicio do buffer (~120 MB por draw), passava dos limites e o draw sumia. Abaixo disso nada muda: as submalhas
+    // de um buffer continuam na mesma entrada do cache.
+    if (const u32 rebase = draw.first_vertex; rebase >= 262'144) {
+        for (u32 b = 0; b < draw.binding_count; ++b) {
+            if (!bindings[b].per_instance) {
+                bindings[b].base += static_cast<u64>(rebase) * bindings[b].stride;
+                bindings[b].records -= std::min(bindings[b].records, rebase);
+            }
+        }
+        vertex_count -= rebase;
+        draw.base_vertex -= static_cast<s32>(rebase);
+        draw.first_vertex = 0;
+        if (++stats.rebased <= 8) {
+            std::printf("[REBASE] VS %016llx: %u indices, buffers rebased to vertex %u\n", static_cast<unsigned long long>(info->vs_hash),
+                        count, rebase);
+        }
     }
     size_t arena_bytes = 0;
     u64 binding_bytes[8], binding_needed[8];
@@ -6814,10 +6837,12 @@ void PrintStats() {
         std::printf("  geometry cache: %.1f MiB reused from GPU (%.1f%%), %.1f MiB uploaded to static buffer, %.1f MiB "
                     "copied to ring | %" PRIu64 " hits, %" PRIu64 " uploads, %" PRIu64 " changes detected, %" PRIu64
                     " full checks, %" PRIu64 " flushes | static buffer in use: %.1f MiB | draws with more than one "
-                    "instance: %" PRIu64 " (%" PRIu64 " with instance step greater than 1; %" PRIu64 " expanded buffers)\n",
+                    "instance: %" PRIu64 " (%" PRIu64 " with instance step greater than 1; %" PRIu64 " expanded buffers) | "
+                    "draws rebased to their first vertex: %" PRIu64 "\n",
                     v.cache_hit_bytes / 1048576.0, geometry_total > 0 ? 100.0 * v.cache_hit_bytes / geometry_total : 0.0,
                     v.cache_upload_bytes / 1048576.0, v.ring_bytes / 1048576.0, v.cache_hits, v.cache_uploads, v.cache_changed,
-                    v.cache_rechecks, v.cache_resets, renderer.StaticBytes() / 1048576.0, v.instanced, v.instanced_step, v.instanced_expanded);
+                    v.cache_rechecks, v.cache_resets, renderer.StaticBytes() / 1048576.0, v.instanced, v.instanced_step, v.instanced_expanded,
+                    v.rebased);
         auto print_map = [](const char* title, const std::map<u32, u64>& map) {
             if (map.empty()) {
                 return;
