@@ -14,7 +14,7 @@
 // para medir a cobertura do recompilador e como base da pipeline; antes de usar um modulo com
 // um estado diferente do padrao ele tem de ser recompilado com o RuntimeInfo real.
 //
-// uso: shader_compiler_tool [pasta dumped_shaders] [pasta shaders_spv]
+// uso: shader_compiler_tool [pasta dumped_shaders] [pasta shaders_spv] [--pairs-only ARQUIVO | --serve]
 #include <array>
 #include <cstdio>
 #include <cstdlib>
@@ -659,6 +659,249 @@ std::string FirstLogLine(const std::string& log) {
     return best.substr(0, 220);
 }
 
+// Pares (VS, PS) dos retratos de snapshots_file (gravados pelo jogo). live: so os que ainda nao existem em pairs/.
+void TranslatePairs(const fs::path& snapshots_file, bool live, bool quiet, const std::vector<ShaderEntry>& entries,
+                    const fs::path& shader_dir, const fs::path& out_dir, u32* done, u32* total) {
+    std::error_code ec;
+    std::map<std::string, const ShaderEntry*> by_name;
+    for (const ShaderEntry& entry : entries) {
+        by_name[entry.stage + entry.hash] = &entry;
+    }
+    // retratos do user data real de cada variante de par: "pair <vs> <ps> <variante>"
+    struct PairSnapshot {
+        std::array<StageSnapshot, 2> stages;
+        std::vector<u32> fetch_code;
+        int fetch_sgpr = -1;
+    };
+    std::map<std::string, PairSnapshot> snapshots;
+    {
+        std::ifstream snap(snapshots_file);
+        std::string text, key;
+        while (std::getline(snap, text)) {
+            std::istringstream fields(text);
+            std::string a, b, c, d;
+            fields >> a >> b >> c;
+            if (a == "pair") {
+                fields >> d;
+                key = d.empty() ? std::string() : b + "_" + c + "_" + d;
+                if (!key.empty()) {
+                    snapshots[key] = {}; // o mesmo par pode aparecer duas vezes no arquivo: vale o ultimo
+                }
+                continue;
+            }
+            if (key.empty()) {
+                continue;
+            }
+            if (a == "fetch") {
+                PairSnapshot& pair = snapshots[key];
+                pair.fetch_sgpr = std::stoi(b);
+                pair.fetch_code.push_back(static_cast<u32>(std::stoul(c, nullptr, 16)));
+                u32 word = 0;
+                while (fields >> std::hex >> word) {
+                    pair.fetch_code.push_back(word);
+                }
+                continue;
+            }
+            StageSnapshot& stage = snapshots[key].stages[a == "ps"];
+            if (b == "ud") {
+                stage.ud[0] = static_cast<u32>(std::stoul(c, nullptr, 16));
+                for (u32 i = 1; i < 16; ++i) {
+                    fields >> std::hex >> stage.ud[i];
+                }
+            } else if (b == "tab") {
+                auto& table = stage.tables[static_cast<u32>(std::stoul(c))];
+                for (u32& word : table) {
+                    fields >> std::hex >> word;
+                }
+            }
+        }
+    }
+    u32 pairs = 0, pairs_ok = 0, pairs_real = 0;
+    fs::create_directories(out_dir / "pairs", ec);
+    for (const auto& [snapshot_key, pair_snapshot] : snapshots) {
+        const auto cols = Split(snapshot_key, '_');
+        if (cols.size() != 3) {
+            continue;
+        }
+        const auto vs = by_name.find("vs" + cols[0]);
+        const auto ps = by_name.find("ps" + cols[1]);
+        if (vs == by_name.end() || ps == by_name.end()) {
+            continue;
+        }
+        if (live) { // ja existe (ou foi desativado a mao: .txt.invalido)
+            bool present = false;
+            for (const char* suffix : {".txt", ".txt.invalido", ".txt.invalido2"}) {
+                present |= fs::exists(out_dir / "pairs" / ("pair_" + snapshot_key + suffix), ec);
+            }
+            if (present) {
+                continue;
+            }
+        }
+        ++pairs;
+        const FetchPair* fetch = nullptr;
+        const std::vector<u32>* fetch_code = pair_snapshot.fetch_code.empty() ? nullptr : &pair_snapshot.fetch_code;
+        Shader::Backend::Bindings shared{};
+        std::string vs_layout, ps_layout;
+        Result vs_result, ps_result;
+        Job vs_job{vs->second, fetch, shader_dir, &vs_result, &shared, &vs_layout, nullptr, fetch_code, pair_snapshot.fetch_sgpr};
+        Job ps_job{ps->second, nullptr, shader_dir, &ps_result, &shared, &ps_layout};
+        u32 seh = 0;
+        tool::TakeLog();
+        const bool vs_ok = Guarded(RecompileThunk, &vs_job, &seh) && vs_result.ok;
+        const bool ps_ok = vs_ok && Guarded(RecompileThunk, &ps_job, &seh) && ps_result.ok;
+        const std::string name = "pair_" + snapshot_key;
+        // Segunda traducao, agora com os descritores reais: e este o SPIR-V que vai para o
+        // pipeline. A primeira (memoria de sondagem) so serve para saber as origens.
+        // Imagens cujo T# veio zerado no retrato (retratos antigos so tinham 64 dwords por
+        // tabela, ou o slot estava vazio no primeiro draw): o recompilador leria tipo 0 e
+        // declararia textura 1D. Entram como 2D RGBA8, que e o caso de longe mais comum; o jogo
+        // confere o tipo real do T# em cada draw.
+        std::array<StageSnapshot, 2> patched = pair_snapshot.stages;
+        for (u32 stage = 0; stage < 2; ++stage) {
+            std::istringstream image_lines(stage == 0 ? vs_layout : ps_layout);
+            std::string text, word, source;
+            while (std::getline(image_lines, text)) {
+                std::istringstream fields(text);
+                u32 binding = 0, reg = 0, dword = 0;
+                fields >> word;
+                if (word != "image") {
+                    continue;
+                }
+                fields >> word >> binding >> word >> source;
+                u32* t = nullptr;
+                if (std::sscanf(source.c_str(), "ud:%u", &reg) == 1 && reg + 8 <= 16) {
+                    t = &patched[stage].ud[reg];
+                } else if (std::sscanf(source.c_str(), "tab:%u:%u", &reg, &dword) == 2 && dword + 8 <= 192) {
+                    const auto table = patched[stage].tables.find(reg);
+                    if (table != patched[stage].tables.end()) {
+                        t = &table->second[dword];
+                    }
+                }
+                if (t && (t[3] >> 28) == 0) {
+                    t[1] = 0x0Au << 20;  // RGBA8 unorm
+                    t[3] = 0x90000FACu;  // 2D, swizzle RGBA
+                }
+            }
+        }
+        const std::array<StageSnapshot, 2>* snapshot = &patched;
+        std::string specialized = shader_metadata::DescriptorFlag(false);
+        if (vs_ok && ps_ok) {
+            Shader::Backend::Bindings real{};
+            Result vs_real, ps_real;
+            Job vs_real_job{vs->second, fetch, shader_dir, &vs_real, &real, nullptr, &(*snapshot)[0], fetch_code, pair_snapshot.fetch_sgpr};
+            Job ps_real_job{ps->second, nullptr, shader_dir, &ps_real, &real, nullptr, &(*snapshot)[1]};
+            const bool real_ok = Guarded(RecompileThunk, &vs_real_job, &seh) && vs_real.ok &&
+                                 Guarded(RecompileThunk, &ps_real_job, &seh) && ps_real.ok;
+            if (real_ok && real == shared) {
+                vs_result.spv = vs_real.spv;
+                ps_result.spv = ps_real.spv;
+                specialized = shader_metadata::DescriptorFlag(true);
+                ++pairs_real;
+                // Formato (dst_sel + tipo numerico + formato de dados do V#) com que cada
+                // atributo foi especializado: o jogo so usa o par se o draw tiver o mesmo.
+                std::istringstream lines(vs_layout);
+                std::string text, word;
+                std::ostringstream formats;
+                while (std::getline(lines, text)) {
+                    std::istringstream fields(text);
+                    u32 location = 0, sgpr = 0, dword = 0;
+                    fields >> word;
+                    if (word != "attribute") {
+                        continue;
+                    }
+                    fields >> word >> location >> word >> sgpr >> word >> dword;
+                    const auto table = (*snapshot)[0].tables.find(sgpr);
+                    if (table != (*snapshot)[0].tables.end() && dword + 3 < 192) {
+                        formats << "  vformat location " << location << " format " << (table->second[dword + 3] & 0x7FFFF) << "\n";
+                    }
+                }
+                // Tipo do T# (2D, cubo, array, 3D) com que cada imagem foi especializada: o
+                // descritor que o jogo vincular tem de ter o mesmo tipo de view.
+                for (u32 stage = 0; stage < 2; ++stage) {
+                    std::istringstream image_lines(stage == 0 ? vs_layout : ps_layout);
+                    const StageSnapshot& snap = (*snapshot)[stage];
+                    while (std::getline(image_lines, text)) {
+                        std::istringstream fields(text);
+                        u32 binding = 0;
+                        std::string source;
+                        fields >> word;
+                        if (word != "image") {
+                            continue;
+                        }
+                        fields >> word >> binding >> word >> source;
+                        u32 reg = 0, dword = 0, type = 0;
+                        if (std::sscanf(source.c_str(), "ud:%u", &reg) == 1 && reg + 3 < 16) {
+                            type = snap.ud[reg + 3] >> 28;
+                        } else if (std::sscanf(source.c_str(), "tab:%u:%u", &reg, &dword) == 2) {
+                            const auto table = snap.tables.find(reg);
+                            if (table != snap.tables.end() && dword + 3 < 192) {
+                                type = table->second[dword + 3] >> 28;
+                            }
+                        }
+                        formats << "  itype binding " << binding << " type " << type << "\n";
+                    }
+                }
+                ps_layout += formats.str();
+            } else {
+                std::printf("  pair %s: translation with actual descriptors failed (%s)\n", name.c_str(),
+                            !real_ok ? (vs_real.ok ? ps_real.reason : vs_real.reason).c_str() : "bindings differ from probe");
+            }
+        }
+        if (vs_ok && ps_ok) {
+            ++pairs_ok;
+            std::ofstream(out_dir / "pairs" / (name + ".vs.spv"), std::ios::binary)
+                .write(reinterpret_cast<const char*>(vs_result.spv.data()), vs_result.spv.size() * 4);
+            std::ofstream(out_dir / "pairs" / (name + ".ps.spv"), std::ios::binary)
+                .write(reinterpret_cast<const char*>(ps_result.spv.data()), ps_result.spv.size() * 4);
+            std::ofstream(out_dir / "pairs" / (name + ".txt"))
+                << "pair vs " << cols[0] << " ps " << cols[1] << " variante " << cols[2] << " fetch_sgpr " << pair_snapshot.fetch_sgpr
+                << " real " << specialized << "\n"
+                << vs_layout << ps_layout;
+        } else {
+            std::printf("  pair %s: failed in %s (%s)\n", name.c_str(), vs_ok ? "PS" : "VS", (vs_ok ? ps_result.reason : vs_result.reason).c_str());
+        }
+    }
+    if (!quiet) {
+        std::printf("UI PAIRS: %u of %u compiled with contiguous bindings, %u with actual descriptors -> %s\n", pairs_ok,
+                    pairs, pairs_real, (out_dir / "pairs").string().c_str());
+    }
+    *done = pairs_ok;
+    *total = pairs;
+}
+
+// index.tsv a partir de *offset (so linhas inteiras): o jogo acrescenta shaders novos enquanto roda.
+bool LoadEntries(const fs::path& shader_dir, std::vector<ShaderEntry>* entries, std::set<std::string>* seen,
+                 std::streamoff* offset) {
+    std::ifstream in(shader_dir / "index.tsv", std::ios::binary);
+    if (!in) {
+        return false;
+    }
+    in.seekg(*offset);
+    std::string line;
+    while (std::getline(in, line)) {
+        if (in.eof()) {
+            break; // linha sem \n: o jogo ainda esta escrevendo, fica para a proxima
+        }
+        *offset = in.tellg();
+        if (!line.empty() && line.back() == '\r') {
+            line.pop_back();
+        }
+        const auto cols = Split(line, '\t');
+        if (cols.size() < 8 || !seen->insert(cols[0] + cols[1]).second) {
+            continue;
+        }
+        ShaderEntry e;
+        e.stage = cols[0];
+        e.hash = cols[1];
+        e.code_bytes = std::strtoul(cols[3].c_str(), nullptr, 10);
+        for (const auto& reg : Split(cols[7], ' ')) {
+            e.regs.push_back(std::strtoul(reg.c_str(), nullptr, 16));
+        }
+        entries->push_back(std::move(e));
+    }
+    return true;
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
@@ -667,12 +910,15 @@ int main(int argc, char** argv) {
     // --pairs-only ARQUIVO (usado pelo jogo, ao vivo): so os pares dos retratos de ARQUIVO que ainda
     // nao existem em pairs/; nao refaz os shaders avulsos nem o relatorio.
     fs::path pairs_only;
-    for (int i = 3; i + 1 < argc; ++i) {
-        if (!std::strcmp(argv[i], "--pairs-only")) {
+    bool serve = false;
+    for (int i = 3; i < argc; ++i) {
+        if (!std::strcmp(argv[i], "--pairs-only") && i + 1 < argc) {
             pairs_only = argv[i + 1];
+        } else if (!std::strcmp(argv[i], "--serve")) {
+            serve = true;
         }
     }
-    const bool live = !pairs_only.empty();
+    const bool live = !pairs_only.empty() || serve;
     std::error_code ec;
     fs::create_directories(out_dir, ec);
     tool::InitLogCapture();
@@ -686,28 +932,32 @@ int main(int argc, char** argv) {
     }
 
     std::vector<ShaderEntry> entries;
-    {
-        std::ifstream in(shader_dir / "index.tsv");
-        if (!in) {
-            std::printf("ERROR: could not open %s\n", (shader_dir / "index.tsv").string().c_str());
-            return 1;
-        }
-        std::set<std::string> seen;
-        std::string line;
-        while (std::getline(in, line)) {
-            const auto cols = Split(line, '\t');
-            if (cols.size() < 8 || !seen.insert(cols[0] + cols[1]).second) {
+    std::set<std::string> seen_entries;
+    std::streamoff index_offset = 0;
+    if (!LoadEntries(shader_dir, &entries, &seen_entries, &index_offset)) {
+        std::printf("ERROR: could not open %s\n", (shader_dir / "index.tsv").string().c_str());
+        return 1;
+    }
+    // --serve (usado pelo jogo): fica aberto e traduz, a cada linha do stdin, os pares novos do arquivo de retratos
+    // daquela linha; responde "DONE <traduzidos> <pedidos>". Abrir a ferramenta custa ~250 ms (memoria de sondagem,
+    // indices); aberta, um par novo custa ~30 ms.
+    if (serve) {
+        char request[4096];
+        while (std::fgets(request, sizeof(request), stdin)) {
+            std::string path = request;
+            while (!path.empty() && (path.back() == '\n' || path.back() == '\r')) {
+                path.pop_back();
+            }
+            if (path.empty()) {
                 continue;
             }
-            ShaderEntry e;
-            e.stage = cols[0];
-            e.hash = cols[1];
-            e.code_bytes = std::strtoul(cols[3].c_str(), nullptr, 10);
-            for (const auto& reg : Split(cols[7], ' ')) {
-                e.regs.push_back(std::strtoul(reg.c_str(), nullptr, 16));
-            }
-            entries.push_back(std::move(e));
+            LoadEntries(shader_dir, &entries, &seen_entries, &index_offset);
+            u32 done = 0, total = 0;
+            TranslatePairs(fs::u8path(path), true, true, entries, shader_dir, out_dir, &done, &total);
+            std::printf("DONE %u %u\n", done, total);
+            std::fflush(stdout);
         }
+        return 0;
     }
     // pares VS <-> fetch shader (o arquivo da execucao mais recente e o da anterior)
     std::map<std::string, std::vector<FetchPair>> fetch_of;
@@ -810,208 +1060,9 @@ int main(int argc, char** argv) {
         }
     }
 
-    // ---- pares (VS, PS) usados pela interface: ui_shader_pairs.tsv, gravado pelo jogo ----
     {
-        std::map<std::string, const ShaderEntry*> by_name;
-        for (const ShaderEntry& entry : entries) {
-            by_name[entry.stage + entry.hash] = &entry;
-        }
-        // retratos do user data real de cada variante de par: "pair <vs> <ps> <variante>"
-        struct PairSnapshot {
-            std::array<StageSnapshot, 2> stages;
-            std::vector<u32> fetch_code;
-            int fetch_sgpr = -1;
-        };
-        std::map<std::string, PairSnapshot> snapshots;
-        {
-            std::ifstream snap(live ? pairs_only : out_dir / "pair_snapshots.txt");
-            std::string text, key;
-            while (std::getline(snap, text)) {
-                std::istringstream fields(text);
-                std::string a, b, c, d;
-                fields >> a >> b >> c;
-                if (a == "pair") {
-                    fields >> d;
-                    key = d.empty() ? std::string() : b + "_" + c + "_" + d;
-                    if (!key.empty()) {
-                        snapshots[key] = {}; // o mesmo par pode aparecer duas vezes no arquivo: vale o ultimo
-                    }
-                    continue;
-                }
-                if (key.empty()) {
-                    continue;
-                }
-                if (a == "fetch") {
-                    PairSnapshot& pair = snapshots[key];
-                    pair.fetch_sgpr = std::stoi(b);
-                    pair.fetch_code.push_back(static_cast<u32>(std::stoul(c, nullptr, 16)));
-                    u32 word = 0;
-                    while (fields >> std::hex >> word) {
-                        pair.fetch_code.push_back(word);
-                    }
-                    continue;
-                }
-                StageSnapshot& stage = snapshots[key].stages[a == "ps"];
-                if (b == "ud") {
-                    stage.ud[0] = static_cast<u32>(std::stoul(c, nullptr, 16));
-                    for (u32 i = 1; i < 16; ++i) {
-                        fields >> std::hex >> stage.ud[i];
-                    }
-                } else if (b == "tab") {
-                    auto& table = stage.tables[static_cast<u32>(std::stoul(c))];
-                    for (u32& word : table) {
-                        fields >> std::hex >> word;
-                    }
-                }
-            }
-        }
-        u32 pairs = 0, pairs_ok = 0, pairs_real = 0;
-        fs::create_directories(out_dir / "pairs", ec);
-        for (const auto& [snapshot_key, pair_snapshot] : snapshots) {
-            const auto cols = Split(snapshot_key, '_');
-            if (cols.size() != 3) {
-                continue;
-            }
-            const auto vs = by_name.find("vs" + cols[0]);
-            const auto ps = by_name.find("ps" + cols[1]);
-            if (vs == by_name.end() || ps == by_name.end()) {
-                continue;
-            }
-            if (live) { // ja existe (ou foi desativado a mao: .txt.invalido)
-                bool present = false;
-                for (const char* suffix : {".txt", ".txt.invalido", ".txt.invalido2"}) {
-                    present |= fs::exists(out_dir / "pairs" / ("pair_" + snapshot_key + suffix), ec);
-                }
-                if (present) {
-                    continue;
-                }
-            }
-            ++pairs;
-            const FetchPair* fetch = nullptr;
-            const std::vector<u32>* fetch_code = pair_snapshot.fetch_code.empty() ? nullptr : &pair_snapshot.fetch_code;
-            Shader::Backend::Bindings shared{};
-            std::string vs_layout, ps_layout;
-            Result vs_result, ps_result;
-            Job vs_job{vs->second, fetch, shader_dir, &vs_result, &shared, &vs_layout, nullptr, fetch_code, pair_snapshot.fetch_sgpr};
-            Job ps_job{ps->second, nullptr, shader_dir, &ps_result, &shared, &ps_layout};
-            u32 seh = 0;
-            tool::TakeLog();
-            const bool vs_ok = Guarded(RecompileThunk, &vs_job, &seh) && vs_result.ok;
-            const bool ps_ok = vs_ok && Guarded(RecompileThunk, &ps_job, &seh) && ps_result.ok;
-            const std::string name = "pair_" + snapshot_key;
-            // Segunda traducao, agora com os descritores reais: e este o SPIR-V que vai para o
-            // pipeline. A primeira (memoria de sondagem) so serve para saber as origens.
-            // Imagens cujo T# veio zerado no retrato (retratos antigos so tinham 64 dwords por
-            // tabela, ou o slot estava vazio no primeiro draw): o recompilador leria tipo 0 e
-            // declararia textura 1D. Entram como 2D RGBA8, que e o caso de longe mais comum; o jogo
-            // confere o tipo real do T# em cada draw.
-            std::array<StageSnapshot, 2> patched = pair_snapshot.stages;
-            for (u32 stage = 0; stage < 2; ++stage) {
-                std::istringstream image_lines(stage == 0 ? vs_layout : ps_layout);
-                std::string text, word, source;
-                while (std::getline(image_lines, text)) {
-                    std::istringstream fields(text);
-                    u32 binding = 0, reg = 0, dword = 0;
-                    fields >> word;
-                    if (word != "image") {
-                        continue;
-                    }
-                    fields >> word >> binding >> word >> source;
-                    u32* t = nullptr;
-                    if (std::sscanf(source.c_str(), "ud:%u", &reg) == 1 && reg + 8 <= 16) {
-                        t = &patched[stage].ud[reg];
-                    } else if (std::sscanf(source.c_str(), "tab:%u:%u", &reg, &dword) == 2 && dword + 8 <= 192) {
-                        const auto table = patched[stage].tables.find(reg);
-                        if (table != patched[stage].tables.end()) {
-                            t = &table->second[dword];
-                        }
-                    }
-                    if (t && (t[3] >> 28) == 0) {
-                        t[1] = 0x0Au << 20;  // RGBA8 unorm
-                        t[3] = 0x90000FACu;  // 2D, swizzle RGBA
-                    }
-                }
-            }
-            const std::array<StageSnapshot, 2>* snapshot = &patched;
-            std::string specialized = shader_metadata::DescriptorFlag(false);
-            if (vs_ok && ps_ok) {
-                Shader::Backend::Bindings real{};
-                Result vs_real, ps_real;
-                Job vs_real_job{vs->second, fetch, shader_dir, &vs_real, &real, nullptr, &(*snapshot)[0], fetch_code, pair_snapshot.fetch_sgpr};
-                Job ps_real_job{ps->second, nullptr, shader_dir, &ps_real, &real, nullptr, &(*snapshot)[1]};
-                const bool real_ok = Guarded(RecompileThunk, &vs_real_job, &seh) && vs_real.ok &&
-                                     Guarded(RecompileThunk, &ps_real_job, &seh) && ps_real.ok;
-                if (real_ok && real == shared) {
-                    vs_result.spv = vs_real.spv;
-                    ps_result.spv = ps_real.spv;
-                    specialized = shader_metadata::DescriptorFlag(true);
-                    ++pairs_real;
-                    // Formato (dst_sel + tipo numerico + formato de dados do V#) com que cada
-                    // atributo foi especializado: o jogo so usa o par se o draw tiver o mesmo.
-                    std::istringstream lines(vs_layout);
-                    std::string text, word;
-                    std::ostringstream formats;
-                    while (std::getline(lines, text)) {
-                        std::istringstream fields(text);
-                        u32 location = 0, sgpr = 0, dword = 0;
-                        fields >> word;
-                        if (word != "attribute") {
-                            continue;
-                        }
-                        fields >> word >> location >> word >> sgpr >> word >> dword;
-                        const auto table = (*snapshot)[0].tables.find(sgpr);
-                        if (table != (*snapshot)[0].tables.end() && dword + 3 < 192) {
-                            formats << "  vformat location " << location << " format " << (table->second[dword + 3] & 0x7FFFF) << "\n";
-                        }
-                    }
-                    // Tipo do T# (2D, cubo, array, 3D) com que cada imagem foi especializada: o
-                    // descritor que o jogo vincular tem de ter o mesmo tipo de view.
-                    for (u32 stage = 0; stage < 2; ++stage) {
-                        std::istringstream image_lines(stage == 0 ? vs_layout : ps_layout);
-                        const StageSnapshot& snap = (*snapshot)[stage];
-                        while (std::getline(image_lines, text)) {
-                            std::istringstream fields(text);
-                            u32 binding = 0;
-                            std::string source;
-                            fields >> word;
-                            if (word != "image") {
-                                continue;
-                            }
-                            fields >> word >> binding >> word >> source;
-                            u32 reg = 0, dword = 0, type = 0;
-                            if (std::sscanf(source.c_str(), "ud:%u", &reg) == 1 && reg + 3 < 16) {
-                                type = snap.ud[reg + 3] >> 28;
-                            } else if (std::sscanf(source.c_str(), "tab:%u:%u", &reg, &dword) == 2) {
-                                const auto table = snap.tables.find(reg);
-                                if (table != snap.tables.end() && dword + 3 < 192) {
-                                    type = table->second[dword + 3] >> 28;
-                                }
-                            }
-                            formats << "  itype binding " << binding << " type " << type << "\n";
-                        }
-                    }
-                    ps_layout += formats.str();
-                } else {
-                    std::printf("  pair %s: translation with actual descriptors failed (%s)\n", name.c_str(),
-                                !real_ok ? (vs_real.ok ? ps_real.reason : vs_real.reason).c_str() : "bindings differ from probe");
-                }
-            }
-            if (vs_ok && ps_ok) {
-                ++pairs_ok;
-                std::ofstream(out_dir / "pairs" / (name + ".vs.spv"), std::ios::binary)
-                    .write(reinterpret_cast<const char*>(vs_result.spv.data()), vs_result.spv.size() * 4);
-                std::ofstream(out_dir / "pairs" / (name + ".ps.spv"), std::ios::binary)
-                    .write(reinterpret_cast<const char*>(ps_result.spv.data()), ps_result.spv.size() * 4);
-                std::ofstream(out_dir / "pairs" / (name + ".txt"))
-                    << "pair vs " << cols[0] << " ps " << cols[1] << " variante " << cols[2] << " fetch_sgpr " << pair_snapshot.fetch_sgpr
-                    << " real " << specialized << "\n"
-                    << vs_layout << ps_layout;
-            } else {
-                std::printf("  pair %s: failed in %s (%s)\n", name.c_str(), vs_ok ? "PS" : "VS", (vs_ok ? ps_result.reason : vs_result.reason).c_str());
-            }
-        }
-        std::printf("UI PAIRS: %u of %u compiled with contiguous bindings, %u with actual descriptors -> %s\n", pairs_ok,
-                    pairs, pairs_real, (out_dir / "pairs").string().c_str());
+        u32 done = 0, total = 0;
+        TranslatePairs(live ? pairs_only : out_dir / "pair_snapshots.txt", live, false, entries, shader_dir, out_dir, &done, &total);
     }
 
     u32 shaders = 0, ok = 0, failed = 0, skipped = 0;

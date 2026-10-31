@@ -3245,6 +3245,123 @@ void SaveWarmPair(const GamePairInfo& info) {
 
 std::mutex g_live_tool_mutex; // Fase 56: thread de pares e thread de render usam o mesmo arquivo de lote
 
+// Fase 77: a ferramenta fica aberta (--serve) e recebe um arquivo de retratos por linha no stdin. Abrir a
+// ferramenta custava ~250 ms por traducao na hora (memoria de sondagem, indices de shaders): era o engasgo de
+// 200 a 400 ms de cada par novo. Aberta, um par custa ~10 ms. Ferramenta antiga (sem --serve): ela trata o
+// arquivo vazio de --pairs-only e sai sem "DONE", e o jogo volta a abrir uma por lote. Com g_live_tool_mutex.
+struct LiveServer {
+    HANDLE process = nullptr;
+    HANDLE input = nullptr;  // stdin dela
+    HANDLE output = nullptr; // stdout dela
+    std::string pending;
+    bool unsupported = false;
+};
+LiveServer g_live_server;
+
+void StopLiveServer() {
+    auto& s = g_live_server;
+    if (s.input) {
+        CloseHandle(s.input);
+    }
+    if (s.output) {
+        CloseHandle(s.output);
+    }
+    if (s.process) {
+        if (WaitForSingleObject(s.process, 0) == WAIT_TIMEOUT) {
+            TerminateProcess(s.process, 1);
+        }
+        CloseHandle(s.process);
+    }
+    s.process = s.input = s.output = nullptr;
+    s.pending.clear();
+}
+
+bool StartLiveServer(const std::filesystem::path& shader_dir, const std::filesystem::path& spv_dir,
+                     const std::filesystem::path& empty_list) {
+    auto& s = g_live_server;
+    if (s.process) {
+        if (WaitForSingleObject(s.process, 0) == WAIT_TIMEOUT) {
+            return true;
+        }
+        StopLiveServer(); // caiu: abre outra
+    }
+    if (s.unsupported) {
+        return false;
+    }
+    SECURITY_ATTRIBUTES inherit{sizeof(inherit), nullptr, TRUE};
+    HANDLE child_in = nullptr, child_out = nullptr;
+    if (!CreatePipe(&child_in, &s.input, &inherit, 0)) {
+        return false;
+    }
+    if (!CreatePipe(&s.output, &child_out, &inherit, 0)) {
+        CloseHandle(child_in);
+        CloseHandle(s.input);
+        s.input = nullptr;
+        return false;
+    }
+    SetHandleInformation(s.input, HANDLE_FLAG_INHERIT, 0);
+    SetHandleInformation(s.output, HANDLE_FLAG_INHERIT, 0);
+    std::wstring command = L"\"" + g_live_tool.wstring() + L"\" \"" + shader_dir.wstring() + L"\" \"" + spv_dir.wstring() +
+                           L"\" --pairs-only \"" + empty_list.wstring() + L"\" --serve";
+    STARTUPINFOW startup{};
+    startup.cb = sizeof(startup);
+    startup.dwFlags = STARTF_USESTDHANDLES;
+    startup.hStdInput = child_in;
+    startup.hStdOutput = child_out;
+    startup.hStdError = child_out;
+    PROCESS_INFORMATION process{};
+    const bool ok = CreateProcessW(nullptr, command.data(), nullptr, nullptr, TRUE, CREATE_NO_WINDOW, nullptr,
+                                   g_live_root.c_str(), &startup, &process);
+    CloseHandle(child_in);
+    CloseHandle(child_out);
+    if (!ok) {
+        StopLiveServer();
+        return false;
+    }
+    CloseHandle(process.hThread);
+    s.process = process.hProcess;
+    return true;
+}
+
+// Manda um arquivo de retratos e espera o "DONE" (leitura bloqueante: volta assim que ela responde; se ela sair,
+// o pipe quebra e a leitura falha). false = sem servidor.
+bool ServeLiveRequest(const std::filesystem::path& list) {
+    auto& s = g_live_server;
+    const std::u8string path = list.u8string();
+    const std::string line = std::string(path.begin(), path.end()) + "\n";
+    DWORD written = 0;
+    if (!WriteFile(s.input, line.data(), static_cast<DWORD>(line.size()), &written, nullptr) || written != line.size()) {
+        StopLiveServer();
+        return false;
+    }
+    for (;;) {
+        const size_t done = s.pending.find("DONE");
+        if (done != std::string::npos) {
+            const size_t end = s.pending.find('\n', done);
+            if (end != std::string::npos) {
+                s.pending.erase(0, end + 1);
+                return true;
+            }
+        }
+        char chunk[4096];
+        DWORD got = 0;
+        if (!ReadFile(s.output, chunk, sizeof(chunk), &got, nullptr) || !got) {
+            // saiu sem responder: ferramenta sem --serve (ou caiu)
+            const bool old_tool = s.pending.find("TOTAL") != std::string::npos;
+            StopLiveServer();
+            if (old_tool) {
+                s.unsupported = true;
+                log::Tagged("SHADER-LIVE", "recompiler without --serve: one run per batch");
+            }
+            return false;
+        }
+        s.pending.append(chunk, got);
+        if (s.pending.size() > (1u << 20)) {
+            s.pending.erase(0, s.pending.size() - 4096); // avisos de pares com falha: so interessa o fim
+        }
+    }
+}
+
 void RunLiveCompiler(const std::vector<LiveSnapshot>& batch) {
     std::lock_guard tool_lock(g_live_tool_mutex);
     const std::filesystem::path shader_dir = g_live_shader_dir;
@@ -3265,6 +3382,20 @@ void RunLiveCompiler(const std::vector<LiveSnapshot>& batch) {
             std::fprintf(f, "pair %s\n%s", snapshot.name.c_str(), snapshot.text.c_str());
         }
         std::fclose(f);
+    }
+    {
+        const auto start = std::chrono::steady_clock::now();
+        const std::filesystem::path empty_list = spv_dir / "pair_snapshots_vazio.txt";
+        if (std::FILE* f = _wfopen(empty_list.c_str(), L"w")) {
+            std::fclose(f);
+        }
+        if (StartLiveServer(shader_dir, spv_dir, empty_list) && ServeLiveRequest(list)) {
+            const u64 ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start).count();
+            ++g_live_runs;
+            g_live_ms += ms;
+            log::Tagged("SHADER-LIVE", "%zu new pair(s) sent to recompiler (open): %llu ms", batch.size(), static_cast<unsigned long long>(ms));
+            return;
+        }
     }
     std::wstring command = L"\"" + g_live_tool.wstring() + L"\" \"" + shader_dir.wstring() + L"\" \"" + spv_dir.wstring() +
                            L"\" --pairs-only \"" + list.wstring() + L"\"";
