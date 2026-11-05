@@ -17,6 +17,7 @@ import re
 import struct
 import subprocess
 import sys
+import threading
 import time
 
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..'))
@@ -160,6 +161,66 @@ def run_step(args, label, start, end):
         fail(T('%s falhou (codigo %d)', '%s failed (code %d)') % (label, proc.returncode))
 
 
+def prewarm(args, start, end):
+    """Fase 77: o port cria todos os pipelines das receitas no cache do driver de video (o mesmo exe que o launcher abre:
+    o cache da AMD e por caminho do exe). Le "[PREWARM] progress aot A/B F pipelines P/Q": ate o pacote AOT terminar de
+    carregar, 40% da faixa; depois, os pipelines. Sem saida por 10 min = travado (fecha). Falha aqui nao impede jogar:
+    a tela de carregamento do jogo cria o que faltar."""
+    exe = os.path.join(ROOT, 'build', 'lego_dimensions.exe')
+    if not os.path.isfile(exe):
+        exe = os.path.join(ROOT, 'lego_dimensions.exe')
+    if not os.path.isfile(exe):
+        print(T('AVISO lego_dimensions.exe nao encontrado: pipelines ficam para a primeira abertura do jogo',
+                'WARNING lego_dimensions.exe not found: pipelines are left for the first game start'), flush=True)
+        return
+    label = T('criando os pipelines Vulkan no cache do driver', 'building the Vulkan pipelines into the driver cache')
+    progress(start, label)
+    cmd_extra = []
+    if args.prever:  # receitas previstas para os pares que ninguem jogou ainda (prever_pipelines.py, segundos)
+        guess = subprocess.run([sys.executable, '-u', os.path.join(ROOT, 'tools', 'setup', 'prever_pipelines.py'), '--root', ROOT], cwd=ROOT,
+                               capture_output=True, text=True, encoding='utf-8', errors='replace')
+        for line in (guess.stdout + guess.stderr).strip().splitlines()[-3:]:
+            print(line, flush=True)
+        cmd_extra = ['--prewarm-predicted']
+    cmd = [exe, '--prewarm-only', '--app0', args.app0] + cmd_extra
+    if args.addcont and os.path.isdir(args.addcont):
+        cmd += ['--addcont', args.addcont]
+    if args.patch:
+        cmd += ['--patch', args.patch]
+    proc = subprocess.Popen(cmd, cwd=ROOT, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, encoding='utf-8', errors='replace')
+    last = [time.time()]
+
+    def watchdog():
+        while proc.poll() is None:
+            if time.time() - last[0] > 600:
+                print(T('AVISO o pre-aquecimento parou de responder: fechado', 'WARNING the pre-warm stopped responding: closed'), flush=True)
+                proc.kill()
+                return
+            time.sleep(5)
+
+    threading.Thread(target=watchdog, daemon=True).start()
+    shown = -1
+    for line in proc.stdout:
+        last[0] = time.time()
+        line = line.rstrip()
+        m = re.match(r'\[PREWARM\] progress aot (\d+)/(\d+) (\d) pipelines (\d+)/(\d+)', line)
+        if not m:
+            if line.startswith('[PREWARM]') or line.startswith('[LOADING]') or 'ERRO' in line or 'ERROR' in line:
+                print(line, flush=True)
+            continue
+        aot_done, aot_total, aot_finished, done, total = (int(g) for g in m.groups())
+        frac = 0.4 * (aot_done / aot_total if aot_total else 0.0) if not aot_finished else 0.4 + 0.6 * (done / total if total else 1.0)
+        pct = start + int((end - start) * min(frac, 1.0))
+        text = '%s (%d/%d)' % (label, done, total) if aot_finished else label
+        if pct != shown or aot_finished:
+            shown = pct
+            progress(pct, text)
+    code = proc.wait()
+    if code != 0:
+        print(T('AVISO pre-aquecimento terminou com codigo %d: o que faltar e criado na primeira abertura do jogo',
+                'WARNING pre-warm ended with code %d: what is missing is built on the first game start') % code, flush=True)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--app0', required=True)
@@ -168,6 +229,10 @@ def main():
     ap.add_argument('--jobs', type=int, default=max(1, (os.cpu_count() or 4) - 2))
     ap.add_argument('--sem-aot', action='store_true', help='eboot only (shaders deferred to live compiler)')
     ap.add_argument('--limite', type=int, default=0, help='only first N translation batches (test)')
+    ap.add_argument('--so-pipelines', action='store_true', help='only build the known pipelines into the GPU driver cache (Phase 77)')
+    ap.add_argument('--prever', action='store_true',
+                    help='also predicted pipelines for content nobody played (Phase 77; ~4 min more, but the AMD driver keeps '
+                         'its whole cache in RAM: about +1.8 GB in every game session)')
     args = ap.parse_args()
     t0 = time.time()
     progress(1, T('conferindo o jogo', 'checking the game'))
@@ -177,6 +242,10 @@ def main():
         args.patch = nu2dat.find_patch(args.app0)
     check_game(args.app0, args.patch)
     check_dlcs(args.addcont)
+    if args.so_pipelines:
+        prewarm(args, 1, 99)
+        progress(100, T('pronto em %.0f min', 'done in %.0f min') % ((time.time() - t0) / 60))
+        return
     progress(3, T('convertendo o eboot.bin', 'converting eboot.bin'))
     convert_eboot(args.app0, args.patch)
     progress(4, T('montando os icones dos botoes de cada controle', 'building the button icons for each controller'))  # Fase 62
@@ -196,16 +265,8 @@ def main():
         progress(15, T('planejando as variantes', 'planning the variants'))
         run_step(['plan'], T('planejando', 'planning'), 15, 17)
         progress(17, T('traduzindo os shaders para Vulkan (a etapa mais longa)', 'translating the shaders to Vulkan (the longest step)'))
-        run_step(['compile', '--jobs', str(args.jobs)] + (['--limit', str(args.limite)] if args.limite else []), T('traduzindo shaders', 'translating shaders'), 17, 95)
-        exe = os.path.join(ROOT, 'build', 'lego_dimensions.exe')
-        if not os.path.isfile(exe):
-            exe = os.path.join(ROOT, 'lego_dimensions.exe')
-        if os.path.isfile(exe):
-            progress(96, T('pre-aquecendo pipelines Vulkan em disco', 'pre-warming Vulkan pipelines to disk'))
-            try:
-                subprocess.run([exe, '--prewarm-only'], cwd=ROOT, timeout=120)
-            except Exception:
-                pass
+        run_step(['compile', '--jobs', str(args.jobs)] + (['--limit', str(args.limite)] if args.limite else []), T('traduzindo shaders', 'translating shaders'), 17, 85)
+        prewarm(args, 85, 99)
     with open(os.path.join(ROOT, 'assets', 'preparado.txt'), 'w', encoding='utf-8') as f:
         f.write('app0=%s\npatch=%s\naddcont=%s\naot=%s\n' % (args.app0, args.patch, args.addcont, 'nao' if args.sem_aot else 'sim'))
     progress(100, T('pronto em %.0f min', 'done in %.0f min') % ((time.time() - t0) / 60))

@@ -7363,6 +7363,12 @@ void SetSyncShaders(bool enabled, double pipeline_budget_ms) {
 }
 
 // Fase 42: progresso para a tela de carregamento (antes de o jogo comecar).
+std::atomic<bool> g_prewarm_all{false}; // Fase 77
+
+void SetPrewarmAll(bool all) {
+    g_prewarm_all = all;
+}
+
 void GetLoadingStatus(LoadingStatus* out) {
     out->pack_done = g_aot_prefetch_done.load();
     out->pack_total = g_aot_prefetch_total.load();
@@ -7382,7 +7388,7 @@ void GetLoadingStatus(LoadingStatus* out) {
         const char* env = std::getenv("LD_PREWARM_GATE");
         return !(env && !std::strcmp(env, "tudo"));
     }();
-    if (area_gate) {
+    if (area_gate && !g_prewarm_all.load()) { // Fase 77: Preparar / driver novo = todos
         u32 done = 0, total = 0;
         render::VulkanRenderer::Instance().PrewarmPriorityProgress(&done, &total);
         if (total) {

@@ -22,7 +22,10 @@
 #include <condition_variable>
 #include <cstdio>
 #include <cstring>
+#include <cstdlib>
 #include <deque>
+#include <filesystem>
+#include <string>
 #include <mutex>
 #include <thread>
 #include <vector>
@@ -1088,11 +1091,41 @@ bool OpenWindowEarly(u32 timeout_ms) {
     return renderer.Active();
 }
 
-void RunLoadingScreen(u32 max_seconds) {
+// Fase 77: marca do driver para o qual todos os pipelines conhecidos ja foram criados (cache do driver quente).
+std::filesystem::path DriverStampFile() {
+    const std::string& dir = render::GameSpirvDirectory();
+    return dir.empty() ? std::filesystem::path{} : std::filesystem::path(dir) / "pipelines_driver.txt";
+}
+
+bool RunLoadingScreen(u32 max_seconds, bool prewarm_only) {
     constexpr u32 kYellow = 0xFF00D5FF, kWhite = 0xFFFFFFFF, kGray = 0xFF808080, kDark = 0xFF303030, kGreen = 0xFF60D060;
     const auto start = std::chrono::steady_clock::now();
     std::vector<LoadingVertex> vertices;
     char line[160];
+    // Fase 77: driver novo (ou primeira vez desde o Preparar desta versao) = espera todos os pipelines, uma vez.
+    // LD_PREWARM_GATE=area desliga (volta ao comportamento da Fase 72 mesmo com o driver novo).
+    const std::string stamp = render::VulkanRenderer::Instance().DriverStamp();
+    const std::filesystem::path stamp_file = DriverStampFile();
+    bool all = prewarm_only;
+    if (!all && !stamp.empty() && !stamp_file.empty()) {
+        const char* gate = std::getenv("LD_PREWARM_GATE");
+        std::string saved;
+        if (std::FILE* f = _wfopen(stamp_file.c_str(), L"rb")) {
+            char buffer[2048];
+            saved.assign(buffer, std::fread(buffer, 1, sizeof(buffer), f));
+            std::fclose(f);
+        }
+        while (!saved.empty() && (saved.back() == '\n' || saved.back() == '\r')) {
+            saved.pop_back();
+        }
+        all = saved != stamp && !(gate && !std::strcmp(gate, "area"));
+        if (all) {
+            std::printf("[LOADING] GPU driver or exe path changed since all pipelines were last built (%s): building all of them once\n",
+                        saved.empty() ? "no record" : "record differs");
+        }
+    }
+    gnm::SetPrewarmAll(all);
+    double last_report = -1.0;
     for (;;) {
         gnm::LoadingStatus st;
         gnm::GetLoadingStatus(&st);
@@ -1109,7 +1142,10 @@ void RunLoadingScreen(u32 max_seconds) {
         vertices.clear();
         const std::string title = "LEGO DIMENSIONS";
         Text(vertices, title, 640.0f - TextWidth(title, 8.0f) / 2, 150.0f, 8.0f, kYellow);
-        const std::string subtitle = done ? lang::T("INICIANDO O JOGO", "STARTING THE GAME") : lang::T("PREPARANDO SHADERS E PIPELINES", "PREPARING SHADERS AND PIPELINES");
+        const std::string subtitle = done           ? (prewarm_only ? lang::T("PRONTO", "DONE") : lang::T("INICIANDO O JOGO", "STARTING THE GAME"))
+                                     : prewarm_only ? lang::T("PREPARAR: CRIANDO TODOS OS PIPELINES", "PREPARE: BUILDING ALL PIPELINES")
+                                     : all          ? lang::T("DRIVER DE VIDEO NOVO: CRIANDO TODOS OS PIPELINES", "NEW GPU DRIVER: BUILDING ALL PIPELINES")
+                                                    : lang::T("PREPARANDO SHADERS E PIPELINES", "PREPARING SHADERS AND PIPELINES");
         Text(vertices, subtitle, 640.0f - TextWidth(subtitle, 3.0f) / 2, 230.0f, 3.0f, kWhite);
         std::snprintf(line, sizeof(line), lang::T("PACOTE DE SHADERS AOT: %llu / %llu MB", "AOT SHADER PACK: %llu / %llu MB"), static_cast<unsigned long long>(st.pack_done >> 20),
                       static_cast<unsigned long long>(st.pack_total >> 20));
@@ -1129,11 +1165,24 @@ void RunLoadingScreen(u32 max_seconds) {
         const std::string hint = lang::T("TEXTURAS SAO LIDAS DA MEMORIA DO JOGO QUANDO APARECEM", "TEXTURES ARE READ FROM GAME MEMORY WHEN THEY APPEAR");
         Text(vertices, hint, 640.0f - TextWidth(hint, 2.0f) / 2, 600.0f, 2.0f, kGray);
         DrawLoading(vertices);
+        if (prewarm_only && (done || seconds - last_report >= 1.0)) { // Fase 77: progresso para o preparar.py
+            last_report = seconds;
+            std::printf("[PREWARM] progress aot %u/%u %d pipelines %u/%u\n", st.aot_done, st.aot_total, st.aot_finished ? 1 : 0,
+                        st.pipelines_done, st.pipelines_total);
+            std::fflush(stdout);
+        }
         if (done || seconds > max_seconds) {
-            std::printf("[LOADING] loading screen: %.1f s (pack %s, %u pairs, %u of %u pipelines, %u of %u pack shaders)%s\n", seconds,
-                        st.pack_finished ? "read" : "INCOMPLETO", st.pairs_done, st.pipelines_done, st.pipelines_total, st.aot_done, st.aot_total,
-                        done ? "" : " - time limit reached, starting game anyway");
-            return;
+            std::printf("[LOADING] loading screen: %.1f s (pack %s, %u pairs, %u of %u pipelines%s, %u of %u pack shaders)%s\n", seconds,
+                        st.pack_finished ? "read" : "INCOMPLETO", st.pairs_done, st.pipelines_done, st.pipelines_total, all ? ", all" : "",
+                        st.aot_done, st.aot_total, done ? "" : " - time limit reached, starting game anyway");
+            if (done && all && !stamp.empty() && !stamp_file.empty()) {
+                if (std::FILE* f = _wfopen(stamp_file.c_str(), L"wb")) { // so com tudo pronto: a proxima abertura volta a Fase 72
+                    std::fprintf(f, "%s\n", stamp.c_str());
+                    std::fclose(f);
+                }
+            }
+            gnm::SetPrewarmAll(false);
+            return done;
         }
         Sleep(33);
     }

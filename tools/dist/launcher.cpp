@@ -510,9 +510,12 @@ bool RunPython(const wchar_t* script, const std::wstring& args, Task task) {
     return RunCommand(command, task, L"ERROR: could not start Python.", L"ERROR: could not start Python.");
 }
 
-void RunPrepare() {
+void RunPrepare(bool pipelines_only) {
     SaveSettings();
     std::wstring args = L" --app0 " + Quote(g_game_dir);
+    if (pipelines_only) {
+        args += L" --so-pipelines"; // Fase 77
+    }
     const std::wstring dlc = g_dlc_dir;
     if (!dlc.empty()) {
         args += L" --addcont " + Quote(dlc);
@@ -521,7 +524,9 @@ void RunPrepare() {
         args += L" --patch " + Quote(patch); // Fase 58
     }
     if (RunPython(L"preparar.py", args, Task::kPrepare)) {
-        g_step = ui::T(L"Preparando... (a tradu\u00e7\u00e3o dos shaders leva de 20 a 60 minutos, s\u00f3 na primeira vez)", L"Preparing... (translating the shaders takes 20 to 60 minutes, first time only)");
+        g_step = pipelines_only ? ui::T(L"Criando os pipelines no cache do driver de v\u00eddeo...", L"Building the pipelines into the GPU driver cache...")
+                                : ui::T(L"Preparando... (a tradu\u00e7\u00e3o dos shaders leva de 20 a 60 minutos, s\u00f3 na primeira vez)",
+                                        L"Preparing... (translating the shaders takes 20 to 60 minutes, first time only)");
         UpdateStatus();
     }
 }
@@ -1739,7 +1744,8 @@ std::vector<Row> Rows() {
                     ui::T(L"Sem bordas. F11 alterna dentro do jogo.", L"Borderless. F11 switches in game."), OnOff(g_opt_fullscreen), toggle(g_opt_fullscreen)});
     rows.push_back({kTabDisplay, RowKind::kChoice, L"60 FPS", ui::T(L"Desligado: os 30 FPS do PS4.", L"Off: the PS4's 30 FPS."), OnOff(g_opt_fps), toggle(g_opt_fps)});
     rows.push_back({kTabDisplay, RowKind::kChoice, ui::T(L"Bibliotecas de pipeline (GPL)", L"Pipeline libraries (GPL)"),
-                    ui::T(L"Automático: ligado na NVIDIA / Intel, desligado na AMD.", L"Automatic: on for NVIDIA / Intel, off for AMD."),
+                    ui::T(L"Automático: ligado na NVIDIA / Intel, desligado na AMD (pode deixar a tela preta).",
+                          L"Automatic: on for NVIDIA / Intel, off for AMD (may give a black screen)."),
                     ui::T(CurrentGpl().pt, CurrentGpl().en), [](int step) {
                         g_gpl_value = Step(kGplChoices, g_gpl_value, step, [](const IconChoice& c) { return std::wstring(c.code); });
                         SaveSettings();
@@ -2105,12 +2111,13 @@ POINT BelowSpot(int id) {
     return at;
 }
 
-enum ToolId { kToolToypad = 1, kToolShortcut, kToolPrepare, kToolPkg, kToolTransfer, kToolUpdate };
+enum ToolId { kToolToypad = 1, kToolShortcut, kToolPrepare, kToolPipelines, kToolPkg, kToolTransfer, kToolUpdate };
 void ModsMenu(POINT at);
 void ExtractPkgs();
 void OpenTransfer();
 void CheckUpdate();
-void RunPrepare();
+void RunPrepare(bool pipelines_only = false);
+bool GameRunning();
 void RunGame();
 void CreateDesktopShortcut();
 void LaunchLegoToypad(bool notify_if_running);
@@ -2122,16 +2129,35 @@ void AskPrepare() {
     }
 }
 
+// Fase 77: so os pipelines no cache do driver de video (depois de atualizar o driver, ou para refazer as previstas)
+void AskPipelines() {
+    if (GameRunning()) {
+        MessageBoxW(g_main, ui::T(L"Feche o jogo antes.", L"Close the game first."), L"LEGO Dimensions PC", MB_OK | MB_ICONINFORMATION);
+        return;
+    }
+    if (MessageBoxW(g_main,
+                    ui::T(L"Criar de novo no cache do driver de vídeo todos os pipelines já conhecidos?\n\n"
+                          L"Use depois de atualizar o driver de vídeo. Leva cerca de 1 minuto e evita engasgos na primeira vez em cada lugar. "
+                          L"(O jogo também faz isso sozinho na primeira abertura com um driver novo.)",
+                          L"Build every known pipeline into the GPU driver cache again?\n\n"
+                          L"Use it after updating the GPU driver. Takes about 1 minute and avoids hitches the first time in each place. "
+                          L"(The game also does this by itself the first time it starts with a new driver.)"),
+                    L"LEGO Dimensions PC", MB_YESNO | MB_ICONQUESTION) == IDYES) {
+        RunPrepare(true);
+    }
+}
+
 void ToolsMenu(POINT at) {
     HMENU menu = CreatePopupMenu();
     for (const auto& [id, pt, en] : std::vector<std::tuple<int, const wchar_t*, const wchar_t*>>{
              {kToolToypad, L"Abrir o LegoToypad", L"Open Toypad"},
              {kToolShortcut, L"Criar atalho na Área de Trabalho", L"Create desktop shortcut"},
              {kToolPrepare, L"Preparar o jogo", L"Prepare game"},
+             {kToolPipelines, L"Recriar os pipelines (depois de atualizar o driver)", L"Rebuild pipelines (after a GPU driver update)"},
              {kToolPkg, L"Extrair PKG...", L"Extract PKG..."},
              {kToolTransfer, L"Transferir um save...", L"Transfer a save..."},
              {kToolUpdate, L"Procurar atualizações", L"Check for updates"}}) {
-        const bool off = (id == kToolPrepare && !GameFolderOk());
+        const bool off = (id == kToolPrepare && !GameFolderOk()) || (id == kToolPipelines && (!GameFolderOk() || !Prepared()));
         AppendMenuW(menu, MF_STRING | (off ? MF_GRAYED : 0), id, ui::T(pt, en));
     }
     const int picked = TrackPopupMenu(menu, TPM_RETURNCMD | TPM_LEFTALIGN | TPM_TOPALIGN | TPM_NONOTIFY, at.x, at.y, 0, g_main, nullptr);
@@ -2140,6 +2166,7 @@ void ToolsMenu(POINT at) {
     case kToolToypad: LaunchLegoToypad(true); break;
     case kToolShortcut: CreateDesktopShortcut(); break;
     case kToolPrepare: AskPrepare(); break;
+    case kToolPipelines: AskPipelines(); break;
     case kToolPkg: ExtractPkgs(); break;
     case kToolTransfer: OpenTransfer(); break;
     case kToolUpdate: CheckUpdate(); break;

@@ -58,7 +58,11 @@ u64 FlipCount();
 bool OpenWindowEarly(u32 timeout_ms);
 // Fase 42: tela de carregamento. Mostra o progresso do pacote AOT, dos pares e dos pipelines ja
 // vistos, e volta quando tudo terminou (ou depois de `max_seconds`).
-void RunLoadingScreen(u32 max_seconds);
+// Fase 77: com o driver de video diferente do da ultima vez que todos os pipelines foram criados (marca em
+// shaders_spv\pipelines_driver.txt), espera TODOS os pipelines conhecidos, nao so os da area de entrada; com
+// `prewarm_only` (Preparar) sempre espera todos e imprime "[PREWARM] progress <pct> <feitos>/<total>" a cada segundo.
+// Devolve true se tudo terminou (false = limite de tempo).
+bool RunLoadingScreen(u32 max_seconds, bool prewarm_only = false);
 
 // Fase 65: contador de FPS / info no canto de cima, a esquerda (--stats-overlay; F10 alterna no jogo).
 void SetStatsOverlay(bool enabled);
@@ -90,4 +94,6 @@ struct LoadingStatus {
     bool aot_finished = false;
 };
 void GetLoadingStatus(LoadingStatus* out);
+// Fase 77: true = GetLoadingStatus conta todos os pipelines do aquecimento (nao so os prioritarios da Fase 72).
+void SetPrewarmAll(bool all);
 } // namespace hle::gnm

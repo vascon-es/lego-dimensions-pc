@@ -358,6 +358,10 @@ public:
     u32 PrewarmPipelines();
     void BenchPipelines(const std::string& path); // Fase 53: so medicao (LD_PIPE_BENCH)
     void PrewarmProgress(u32* done, u32* total) const;
+    u32 PrewarmWaiting() const;
+    void SetPrewarmPredicted(bool enabled);              // Fase 77: so no --prewarm-only (receitas previstas)
+    void PredictedStats(u32* built, u32* failed) const; // Fase 77      // Fase 77: receitas cujo par de shaders nao foi registrado (fora do pacote AOT)
+    std::string DriverStamp() const; // Fase 77: "fabricante dispositivo versao-do-driver caminho-do-exe" (vazio sem Vulkan)
     double LastGpuFrameMs() const;                               // Fase 75: tempo de GPU do ultimo quadro terminado
     void SavePipelineCache(const char* reason);                 // Fase 70: grava o cache de pipelines do Vulkan (arquivo temporario + troca)
     void SetCurrentLevel(const std::string& name);              // Fase 72: o jogo comecou a carregar esta area

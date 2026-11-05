@@ -1,3 +1,4 @@
+#include <chrono>
 #include <cinttypes>
 #include <cmath>
 #include <cstdio>
@@ -11,6 +12,7 @@
 #include <vector>
 
 #include <windows.h>
+#include <psapi.h>
 #include <shellapi.h>
 
 #include <timeapi.h>
@@ -1374,6 +1376,12 @@ int main(int argc, char** argv) {
             hle::gnm::SetAot(true, true); // diagnostico: pares do pacote AOT mesmo quando o compilado com o jogo existe
         } else if (!std::strcmp(argv[i], "--prewarm-only")) {
             prewarm_only = true;
+        } else if (!std::strcmp(argv[i], "--prewarm-predicted")) {
+            // Fase 77 (opcional, preparar.py --prever): tambem as receitas previstas para pares que ninguem jogou. Medido na
+            // RX 6600: 184 mil pipelines em 4 min, depois ~1,2 ms cada no jogo em vez de ~30 ms; mas o driver da AMD carrega o
+            // cache inteiro (2,2 GB em vez de 0,4) na memoria em toda sessao: +1,8 GB de RAM para ~25% dos engasgos de
+            // primeira vez. Por isso fica desligado por padrao.
+            render::VulkanRenderer::Instance().SetPrewarmPredicted(true);
         } else if (!std::strcmp(argv[i], "--no-warmup")) {
             shader_warmup = false; // nao carrega na abertura os pares e pipelines ja vistos
         } else if (!std::strcmp(argv[i], "--no-async-textures")) {
@@ -1620,23 +1628,37 @@ int main(int argc, char** argv) {
     // ---- 4. tela de carregamento (Fase 42) --------------------------------
     // Abre a janela antes do jogo e espera o pacote AOT ser lido, os pares ja usados serem
     // carregados e os pipelines ja vistos serem criados; so entao o jogo comeca.
+    // Fase 77: --prewarm-only (Preparar) cria TODOS os pipelines das receitas no cache do driver. Antes chamava o
+    // aquecimento antes de o pacote AOT terminar de carregar (os pipelines dos pares do pacote ficavam de fora) e
+    // desistia em 20 s; agora espera o mesmo que a tela de carregamento, com todos os pipelines, sem limite curto.
     if (prewarm_only) {
-        std::printf("[PREWARM] Modo pre-aquecimento de pipelines solicitado (--prewarm-only)\n");
-        if (hle::videoout::OpenWindowEarly(5000)) {
-            render::VulkanRenderer::Instance().PrewarmPipelines();
-            for (int i = 0; i < 400; ++i) {
-                u32 done = 0, total = 0;
-                render::VulkanRenderer::Instance().PrewarmProgress(&done, &total);
-                if (total > 0 && done >= total) {
-                    std::printf("[PREWARM] Concluidos todos os %u pipelines pre-aquecidos!\n", total);
-                    break;
-                }
-                Sleep(50);
-            }
-            render::VulkanRenderer::Instance().SaveDiskPipelineCache();
-            std::printf("[PREWARM] Cache salvo em disco com sucesso. Finalizando pre-aquecimento.\n");
+        std::printf("[PREWARM] building every known pipeline into the GPU driver cache (--prewarm-only)\n");
+        auto& renderer = render::VulkanRenderer::Instance();
+        if (!hle::videoout::OpenWindowEarly(15000)) {
+            std::printf("[PREWARM] ERROR: no Vulkan window (%s)\n", renderer.LastError().c_str());
+            return 2;
         }
-        return 0;
+        const auto start = std::chrono::steady_clock::now();
+        const bool finished = hle::videoout::RunLoadingScreen(3600, true);
+        u32 done = 0, total = 0;
+        renderer.PrewarmProgress(&done, &total);
+        u32 predicted = 0, predicted_failed = 0;
+        renderer.PredictedStats(&predicted, &predicted_failed);
+        std::printf("[PREWARM] %s: %u of %u pipelines in %.1f s (%u predicted for pairs nobody played yet, %u predicted failed); "
+                    "%u recipes skipped (their shader pair is not in the AOT pack)\n",
+                    finished ? "done" : "TIME LIMIT", done, total, std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count(),
+                    predicted, predicted_failed, renderer.PrewarmWaiting());
+        PROCESS_MEMORY_COUNTERS_EX memory{};
+        if (K32GetProcessMemoryInfo(GetCurrentProcess(), reinterpret_cast<PROCESS_MEMORY_COUNTERS*>(&memory), sizeof(memory))) {
+            std::printf("[PREWARM] process memory %llu MB (peak working set %llu MB)\n", static_cast<unsigned long long>(memory.PrivateUsage >> 20),
+                        static_cast<unsigned long long>(memory.PeakWorkingSetSize >> 20));
+        }
+        renderer.SaveDiskPipelineCache();
+        std::fflush(stdout);
+        // Como o fechamento do jogo (hle_videoout): sem destrutores globais. Voltar do main com as threads de
+        // pipeline vivas terminava em abort (0xC0000409). O driver ja guardou cada pipeline ao cria-lo.
+        TerminateProcess(GetCurrentProcess(), finished ? 0 : 3);
+        return finished ? 0 : 3;
     }
 
     if (loading_screen && window && hle::videoout::OpenWindowEarly(15000)) {

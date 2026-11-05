@@ -12,6 +12,7 @@
 #include <map>
 #include <memory>
 #include <thread>
+#include <cctype>
 #include <unordered_map>
 #include <unordered_set>
 #include <mutex>
@@ -704,10 +705,14 @@ bool CreateDevice() {
         gpl_mode = env[0] != '0';
     }
     const u32 vendor = g.properties.vendorID;
+    // Fase 77: retestado na RX 6600 (driver 26.6.1 = Vulkan 2.0.342) com as bibliotecas sob demanda: a imagem sai certa e a GPL
+    // tira os engasgos de pipeline novo (sem receitas: 50 -> 7 quadros acima de 25 ms no 1o minuto, espera 749 -> 16 ms), MAS a
+    // tela preta da Fase 41 voltou com o mesmo exe depois que o cache do driver dele foi preenchido por outra versao do port (o
+    // mesmo build num caminho novo = imagem certa). Intermitente e ligado ao cache do driver: continua desligada sozinha na AMD.
     const bool gpl_wanted = gpl_mode >= 0 ? gpl_mode == 1 : vendor == 0x10DE || vendor == 0x8086;
     g_gpl_reason = gpl_mode >= 0     ? (gpl_mode ? "forced on" : "forced off")
                    : gpl_wanted       ? "automatic: NVIDIA / Intel"
-                   : vendor == 0x1002 ? "automatic: AMD (black screen on driver 26.6.1)"
+                   : vendor == 0x1002 ? "automatic: AMD (black screen depending on the driver cache, driver 26.6.1)"
                                       : "automatic: untested vendor";
     g.gpl = gpl_wanted && g.game_shaders && has_gpl && has_pipeline_library && has_eds3 && have_gpl.graphicsPipelineLibrary &&
             have_eds3.extendedDynamicState3DepthClampEnable && fast_linking;
@@ -2859,7 +2864,15 @@ struct PipelineJob {
     bool upgrade = false; // ... e depois este job, em segundo plano, troca pela versao otimizada
     u32 level = 0;         // Fase 72: area em que o pipeline foi usado pela primeira vez (0 = desconhecida)
     bool priority = false; // Fase 72: aquecimento da area atual / da ultima sessao: prioridade normal e na frente
+    bool predicted = false; // Fase 77: receita prevista (Preparar): so vai para o cache do driver e e destruido
 };
+std::atomic<bool> g_prewarm_predicted{false}; // Fase 77: --prewarm-only tambem le pipeline_states_previstas.txt
+std::atomic<u32> g_predicted_built{0}, g_predicted_failed{0};
+// Fase 77: as ~180 mil previstas ficam como chaves compactas e entram na fila de pipelines aos poucos (um job carrega o
+// GameDraw inteiro, ~3 KB: todos de uma vez eram centenas de MB a mais no Preparar)
+std::mutex g_predicted_mutex;
+std::deque<std::vector<u32>> g_predicted_backlog;
+std::atomic<u32> g_predicted_in_queue{0};
 // Fase 56: pipelines trocados pela versao otimizada. So sao destruidos quando nenhum frame em voo pode
 // mais usar (3 frames depois). Protegido por g.mutex.
 struct RetiredPipeline {
@@ -3083,6 +3096,10 @@ std::atomic<u64> g_pipelines_delivered{0};
 void PipelineWorker();
 bool ResolvePairModules(u64 key, VkShaderModule* vs_out, VkShaderModule* ps_out); // Fase 59 (definidas mais abaixo)
 bool ResolvePairModulesLocked(u64 key, State::GamePair& pair);
+bool TemporaryPairModules(u64 key, VkShaderModule* vs_out, VkShaderModule* ps_out); // Fase 77
+void RefillPredicted();                                                              // Fase 77
+void EnsurePairLibraries(u64 key, VkShaderModule vs, VkShaderModule ps, VkPipelineLayout layout, VkPipeline* vs_lib,
+                         VkPipeline* fs_lib); // Fase 77
 
 // Com g_pipeline_mutex.
 void EnsurePipelineWorkers() {
@@ -3110,13 +3127,45 @@ void PipelineWorker() {
         const bool urgent = job.fast || (!job.upgrade && !job.prewarm) || job.priority; // Fase 72: area atual
         SetThreadPriority(GetCurrentThread(), urgent ? THREAD_PRIORITY_NORMAL : THREAD_PRIORITY_BELOW_NORMAL);
         g_pipeline_flags = (job.fast || job.prewarm) ? VK_PIPELINE_CREATE_DISABLE_OPTIMIZATION_BIT : 0;
+        // Fase 77: receita prevista = modulos so para este pipeline (no cache compartilhado, os ~100 mil pares
+        // previstos levavam o Preparar a 17 GB de memoria); o cache do driver e por conteudo, nao por modulo
+        VkShaderModule temp_vs = VK_NULL_HANDLE, temp_ps = VK_NULL_HANDLE;
+        if (job.predicted && (!job.vs || !job.ps) && TemporaryPairModules(job.draw.pair, &temp_vs, &temp_ps)) {
+            job.vs = temp_vs;
+            job.ps = temp_ps;
+        }
         if (!job.vs || !job.ps) {
             ResolvePairModules(job.draw.pair, &job.vs, &job.ps); // Fase 59: par do pacote registrado sem modulos
+        }
+        if (g.gpl && !temp_vs && job.vs && job.ps && (!job.vs_lib || !job.fs_lib)) {
+            EnsurePairLibraries(job.draw.pair, job.vs, job.ps, job.layout, &job.vs_lib, &job.fs_lib); // Fase 77: bibliotecas sob demanda
         }
         const VkPipeline pipeline = job.vs && job.ps ? BuildGamePipeline(job.draw, job.vs, job.ps, job.layout, job.formats, job.depth_format,
                                                                          job.has_depth, job.vs_lib, job.fs_lib)
                                                      : VK_NULL_HANDLE;
         g_pipeline_flags = 0;
+        if (temp_vs) {
+            vk.vkDestroyShaderModule(g.device, temp_vs, nullptr);
+        }
+        if (temp_ps) {
+            vk.vkDestroyShaderModule(g.device, temp_ps, nullptr);
+        }
+        if (job.predicted) { // Fase 77: o driver ja guardou no cache dele; nada fica na memoria deste processo
+            if (pipeline) {
+                vk.vkDestroyPipeline(g.device, pipeline, nullptr);
+                ++g_predicted_built;
+            } else {
+                ++g_predicted_failed;
+            }
+            ++g_prewarm_done;
+            {
+                const TimedLock lock(g.mutex);
+                g_pipelines_pending.erase(job.hash);
+            }
+            --g_predicted_in_queue;
+            RefillPredicted();
+            continue;
+        }
         if (job.upgrade) { // Fase 56: versao otimizada pronta: troca (a rapida sai de uso aos poucos)
             if (pipeline) {
                 const TimedLock lock(g.mutex);
@@ -4786,6 +4835,73 @@ bool ResolvePairModules(u64 key, VkShaderModule* vs_out, VkShaderModule* ps_out)
     return true;
 }
 
+// Fase 77: com GPL, as bibliotecas de shader do par sao criadas no primeiro pipeline dele (antes: no registro de cada
+// uma das 170 mil variantes do pacote AOT = 446 s de tela de carregamento fria, 48 s quente e 23 GB de memoria na RX 6600).
+void EnsurePairLibraries(u64 key, VkShaderModule vs, VkShaderModule ps, VkPipelineLayout layout, VkPipeline* vs_lib, VkPipeline* fs_lib) {
+    {
+        const TimedLock lock(g.mutex);
+        if (const auto pair = g.game_pairs.find(key); pair != g.game_pairs.end() && pair->second.vs_lib && pair->second.fs_lib) {
+            *vs_lib = pair->second.vs_lib;
+            *fs_lib = pair->second.fs_lib;
+            return;
+        }
+    }
+    const auto start = std::chrono::steady_clock::now();
+    VkPipeline new_vs = CreateShaderLibrary(vs, true, layout);
+    VkPipeline new_fs = CreateShaderLibrary(ps, false, layout);
+    const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+    {
+        const TimedLock lock(g_lib_mutex);
+        if (new_vs && new_fs) {
+            g_gpl_stats.shader_libs += 2;
+            g_gpl_stats.shader_lib_ms += ms;
+            g_gpl_stats.shader_lib_worst_ms = std::max(g_gpl_stats.shader_lib_worst_ms, ms);
+        } else {
+            ++g_gpl_stats.lib_failures;
+        }
+    }
+    if (!new_vs || !new_fs) { // o par usa o pipeline monolitico
+        if (new_vs) vk.vkDestroyPipeline(g.device, new_vs, nullptr);
+        if (new_fs) vk.vkDestroyPipeline(g.device, new_fs, nullptr);
+        return;
+    }
+    const TimedLock lock(g.mutex);
+    const auto pair = g.game_pairs.find(key);
+    if (pair == g.game_pairs.end() || (pair->second.vs_lib && pair->second.fs_lib)) { // outra thread criou antes
+        g_retired_pipelines.push_back({new_vs, g.frame_serial});
+        g_retired_pipelines.push_back({new_fs, g.frame_serial});
+        if (pair != g.game_pairs.end()) {
+            *vs_lib = pair->second.vs_lib;
+            *fs_lib = pair->second.fs_lib;
+        }
+        return;
+    }
+    pair->second.vs_lib = *vs_lib = new_vs;
+    pair->second.fs_lib = *fs_lib = new_fs;
+}
+
+bool TemporaryPairModules(u64 key, VkShaderModule* vs_out, VkShaderModule* ps_out) {
+    std::vector<u32> code[2];
+    if (!g_module_loader || !g_module_loader(key, &code[0], &code[1])) {
+        return false;
+    }
+    VkShaderModule modules[2] = {};
+    for (int i = 0; i < 2; ++i) {
+        VkShaderModuleCreateInfo info{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+        info.codeSize = code[i].size() * 4;
+        info.pCode = code[i].data();
+        if (vk.vkCreateShaderModule(g.device, &info, nullptr, &modules[i]) != VK_SUCCESS) {
+            if (i) {
+                vk.vkDestroyShaderModule(g.device, modules[0], nullptr);
+            }
+            return false;
+        }
+    }
+    *vs_out = modules[0];
+    *ps_out = modules[1];
+    return true;
+}
+
 } // namespace
 
 void VulkanRenderer::SetModuleLoader(ModuleLoader loader) {
@@ -4795,7 +4911,7 @@ void VulkanRenderer::SetModuleLoader(ModuleLoader loader) {
 bool VulkanRenderer::RegisterGamePairLazy(u64 key, const std::vector<GamePairLayout::Binding>& bindings) {
     {
         const TimedLock lock(g.mutex);
-        if (!g.active || !g.game_shaders || g.gpl || !g_module_loader) { // GPL compila os modulos no registro
+        if (!g.active || !g.game_shaders || !g_module_loader) { // Fase 77: com GPL tambem (bibliotecas sob demanda)
             return false;
         }
         if (g.game_pairs.count(key)) {
@@ -4838,7 +4954,9 @@ bool VulkanRenderer::RegisterGamePair(u64 key, const GamePairLayout& layout) {
         return false;
     }
     if (g.gpl) {
-        // Fase 41: o driver compila os shaders do par agora (thread de pares / aquecimento), nao no draw
+        // Fase 41: o driver compila os shaders do par agora (thread de pares / aquecimento), nao no draw. Fase 77: tentei deixar
+        // estes (os ~3200 pares ja usados) tambem para o primeiro pipeline, como os do pacote AOT, e a imagem ficou PRETA na
+        // RX 6600 (causa nao achada); a tela de carregamento fria com GPL fica em ~64 s uma vez (o Preparar ja faz isso).
         const auto start = std::chrono::steady_clock::now();
         pair.vs_lib = CreateShaderLibrary(pair.vs, true, pair.layout);
         pair.fs_lib = CreateShaderLibrary(pair.ps, false, pair.layout);
@@ -5736,6 +5854,7 @@ u32 VulkanRenderer::PrewarmPipelines() {
     std::lock_guard waiting_lock(g_prewarm_waiting_mutex);
     std::vector<std::vector<u32>> records;
     records.swap(g_prewarm_waiting);
+    static std::unordered_set<u64> predicted_hashes; // Fase 77 (com g_prewarm_waiting_mutex)
     {
         std::lock_guard file_lock(g_pipeline_file_mutex);
         // Fase 71: a base distribuida com o port (refeita a cada versao por tools/pipeline_states.py) e depois o
@@ -5751,7 +5870,13 @@ u32 VulkanRenderer::PrewarmPipelines() {
             paths.push_back((std::filesystem::path(g_pipeline_state_path).parent_path() / "pipeline_states_base.txt").string());
         }
         paths.push_back(g_pipeline_state_path);
+        // Fase 77: receitas previstas para pares que ninguem jogou (tools/setup/prever_pipelines.py), so no Preparar
+        const std::string predicted_path = (std::filesystem::path(g_pipeline_state_path).parent_path() / "pipeline_states_previstas.txt").string();
+        if (g_prewarm_predicted.load()) {
+            paths.push_back(predicted_path);
+        }
         for (const std::string& path : paths) {
+            const bool from_predicted = path == predicted_path;
             std::ifstream in(path);
             std::string line;
             u32 read = 0, added = 0;
@@ -5782,6 +5907,9 @@ u32 VulkanRenderer::PrewarmPipelines() {
                 }
                 ++read;
                 if (key.size() >= 13 && g_pipeline_saved.insert(HashPipelineKey(key)).second) {
+                    if (from_predicted) {
+                        predicted_hashes.insert(HashPipelineKey(key));
+                    }
                     records.push_back(std::move(key));
                     ++added;
                 }
@@ -5794,12 +5922,14 @@ u32 VulkanRenderer::PrewarmPipelines() {
     }
     u32 queued = 0;
     std::vector<PipelineJob> first, rest; // Fase 72: area prioritaria na frente da fila
+    std::vector<std::vector<u32>> predicted_keys; // Fase 77: entram na fila aos poucos (RefillPredicted)
     for (const std::vector<u32>& key : records) {
         PipelineJob job;
         if (!JobFromKey(key, job)) {
             continue; // linha de outra versao do formato
         }
         job.prewarm = true;
+        job.predicted = predicted_hashes.count(job.hash) != 0;
         {
             std::lock_guard level_lock(g_level_mutex);
             const auto level = g_pipeline_level.find(job.hash);
@@ -5822,6 +5952,12 @@ u32 VulkanRenderer::PrewarmPipelines() {
             job.fs_lib = pair->second.fs_lib;
             job.layout = pair->second.layout;
         }
+        if (job.predicted) {
+            predicted_keys.push_back(key);
+            ++g_prewarm_total;
+            ++queued;
+            continue;
+        }
         g_prewarm_priority_total += job.priority;
         (job.priority ? first : rest).push_back(std::move(job));
         ++g_prewarm_total;
@@ -5837,9 +5973,64 @@ u32 VulkanRenderer::PrewarmPipelines() {
             g_pipeline_jobs.push_back(std::move(job));
         }
     }
+    if (!predicted_keys.empty()) {
+        {
+            std::lock_guard lock(g_predicted_mutex);
+            for (std::vector<u32>& key : predicted_keys) {
+                g_predicted_backlog.push_back(std::move(key));
+            }
+        }
+        RefillPredicted();
+    }
     g_pipeline_cv.notify_all();
     return queued;
 }
+
+namespace {
+// Fase 77: poe na fila de pipelines ate 1024 receitas previstas por vez (chamado no aquecimento e a cada uma pronta).
+// Ordem dos locks: g_predicted_mutex -> g.mutex -> g_pipeline_mutex.
+void RefillPredicted() {
+    std::vector<PipelineJob> batch;
+    {
+        std::lock_guard lock(g_predicted_mutex);
+        while (!g_predicted_backlog.empty() && g_predicted_in_queue.load() + batch.size() < 1024) {
+            const std::vector<u32> key = std::move(g_predicted_backlog.front());
+            g_predicted_backlog.pop_front();
+            PipelineJob job;
+            bool ok = JobFromKey(key, job);
+            {
+                const TimedLock glock(g.mutex);
+                const auto pair = ok ? g.game_pairs.find(job.draw.pair) : g.game_pairs.end();
+                ok = pair != g.game_pairs.end();
+                if (ok) {
+                    job.vs = pair->second.vs;
+                    job.ps = pair->second.ps;
+                    job.vs_lib = pair->second.vs_lib;
+                    job.fs_lib = pair->second.fs_lib;
+                    job.layout = pair->second.layout;
+                } else if (job.hash) {
+                    g_pipelines_pending.erase(job.hash);
+                }
+            }
+            if (!ok) {
+                ++g_prewarm_done; // contado no total: sai como feito
+                ++g_predicted_failed;
+                continue;
+            }
+            job.prewarm = job.predicted = true;
+            batch.push_back(std::move(job));
+        }
+        g_predicted_in_queue += static_cast<u32>(batch.size());
+    }
+    if (!batch.empty()) {
+        std::lock_guard lock(g_pipeline_mutex);
+        for (PipelineJob& job : batch) {
+            g_pipeline_jobs.push_back(std::move(job));
+        }
+    }
+    g_pipeline_cv.notify_all();
+}
+} // namespace
 
 // Fase 72: o jogo comecou a carregar uma area (radar). Anota o primeiro uso dos pipelines por 2 min e passa para a
 // frente da fila, na prioridade normal, o que do aquecimento for desta area e ainda nao foi criado.
@@ -5878,6 +6069,43 @@ void VulkanRenderer::SetCurrentLevel(const std::string& name) {
         });
     }
     std::printf("[PIPELINES] area %s: %u of its prewarm pipelines moved to the front of the queue\n", name.c_str(), moved);
+}
+
+void VulkanRenderer::SetPrewarmPredicted(bool enabled) {
+    g_prewarm_predicted = enabled;
+}
+
+void VulkanRenderer::PredictedStats(u32* built, u32* failed) const {
+    *built = g_predicted_built.load();
+    *failed = g_predicted_failed.load();
+}
+
+u32 VulkanRenderer::PrewarmWaiting() const {
+    std::lock_guard lock(g_prewarm_waiting_mutex);
+    return static_cast<u32>(g_prewarm_waiting.size());
+}
+
+// Fase 77: identidade do cache de pipelines do driver. O da AMD e por caminho do exe (Fase 53) e um driver novo
+// joga fora tudo o que estava guardado; com isto diferente do arquivo pipelines_driver.txt a tela de carregamento
+// cria de novo todos os pipelines conhecidos, uma vez.
+std::string VulkanRenderer::DriverStamp() const {
+    if (!g.active) {
+        return {};
+    }
+    wchar_t exe[MAX_PATH * 2] = {};
+    const DWORD length = GetModuleFileNameW(nullptr, exe, static_cast<DWORD>(std::size(exe)));
+    char head[96];
+    std::snprintf(head, sizeof(head), "%04x %04x %08x ", g.properties.vendorID, g.properties.deviceID, g.properties.driverVersion);
+    std::string path;
+    if (length) {
+        const int bytes = WideCharToMultiByte(CP_UTF8, 0, exe, static_cast<int>(length), nullptr, 0, nullptr, nullptr);
+        path.resize(bytes);
+        WideCharToMultiByte(CP_UTF8, 0, exe, static_cast<int>(length), path.data(), bytes, nullptr, nullptr);
+        for (char& c : path) {
+            c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+        }
+    }
+    return head + path;
 }
 
 // Fase 72: progresso so dos pipelines prioritarios (LD_PREWARM_GATE=area).
@@ -6003,6 +6231,22 @@ void VulkanRenderer::BenchPipelines(const std::string& path) {
         }
         const VkFormat depth_format = has_depth ? TargetVkFormat(GameDraw::kTargetDepth32F) : VK_FORMAT_UNDEFINED;
         double ms[6]{};
+        if (std::getenv("LD_PIPE_BENCH_EXACT")) { // Fase 77: o mesmo pedido de um frame do jogo (estado exato, sem otimizacao)
+            if (!pair.vs || !pair.ps) {
+                ResolvePairModules(d.pair, &pair.vs, &pair.ps); // par do pacote carregado sem modulos (Fase 59), como no jogo
+            }
+            g_pipeline_flags = VK_PIPELINE_CREATE_DISABLE_OPTIMIZATION_BIT;
+            const auto start = std::chrono::steady_clock::now();
+            const VkPipeline pipeline = BuildGamePipeline(d, pair.vs, pair.ps, pair.layout, formats, depth_format, has_depth);
+            const double exact = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+            g_pipeline_flags = 0;
+            if (pipeline) {
+                vk.vkDestroyPipeline(g.device, pipeline, nullptr);
+            }
+            std::printf("[BENCH-EXACT] pair %016llx: %.2f ms%s\n", static_cast<unsigned long long>(d.pair), exact, pipeline ? "" : " FAILED");
+            ++n;
+            continue;
+        }
         {
             // sem otimizacao, num estado proprio (cull trocado): quanto custa o pipeline "rapido"
             GameDraw v = d;
