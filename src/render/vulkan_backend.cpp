@@ -3094,6 +3094,9 @@ std::condition_variable g_pipeline_done_cv;
 std::atomic<u64> g_pipelines_delivered{0};
 
 void PipelineWorker();
+void UpgradeWorker(); // Fase 78
+int UpgradeMode();
+extern std::thread g_upgrade_thread;
 bool ResolvePairModules(u64 key, VkShaderModule* vs_out, VkShaderModule* ps_out); // Fase 59 (definidas mais abaixo)
 bool ResolvePairModulesLocked(u64 key, State::GamePair& pair);
 bool TemporaryPairModules(u64 key, VkShaderModule* vs_out, VkShaderModule* ps_out); // Fase 77
@@ -3107,8 +3110,30 @@ void EnsurePipelineWorkers() {
         for (int i = 0; i < PipelineThreadCount(); ++i) {
             g_pipeline_threads.emplace_back(PipelineWorker);
         }
+        if (UpgradeMode() == 1) {
+            g_upgrade_thread = std::thread(UpgradeWorker); // Fase 78
+        }
     }
 }
+
+// Fase 78: a versao otimizada (Fase 56) de cada pipeline pedido no jogo nunca esta no cache do driver (o Preparar
+// cria so a rapida): 30-100 ms de CPU cada. Nas 12 threads de pipeline, a primeira visita a uma area somava ~18 s de
+// CPU no primeiro minuto e as texturas esperavam (fim de quadro de 100+ ms). Agora vao para UMA thread de prioridade
+// minima, que so trabalha com a fila urgente vazia. LD_PIPE_UPGRADE: 1 (padrao) = assim; 0 = nunca otimiza (como os
+// pipelines do Preparar); all = como antes (na fila comum).
+int UpgradeMode() {
+    static const int mode = [] {
+        const char* env = std::getenv("LD_PIPE_UPGRADE");
+        if (!env) return 1;
+        if (!std::strcmp(env, "all")) return 2;
+        return std::clamp(std::atoi(env), 0, 1);
+    }();
+    return mode;
+}
+std::deque<PipelineJob> g_upgrade_jobs; // com g_pipeline_mutex
+std::thread g_upgrade_thread;
+
+void ProcessPipelineJob(PipelineJob job);
 
 void PipelineWorker() {
     for (;;) {
@@ -3122,10 +3147,38 @@ void PipelineWorker() {
             job = g_pipeline_jobs.front();
             g_pipeline_jobs.pop_front();
         }
+        ProcessPipelineJob(std::move(job));
+    }
+}
+
+void UpgradeWorker() {
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_LOWEST);
+    for (;;) {
+        PipelineJob job;
+        {
+            std::unique_lock lock(g_pipeline_mutex);
+            // so com a fila urgente vazia (a espera curta re-confere: quem esvazia a fila nao avisa esta thread)
+            while (!g_pipeline_stop.load() && (g_upgrade_jobs.empty() || !g_pipeline_jobs.empty())) {
+                g_pipeline_cv.wait_for(lock, std::chrono::milliseconds(50));
+            }
+            if (g_pipeline_stop.load()) {
+                return;
+            }
+            job = std::move(g_upgrade_jobs.front());
+            g_upgrade_jobs.pop_front();
+        }
+        ProcessPipelineJob(std::move(job));
+    }
+}
+
+void ProcessPipelineJob(PipelineJob job) {
+    {
         // Fase 59: so o pipeline que um frame espera roda na prioridade normal; versao otimizada (troca),
         // aquecimento e pedidos sem pressa ficam abaixo do normal e nao disputam a CPU com o jogo.
         const bool urgent = job.fast || (!job.upgrade && !job.prewarm) || job.priority; // Fase 72: area atual
-        SetThreadPriority(GetCurrentThread(), urgent ? THREAD_PRIORITY_NORMAL : THREAD_PRIORITY_BELOW_NORMAL);
+        SetThreadPriority(GetCurrentThread(), urgent                             ? THREAD_PRIORITY_NORMAL
+                                              : job.upgrade && UpgradeMode() == 1 ? THREAD_PRIORITY_LOWEST
+                                                                                   : THREAD_PRIORITY_BELOW_NORMAL);
         g_pipeline_flags = (job.fast || job.prewarm) ? VK_PIPELINE_CREATE_DISABLE_OPTIMIZATION_BIT : 0;
         // Fase 77: receita prevista = modulos so para este pipeline (no cache compartilhado, os ~100 mil pares
         // previstos levavam o Preparar a 17 GB de memoria); o cache do driver e por conteudo, nao por modulo
@@ -3140,9 +3193,17 @@ void PipelineWorker() {
         if (g.gpl && !temp_vs && job.vs && job.ps && (!job.vs_lib || !job.fs_lib)) {
             EnsurePairLibraries(job.draw.pair, job.vs, job.ps, job.layout, &job.vs_lib, &job.fs_lib); // Fase 77: bibliotecas sob demanda
         }
+        const auto build_start = std::chrono::steady_clock::now();
         const VkPipeline pipeline = job.vs && job.ps ? BuildGamePipeline(job.draw, job.vs, job.ps, job.layout, job.formats, job.depth_format,
                                                                          job.has_depth, job.vs_lib, job.fs_lib)
                                                      : VK_NULL_HANDLE;
+        if (job.fast) { // Fase 78: pedido do jogo que nao saiu do cache do driver (chave completa, para cruzar com as receitas)
+            const double build_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - build_start).count();
+            if (build_ms >= 5.0) {
+                std::printf("[PIPE-MISS] %.1f ms key %016llx pair %016llx\n", build_ms, static_cast<unsigned long long>(job.hash),
+                            static_cast<unsigned long long>(job.draw.pair));
+            }
+        }
         g_pipeline_flags = 0;
         if (temp_vs) {
             vk.vkDestroyShaderModule(g.device, temp_vs, nullptr);
@@ -3164,7 +3225,7 @@ void PipelineWorker() {
             }
             --g_predicted_in_queue;
             RefillPredicted();
-            continue;
+            return;
         }
         if (job.upgrade) { // Fase 56: versao otimizada pronta: troca (a rapida sai de uso aos poucos)
             if (pipeline) {
@@ -3176,14 +3237,18 @@ void PipelineWorker() {
                 slot = pipeline;
                 ++g_upgraded;
             }
-            continue;
+            return;
         }
-        if (job.fast && pipeline) {
+        if (job.fast && pipeline && UpgradeMode() != 0) {
             PipelineJob upgrade = job;
             upgrade.fast = false;
             upgrade.upgrade = true;
             std::lock_guard lock(g_pipeline_mutex);
-            g_pipeline_jobs.push_back(std::move(upgrade)); // depois de tudo o que um frame espera
+            if (UpgradeMode() == 2) {
+                g_pipeline_jobs.push_back(std::move(upgrade)); // depois de tudo o que um frame espera
+            } else {
+                g_upgrade_jobs.push_back(std::move(upgrade)); // Fase 78: so a thread de versao otimizada
+            }
         }
         if (job.prewarm) {
             ++g_prewarm_done;
@@ -3225,7 +3290,16 @@ void StopPipelineWorker() {
         }
     }
     g_pipeline_threads.clear();
+    if (g_upgrade_thread.joinable()) {
+        g_upgrade_thread.join();
+    }
 }
+
+} // namespace
+bool JobFromKey(const std::vector<u32>& key, PipelineJob& job); // definida mais abaixo, fora do namespace anonimo
+namespace {
+// Fase 78: LD_PIPE_DRAW_JOBS=1 volta a montar o pedido do jogo pelo draw cru (diagnostico)
+std::atomic<bool> g_draw_jobs{std::getenv("LD_PIPE_DRAW_JOBS") != nullptr};
 
 // Pipeline com os modulos do jogo, pelo estado do draw. Chamado com g.mutex. Se ainda nao existe,
 // o pedido vai para a thread de pipelines e o draw fica de fora ate ele chegar (VK_NULL_HANDLE).
@@ -3287,16 +3361,24 @@ VkPipeline GetGamePipeline(const GameDraw& draw, const State::GamePair& pair, St
     }
     if (g_pipelines_pending.insert(key_hash).second) {
         PipelineJob job;
-        job.hash = key_hash;
-        job.draw = draw;
+        // Fase 78: o pedido do jogo e montado pela CHAVE, como o Preparar e a tela de carregamento montam as receitas e
+        // as previsoes. Montado pelo draw cru (bits de profundidade / estencil / blend que a chave descarta, formato real
+        // da profundidade), o driver via outro pipeline: nenhum previsto saia do cache dele (117 de 159 faltas medidas
+        // eram previstos ja criados). Os pipelines das receitas ja eram usados assim no jogo.
+        if (!g_draw_jobs.load(std::memory_order_relaxed) && JobFromKey(key, job)) {
+            job.hash = key_hash;
+        } else {
+            job.hash = key_hash;
+            job.draw = draw;
+            std::memcpy(job.formats, formats, sizeof(formats));
+            job.depth_format = depth ? depth->format : VK_FORMAT_UNDEFINED;
+            job.has_depth = depth != nullptr;
+        }
         job.vs = pair.vs;
         job.ps = pair.ps;
         job.vs_lib = pair.vs_lib;
         job.fs_lib = pair.fs_lib;
         job.layout = pair.layout;
-        std::memcpy(job.formats, formats, sizeof(formats));
-        job.depth_format = depth ? depth->format : VK_FORMAT_UNDEFINED;
-        job.has_depth = depth != nullptr;
         job.key = key;
         job.fast = for_frame && g_fast_first; // Fase 56
         {
