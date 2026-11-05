@@ -50,6 +50,19 @@ TOOL = os.path.join(ROOT, 'tools', 'shader_compiler_tool', 'build', 'shader_comp
 # tipo da textura e o formato; enderecos e tamanhos nao entram no SPIR-V.
 T_2D = [0x10E2C710, 0x02500000, 0x001FC07F, 0x96D70FAC, 0x000FE000, 0, 0, 0]
 T_CUBE = [0x10EB8F30, 0x02500000, 0x007FC1FF, 0xB6D90FAC, 0x003FE000, 0x0000A000, 0, 0]
+T_3D = [0x10F47C50, 0x00A00000, 0x0007C03F, 0xA4800FAC, 0x0007E00F, 0, 0, 0]  # Fase 78: de um retrato real (tipo 0xA)
+# Fase 78: tipo de textura aprendido dos retratos: 0 = 2D, 1 = cubo, 2 = 3D (T# dword 3 >> 28 = 0x9 / 0xB / 0xA)
+TEXTURE_TYPE = {0x9: 0, 0xB: 1, 0xA: 2}
+# Fase 78: tipos por PAR ("vs:ps" -> {origem: tipo}): o mesmo PS pode ler cubo com um VS e 2D com outro, e a variante do
+# pacote e por par. Preenchido por learn_from_snapshots e merge_learned.
+PAIR_TYPES = {}
+
+
+def types_for(vs, ps, ps_types):
+    """tipos reais das texturas do par: os do par, senao os unanimes do PS"""
+    out = dict(ps_types.get(ps) or {})
+    out.update(PAIR_TYPES.get('%s:%s' % (vs, ps), {}))
+    return out or None
 S_DEFAULT = [0x00007400, 0x00FFF000, 0x0AF00000, 0]
 V_CONST = [0xBAB79440, 0x00100010, 0x00000100, 0x20077FAC]
 TABLE_DWORDS = 192
@@ -58,6 +71,45 @@ FAKE_POINTER = (0xB0000000, 0x10)  # so precisa ser nao nulo: a ferramenta troca
 
 # ======================= extract =======================
 nu2dat_errors = collections.Counter()
+
+
+EBOOT_PAIRS = os.path.join(ROOT, 'tools', 'data', 'pares_eboot.txt')
+
+
+def known_eboot_pairs():
+    """Fase 78: pares (VS, PS) ja vistos pelo port: a lista que vem com ele (EBOOT_PAIRS) e o que este PC viu."""
+    out = set()
+
+    def add(vs, ps):
+        if re.fullmatch(r'[0-9a-f]{16}', vs) and re.fullmatch(r'[0-9a-f]{16}', ps):
+            out.add((vs, ps))
+    for path, first_col in ((EBOOT_PAIRS, 0), (os.path.join(SPV, 'pair_warm.tsv'), 0), (os.path.join(SPV, 'pair_snapshots.txt'), 1)):
+        if not os.path.isfile(path):
+            continue
+        with open(path, encoding='ascii', errors='replace') as f:
+            for line in f:
+                p = line.split()
+                if first_col == 1 and (not p or p[0] != 'pair'):
+                    continue
+                if len(p) >= first_col + 2:
+                    add(p[first_col], p[first_col + 1])
+    for path in glob.glob(os.path.join(SPV, 'pairs', 'pair_*.txt')):
+        m = re.match(r'pair_([0-9a-f]{16})_([0-9a-f]{16})_', os.path.basename(path))
+        if m:
+            add(m.group(1), m.group(2))
+    return out
+
+
+def cmd_export_eboot_pairs(args):
+    """Fase 78: grava em EBOOT_PAIRS os pares vistos que usam shader do eboot (so hashes; vai com o port)."""
+    elf_path = os.path.join(ROOT, 'assets', 'decrypted_elfs', 'eboot.bin.elf')
+    with open(elf_path, 'rb') as f:
+        eboot = {'%016x' % gcn.fnv_bytes(blob) for _s, _h, blob in gcn.shaders_in(f.read())}
+    pairs = sorted(p for p in known_eboot_pairs() if p[0] in eboot or p[1] in eboot)
+    with open(EBOOT_PAIRS, 'w', newline='\n') as f:
+        f.write('# Fase 78: pares (VS PS) com shader do eboot.bin ja vistos pelo port (so hashes; o extract compila)\n')
+        f.writelines('%s %s\n' % p for p in pairs)
+    print('EBOOT PAIRS: %d -> %s' % (len(pairs), EBOOT_PAIRS))
 
 
 def cmd_extract(args):
@@ -69,28 +121,32 @@ def cmd_extract(args):
     t0 = time.time()
     index_lines = []
     packs = collections.Counter()
+
+    def add_shader(stage, hdr, blob):
+        h = '%016x' % gcn.fnv_bytes(blob)
+        if h in seen:
+            return h
+        info = gcn.parse_header(stage, hdr)
+        if stage == gcn.STAGE_PS:
+            info['cubes'] = sorted(gcn.cube_sources(gcn.words(blob)))
+        seen[h] = (stage, info)
+        prefix = 'vs' if stage == gcn.STAGE_VS else 'ps'
+        path = os.path.join(BIN, '%s_%s.bin' % (prefix, h))
+        if not os.path.exists(path):
+            with open(path, 'wb') as f:
+                f.write(blob)
+        code_bytes = struct.unpack_from('<I', blob, len(blob) - 28 + 8)[0] >> 8  # ShaderBinaryInfo.length
+        regs = ' '.join('%08x' % r for r in info['regs'])
+        index_lines.append('%s\t%s\t%d\t%d\t-\t-\t0x0\t%s\n' % (prefix, h, len(blob), code_bytes, regs))
+        return h
+
     for pack, name, data in nu2dat.iter_files(args.app0, addcont=args.addcont, errors=nu2dat_errors, patch=args.patch or None):
         packs['DLC' if pack.startswith('DLC') and not pack.startswith('DLCSTREAM') else 'jogo base'] += 1
         files += 1
         found = gcn.shaders_in(data)
         hashes = []
         for stage, hdr, blob in found:
-            h = '%016x' % gcn.fnv_bytes(blob)
-            hashes.append((stage, h))
-            if h in seen:
-                continue
-            info = gcn.parse_header(stage, hdr)
-            if stage == gcn.STAGE_PS:
-                info['cubes'] = sorted(gcn.cube_sources(gcn.words(blob)))
-            seen[h] = (stage, info)
-            prefix = 'vs' if stage == gcn.STAGE_VS else 'ps'
-            path = os.path.join(BIN, '%s_%s.bin' % (prefix, h))
-            if not os.path.exists(path):
-                with open(path, 'wb') as f:
-                    f.write(blob)
-            code_bytes = struct.unpack_from('<I', blob, len(blob) - 28 + 8)[0] >> 8  # ShaderBinaryInfo.length
-            regs = ' '.join('%08x' % r for r in info['regs'])
-            index_lines.append('%s\t%s\t%d\t%d\t-\t-\t0x0\t%s\n' % (prefix, h, len(blob), code_bytes, regs))
+            hashes.append((stage, add_shader(stage, hdr, blob)))
         for i in range(0, len(hashes) - 1, 2):
             (s0, h0), (s1, h1) = hashes[i], hashes[i + 1]
             if s0 == gcn.STAGE_VS and s1 == gcn.STAGE_PS:
@@ -98,6 +154,24 @@ def cmd_extract(args):
                 first_file.setdefault((h0, h1), name)
         if files % 500 == 0:
             print('  %d files, %d shaders, %d pairs (%.0f s)' % (files, len(seen), len(pairs), time.time() - t0), flush=True)
+    # Fase 78: os shaders do proprio executavel (interface, pos-processamento, efeitos de tela): ~420, com o mesmo
+    # cabecalho dos .DAT, mas sem a ordem VS/PS dos arquivos. Os pares vem de EBOOT_PAIRS (os que o port ja viu, so
+    # hashes) e do que este PC ja viu (pair_warm.tsv, pares compilados, retratos). Sem eles, todo desenho com shader
+    # do eboot caia na traducao ao vivo e no pipeline montado na hora.
+    eboot_path = os.path.join(ROOT, 'assets', 'decrypted_elfs', 'eboot.bin.elf')
+    if os.path.isfile(eboot_path):
+        with open(eboot_path, 'rb') as f:
+            elf = f.read()
+        eboot = {add_shader(stage, hdr, blob) for stage, hdr, blob in gcn.shaders_in(elf)}
+        known = known_eboot_pairs()
+        added = 0
+        for vs, ps in sorted(known):
+            if (vs in eboot or ps in eboot) and seen.get(vs, (0,))[0] == gcn.STAGE_VS and seen.get(ps, (0,))[0] == gcn.STAGE_PS:
+                if (vs, ps) not in pairs:
+                    added += 1
+                pairs[(vs, ps)] += 1
+                first_file.setdefault((vs, ps), 'eboot.bin')
+        print('  eboot.bin: %d shaders, %d pairs' % (len(eboot), added), flush=True)
     with open(os.path.join(BIN, 'index.tsv'), 'w', newline='\n') as f:
         f.writelines(index_lines)
     with open(os.path.join(AOT, 'shaders.tsv'), 'w', newline='\n') as f:
@@ -280,7 +354,8 @@ def stage_snapshot(info, is_ps, vb_formats=None, real_types=None, vb_layout=None
 
     def image(source):
         if real_types and source in real_types:
-            return T_CUBE if real_types[source] else T_2D
+            kind = int(real_types[source])
+            return T_3D if kind == 2 else T_CUBE if kind == 1 else T_2D
         return T_CUBE if source in info['cubes'] else T_2D
 
     if eud_reg is not None:
@@ -354,9 +429,11 @@ def learn_from_snapshots(shaders):
     fetch_alt  {hash do fetch gerado pelo cabecalho: {fetch real: {classes}}} - leituras de vertice que vem da
                malha (o jogo gera o fetch pela declaracao de vertices, nao pelo shader); servem para todo VS
                com o mesmo fetch gerado;
-    ps_types   {PS: {origem do T#: True se cubo}} - tipo real de cada textura (a previsao pelo codigo erra)."""
+    ps_types   {PS: {origem do T#: tipo}} - tipo real de cada textura (a previsao pelo codigo erra); Fase 78: so as
+               origens em que todos os retratos concordam (0 2D, 1 cubo, 2 3D); o tipo por par vai para PAIR_TYPES."""
     fetch_alt = collections.defaultdict(lambda: collections.defaultdict(set))
     votes = collections.defaultdict(lambda: collections.defaultdict(collections.Counter))
+    pair_votes = collections.defaultdict(lambda: collections.defaultdict(collections.Counter))
     path = os.path.join(SPV, 'pair_snapshots.txt')
     if not os.path.exists(path):
         return fetch_alt, {}
@@ -403,9 +480,14 @@ def learn_from_snapshots(shaders):
                     for a in range(16):
                         sources.append(('tab:%d:%d' % (reg, 8 * a), tables[reg][8 * a:8 * a + 8]))
             for source, words in sources:
-                if len(words) >= 4 and (words[3] >> 28) in (0x9, 0xB):
-                    votes[ps][source][(words[3] >> 28) == 0xB] += 1
-    ps_types = {ps: {src: c.most_common(1)[0][0] for src, c in per.items()} for ps, per in votes.items()}
+                if len(words) >= 4 and (words[3] >> 28) in TEXTURE_TYPE:
+                    kind = TEXTURE_TYPE[words[3] >> 28]
+                    votes[ps][source][kind] += 1
+                    pair_votes['%s:%s' % (vs, ps)][source][kind] += 1
+    ps_types = {ps: {src: next(iter(c)) for src, c in per.items() if len(c) == 1} for ps, per in votes.items()}
+    ps_types = {ps: per for ps, per in ps_types.items() if per}
+    for key, per in pair_votes.items():
+        PAIR_TYPES[key] = {src: c.most_common(1)[0][0] for src, c in per.items()}
     return fetch_alt, ps_types
 
 
@@ -414,7 +496,9 @@ def merge_learned(fetch_alt, ps_types, data):
         for words, classes in alts:
             fetch_alt[gen][tuple(int(x, 16) for x in words)].add(tuple(classes))
     for ps, per in data.get('ps_types', {}).items():
-        ps_types.setdefault(ps, {}).update({k: bool(v) for k, v in per.items() if k not in ps_types.get(ps, {})})
+        ps_types.setdefault(ps, {}).update({k: int(v) for k, v in per.items() if k not in ps_types.get(ps, {})})
+    for key, per in data.get('pair_types', {}).items():  # Fase 78
+        PAIR_TYPES.setdefault(key, {}).update({k: int(v) for k, v in per.items() if k not in PAIR_TYPES.get(key, {})})
 
 
 def cmd_export_dictionary(args):
@@ -425,6 +509,7 @@ def cmd_export_dictionary(args):
     fetch_alt, ps_types = learn_from_snapshots(shaders)  # Fase 52
     data['fetch_alt'] = {gen: [[['%08x' % w for w in real], list(c)] for real, cs in alts.items() for c in cs] for gen, alts in fetch_alt.items()}
     data['ps_types'] = {ps: {k: int(v) for k, v in per.items()} for ps, per in ps_types.items()}
+    data['pair_types'] = {key: dict(per) for key, per in PAIR_TYPES.items()}  # Fase 78
     print('  learned vertex fetches: %d fetch shaders generated with fallback | actual texture types from %d PS' % (len(fetch_alt), len(ps_types)))
     with open(DICTIONARY_JSON, 'w', newline='\n') as f:
         json.dump(data, f, separators=(',', ':'))
@@ -449,6 +534,21 @@ def _vs_real_layouts(path):
     return out
 
 
+_COMPONENTS = (0, 1, 1, 2, 1, 2, 3, 3, 4, 4, 4, 2, 4, 3, 4, 0)
+
+
+def _swizzle_fits(w3):
+    """AotSwizzleFits do port (hle_gnm.cpp): identidade nos componentes que o formato tem, 0 / 1 (w) nos outros."""
+    data, sel = (w3 >> 15) & 0xF, w3 & 0xFFF
+    if data == 0xA and ((w3 >> 12) & 7) == 0 and sel == 0xF2E:
+        return True
+    for i in range(4):
+        s = (sel >> (3 * i)) & 7
+        if s != 4 + i and not (i >= _COMPONENTS[data] and s == (1 if i == 3 else 0)):
+            return False
+    return True
+
+
 def _real_variant(lines):
     """(assinatura canonica, linhas do VS normalizadas) ou None se o swizzle nao cabe no pacote."""
     fetch_line = next((l for l in lines if l.startswith('fetch ')), None)
@@ -470,8 +570,10 @@ def _real_variant(lines):
         sel, num, fmt = w3 & 0xFFF, (w3 >> 12) & 7, (w3 >> 15) & 0xF
         if sel == 0xF2E and fmt == 0xA and num == 0:  # BGRA: o jogo poe no VkFormat (kUnorm8x4Bgra)
             t[off + 3] = (w3 & ~0xFFF) | 0xFAC
-        elif sel != 0xFAC:
+        elif not _swizzle_fits(w3):
             return None  # o draw recusaria o par do pacote (AotSwizzleFits)
+        elif sel != 0xFAC:  # Fase 78: XYZ1 e parecidos (componentes que o formato nao tem = 0/1) cabem, como no port
+            t[off + 3] = (w3 & ~0xFFF) | 0xFAC
         classes.append(1 if num == 4 else 2 if num == 5 else 0)
     sig = '%016x' % gcn.class_signature(fetch, classes)
     text = [fetch_line, 'vs ud ' + ' '.join('%08x' % v for v in ud)]
@@ -559,6 +661,18 @@ def cmd_plan(args):
         # Fase 52: leituras de vertice aprendidas de outros VS com o mesmo fetch gerado (atributos da malha)
         gen = gcn.fetch_shader(shaders[vs])
         extra = []
+        # Fase 78: VS com mais de 8 atributos: o jogo le todos num lote so; as mesmas classes das variantes do dicionario
+        for one in gcn.fetch_shaders_extra(shaders[vs]):
+            layout = gcn.fetch_layout(list(one))
+            inverse = {v: k for k, v in gcn.CLASS_TEMPLATE.items()}
+            for _sig, formats in variants:
+                classes = [inverse.get(f) for f in formats]
+                if None in classes or len(classes) != len(layout):
+                    continue
+                vb = [(b, o, gcn.CLASS_TEMPLATE[c]) for (b, o, _), c in zip(layout, classes)]
+                extra.append(('%016x' % gcn.class_signature(list(one), classes), None, list(one), vb))
+        if extra:
+            stats['pares com VS de mais de 8 atributos (lote unico)'] += 1
         for real, class_set in (fetch_alt.get('%016x' % gcn.fnv_words(gen), {}).items() if gen is not None else ()):
             layout = gcn.fetch_layout(list(real))
             for classes in sorted(class_set)[:3]:
@@ -567,13 +681,17 @@ def cmd_plan(args):
                     extra.append(('%016x' % gcn.class_signature(list(real), classes), None, list(real), vb))
         if extra:
             stats['pares com leitura de vertice aprendida'] += 1
+        planned = set()
         for sig, formats, fetch_words, vb in [(sg, fm, None, None) for sg, fm in variants] + extra:
+            if sig in planned:  # Fase 78: o lote unico pode repetir uma leitura aprendida
+                continue
+            planned.add(sig)
             if (vs, ps, sig) in packed:
                 stats['variantes ja no pacote'] += 1
                 continue
             stats['variantes a compilar'] += 1
             chunk.append('pair %s %s %s\n' % (vs, ps, sig))
-            chunk.append(snapshot_text(shaders[vs], shaders[ps], formats, ps_types.get(ps), fetch_words, vb))
+            chunk.append(snapshot_text(shaders[vs], shaders[ps], formats, types_for(vs, ps, ps_types), fetch_words, vb))
             plan_lines.append('%s\t%s\t%s\t%s\t%s\n' % (vs, ps, sig, source if formats else 'leitura aprendida',
                                                          ' '.join('%x' % f for f in (formats or [v[2] for v in vb]))))
             chunk_pairs += 1
@@ -605,7 +723,7 @@ def cmd_plan(args):
                     if ps not in shaders or (vs, ps, sig) in packed or (vs, ps, sig) in done:
                         continue
                     done.add((vs, ps, sig))
-                    ud, tables = stage_snapshot(shaders[ps], True, None, ps_types.get(ps))
+                    ud, tables = stage_snapshot(shaders[ps], True, None, types_for(vs, ps, ps_types))
                     ps_text = 'ps ud %s\n' % ' '.join('%08x' % v for v in ud)
                     ps_text += ''.join('ps tab %d %s\n' % (r, ' '.join('%08x' % v for v in tables[r])) for r in sorted(tables))
                     chunk.append('pair %s %s %s\n' % (vs, ps, sig))
@@ -639,7 +757,7 @@ class PackWriter:
          blob <id> <offset> <empacotado> <tamanho>
          pair <vs> <ps> <variante> <blob do .txt> <blob do .vs.spv> <blob do .ps.spv>"""
 
-    def __init__(self, path, append=False):
+    def __init__(self, path, append=False, replace=False):
         import hashlib
         import winpack
         self.hashlib = hashlib
@@ -654,7 +772,7 @@ class PackWriter:
                     p = line.split()
                     if p[0] == 'blob':
                         self.first_id = max(self.first_id, int(p[1]) + 1)
-                    elif p[0] == 'pair':
+                    elif p[0] == 'pair' and not replace:  # Fase 78: --substituir grava de novo (a ultima linha vale)
                         self.skip.add(tuple(p[1:4]))
             self.offset = os.path.getsize(path + '.pak')
             self.pak = open(path + '.pak', 'ab')
@@ -717,7 +835,7 @@ def cmd_compile(args):
     if not os.path.exists(TOOL):
         sys.exit('ferramenta nao encontrada: ' + TOOL)
     tmp_name = os.path.join(AOT, 'aot_pairs' if args.append else 'aot_pairs.novo')
-    writer = PackWriter(tmp_name, args.append)
+    writer = PackWriter(tmp_name, args.append, getattr(args, 'substituir', False))
     t0 = time.time()
     done = [0]
     failures = collections.Counter()
@@ -839,13 +957,16 @@ def main():
     p.add_argument('--jobs', type=int, default=max(1, (os.cpu_count() or 4) - 2))
     p.add_argument('--limit', type=int, default=0)
     p.add_argument('--append', action='store_true', help='append to existing pack instead of rebuilding')
+    p.add_argument('--substituir', action='store_true', help='with --append: also re-pack variants already in the pack (the newest wins)')
     p = sub.add_parser('validate')
     p.add_argument('--dictionary', action='store_true')
     sub.add_parser('export-dictionary')
     sub.add_parser('export-reais')
+    sub.add_parser('export-eboot-pairs')
     args = ap.parse_args()
     {'extract': cmd_extract, 'plan': cmd_plan, 'compile': cmd_compile, 'validate': cmd_validate,
-     'export-dictionary': cmd_export_dictionary, 'export-reais': cmd_export_reais}[args.cmd](args)
+     'export-dictionary': cmd_export_dictionary, 'export-reais': cmd_export_reais,
+     'export-eboot-pairs': cmd_export_eboot_pairs}[args.cmd](args)
 
 
 if __name__ == '__main__':

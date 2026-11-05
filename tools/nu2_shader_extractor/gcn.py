@@ -69,17 +69,17 @@ def parse_header(stage, hdr):
     return {'regs': regs, 'slots': slots, 'sem': sem}
 
 
-def fetch_shader(info):
+def fetch_shader(info, batch_size=8):
     """Fetch shader que o jogo gera para o VS (sem instancia): por atributo, s_load_dwordx4 do V#
     (tabela de vertex buffers, dword 4 * semantica) e buffer_load_format_x..xyzw no VGPR do atributo.
-    Em lotes de 8 atributos (s[16:47] / s[4:11] em unidades de 4)."""
+    Em lotes de 8 atributos (s[16:47] / s[4:11] em unidades de 4); ver fetch_shaders para VS com mais de 8."""
     table = next((s[2] for s in info['slots'] if s[0] == USAGE_VERTEX_BUFFER_TABLE), None)
     if table is None or not info['sem']:
         return None
     w = []
     sem = list(info['sem'])
-    for start in range(0, len(sem), 8):
-        batch = sem[start:start + 8]
+    for start in range(0, len(sem), batch_size):
+        batch = sem[start:start + batch_size]
         for i, (s, vgpr, size, _) in enumerate(batch):
             w.append(0xC0800100 | ((16 + 4 * i) << 15) | ((table // 2) << 9) | (4 * s))
         w.append(0xBF8C007F)  # s_waitcnt lgkmcnt(0)
@@ -88,6 +88,17 @@ def fetch_shader(info):
             w.append(0x80000000 | ((4 + i) << 16) | (vgpr << 8))
     w += [0xBF8C0000, 0xBE802000]  # s_waitcnt vmcnt(0); s_setpc_b64 s[0:1]
     return w
+
+
+def fetch_shaders_extra(info):
+    """Fase 78: fetch shaders que o jogo tambem gera alem de fetch_shader(info). Para VS com mais de 8 atributos o
+    jogo quase sempre le todos num lote so (s[16:16+4n]): conferido em 472 de 478 retratos reais com 9-10 atributos;
+    o lote de 8 de fetch_shader so aparece em 6. Sem este, todo VS assim caia na traducao ao vivo."""
+    n = len(info['sem'])
+    if n <= 8 or n > 16:
+        return []
+    one = fetch_shader(info, batch_size=n)
+    return [one] if one is not None else []
 
 
 def fetch_sgpr(info):
