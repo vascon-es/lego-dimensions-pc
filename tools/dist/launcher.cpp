@@ -219,6 +219,23 @@ bool AotReady() {
     return fs::is_regular_file(g_root / L"assets" / L"shaders_aot" / L"aot_pairs.pak", ec);
 }
 
+// Fase 78: versao do pacote AOT que este port espera (PACK_VERSION do preparar.py). Quem preparou com uma versao mais
+// antiga recebe um pedido para preparar de novo (o pacote ganhou os shaders do eboot e outras correcoes).
+constexpr int kPackVersion = 78;
+
+// Valor inteiro de "chave=valor" em assets/preparado.txt (0 se nao tem).
+int PreparedValue(const char* key) {
+    std::ifstream in(g_root / L"assets" / L"preparado.txt");
+    std::string line;
+    const std::string prefix = std::string(key) + "=";
+    while (std::getline(in, line)) {
+        if (line.rfind(prefix, 0) == 0) {
+            return std::atoi(line.c_str() + prefix.size());
+        }
+    }
+    return 0;
+}
+
 // Fase 58: atualizacao separada (formato do shadPS4), dentro da pasta do jogo ou ao lado dela.
 fs::path FindPatch(const fs::path& game) {
     return game_region::FindPatch(game);
@@ -1169,6 +1186,25 @@ void RunGame() {
                                          L"(more pop-in and stutter the first time). Play anyway?"),
                                    L"LEGO Dimensions PC", MB_YESNO | MB_ICONQUESTION) != IDYES) {
         return;
+    }
+    if (AotReady() && PreparedValue("pacote") < kPackVersion && PreparedValue("aviso_pacote") < kPackVersion) {
+        const int answer = MessageBoxW(
+            g_main,
+            ui::T(L"Esta versão melhora o que o Preparar gera: menos travadas na primeira visita a cada lugar. "
+                  L"Para valer, é preciso preparar de novo (seus saves e opções não mudam).\n\n"
+                  L"Sim: preparar agora.\nNão: jogar assim (não pergunta de novo; dá para preparar depois em Ferramentas).",
+                  L"This version improves what Prepare builds: fewer hitches the first time you visit each place. "
+                  L"It takes a new Prepare to apply (your saves and options stay).\n\n"
+                  L"Yes: prepare now.\nNo: play as is (won't ask again; you can prepare later from Tools)."),
+            L"LEGO Dimensions PC", MB_YESNOCANCEL | MB_ICONQUESTION);
+        if (answer == IDCANCEL) {
+            return;
+        }
+        if (answer == IDYES) {
+            RunPrepare(false);
+            return;
+        }
+        std::ofstream(g_root / L"assets" / L"preparado.txt", std::ios::app) << "aviso_pacote=" << kPackVersion << "\n";
     }
     std::error_code icons_ec;
     if (!fs::is_regular_file(g_root / L"assets" / L"buttons" / L"ps4_dxt5.hash", icons_ec)) {

@@ -89,7 +89,7 @@ def stage():
     if os.path.isfile(R('tools', 'LegoToypad.ini')):
         copy(R('tools', 'LegoToypad.ini'), S('tools', 'LegoToypad.ini'))
     # ferramentas de preparacao
-    for f in ('nu2_shader_extractor.py', 'gcn.py', 'nu2dat.py', 'nu2toc.py', 'winpack.py'):  # Fase 60: nu2toc le a tabela do .DAT
+    for f in ('nu2_shader_extractor.py', 'gcn.py', 'nu2dat.py', 'nu2toc.py', 'winpack.py', 'nu2mat.py'):  # Fase 60: nu2toc le a tabela do .DAT; Fase 78: nu2mat os materiais
         copy(R('tools', 'nu2_shader_extractor', f), S('tools', 'nu2_shader_extractor', f))
     copy(R('tools', 'check_binaries.py'), S('tools', 'check_binaries.py'))
     copy(R('tools', 'game_regions.py'), S('tools', 'game_regions.py'))
@@ -111,6 +111,7 @@ def stage():
     copy(R('tools', 'data', 'layout_dictionary.json'), S('tools', 'data', 'layout_dictionary.json'))
     copy(R('tools', 'data', 'figuras_ocultas.json'), S('tools', 'data', 'figuras_ocultas.json'))  # Fase 67: figuras desligadas no jogo
     copy(R('tools', 'data', 'vs_reais.txt'), S('tools', 'data', 'vs_reais.txt'))  # Fase 51: leituras de vertice reais (so numeros)
+    copy(R('tools', 'data', 'pares_eboot.txt'), S('tools', 'data', 'pares_eboot.txt'))  # Fase 78: pares com shader do eboot (so hashes)
     # Python portatil
     for f in ('python.exe', 'pythonw.exe', 'python3.dll', 'python%d%d.dll' % sys.version_info[:2], 'vcruntime140.dll', 'vcruntime140_1.dll',
               'LICENSE.txt'):

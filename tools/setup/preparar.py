@@ -21,6 +21,9 @@ import threading
 import time
 
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..'))
+# Fase 78: sobe quando o pacote AOT muda de forma que valha refazer (shaders do eboot, leitura de vertices em lote unico,
+# tipos de textura por par, 3D). Gravado em assets/preparado.txt; o launcher compara com o dele (kPackVersion).
+PACK_VERSION = 78
 sys.path.insert(0, os.path.join(ROOT, 'tools'))
 EXTRACTOR = os.path.join(ROOT, 'tools', 'nu2_shader_extractor', 'nu2_shader_extractor.py')
 from game_regions import read_sfo, title_id, SUPPORTED_TITLE_IDS
@@ -177,8 +180,12 @@ def prewarm(args, start, end):
     progress(start, label)
     cmd_extra = []
     if args.prever:  # receitas previstas para os pares que ninguem jogou ainda (prever_pipelines.py, segundos)
-        guess = subprocess.run([sys.executable, '-u', os.path.join(ROOT, 'tools', 'setup', 'prever_pipelines.py'), '--root', ROOT], cwd=ROOT,
-                               capture_output=True, text=True, encoding='utf-8', errors='replace')
+        guess_cmd = [sys.executable, '-u', os.path.join(ROOT, 'tools', 'setup', 'prever_pipelines.py'), '--root', ROOT, '--app0', args.app0]
+        if args.addcont and os.path.isdir(args.addcont):  # Fase 78: os materiais vem dos .DAT do jogo, da atualizacao e das DLCs
+            guess_cmd += ['--addcont', args.addcont]
+        if args.patch:
+            guess_cmd += ['--patch', args.patch]
+        guess = subprocess.run(guess_cmd, cwd=ROOT, capture_output=True, text=True, encoding='utf-8', errors='replace')
         for line in (guess.stdout + guess.stderr).strip().splitlines()[-3:]:
             print(line, flush=True)
         cmd_extra = ['--prewarm-predicted']
@@ -230,9 +237,10 @@ def main():
     ap.add_argument('--sem-aot', action='store_true', help='eboot only (shaders deferred to live compiler)')
     ap.add_argument('--limite', type=int, default=0, help='only first N translation batches (test)')
     ap.add_argument('--so-pipelines', action='store_true', help='only build the known pipelines into the GPU driver cache (Phase 77)')
-    ap.add_argument('--prever', action='store_true',
-                    help='also predicted pipelines for content nobody played (Phase 77; ~4 min more, but the AMD driver keeps '
-                         'its whole cache in RAM: about +1.8 GB in every game session)')
+    ap.add_argument('--prever', action='store_true', default=True,
+                    help='(default) also predicted pipelines for content nobody played, from the game materials (Phase 78: '
+                         '~1.5 min more and about +0.6 GB of RAM in game; halves the first-visit pipeline misses)')
+    ap.add_argument('--sem-prever', dest='prever', action='store_false', help='skip the predicted pipelines')
     args = ap.parse_args()
     t0 = time.time()
     progress(1, T('conferindo o jogo', 'checking the game'))
@@ -268,7 +276,9 @@ def main():
         run_step(['compile', '--jobs', str(args.jobs)] + (['--limit', str(args.limite)] if args.limite else []), T('traduzindo shaders', 'translating shaders'), 17, 85)
         prewarm(args, 85, 99)
     with open(os.path.join(ROOT, 'assets', 'preparado.txt'), 'w', encoding='utf-8') as f:
-        f.write('app0=%s\npatch=%s\naddcont=%s\naot=%s\n' % (args.app0, args.patch, args.addcont, 'nao' if args.sem_aot else 'sim'))
+        # Fase 78: versao do pacote AOT (o launcher pede um Preparar novo a quem tem um pacote mais antigo)
+        f.write('app0=%s\npatch=%s\naddcont=%s\naot=%s\npacote=%d\n' % (args.app0, args.patch, args.addcont, 'nao' if args.sem_aot else 'sim',
+                                                                       PACK_VERSION))
     progress(100, T('pronto em %.0f min', 'done in %.0f min') % ((time.time() - t0) / 60))
 
 
