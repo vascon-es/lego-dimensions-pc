@@ -99,6 +99,7 @@ def stage():
     copy(R('tools', 'setup', 'ld_transfer.py'), S('tools', 'setup', 'ld_transfer.py'))  # Fase 63: LD PC Transfer
     copy(R('tools', 'setup', 'mods.py'), S('tools', 'setup', 'mods.py'))  # Fase 64: carregador de mods
     copy(R('tools', 'setup', 'launcher_art.py'), S('tools', 'setup', 'launcher_art.py'))  # 1.8.7: a fonte do jogo para o launcher
+    copy(R('tools', 'setup', 'prever_pipelines.py'), S('tools', 'setup', 'prever_pipelines.py'))  # 1.8.9: receitas previstas (preparar.py --prever)
     # 7-Zip 26.03 (LGPL + restricao do unRAR; License.txt vai junto): abre os .rar v6 / dicionario grande que o tar.exe
     # do Windows nao abre. Copia oficial em tools\7zip, no repositorio.
     for f in ('7z.exe', '7z.dll', 'License.txt', 'readme.txt'):
