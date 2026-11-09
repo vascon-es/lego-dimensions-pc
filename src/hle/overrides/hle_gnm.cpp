@@ -2916,14 +2916,32 @@ void AssignCameraResource(u64 vs_hash, GamePairInfo* info) {
 // colunas x / y estao na proporcao 16:9 (P00 / P11 = 9 / 16). Matrizes de mundo (coluna w zero), de sombra e inversas
 // nao batem. Depois, pares (1 / P00, 1 / P11) da mesma projecao (vs_inverse_projection_xy / fs_inverse_projection_xy)
 // sao corrigidos pelo inverso.
-std::atomic<u32> g_aspect_p00{0}, g_aspect_p11{0}; // bits do float da ultima projecao do jogo vista (antes da correcao)
+// As projecoes do jogo vistas por ultimo (P00, P11 antes da correcao), em bits de float empacotados. 1.9.2: era so a
+// ULTIMA vista; os passes de tela cheia (sem matriz propria) dependiam da ordem dos desenhos - quando o ultimo desenho com
+// projecao era de outra camera (rostos 3D do HUD, reflexos), o par da luz / sombra diferida ficava sem correcao naquele
+// quadro e as sombras e texturas do chao piscavam no ultrawide / 4:3.
+constexpr u32 kAspectSlots = 16;
+std::atomic<u64> g_aspect_pairs[kAspectSlots]{};
+std::atomic<u32> g_aspect_next{0};
+std::atomic<u64> g_aspect_last{0}; // a ultima vista (o que a 1.9.2 usava) - so para a contagem [ASPECT]
+
+void RememberProjection(float p00, float p11) {
+    for (auto& slot : g_aspect_pairs) {
+        const u64 v = slot.load(std::memory_order_relaxed);
+        const float a = std::bit_cast<float>(static_cast<u32>(v >> 32)), b = std::bit_cast<float>(static_cast<u32>(v));
+        if (v && std::fabs(a / p00 - 1.0f) < 0.0005f && std::fabs(b / p11 - 1.0f) < 0.0005f) {
+            return;
+        }
+    }
+    const u64 packed = (static_cast<u64>(std::bit_cast<u32>(p00)) << 32) | std::bit_cast<u32>(p11);
+    g_aspect_pairs[g_aspect_next.fetch_add(1, std::memory_order_relaxed) % kAspectSlots].store(packed, std::memory_order_relaxed);
+}
 
 // TAA (1.9.1): depois da proporcao, o deslocamento do quadro (jx, jy em NDC) entra na projecao: x / y do recorte += j * w.
 // `camera`: e o buffer de camera do VS de um desenho com profundidade - a matriz (sem o deslocamento) vai para o TAA.
 void PatchProjection(u8* data, u32 bytes, float sx, float sy, float jx, float jy, bool camera, u64 depth) {
     const u32 count = bytes / 4;
     float* f = reinterpret_cast<float*>(data);
-    float p00 = 0.0f, p11 = 0.0f;
     bool found = false;
     for (u32 i = 0; i + 16 <= count; i += 4) {
         float* m = f + i;
@@ -2967,26 +2985,51 @@ void PatchProjection(u8* data, u32 bytes, float sx, float sy, float jx, float jy
                 m[row * 4 + 1] += jy * m[row * 4 + 3];
             }
         }
-        p00 = l0;
-        p11 = l1;
+        if (sx != 1.0f || sy != 1.0f) {
+            RememberProjection(l0, l1);
+            g_aspect_last.store((static_cast<u64>(std::bit_cast<u32>(l0)) << 32) | std::bit_cast<u32>(l1), std::memory_order_relaxed);
+        }
         found = true;
         i += 12; // a matriz inteira ja foi vista
     }
     if (sx == 1.0f && sy == 1.0f) {
         return; // so o deslocamento do TAA: os pares (1 / P00, 1 / P11) nao mudam
     }
-    if (found) {
-        g_aspect_p00.store(std::bit_cast<u32>(p00), std::memory_order_relaxed);
-        g_aspect_p11.store(std::bit_cast<u32>(p11), std::memory_order_relaxed);
-    } else {
-        p00 = std::bit_cast<float>(g_aspect_p00.load(std::memory_order_relaxed));
-        p11 = std::bit_cast<float>(g_aspect_p11.load(std::memory_order_relaxed));
-        if (!(p00 > 0.0f && p11 > 0.0f)) {
-            return;
+    // pares (1 / P00, 1 / P11) de QUALQUER projecao do jogo vista recentemente (nao so a ultima)
+    float known[kAspectSlots][2];
+    u32 known_count = 0;
+    for (const auto& slot : g_aspect_pairs) {
+        if (const u64 v = slot.load(std::memory_order_relaxed)) {
+            known[known_count][0] = std::bit_cast<float>(static_cast<u32>(v >> 32));
+            known[known_count][1] = std::bit_cast<float>(static_cast<u32>(v));
+            ++known_count;
         }
     }
-    for (u32 i = 0; i + 2 <= count; i += 2) {
-        if (f[i] > 0.0f && f[i + 1] > 0.0f && std::fabs(f[i] * p00 - 1.0f) < 0.002f && std::fabs(f[i + 1] * p11 - 1.0f) < 0.002f) {
+    (void)found;
+    for (u32 i = 0; i + 2 <= count && known_count; i += 2) {
+        if (!(f[i] > 0.0f && f[i + 1] > 0.0f)) {
+            continue;
+        }
+        bool match = false;
+        for (u32 k = 0; k < known_count && !match; ++k) {
+            match = std::fabs(f[i] * known[k][0] - 1.0f) < 0.002f && std::fabs(f[i + 1] * known[k][1] - 1.0f) < 0.002f;
+        }
+        if (match) {
+            {   // contagem: quantos destes o codigo da 1.9.2 (so a ultima projecao) deixaria sem correcao
+                static std::atomic<u64> total{0}, old_miss{0}, last_frame{0};
+                const u64 last = g_aspect_last.load(std::memory_order_relaxed);
+                const float a = std::bit_cast<float>(static_cast<u32>(last >> 32)), b = std::bit_cast<float>(static_cast<u32>(last));
+                ++total;
+                if (!(last && std::fabs(f[i] * a - 1.0f) < 0.002f && std::fabs(f[i + 1] * b - 1.0f) < 0.002f)) {
+                    ++old_miss;
+                }
+                if (const u64 frame = g_texture_frame; frame / 600 != last_frame.load(std::memory_order_relaxed) / 600) {
+                    last_frame = frame;
+                    std::printf("[ASPECT] frame %llu: %llu inverse-projection pairs corrected, %llu of them by a camera that was not the last "
+                                "one drawn\n", static_cast<unsigned long long>(frame), static_cast<unsigned long long>(total.load()),
+                                static_cast<unsigned long long>(old_miss.load()));
+                }
+            }
             f[i] /= sx;
             f[i + 1] /= sy;
         }
