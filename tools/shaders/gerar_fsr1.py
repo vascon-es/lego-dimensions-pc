@@ -16,7 +16,8 @@ SRC = os.path.join(ROOT, 'src', 'render', 'shaders')
 FSR = os.path.join(ROOT, 'externals', 'fidelityfx-fsr1')
 OUT = os.path.join(ROOT, 'src', 'render', 'fsr1_spv.h')
 SHADERS = [('kFullscreenVert', 'fullscreen.vert'), ('kFsr1EasuFrag', 'fsr1_easu.frag'), ('kFsr1RcasFrag', 'fsr1_rcas.frag'),
-           ('kTaaFrag', 'taa.frag'), ('kTemporalInputsFrag', 'temporal_inputs.frag')]
+           ('kTaaFrag', 'taa.frag'), ('kTemporalInputsFrag', 'temporal_inputs.frag'),
+           ('kDownscaleFrag', 'downscale.frag')]
 
 
 def glslc():

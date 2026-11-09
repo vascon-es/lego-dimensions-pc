@@ -892,7 +892,7 @@ bool CreateSwapchain() {
     info.imageColorSpace = g.format.colorSpace;
     info.imageExtent = extent;
     info.imageArrayLayers = 1;
-    info.imageUsage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
+    info.imageUsage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | (std::getenv("LD_GRAB_TRIGGER") ? VK_IMAGE_USAGE_TRANSFER_SRC_BIT : 0u);
     info.imageSharingMode = VK_SHARING_MODE_EXCLUSIVE;
     info.preTransform = caps.currentTransform;
     info.compositeAlpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;
@@ -4584,7 +4584,7 @@ bool EnsureTaaImages(u32 width, u32 height) {
         image.arrayLayers = 1;
         image.samples = VK_SAMPLE_COUNT_1_BIT;
         image.tiling = VK_IMAGE_TILING_OPTIMAL;
-        image.usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+        image.usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
         if (vk.vkCreateImage(g.device, &image, nullptr, &g_taa.images[i]) != VK_SUCCESS) {
             g_taa.images[i] = VK_NULL_HANDLE;
             return false;
@@ -4937,6 +4937,12 @@ bool FfxPass(State::RenderTarget* shown, u32 out_w, u32 out_h, VkImageView* out_
         (!g_ffx_native.load(std::memory_order_relaxed) && out_w <= shown->width && out_h <= shown->height)) {
         return false;
     }
+    if (out_w < shown->width || out_h < shown->height) {
+        // o FSR so amplia: com a area na janela menor que a imagem (resolucao maior que o monitor), o FSR AA sai no tamanho
+        // da imagem e a janela reduz com o filtro de area (DownscaleDraw). Pedir saida menor gerava lixo piscando.
+        out_w = shown->width;
+        out_h = shown->height;
+    }
     if (!LoadFfx() || !EnsureFfxPipelines() || !EnsureFfxContext(shown->width, shown->height, out_w, out_h)) {
         return false;
     }
@@ -4946,7 +4952,8 @@ bool FfxPass(State::RenderTarget* shown, u32 out_w, u32 out_h, VkImageView* out_
         !EnsureOwnImage(g_ffx.depth[0], shown->width, shown->height, VK_FORMAT_R32_SFLOAT, input_usage) ||
         !EnsureOwnImage(g_ffx.depth[1], shown->width, shown->height, VK_FORMAT_R32_SFLOAT, input_usage) ||
         !EnsureOwnImage(g_ffx.reactive, shown->width, shown->height, VK_FORMAT_R8_UNORM, input_usage) ||
-        !EnsureOwnImage(g_ffx.output, out_w, out_h, VK_FORMAT_R16G16B16A16_SFLOAT, VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT)) {
+        !EnsureOwnImage(g_ffx.output, out_w, out_h, VK_FORMAT_R16G16B16A16_SFLOAT,
+                        VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT)) {
         return false;
     }
     // 1. entradas (cor, movimento, profundidade) numa passagem
@@ -5081,6 +5088,169 @@ bool FfxPass(State::RenderTarget* shown, u32 out_w, u32 out_h, VkImageView* out_
     *out_set = g_ffx.present_set;
     return true;
 }
+
+// ---- DIAGNOSTICO 1.9.1 (LD_GRAB_TRIGGER=<arquivo>, LD_GRAB_DIR=<pasta>, LD_GRAB_COUNT=n): quadros consecutivos ----
+// Quando o arquivo-gatilho aparece, os proximos n quadros sao gravados em <pasta>: a imagem do jogo (antes do AA, "jogo_NNN")
+// e a que vai para a janela (TAA / FSR / a mesma, "saida_NNN"), em PPM 8 bits. Para achar cintilacao entre quadros.
+struct GrabState {
+    bool enabled = false, init = false;
+    std::filesystem::path trigger, dir;
+    u32 count = 24, done = 0, active = 0;
+    State::HostBuffer buffers[2];
+    u32 width[2]{}, height[2]{}, bpp[2]{};
+    bool half[2]{}, pending = false;
+    u64 checks = 0;
+} g_grab;
+
+bool GrabWanted() {
+    if (!g_grab.init) {
+        g_grab.init = true;
+        const char* trigger = std::getenv("LD_GRAB_TRIGGER");
+        const char* dir = std::getenv("LD_GRAB_DIR");
+        g_grab.enabled = trigger && dir;
+        if (g_grab.enabled) {
+            g_grab.trigger = trigger;
+            g_grab.dir = dir;
+            if (const char* n = std::getenv("LD_GRAB_COUNT")) {
+                g_grab.count = std::clamp(std::atoi(n), 1, 240);
+            }
+        }
+    }
+    if (!g_grab.enabled) {
+        return false;
+    }
+    if (!g_grab.active && (++g_grab.checks % 15) == 0 && std::filesystem::exists(g_grab.trigger)) {
+        std::error_code ec;
+        std::filesystem::remove(g_grab.trigger, ec);
+        std::filesystem::create_directories(g_grab.dir, ec);
+        g_grab.active = g_grab.count;
+        // a numeracao continua entre gatilhos (parado 000-023, andando 024-047...)
+        std::printf("[GRAB] recording %u consecutive frames to %s\n", g_grab.count, g_grab.dir.string().c_str());
+    }
+    return g_grab.active > 0;
+}
+
+// Copia a imagem (em SHADER_READ_ONLY) para o buffer i; o arquivo sai no proximo quadro (depois da cerca).
+void GrabImage(u32 i, VkImage image, u32 width, u32 height, VkFormat format,
+               VkImageLayout layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL) {
+    const bool half = format == VK_FORMAT_R16G16B16A16_SFLOAT;
+    const u32 bpp = half ? 8 : 4;
+    const u64 bytes = static_cast<u64>(width) * height * bpp;
+    if (!g_grab.buffers[i].buffer || g_grab.buffers[i].size < bytes) {
+        if (g_grab.buffers[i].buffer) {
+            return; // tamanho mudou no meio: ignora
+        }
+        if (!CreateHostBuffer(g_grab.buffers[i], bytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT, "grab")) {
+            return;
+        }
+    }
+    Transition(g.command, image, VK_IMAGE_ASPECT_COLOR_BIT, layout, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+    VkBufferImageCopy region{};
+    region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+    region.imageExtent = {width, height, 1};
+    vk.vkCmdCopyImageToBuffer(g.command, image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, g_grab.buffers[i].buffer, 1, &region);
+    Transition(g.command, image, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, layout);
+    g_grab.width[i] = width;
+    g_grab.height[i] = height;
+    g_grab.bpp[i] = bpp;
+    g_grab.half[i] = half;
+    g_grab.pending = true;
+}
+
+float HalfToFloat(u16 h) {
+    const u32 sign = (h >> 15) & 1, exp = (h >> 10) & 31, mant = h & 1023;
+    float v = exp == 0 ? std::ldexp(static_cast<float>(mant), -24) : exp == 31 ? 65504.0f : std::ldexp(static_cast<float>(mant | 1024), static_cast<int>(exp) - 25);
+    return sign ? -v : v;
+}
+
+// Depois da cerca do quadro anterior: grava os PPM.
+void GrabFlush() {
+    if (!g_grab.pending) {
+        return;
+    }
+    g_grab.pending = false;
+    static const char* names[2] = {"jogo", "janela"};
+    for (u32 i = 0; i < 2; ++i) {
+        if (!g_grab.width[i]) {
+            continue;
+        }
+        // bruto (rapido; o script converte): cabecalho "LDGRAB largura altura bytes_por_pixel meio_float" + pixels
+        char name[64];
+        std::snprintf(name, sizeof(name), "%s_%03u.raw", names[i], g_grab.done);
+        FILE* f = _wfopen((g_grab.dir / name).c_str(), L"wb");
+        if (!f) {
+            continue;
+        }
+        std::fprintf(f, "LDGRAB %u %u %u %u\n", g_grab.width[i], g_grab.height[i], g_grab.bpp[i], g_grab.half[i] ? 1u : 0u);
+        std::fwrite(g_grab.buffers[i].mapped, 1, static_cast<size_t>(g_grab.width[i]) * g_grab.height[i] * g_grab.bpp[i], f);
+        std::fclose(f);
+        g_grab.width[i] = 0;
+    }
+    ++g_grab.done;
+}
+
+// ---- 1.9.1: reducao para a janela (imagem maior que a area dela) com filtro de area: downscale.frag ----
+struct DownState {
+    bool tried = false;
+    VkShaderModule fs = VK_NULL_HANDLE;
+    VkPipeline pipeline = VK_NULL_HANDLE;
+    VkFormat format = VK_FORMAT_UNDEFINED;
+    VkDescriptorSet set = VK_NULL_HANDLE;
+} g_down;
+
+bool EnsureDown() {
+    if (!EnsureFsr()) { // layout, vertex shader e pipeline base do FSR 1
+        return false;
+    }
+    if (!g_down.tried) {
+        g_down.tried = true;
+        g_down.fs = FsrModule(kDownscaleFrag, sizeof(kDownscaleFrag));
+        VkDescriptorSetAllocateInfo allocate{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+        allocate.descriptorPool = g.descriptor_pool;
+        allocate.descriptorSetCount = 1;
+        allocate.pSetLayouts = &g.set_layout;
+        if (vk.vkAllocateDescriptorSets(g.device, &allocate, &g_down.set) != VK_SUCCESS) {
+            g_down.set = VK_NULL_HANDLE;
+        }
+    }
+    if (!g_down.fs || !g_down.set) {
+        return false;
+    }
+    if (g_down.format != g.format.format) {
+        if (g_down.pipeline) {
+            vk.vkDestroyPipeline(g.device, g_down.pipeline, nullptr);
+        }
+        g_down.pipeline = FsrPipeline(g_down.fs, g.format.format);
+        g_down.format = g.format.format;
+    }
+    return g_down.pipeline != VK_NULL_HANDLE;
+}
+
+void DownscaleDraw(VkImageView view, u32 src_w, u32 src_h, float x, float y, float w, float h) {
+    VkDescriptorImageInfo info{g.sampler, view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
+    VkWriteDescriptorSet write{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+    write.dstSet = g_down.set;
+    write.descriptorCount = 1;
+    write.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    write.pImageInfo = &info;
+    vk.vkUpdateDescriptorSets(g.device, 1, &write, 0, nullptr);
+    const VkViewport viewport{x, y, w, h, 0.0f, 1.0f};
+    const VkRect2D scissor{{static_cast<s32>(x), static_cast<s32>(y)}, {static_cast<u32>(w), static_cast<u32>(h)}};
+    vk.vkCmdBindPipeline(g.command, VK_PIPELINE_BIND_POINT_GRAPHICS, g_down.pipeline);
+    vk.vkCmdSetViewport(g.command, 0, 1, &viewport);
+    vk.vkCmdSetScissor(g.command, 0, 1, &scissor);
+    FsrPush push{};
+    const float sw = static_cast<float>(src_w), sh = static_cast<float>(src_h);
+    const float c[8] = {sw, sh, 1.0f / sw, 1.0f / sh, w, h, std::max(1.0f, sw / w), std::max(1.0f, sh / h)};
+    for (int i = 0; i < 8; ++i) {
+        push.con[i / 4][i % 4] = FloatBits(c[i]);
+    }
+    push.origin[0] = x;
+    push.origin[1] = y;
+    vk.vkCmdPushConstants(g.command, g_fsr.layout, VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(push), &push);
+    vk.vkCmdBindDescriptorSets(g.command, VK_PIPELINE_BIND_POINT_GRAPHICS, g_fsr.layout, 0, 1, &g_down.set, 0, nullptr);
+    vk.vkCmdDraw(g.command, 3, 1, 0, 0);
+}
 } // namespace
 
 bool VulkanRenderer::DrawFrame(u64 display_address) {
@@ -5145,6 +5315,7 @@ bool VulkanRenderer::DrawFrame(u64 display_address) {
         return skip(false);
     }
     lap(2);
+    GrabFlush(); // DIAGNOSTICO (LD_GRAB_TRIGGER)
     g.hang_timeouts = 0;
     EvictForgottenTextures(); // Fase 59
     if (!g.temp_staging.empty()) { // Fase 59: buffers temporarios de envio cujo frame ja terminou
@@ -5729,6 +5900,12 @@ bool VulkanRenderer::DrawFrame(u64 display_address) {
     if (!ffx && !taa) {
         ClearJitter();
     }
+    bool grab_window = false;
+    if (shown && present_pipeline && GrabWanted()) { // DIAGNOSTICO: quadros consecutivos: a imagem do jogo e a janela
+        GrabImage(0, shown->image, shown->width, shown->height, shown->format);
+        grab_window = true;
+        --g_grab.active;
+    }
     // 1.9.1: FSR 1 quando a imagem do jogo e menor que a area dela na janela (EASU aqui, RCAS na passagem da janela)
     bool fsr = shown && present_pipeline && !ffx &&
                FsrEasuPass(present_view, shown->width, shown->height, static_cast<u32>(out_w), static_cast<u32>(out_h));
@@ -5737,6 +5914,10 @@ bool VulkanRenderer::DrawFrame(u64 display_address) {
         PointRcas(present_view);
         fsr = true;
     }
+    // imagem maior que a area na janela (resolucao acima do monitor): reducao com filtro de area em vez do bilinear
+    const u32 present_w = ffx ? g_ffx.output.width : shown ? shown->width : 0;
+    const u32 present_h = ffx ? g_ffx.output.height : shown ? shown->height : 0;
+    const bool down = !fsr && present_pipeline && (present_w > out_w * 1.01f || present_h > out_h * 1.01f) && EnsureDown();
     Transition(g.command, g.images[image_index], VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_UNDEFINED,
                VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
     VkRenderingAttachmentInfo window{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
@@ -5773,6 +5954,8 @@ bool VulkanRenderer::DrawFrame(u64 display_address) {
     const VkBuffer vertex_buffers[2] = {g.vertices.buffer, g.vertices.buffer};
     if (fsr) {
         FsrRcasDraw(out_x, out_y, out_w, out_h); // 1.9.1: FSR 1 (nitidez) direto na janela
+    } else if (down) {
+        DownscaleDraw(present_view, present_w, present_h, out_x, out_y, out_w, out_h);
     } else if (present_pipeline) {
         // 1.9.1: a imagem do jogo mantem a proporcao dela (16:9) numa janela de outra proporcao (ultrawide, 16:10, 4:3):
         // centralizada, com faixas, em vez de esticada
@@ -5789,7 +5972,7 @@ bool VulkanRenderer::DrawFrame(u64 display_address) {
         vk.vkCmdBindIndexBuffer(g.command, g.indices.buffer, 0, VK_INDEX_TYPE_UINT16);
         vk.vkCmdDrawIndexed(g.command, 6, 1, 0, 0, 0);
     }
-    bound = fsr ? g_fsr.rcas : present_pipeline;
+    bound = fsr ? g_fsr.rcas : down ? g_down.pipeline : present_pipeline;
     for (const State::Queued& draw : g.queue_draws) {
         if (draw.pipeline != bound) {
             vk.vkCmdBindPipeline(g.command, VK_PIPELINE_BIND_POINT_GRAPHICS, draw.pipeline);
@@ -5814,6 +5997,9 @@ bool VulkanRenderer::DrawFrame(u64 display_address) {
     }
     vk.vkCmdEndRendering(g.command);
     TailMarker(3);
+    if (grab_window) { // DIAGNOSTICO: o que vai para a tela (BGRA)
+        GrabImage(1, g.images[image_index], g.extent.width, g.extent.height, VK_FORMAT_B8G8R8A8_UNORM, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+    }
     Transition(g.command, g.images[image_index], VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
                VK_IMAGE_LAYOUT_PRESENT_SRC_KHR);
     TailMarker(4);
