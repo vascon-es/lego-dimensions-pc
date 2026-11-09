@@ -13,6 +13,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <bit>
 #include <chrono>
 #include <cinttypes>
 #include <cmath>
@@ -1900,7 +1901,11 @@ constexpr u64 kHotTiledMaxTexels = 512u * 512u;
 void NoteTextureCheck(u64 key, const GuestTexture& texture, TexTracked& state, bool changed) {
     state.rewrites = changed ? state.rewrites + 1 : 0;
     const u64 texels = static_cast<u64>(texture.width) * texture.height * texture.depth;
-    if (state.rewrites < kHotLinearRewrites || texels > (texture.tiling == 8 ? kHotLinearMaxTexels : kHotTiledMaxTexels) ||
+    // 1.9.1 (issue #6, log do jogador na 1.9.0): as telas dos fliperamas (3 texturas lineares de 480x480, uma por buffer)
+    // apareciam reescritas uma vez e nunca chegavam a 2 conferencias seguidas com mudanca (a amostragem e a cada ~30
+    // quadros e cada buffer so e usado num quadro de cada tres). Linear do tamanho de uma tela: promovida na primeira.
+    const u32 needed = texture.tiling == 8 ? 1 : kHotLinearRewrites;
+    if (state.rewrites < needed || texels > (texture.tiling == 8 ? kHotLinearMaxTexels : kHotTiledMaxTexels) ||
         !g_tex_hot_linear.insert(key).second) {
         return;
     }
@@ -2206,6 +2211,19 @@ u64 EnsureGuestTexture(const GuestTexture& texture) {
                 if (hash != state.hash && renderer.UpdateTexture(key, data)) {
                     state.hash = hash;
                     ++g_vk_stats.textures_refreshed;
+                    if (g_tex_hot_linear.count(key)) { // 1.9.1 (issue #6): quantas vezes a tela do fliperama mudou
+                        static std::unordered_map<u64, std::pair<u32, u32>> hot_stats; // texture -> (mudancas, quadro de inicio)
+                        auto& [changes, since] = hot_stats[key];
+                        if (!changes) {
+                            since = static_cast<u32>(g_texture_frame);
+                        }
+                        if (++changes == 120) {
+                            std::printf("[TEXTURE] 0x%llx %ux%u: 120 updates in %u frames (checked every frame)\n",
+                                        static_cast<unsigned long long>(texture.address), texture.width, texture.height,
+                                        static_cast<u32>(g_texture_frame) - since);
+                            changes = 0;
+                        }
+                    }
                 }
             }
         }
@@ -2401,6 +2419,9 @@ struct GamePairInfo {
     std::array<u32, 16> vformats{};
     u32 vformat_count = 0;
     u32 ps_input_mask = 0; // Fase 43: Locations das entradas do PS (antes de religar pelo SPI_PS_INPUT_CNTL)
+    // 1.9.1: buffer do VS que e o g_CameraVS_CB (matriz de camera; assets/shaders_aot/cameras.tsv), -1 = nenhum
+    int camera_resource = -1;
+    u32 camera_offset = 0;
 };
 // Um par tem VARIANTES (Fase 20): o mesmo VS aparece com fetch shaders e formatos de vertice
 // diferentes, e o recompilador especializa o SPIR-V para eles. A assinatura junta o conteudo do
@@ -2833,6 +2854,194 @@ bool LoadLazyAotModules(u64 pair_key, std::vector<u32>* vs, std::vector<u32>* ps
     return vs->size() >= 5 && ps->size() >= 5;
 }
 
+// ---- 1.9.1: matriz de camera ----
+// cameras.tsv (gerado no Preparar pelo extrator, a partir da reflexao dos shaders PSSL): para cada VS que tem o
+// g_CameraVS_CB, de onde vem o V# dele (ud:R ou tab:R:D, as mesmas fontes dos pares) e onde fica vs_viewProj.
+struct CameraSource {
+    u32 source, reg, dword, offset;
+};
+const std::unordered_map<u64, CameraSource>& CameraSources() {
+    static const std::unordered_map<u64, CameraSource> table = [] {
+        std::unordered_map<u64, CameraSource> out;
+        FILE* f = _wfopen((AotDirectory() / "cameras.tsv").c_str(), L"r");
+        if (!f) {
+            std::printf("[CAMERA] cameras.tsv not found: ultrawide and temporal AA disabled until Preparar runs again\n");
+            return out;
+        }
+        char line[256];
+        while (std::fgets(line, sizeof(line), f)) {
+            unsigned long long h = 0;
+            char src[64] = {};
+            u32 offset = 0;
+            if (line[0] == '#' || std::sscanf(line, "%llx %63s %u", &h, src, &offset) != 3) {
+                continue;
+            }
+            CameraSource c{0, 0, 0, offset};
+            if (std::sscanf(src, "ud:%u", &c.reg) == 1) {
+                c.source = 1;
+            } else if (std::sscanf(src, "tab:%u:%u", &c.reg, &c.dword) == 2) {
+                c.source = 2;
+            } else {
+                continue;
+            }
+            out[h] = c;
+        }
+        std::fclose(f);
+        std::printf("[CAMERA] %zu vertex shaders with the camera buffer\n", out.size());
+        return out;
+    }();
+    return table;
+}
+
+void AssignCameraResource(u64 vs_hash, GamePairInfo* info) {
+    const auto& table = CameraSources();
+    const auto it = table.find(vs_hash);
+    if (it == table.end()) {
+        return;
+    }
+    for (size_t i = 0; i < info->resources.size(); ++i) {
+        const auto& r = info->resources[i];
+        if (r.stage == 0 && r.kind == render::GamePairLayout::kBuffer && r.source == it->second.source && r.reg == it->second.reg &&
+            (r.source == 1 || r.dword == it->second.dword)) {
+            info->camera_resource = static_cast<int>(i);
+            info->camera_offset = it->second.offset;
+            return;
+        }
+    }
+}
+
+// 1.9.1: tela que nao e 16:9 (SetFillScreen). Nos desenhos dos alvos da tela, toda matriz de projecao do jogo que
+// aparece num buffer de constantes copiado (camera, camera do quadro anterior do motion blur, etc.) tem o x (Hor+) ou o
+// y (Vert-) do recorte multiplicado. Reconhecida pela forma: a coluna w (x, y, z) e o eixo z da vista, de tamanho 1, e as
+// colunas x / y estao na proporcao 16:9 (P00 / P11 = 9 / 16). Matrizes de mundo (coluna w zero), de sombra e inversas
+// nao batem. Depois, pares (1 / P00, 1 / P11) da mesma projecao (vs_inverse_projection_xy / fs_inverse_projection_xy)
+// sao corrigidos pelo inverso.
+std::atomic<u32> g_aspect_p00{0}, g_aspect_p11{0}; // bits do float da ultima projecao do jogo vista (antes da correcao)
+
+// TAA (1.9.1): depois da proporcao, o deslocamento do quadro (jx, jy em NDC) entra na projecao: x / y do recorte += j * w.
+// `camera`: e o buffer de camera do VS de um desenho com profundidade - a matriz (sem o deslocamento) vai para o TAA.
+void PatchProjection(u8* data, u32 bytes, float sx, float sy, float jx, float jy, bool camera, u64 depth) {
+    const u32 count = bytes / 4;
+    float* f = reinterpret_cast<float*>(data);
+    float p00 = 0.0f, p11 = 0.0f;
+    bool found = false;
+    for (u32 i = 0; i + 16 <= count; i += 4) {
+        float* m = f + i;
+        const float l3 = m[3] * m[3] + m[7] * m[7] + m[11] * m[11];
+        {   // DIAGNOSTICO (LD_DBG_PROJ=1): matrizes com coluna w (perspectiva) que NAO sao reconhecidas
+            static const bool dbg_proj = std::getenv("LD_DBG_PROJ") != nullptr;
+            if (dbg_proj && l3 > 1e-4f && std::isfinite(l3)) {
+                const float a = std::sqrt(m[0] * m[0] + m[4] * m[4] + m[8] * m[8]);
+                const float b = std::sqrt(m[1] * m[1] + m[5] * m[5] + m[9] * m[9]);
+                const bool ok = l3 > 0.98f && l3 < 1.02f && b > 0.2f && b < 50.0f && std::fabs(a / b - 0.5625f) <= 0.004f;
+                if (!ok && b > 0.0f) {
+                    static std::mutex dbg_mutex;
+                    static std::set<std::pair<int, int>> seen;
+                    std::lock_guard lock(dbg_mutex);
+                    if (seen.size() < 40 && seen.insert({static_cast<int>(std::sqrt(l3) * 20.0f), static_cast<int>(a / b * 100.0f)}).second) {
+                        std::printf("[DBG-PROJ] unrecognized perspective at +%u of %u bytes: |w| %.3f P00/P11 %.4f P11 %.3f | %.3f %.3f %.3f %.3f\n",
+                                    i * 4, bytes, std::sqrt(l3), a / b, b, m[3], m[7], m[11], m[15]);
+                    }
+                }
+            }
+        }
+        if (!(l3 > 0.98f && l3 < 1.02f)) {
+            continue;
+        }
+        const float l0 = std::sqrt(m[0] * m[0] + m[4] * m[4] + m[8] * m[8]);
+        const float l1 = std::sqrt(m[1] * m[1] + m[5] * m[5] + m[9] * m[9]);
+        if (!(l1 > 0.2f && l1 < 50.0f) || std::fabs(l0 / l1 - 0.5625f) > 0.004f) {
+            continue;
+        }
+        for (u32 row = 0; row < 4; ++row) {
+            m[row * 4] *= sx;
+            m[row * 4 + 1] *= sy;
+        }
+        if (camera && depth) {
+            render::NoteSceneCamera(m, depth);
+            camera = false; // so a primeira (vs_viewProj)
+        }
+        if (jx != 0.0f || jy != 0.0f) {
+            for (u32 row = 0; row < 4; ++row) {
+                m[row * 4] += jx * m[row * 4 + 3];
+                m[row * 4 + 1] += jy * m[row * 4 + 3];
+            }
+        }
+        p00 = l0;
+        p11 = l1;
+        found = true;
+        i += 12; // a matriz inteira ja foi vista
+    }
+    if (sx == 1.0f && sy == 1.0f) {
+        return; // so o deslocamento do TAA: os pares (1 / P00, 1 / P11) nao mudam
+    }
+    if (found) {
+        g_aspect_p00.store(std::bit_cast<u32>(p00), std::memory_order_relaxed);
+        g_aspect_p11.store(std::bit_cast<u32>(p11), std::memory_order_relaxed);
+    } else {
+        p00 = std::bit_cast<float>(g_aspect_p00.load(std::memory_order_relaxed));
+        p11 = std::bit_cast<float>(g_aspect_p11.load(std::memory_order_relaxed));
+        if (!(p00 > 0.0f && p11 > 0.0f)) {
+            return;
+        }
+    }
+    for (u32 i = 0; i + 2 <= count; i += 2) {
+        if (f[i] > 0.0f && f[i + 1] > 0.0f && std::fabs(f[i] * p00 - 1.0f) < 0.002f && std::fabs(f[i + 1] * p11 - 1.0f) < 0.002f) {
+            f[i] /= sx;
+            f[i + 1] /= sy;
+        }
+    }
+}
+
+// 1.9.1: cada draw com o buffer de camera passa aqui (dados ja copiados para o anel do draw; podem ser alterados).
+// LD_DBG_CAMERA=1: a cada 300 frames, as matrizes distintas do frame, com quantos draws e o alvo de cada uma.
+void NoteCamera(u8* cb, u32 bytes, const GamePairInfo* info, const render::GameDraw& draw) {
+    static const bool dbg = std::getenv("LD_DBG_CAMERA") != nullptr;
+    if (!dbg) {
+        return;
+    }
+    struct Seen {
+        u32 draws = 0, w = 0, h = 0, bytes = 0;
+        bool depth = false;
+        u64 vs = 0;
+        float data[64] = {};
+    };
+    static std::map<u64, Seen> seen;
+    static u64 frame = ~0ull;
+    if (frame != g_texture_frame) {
+        if (!seen.empty() && frame % 300 == 0) {
+            std::printf("[CAMERA-DBG] frame %llu: %zu distinct cameras\n", static_cast<unsigned long long>(frame), seen.size());
+            u32 n = 0;
+            for (const auto& [key, c] : seen) {
+                if (++n > 12) {
+                    break;
+                }
+                std::printf("[CAMERA-DBG]  %u draws, target %ux%u depth %d, cb %u bytes, vs %016llx\n", c.draws, c.w, c.h, c.depth, c.bytes,
+                            static_cast<unsigned long long>(c.vs));
+                for (u32 row = 0; row < std::min<u32>(c.bytes / 16, 14); ++row) {
+                    std::printf("[CAMERA-DBG]    +%3u: %12.5f %12.5f %12.5f %12.5f\n", row * 16, c.data[row * 4], c.data[row * 4 + 1],
+                                c.data[row * 4 + 2], c.data[row * 4 + 3]);
+                }
+            }
+        }
+        frame = g_texture_frame;
+        seen.clear();
+    }
+    u64 key = 1469598103934665603ull;
+    for (u32 i = 0; i < 64; ++i) {
+        key = (key ^ cb[info->camera_offset + i]) * 1099511628211ull;
+    }
+    auto& c = seen[key];
+    if (!c.draws++) {
+        c.w = draw.color_count ? draw.colors[0].width : draw.depth.width;
+        c.h = draw.color_count ? draw.colors[0].height : draw.depth.height;
+        c.depth = draw.depth.address != 0;
+        c.bytes = std::min<u32>(bytes - info->camera_offset, 224);
+        c.vs = info->vs_hash;
+        std::memcpy(c.data, cb + info->camera_offset, c.bytes);
+    }
+}
+
 void LoadGamePair(u64 vs_hash, u64 ps_hash, u64 signature, const u32* cntl, GamePairInfo* info) {
     const render::HitchClock hitch(render::HitchClock::kPair);
     char name[96];
@@ -3043,6 +3252,7 @@ void LoadGamePair(u64 vs_hash, u64 ps_hash, u64 signature, const u32* cntl, Game
             resource.view_type = view_types.count(resource.binding) ? view_types[resource.binding] : 0;
         }
     }
+    AssignCameraResource(vs_hash, info);
     slow.Mark(2);
     info->key = (vs_hash ^ (ps_hash * 0x9E3779B97F4A7C15ull) ^ (signature * 0xC2B2AE3D27D4EB4Full)) | 1;
     info->aot = aot.ok;
@@ -4651,6 +4861,31 @@ void SubmitDrawToVulkan(u32 opcode, const u32* body, u32 body_dwords) {
     bool dbg_lut = false; // DIAGNOSTICO (LD_DBG_LUT=1): draws que amostram a tabela 256x128 RGBA16F das luzes
     static const bool dbg_lut_enabled = std::getenv("LD_DBG_LUT") != nullptr;
     std::string dbg_samplers;
+    float aspect_sx = 1.0f, aspect_sy = 1.0f, jitter_x = 0.0f, jitter_y = 0.0f; // 1.9.1: proporcao da tela e TAA
+    render::CameraAspectScale(&aspect_sx, &aspect_sy);
+    render::TemporalJitter(&jitter_x, &jitter_y);
+    {   // DIAGNOSTICO 1.9.1 (LD_DBG_VS=hash,hash,...): alvos dos desenhos desses VS
+        static const std::string dbg_vs = std::getenv("LD_DBG_VS") ? std::getenv("LD_DBG_VS") : "";
+        if (!dbg_vs.empty()) {
+            char hex[17];
+            std::snprintf(hex, sizeof(hex), "%016llx", static_cast<unsigned long long>(info->vs_hash));
+            static std::mutex dbg_mutex;
+            static std::set<std::tuple<u64, u64, u64>> seen;
+            std::lock_guard lock(dbg_mutex);
+            if (dbg_vs.find(hex) != std::string::npos && seen.size() < 60 &&
+                seen.insert({info->vs_hash, info->ps_hash, draw.color_count ? draw.colors[0].address : 0}).second) {
+                std::printf("[DBG-VS] vs %s ps %016llx colors %u target 0x%llx %ux%u fmt %u depth 0x%llx frame %llu\n", hex,
+                            static_cast<unsigned long long>(info->ps_hash), draw.color_count,
+                            static_cast<unsigned long long>(draw.color_count ? draw.colors[0].address : 0),
+                            draw.color_count ? draw.colors[0].width : 0, draw.color_count ? draw.colors[0].height : 0,
+                            draw.color_count ? static_cast<u32>(draw.colors[0].format) : 0, static_cast<unsigned long long>(draw.depth.address),
+                            static_cast<unsigned long long>(g_texture_frame));
+            }
+        }
+    }
+    const bool projection_patch = (aspect_sx != 1.0f || aspect_sy != 1.0f || jitter_x != 0.0f || jitter_y != 0.0f) &&
+                                  render::IsScreenTarget(draw.color_count ? draw.colors[0].width : draw.depth.width,
+                                                         draw.color_count ? draw.colors[0].height : draw.depth.height);
     for (const auto& r : info->resources) {
         const u32* ud = stage_ud[r.stage];
         const u32 dwords = r.kind == render::GamePairLayout::kImage ? 8 : 4;
@@ -4688,6 +4923,14 @@ void SubmitDrawToVulkan(u32 opcode, const u32* body, u32 body_dwords) {
                 buffer.data = arena.data() + used;
                 buffer.bytes = static_cast<u32>(bytes);
                 used += (bytes + 15) & ~15ull;
+                if (&r - info->resources.data() == info->camera_resource && bytes >= info->camera_offset + 64) {
+                    NoteCamera(arena.data() + used - ((bytes + 15) & ~15ull), static_cast<u32>(bytes), info, draw);
+                }
+                if (projection_patch) { // 1.9.1: tela que nao e 16:9 e / ou TAA (ver PatchProjection)
+                    PatchProjection(arena.data() + used - ((bytes + 15) & ~15ull), static_cast<u32>(bytes), aspect_sx, aspect_sy, jitter_x,
+                                    jitter_y, &r - info->resources.data() == info->camera_resource && draw.depth.address != 0,
+                                    draw.depth.address);
+                }
                 if (g_dbg_cb_record) { // DIAGNOSTICO Fase 60 (LD_DBG_CB=1): o jogo muda as constantes depois da copia?
                     DbgCbRecord(address, static_cast<u32>(bytes), arena.data() + used - ((bytes + 15) & ~15ull), info->vs_hash, info->ps_hash,
                                 r.stage, r.binding, r.source);

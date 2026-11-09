@@ -360,7 +360,13 @@ public:
     void PrewarmProgress(u32* done, u32* total) const;
     u32 PrewarmWaiting() const;
     void SetPrewarmPredicted(bool enabled);              // Fase 77: so no --prewarm-only (receitas previstas)
-    void PredictedStats(u32* built, u32* failed) const; // Fase 77      // Fase 77: receitas cujo par de shaders nao foi registrado (fora do pacote AOT)
+    void SetRenderResolution(u32 width, u32 height);     // 1.9.1: resolucao em que o jogo e desenhado (antes do 1o alvo)
+    void SetRenderScale(u32 percent);                    // 1.9.1: interna = saida x porcentagem (25-400)
+    void SetUnlockedPresent(bool enabled);               // 1.9.1: FPS desbloqueado (MAILBOX ou VSync)
+    void SetNoVsync(bool enabled);                       // 1.9.1: sem VSync (IMMEDIATE, pode rasgar)
+    void SetUpscaler(int mode, float sharpness);         // 1.9.1: 0 = bilinear, 1 = AMD FidelityFX FSR 1
+    void SetFillScreen(bool enabled);                    // 1.9.1: tela de outra proporcao = imagem inteira (camera Hor+ / Vert-)
+    void PredictedStats(u32* built, u32* failed) const; // Fase 77: receitas cujo par de shaders nao foi registrado (fora do pacote AOT)
     std::string DriverStamp() const; // Fase 77: "fabricante dispositivo versao-do-driver caminho-do-exe" (vazio sem Vulkan)
     double LastGpuFrameMs() const;                               // Fase 75: tempo de GPU do ultimo quadro terminado
     void SavePipelineCache(const char* reason);                 // Fase 70: grava o cache de pipelines do Vulkan (arquivo temporario + troca)
@@ -408,6 +414,18 @@ public:
 private:
     VulkanRenderer() = default;
 };
+
+// 1.9.1: alvo da tela (1920x1080 e a cadeia de meia / quarto / oitavo de resolucao, nos tamanhos do jogo)?
+bool IsScreenTarget(u32 width, u32 height);
+// 1.9.1: quanto multiplicar o x e o y do recorte da camera para a imagem encher uma tela que nao e 16:9 (1 = nada)
+void CameraAspectScale(float* x, float* y);
+// 1.9.1: TAA. A camera da cena de um desenho (matriz sem o deslocamento, alvo de profundidade), o deslocamento deste
+// quadro em NDC (0 com o TAA desligado) e o modo (0 = nenhum, 1 = TAA).
+void NoteSceneCamera(const float matrix[16], u64 depth_address);
+void TemporalJitter(float* x, float* y);
+void SetAntiAliasing(int mode);
+// 1.9.1: AMD FSR 2 / 3 / 4 (versao maior; 9 = a mais nova; 0 = desligado). native = FSR AA (sem ampliar).
+void SetTemporalUpscaler(int major, bool native);
 
 // Pasta com os .spv recompilados do jogo (assets/shaders_spv), conferidos na inicializacao.
 void SetGameSpirvDirectory(const std::string& directory);

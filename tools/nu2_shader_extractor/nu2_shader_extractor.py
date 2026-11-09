@@ -37,6 +37,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import gcn  # noqa: E402
+import pssl_reflect  # noqa: E402
 import nu2dat  # noqa: E402
 
 ROOT = nu2dat.ROOT
@@ -112,6 +113,57 @@ def cmd_export_eboot_pairs(args):
     print('EBOOT PAIRS: %d -> %s' % (len(pairs), EBOOT_PAIRS))
 
 
+def camera_source(info, slot_api):
+    """1.9.1: de onde vem o V# do buffer de camera (slot de API `slot_api`) do VS, no formato das fontes dos pares:
+    'ud:R' (registrador de user data) ou 'tab:R:D' (tabela / registradores estendidos); None se o cabecalho nao diz."""
+    eud = next((s[2] for s in info['slots'] if s[0] == gcn.USAGE_EXTENDED_USER_DATA), None)
+    for kind, api, reg, _flags in info['slots']:
+        if kind == gcn.USAGE_IMM_CONST_BUFFER and api == slot_api:
+            if reg < 16:
+                return 'ud:%d' % reg
+            return 'tab:%d:%d' % (eud, reg - 16) if eud is not None else None
+    for kind, _api, reg, _flags in info['slots']:
+        if kind == gcn.USAGE_CONST_BUFFER_TABLE:
+            return 'tab:%d:%d' % (reg, 4 * slot_api)
+    return None
+
+
+def write_cameras(seen, cameras):
+    """1.9.1: assets/shaders_aot/cameras.tsv = VS com o g_CameraVS_CB (matriz de camera) e onde o port acha o buffer."""
+    lines = []
+    for h, (slot, offset) in sorted(cameras.items()):
+        stage, info = seen.get(h, (None, None))
+        # a reflexao numera os buffers a partir de 1 (g_CameraVS_CB = 1); o slot de API do cabecalho comeca em 0
+        src = camera_source(info, slot - 1) if stage == gcn.STAGE_VS else None
+        if src:
+            lines.append('%s\t%s\t%d\n' % (h, src, offset))
+    with open(os.path.join(AOT, 'cameras.tsv'), 'w', newline='\n') as f:
+        f.write('# 1.9.1: vs fonte_do_buffer_de_camera deslocamento_de_vs_viewProj\n')
+        f.writelines(lines)
+    print('CAMERAS: %d VS with the camera buffer' % len(lines))
+
+
+def cmd_cameras(args):
+    """1.9.1: so a tabela de cameras (sem refazer o pacote AOT): le os .ps4_shaders e o eboot de novo."""
+    seen, cameras = {}, {}
+
+    def scan(data):
+        found = pssl_reflect.vs_cameras(data, gcn.fnv_bytes, gcn.STAGE_VS)
+        cameras.update(found)
+        for stage, hdr, blob in gcn.shaders_in(data):
+            h = '%016x' % gcn.fnv_bytes(blob)
+            if stage == gcn.STAGE_VS and h in found and h not in seen:
+                seen[h] = (stage, gcn.parse_header(stage, hdr))
+
+    for _p, _n, data in nu2dat.iter_files(args.app0, addcont=args.addcont, errors=nu2dat_errors, patch=args.patch or None):
+        scan(data)
+    eboot_path = os.path.join(ROOT, 'assets', 'decrypted_elfs', 'eboot.bin.elf')
+    if os.path.isfile(eboot_path):
+        with open(eboot_path, 'rb') as f:
+            scan(f.read())
+    write_cameras(seen, cameras)
+
+
 def cmd_extract(args):
     os.makedirs(BIN, exist_ok=True)
     seen = {}       # hash -> (estagio, info)
@@ -121,6 +173,7 @@ def cmd_extract(args):
     t0 = time.time()
     index_lines = []
     packs = collections.Counter()
+    cameras = {}  # 1.9.1: hash do VS -> (slot de API do g_CameraVS_CB, deslocamento de vs_viewProj)
 
     def add_shader(stage, hdr, blob):
         h = '%016x' % gcn.fnv_bytes(blob)
@@ -144,6 +197,7 @@ def cmd_extract(args):
         packs['DLC' if pack.startswith('DLC') and not pack.startswith('DLCSTREAM') else 'jogo base'] += 1
         files += 1
         found = gcn.shaders_in(data)
+        cameras.update(pssl_reflect.vs_cameras(data, gcn.fnv_bytes, gcn.STAGE_VS))
         hashes = []
         for stage, hdr, blob in found:
             hashes.append((stage, add_shader(stage, hdr, blob)))
@@ -163,6 +217,7 @@ def cmd_extract(args):
         with open(eboot_path, 'rb') as f:
             elf = f.read()
         eboot = {add_shader(stage, hdr, blob) for stage, hdr, blob in gcn.shaders_in(elf)}
+        cameras.update(pssl_reflect.vs_cameras(elf, gcn.fnv_bytes, gcn.STAGE_VS))
         known = known_eboot_pairs()
         added = 0
         for vs, ps in sorted(known):
@@ -963,10 +1018,14 @@ def main():
     sub.add_parser('export-dictionary')
     sub.add_parser('export-reais')
     sub.add_parser('export-eboot-pairs')
+    p = sub.add_parser('cameras')
+    p.add_argument('--app0', default=nu2dat.DEFAULT_APP0)
+    p.add_argument('--patch', default='')
+    p.add_argument('--addcont', default=nu2dat.DEFAULT_ADDCONT)
     args = ap.parse_args()
     {'extract': cmd_extract, 'plan': cmd_plan, 'compile': cmd_compile, 'validate': cmd_validate,
      'export-dictionary': cmd_export_dictionary, 'export-reais': cmd_export_reais,
-     'export-eboot-pairs': cmd_export_eboot_pairs}[args.cmd](args)
+     'export-eboot-pairs': cmd_export_eboot_pairs, 'cameras': cmd_cameras}[args.cmd](args)
 
 
 if __name__ == '__main__':

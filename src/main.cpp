@@ -107,6 +107,7 @@ namespace {
 // ser pulada: depois das checagens de estado, vale o "allowcutskip" do nivel ou o bit 0 de [obj+0xe8] (cena
 // ja vista / jogo completo). Troca essa ultima leitura por "mov al, 1", mantendo as checagens de antes.
 bool g_skip_cutscenes = false;
+bool g_keep_16x9 = false; // 1.9.1: --keep-16x9 = tela de outra proporcao com barras (sem corrigir a camera)
 
 bool PatchCutsceneSkip(const loader::ElfPieLoader& elf) {
     std::vector<std::span<uint8_t>> code;
@@ -1201,6 +1202,7 @@ int main(int argc, char** argv) {
         } else if (ini_fps[0] == L'2') {
             hle::videoout::SetForce60Hz(true);
             hle::videoout::SetUnlockedFps(true);
+            render::VulkanRenderer::Instance().SetUnlockedPresent(true); // 1.9.1: sem o teto do VSync
         } else {
             hle::videoout::SetForce60Hz(true);
             hle::videoout::SetUnlockedFps(false);
@@ -1308,13 +1310,41 @@ int main(int argc, char** argv) {
             lang::SetFromCode(argv[++i]);
         } else if (!std::strcmp(argv[i], "--background-pad")) {
             hle::SetPadBackgroundInput(true); // Fase 60: o controle vale mesmo com a janela fora de foco
+        } else if (!std::strcmp(argv[i], "--aa") && i + 1 < argc) { // 1.9.1: taa | off
+            const char* aa = argv[++i];
+            render::SetAntiAliasing(!std::strcmp(aa, "taa") ? 1 : 0);
+            if (!std::strncmp(aa, "fsraa", 5)) { // 1.9.1: FSR AA = FSR sem ampliar (fsraa = a mais nova, fsraa3 / fsraa4)
+                render::SetTemporalUpscaler(aa[5] ? aa[5] - '0' : 3, true); // sem numero: FSR 3 (o 4 pesa ~5 ms numa RX 6600)
+            }
+        } else if (!std::strcmp(argv[i], "--no-vsync")) {
+            render::VulkanRenderer::Instance().SetNoVsync(true); // 1.9.1: IMMEDIATE (mais FPS, com tearing)
+        } else if (!std::strcmp(argv[i], "--keep-16x9")) {
+            g_keep_16x9 = true;
         } else if (!std::strcmp(argv[i], "--skip-cutscenes")) {
             g_skip_cutscenes = true; // Fase 61: toda cutscene pode ser pulada, mesmo sem 100%
         } else if (!std::strcmp(argv[i], "--resolution") && i + 1 < argc) {
             unsigned width = 0, height = 0; // Fase 61: tamanho da janela, ex. 1920x1080
             if (std::sscanf(argv[++i], "%ux%u", &width, &height) == 2 && width && height) {
                 hle::videoout::SetWindowSize(width, height);
+                if (!std::getenv("LD_RENDER_1080")) { // 1.9.1: desenha nessa resolucao (antes: 1920x1080 esticado)
+                    render::VulkanRenderer::Instance().SetRenderResolution(width, height);
+                }
             }
+        } else if (!std::strcmp(argv[i], "--upscaler") && i + 1 < argc) { // 1.9.1: fsr1 | off
+            const char* mode = argv[++i];
+            static float sharpness = 0.25f;
+            if (const char* env = std::getenv("LD_FSR_SHARPNESS")) {
+                sharpness = static_cast<float>(std::atof(env));
+            }
+            render::VulkanRenderer::Instance().SetUpscaler(!std::strcmp(mode, "fsr1") ? 1 : 0, sharpness);
+            // 1.9.1: fsr2 / fsr3 / fsr4 / fsr (a mais nova) = ampliacao temporal da AMD (FFX API)
+            const int major = !std::strcmp(mode, "fsr2") ? 2 : !std::strcmp(mode, "fsr3") ? 3 : !std::strcmp(mode, "fsr4") ? 4
+                              : !std::strcmp(mode, "fsr") ? 9 : 0;
+            if (major) {
+                render::SetTemporalUpscaler(major, false);
+            }
+        } else if (!std::strcmp(argv[i], "--render-scale") && i + 1 < argc) {
+            render::VulkanRenderer::Instance().SetRenderScale(static_cast<u32>(std::atoi(argv[++i]))); // 1.9.1: % da saida
         } else if (!std::strcmp(argv[i], "--fullscreen")) {
             hle::videoout::SetStartFullscreen(true); // Fase 60: tela cheia sem bordas (F11 alterna)
         } else if (!std::strcmp(argv[i], "--fps60")) {
@@ -1326,6 +1356,7 @@ int main(int argc, char** argv) {
         } else if (!std::strcmp(argv[i], "--fps-unlocked") || !std::strcmp(argv[i], "--fps-unlimited")) {
             hle::videoout::SetForce60Hz(true);
             hle::videoout::SetUnlockedFps(true);
+            render::VulkanRenderer::Instance().SetUnlockedPresent(true); // 1.9.1: sem o teto do VSync
         } else if (!std::strcmp(argv[i], "--no-async-pipelines")) {
             render::VulkanRenderer::Instance().SetAsyncPipelines(false); // pipelines criados na thread de render
         } else if (!std::strcmp(argv[i], "--check-modules")) {
@@ -1519,6 +1550,10 @@ int main(int argc, char** argv) {
         hle::gnm::SetFrameDumpDirectory(frame_dump_dir);
         hle::gnm::SetShaderDumpDirectory(shader_dump_dir);
         render::SetGameSpirvDirectory((root / "assets" / "shaders_spv").string());
+        // 1.9.1: tela ultrawide / 16:10 / 4:3 cheia (camera corrigida); precisa do cameras.tsv do Preparar
+        if (!g_keep_16x9 && std::filesystem::is_regular_file(root / "assets" / "shaders_aot" / "cameras.tsv")) {
+            render::VulkanRenderer::Instance().SetFillScreen(true);
+        }
         render::VulkanRenderer::Instance().SetPipelineStateFile((root / "assets" / "shaders_spv" / "pipeline_states.txt").string());
         render::VulkanRenderer::Instance().SetPipelineCacheFile((root / "assets" / "shaders_spv" / "vk_pipeline_cache.bin").string());
         hle::gnm::SetSyncShaders(sync_shaders, sync_budget_ms);

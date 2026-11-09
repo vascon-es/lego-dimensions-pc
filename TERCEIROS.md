@@ -13,7 +13,8 @@
 | [Anomaly](https://github.com/connorh315/anomaly) v1.1 de connorh315: carregador de mods do LEGO Dimensions de PS4 (ganchos, text.csv / collection.txt em camadas), refeito dentro do port | `src/hle/overrides/hle_anomaly.cpp` | GPL-2.0-or-later |
 | [7-Zip](https://www.7-zip.org) 26.03 (`7z.exe` + `7z.dll`: instala mods .rar / .7z) | `tools/7zip` | GNU LGPL, com a restrição do unRAR em parte do `7z.dll`, e BSD |
 | LegoToypad 1.9.3 (app emulador do portal, incluído como está; fora da licença deste projeto) | `tools/LegoToypad.exe` | termos dos autores dele |
-| [Port de PC de inFAMOUS Second Son](https://github.com/Castlesea) de Castlesea: layout do launcher (uma tela desenhada, menu com a barra JOGAR, barra de seleção que desliza, abas nas configurações com linhas `< valor >`, dicas de teclas, navegação por teclado / controle), adaptado | `tools/dist/launcher.cpp` | GPL-2.0-or-later |
+| [AMD FidelityFX FSR 1](https://github.com/GPUOpen-Effects/FidelityFX-FSR) (`ffx_a.h`, `ffx_fsr1.h`) | `externals/fidelityfx-fsr1` (compilado nos shaders do port) | MIT |
+| [AMD FSR SDK](https://github.com/GPUOpen-LibrariesAndSDKs/FidelityFX-SDK) 2.4.0: headers da FFX API e as DLLs Vulkan assinadas (`amd_fidelityfx_loader_vk.dll`, `amd_fidelityfx_upscaler_vk.dll`: FSR 2 / 3 / 4, carregadas em tempo de execução; fora da licença deste projeto) | `externals/fidelityfx-sdk` (DLLs ao lado do `lego_dimensions.exe`) | MIT (headers); termos de redistribuição binária da AMD (DLLs), ver `license.md` |
 | Microsoft Visual C++ Redistributable (DLLs no pacote) | `build/` no instalador | licença de redistribuição da Microsoft |
 
 O texto de cada licença acompanha o componente na pasta dele. A licença deste projeto (GPL-2.0) está em [LICENSE](LICENSE).

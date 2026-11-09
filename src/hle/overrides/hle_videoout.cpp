@@ -465,7 +465,18 @@ void WindowThread() {
                              0, 0, screen_w, screen_h, nullptr, nullptr, wc.hInstance, nullptr);
         g_fullscreen = true;
     } else {
-        RECT rect{0, 0, static_cast<LONG>(target_w ? target_w : 1920), static_cast<LONG>(target_h ? target_h : 1080)};
+        LONG client_w = static_cast<LONG>(target_w ? target_w : 1920), client_h = static_cast<LONG>(target_h ? target_h : 1080);
+        // 1.9.1: resolucao maior que o monitor (ex. 4K numa tela 1080p): o jogo continua desenhado nela, mas a janela
+        // encolhe para caber na area de trabalho, na mesma proporcao (antes passava da tela)
+        RECT work{0, 0, screen_w, screen_h};
+        SystemParametersInfoA(SPI_GETWORKAREA, 0, &work, 0);
+        const LONG max_w = std::max<LONG>(320, work.right - work.left - 16), max_h = std::max<LONG>(240, work.bottom - work.top - 48);
+        if (client_w > max_w || client_h > max_h) {
+            const double fit = std::min(static_cast<double>(max_w) / client_w, static_cast<double>(max_h) / client_h);
+            client_w = static_cast<LONG>(client_w * fit);
+            client_h = static_cast<LONG>(client_h * fit);
+        }
+        RECT rect{0, 0, client_w, client_h};
         AdjustWindowRect(&rect, WS_OVERLAPPEDWINDOW, FALSE);
         int win_w = rect.right - rect.left;
         int win_h = rect.bottom - rect.top;

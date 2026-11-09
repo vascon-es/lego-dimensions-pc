@@ -1,6 +1,8 @@
 #include "render/vulkan_backend.h"
+#include "render/fsr1_spv.h" // 1.9.1: AMD FidelityFX FSR 1, TAA e entradas dos upscalers (SPIR-V gerado)
 
 #include <algorithm>
+#include <cmath>
 #include <atomic>
 #include <cstdio>
 #include <cstring>
@@ -26,6 +28,14 @@
 #define VK_NO_PROTOTYPES
 #define VK_USE_PLATFORM_WIN32_KHR
 #include <vulkan/vulkan.h>
+
+// 1.9.1: AMD FSR 2 / 3 / 4 pela FFX API (externals/fidelityfx-sdk, DLLs assinadas carregadas em tempo de execucao)
+#ifndef _WINDOWS
+#define _WINDOWS 1
+#endif
+#include "ffx_api_loader.h"
+#include "ffx_upscale.h"
+#include "vk/ffx_api_vk.h"
 
 namespace render {
 
@@ -269,6 +279,7 @@ struct State {
         VkDescriptorSet present_set = VK_NULL_HANDLE;
         VkFormat format = VK_FORMAT_UNDEFINED;
         u32 width = 0, height = 0;
+        u32 game_width = 0, game_height = 0; // 1.9.1: o tamanho que o jogo pediu (width/height = o da imagem, escalada)
         bool depth = false;
         VkImageLayout layout = VK_IMAGE_LAYOUT_UNDEFINED; // acompanhado enquanto o frame e gravado
         u64 address = 0;
@@ -813,6 +824,9 @@ void DestroySwapchainObjects() {
 
 // Swapchain 1280x720 B8G8R8A8_UNORM em modo FIFO. O tamanho segue o que a superficie exige
 // (a area cliente da janela, criada com 1280x720); extent 0 = janela minimizada, sem swapchain.
+std::atomic<bool> g_unlocked_present{false}; // 1.9.1: FPS desbloqueado -> MAILBOX se houver, senao FIFO (VSync)
+std::atomic<bool> g_no_vsync{false};         // 1.9.1: --no-vsync -> IMMEDIATE (pode rasgar a imagem)
+
 bool CreateSwapchain() {
     VkSurfaceCapabilitiesKHR caps;
     VkResult result = vk.vkGetPhysicalDeviceSurfaceCapabilitiesKHR(g.physical, g.surface, &caps);
@@ -849,6 +863,24 @@ bool CreateSwapchain() {
         }
     }
     g.present_mode = VK_PRESENT_MODE_FIFO_KHR; // sempre disponivel; apresentacao no VSync
+    {
+        // 1.9.1: FPS desbloqueado sem o teto do VSync: MAILBOX (sem tearing) ou IMMEDIATE. LD_PRESENT=fifo|mailbox|immediate
+        u32 mode_count = 0;
+        vk.vkGetPhysicalDeviceSurfacePresentModesKHR(g.physical, g.surface, &mode_count, nullptr);
+        std::vector<VkPresentModeKHR> modes(mode_count);
+        vk.vkGetPhysicalDeviceSurfacePresentModesKHR(g.physical, g.surface, &mode_count, modes.data());
+        auto has = [&](VkPresentModeKHR m) { return std::find(modes.begin(), modes.end(), m) != modes.end(); };
+        // Desbloqueado: MAILBOX (sem teto e sem tearing) ou, sem ele (driver da AMD no Windows), FIFO = sem o limite de
+        // 30 / 60 do jogo mas no VSync (ate os Hz do monitor). IMMEDIATE so com --no-vsync: rasga a imagem (tearing), e foi
+        // o "glitch" da sessao de 09/11 (112 FPS num monitor de 60 Hz).
+        const char* env = std::getenv("LD_PRESENT");
+        std::string wanted = env ? env : g_no_vsync.load() ? "immediate" : (g_unlocked_present.load() ? "mailbox" : "fifo");
+        if (wanted == "mailbox") {
+            g.present_mode = has(VK_PRESENT_MODE_MAILBOX_KHR) ? VK_PRESENT_MODE_MAILBOX_KHR : VK_PRESENT_MODE_FIFO_KHR;
+        } else if (wanted == "immediate" && has(VK_PRESENT_MODE_IMMEDIATE_KHR)) {
+            g.present_mode = VK_PRESENT_MODE_IMMEDIATE_KHR;
+        }
+    }
 
     VkSwapchainCreateInfoKHR info{VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR};
     info.surface = g.surface;
@@ -2276,6 +2308,27 @@ void PrewarmTargetPool() {
 // Alvo de render do jogo: VkImage + VkImageView, criado na primeira vez que o jogo desenha nele e
 // guardado por (endereco, tamanho, formato). Cor: anexo + amostragem; os sRGB sao mutaveis para
 // terem tambem uma view UNORM (os bytes como estao), usada ao copiar para a janela.
+// 1.9.1: resolucao de renderizacao. O jogo (PS4) desenha sempre em 1920x1080; os alvos da tela (1920x1080 e a cadeia de
+// meia / quarto / oitavo de resolucao) sao criados no tamanho escolhido e viewport / scissor sao escalados na gravacao.
+// Nenhum pixel shader do jogo le a posicao do pixel (SPI_PS_INPUT_ENA sem POS_*): as coordenadas de tela vem
+// interpoladas e normalizadas, entao os shaders nao precisam saber da escala.
+float g_target_scale_x = 1.0f, g_target_scale_y = 1.0f;
+// 1.9.1: tela que nao e 16:9 com SetFillScreen: os alvos tomam a proporcao da tela e a camera do jogo e corrigida na
+// copia do buffer de camera (hle_gnm): Hor+ (mais campo dos lados) em ultrawide, Vert- (mais campo em cima e embaixo)
+// em 16:10 / 4:3. Sem o cameras.tsv nao da para achar a camera: fica o 16:9 com barras.
+float g_camera_scale_x = 1.0f, g_camera_scale_y = 1.0f;
+bool g_fill_screen = false;
+
+bool ScreenFamilyTarget(u32 width, u32 height) {
+    // 1080 / 540 / 270 / 135 de altura (a cadeia de brilho segue ate 16, mas esses ficam como estao), paisagem.
+    // 1024x540 = 960x540 com a largura arredondada (viewport de 960). Mapas de sombra / atlas sao quadrados.
+    // Alturas alinhadas a 8 (1088 / 544 / 272 / 136): a profundidade do PS4 vem assim; fora da escala, o desenho na cor
+    // escalada passava dos limites da profundidade e a GPU travava.
+    return (height == 1080 || height == 1088 || height == 540 || height == 544 || height == 270 || height == 272 || height == 135 ||
+            height == 136) &&
+           width >= height * 3 / 2;
+}
+
 State::RenderTarget* GetTarget(const GameDraw::Target& wanted, bool depth) {
     const VkFormat format = TargetVkFormat(depth ? GameDraw::kTargetDepth32F : wanted.format);
     if (!wanted.address || !wanted.width || !wanted.height || wanted.width > 8192 || wanted.height > 8192 || format == VK_FORMAT_UNDEFINED) {
@@ -2295,8 +2348,23 @@ State::RenderTarget* GetTarget(const GameDraw::Target& wanted, bool depth) {
     const HitchClock hitch(HitchClock::kTarget); // Fase 59
     State::RenderTarget target;
     target.format = format;
+    target.game_width = wanted.width;
+    target.game_height = wanted.height;
     target.width = wanted.width;
     target.height = wanted.height;
+    if (g_target_scale_x != 1.0f || g_target_scale_y != 1.0f) {
+        const bool scaled = ScreenFamilyTarget(wanted.width, wanted.height);
+        if (scaled) {
+            target.width = std::clamp<u32>(static_cast<u32>(wanted.width * g_target_scale_x + 0.5f), 1u, 16384u);
+            target.height = std::clamp<u32>(static_cast<u32>(wanted.height * g_target_scale_y + 0.5f), 1u, 16384u);
+        }
+        static u32 logged = 0;
+        if (logged++ < 60) {
+            std::printf("[TARGET-SCALE] 0x%llx %s %ux%u format %d -> %ux%u%s\n", static_cast<unsigned long long>(wanted.address),
+                        depth ? "depth" : "color", wanted.width, wanted.height, static_cast<int>(format), target.width, target.height,
+                        scaled ? "" : " (not scaled)");
+        }
+    }
     target.depth = depth;
     target.address = wanted.address;
     const bool srgb = format == VK_FORMAT_R8G8B8A8_SRGB;
@@ -2304,7 +2372,7 @@ State::RenderTarget* GetTarget(const GameDraw::Target& wanted, bool depth) {
     image.flags = srgb ? VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT : 0;
     image.imageType = VK_IMAGE_TYPE_2D;
     image.format = format;
-    image.extent = {wanted.width, wanted.height, 1};
+    image.extent = {target.width, target.height, 1};
     image.mipLevels = 1;
     image.arrayLayers = 1;
     image.samples = VK_SAMPLE_COUNT_1_BIT;
@@ -3933,6 +4001,1088 @@ void EvictForgottenTextures() {
     }
 }
 
+// ---- 1.9.1: AMD FidelityFX FSR 1 (EASU + RCAS) na apresentacao ----
+// Quando a imagem do jogo e menor que a area dela na janela (escala de renderizacao abaixo de 100%, ou janela maior que a
+// resolucao de render), a ampliacao bilinear vira EASU (para uma imagem intermediaria do tamanho da saida) + RCAS (nitidez,
+// direto na janela). SPIR-V em fsr1_spv.h (tools/shaders/gerar_fsr1.py).
+namespace {
+std::atomic<int> g_upscaler{0};       // 0 = bilinear, 1 = FSR 1
+std::atomic<float> g_fsr_sharpness{0.25f}; // em "stops" (0 = maxima)
+
+struct FsrState {
+    bool tried = false, ok = false;
+    VkShaderModule vert = VK_NULL_HANDLE, easu_fs = VK_NULL_HANDLE, rcas_fs = VK_NULL_HANDLE;
+    VkPipelineLayout layout = VK_NULL_HANDLE;
+    VkPipeline easu = VK_NULL_HANDLE, rcas = VK_NULL_HANDLE;
+    VkFormat rcas_format = VK_FORMAT_UNDEFINED;
+    VkDescriptorSet easu_set = VK_NULL_HANDLE, rcas_set = VK_NULL_HANDLE;
+    VkImage image = VK_NULL_HANDLE;
+    VkDeviceMemory memory = VK_NULL_HANDLE;
+    VkImageView view = VK_NULL_HANDLE;
+    u32 width = 0, height = 0;
+} g_fsr;
+
+struct FsrPush {
+    u32 con[4][4];
+    float origin[2];
+};
+
+VkShaderModule FsrModule(const u32* code, size_t bytes) {
+    VkShaderModuleCreateInfo info{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+    info.codeSize = bytes;
+    info.pCode = code;
+    VkShaderModule module = VK_NULL_HANDLE;
+    return vk.vkCreateShaderModule(g.device, &info, nullptr, &module) == VK_SUCCESS ? module : VK_NULL_HANDLE;
+}
+
+VkPipeline FsrPipeline(VkShaderModule fragment, VkFormat format, VkShaderModule vert = VK_NULL_HANDLE,
+                       VkPipelineLayout layout = VK_NULL_HANDLE, u32 count = 1, const VkFormat* formats = nullptr) {
+    VkPipelineShaderStageCreateInfo stages[2]{};
+    stages[0] = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0, VK_SHADER_STAGE_VERTEX_BIT, vert ? vert : g_fsr.vert,
+                 "main"};
+    stages[1] = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0, VK_SHADER_STAGE_FRAGMENT_BIT, fragment, "main"};
+    VkPipelineVertexInputStateCreateInfo vertex{VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
+    VkPipelineInputAssemblyStateCreateInfo assembly{VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO};
+    assembly.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+    VkPipelineViewportStateCreateInfo viewport{VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO};
+    viewport.viewportCount = 1;
+    viewport.scissorCount = 1;
+    VkPipelineRasterizationStateCreateInfo raster{VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO};
+    raster.polygonMode = VK_POLYGON_MODE_FILL;
+    raster.cullMode = VK_CULL_MODE_NONE;
+    raster.lineWidth = 1.0f;
+    VkPipelineMultisampleStateCreateInfo multisample{VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO};
+    multisample.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+    VkPipelineColorBlendAttachmentState attachment[4]{};
+    for (auto& a : attachment) {
+        a.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT | VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
+    }
+    VkPipelineColorBlendStateCreateInfo blend{VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO};
+    blend.attachmentCount = count;
+    blend.pAttachments = attachment;
+    const VkDynamicState dynamic_states[2] = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR};
+    VkPipelineDynamicStateCreateInfo dynamic{VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO};
+    dynamic.dynamicStateCount = 2;
+    dynamic.pDynamicStates = dynamic_states;
+    VkPipelineRenderingCreateInfo rendering{VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO};
+    rendering.colorAttachmentCount = count;
+    rendering.pColorAttachmentFormats = formats ? formats : &format;
+    VkGraphicsPipelineCreateInfo info{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};
+    info.pNext = &rendering;
+    info.stageCount = 2;
+    info.pStages = stages;
+    info.pVertexInputState = &vertex;
+    info.pInputAssemblyState = &assembly;
+    info.pViewportState = &viewport;
+    info.pRasterizationState = &raster;
+    info.pMultisampleState = &multisample;
+    info.pColorBlendState = &blend;
+    info.pDynamicState = &dynamic;
+    info.layout = layout ? layout : g_fsr.layout;
+    VkPipeline pipeline = VK_NULL_HANDLE;
+    return vk.vkCreateGraphicsPipelines(g.device, VK_NULL_HANDLE, 1, &info, nullptr, &pipeline) == VK_SUCCESS ? pipeline : VK_NULL_HANDLE;
+}
+
+// Pipelines, layout e descriptor sets (uma vez); o RCAS e refeito se o formato da janela mudar.
+bool EnsureFsr() {
+    if (!g_fsr.tried) {
+        g_fsr.tried = true;
+        g_fsr.vert = FsrModule(kFullscreenVert, sizeof(kFullscreenVert));
+        g_fsr.easu_fs = FsrModule(kFsr1EasuFrag, sizeof(kFsr1EasuFrag));
+        g_fsr.rcas_fs = FsrModule(kFsr1RcasFrag, sizeof(kFsr1RcasFrag));
+        VkPushConstantRange range{VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(FsrPush)};
+        VkPipelineLayoutCreateInfo layout{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+        layout.setLayoutCount = 1;
+        layout.pSetLayouts = &g.set_layout;
+        layout.pushConstantRangeCount = 1;
+        layout.pPushConstantRanges = &range;
+        VkDescriptorSet sets[2]{};
+        const VkDescriptorSetLayout set_layouts[2] = {g.set_layout, g.set_layout};
+        VkDescriptorSetAllocateInfo allocate{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+        allocate.descriptorPool = g.descriptor_pool;
+        allocate.descriptorSetCount = 2;
+        allocate.pSetLayouts = set_layouts;
+        g_fsr.ok = g_fsr.vert && g_fsr.easu_fs && g_fsr.rcas_fs &&
+                   vk.vkCreatePipelineLayout(g.device, &layout, nullptr, &g_fsr.layout) == VK_SUCCESS &&
+                   vk.vkAllocateDescriptorSets(g.device, &allocate, sets) == VK_SUCCESS;
+        g_fsr.easu_set = sets[0];
+        g_fsr.rcas_set = sets[1];
+        if (g_fsr.ok) {
+            g_fsr.easu = FsrPipeline(g_fsr.easu_fs, VK_FORMAT_R8G8B8A8_UNORM);
+            g_fsr.ok = g_fsr.easu != VK_NULL_HANDLE;
+        }
+        std::printf("[FSR] AMD FidelityFX FSR 1: %s\n", g_fsr.ok ? "ready" : "FAILED (bilinear instead)");
+    }
+    if (g_fsr.ok && g_fsr.rcas_format != g.format.format) {
+        if (g_fsr.rcas) {
+            vk.vkDestroyPipeline(g.device, g_fsr.rcas, nullptr);
+        }
+        g_fsr.rcas = FsrPipeline(g_fsr.rcas_fs, g.format.format);
+        g_fsr.rcas_format = g.format.format;
+        g_fsr.ok = g_fsr.rcas != VK_NULL_HANDLE;
+    }
+    return g_fsr.ok;
+}
+
+// Imagem intermediaria (saida do EASU) do tamanho da imagem do jogo na janela.
+bool EnsureFsrImage(u32 width, u32 height) {
+    if (g_fsr.image && g_fsr.width == width && g_fsr.height == height) {
+        return true;
+    }
+    if (g_fsr.view) vk.vkDestroyImageView(g.device, g_fsr.view, nullptr);
+    if (g_fsr.image) vk.vkDestroyImage(g.device, g_fsr.image, nullptr);
+    if (g_fsr.memory) vk.vkFreeMemory(g.device, g_fsr.memory, nullptr);
+    g_fsr.view = VK_NULL_HANDLE;
+    g_fsr.image = VK_NULL_HANDLE;
+    g_fsr.memory = VK_NULL_HANDLE;
+    VkImageCreateInfo image{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+    image.imageType = VK_IMAGE_TYPE_2D;
+    image.format = VK_FORMAT_R8G8B8A8_UNORM;
+    image.extent = {width, height, 1};
+    image.mipLevels = 1;
+    image.arrayLayers = 1;
+    image.samples = VK_SAMPLE_COUNT_1_BIT;
+    image.tiling = VK_IMAGE_TILING_OPTIMAL;
+    image.usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+    if (vk.vkCreateImage(g.device, &image, nullptr, &g_fsr.image) != VK_SUCCESS) {
+        g_fsr.image = VK_NULL_HANDLE;
+        return false;
+    }
+    VkMemoryRequirements needs{};
+    vk.vkGetImageMemoryRequirements(g.device, g_fsr.image, &needs);
+    VkMemoryAllocateInfo allocate{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+    allocate.allocationSize = needs.size;
+    allocate.memoryTypeIndex = FindMemoryType(needs);
+    if (allocate.memoryTypeIndex == UINT32_MAX || vk.vkAllocateMemory(g.device, &allocate, nullptr, &g_fsr.memory) != VK_SUCCESS ||
+        vk.vkBindImageMemory(g.device, g_fsr.image, g_fsr.memory, 0) != VK_SUCCESS) {
+        vk.vkDestroyImage(g.device, g_fsr.image, nullptr);
+        g_fsr.image = VK_NULL_HANDLE;
+        return false;
+    }
+    VkImageViewCreateInfo view{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+    view.image = g_fsr.image;
+    view.viewType = VK_IMAGE_VIEW_TYPE_2D;
+    view.format = VK_FORMAT_R8G8B8A8_UNORM;
+    view.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    if (vk.vkCreateImageView(g.device, &view, nullptr, &g_fsr.view) != VK_SUCCESS) {
+        g_fsr.view = VK_NULL_HANDLE;
+        return false;
+    }
+    g_fsr.width = width;
+    g_fsr.height = height;
+    VkDescriptorImageInfo info{g.sampler, g_fsr.view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
+    VkWriteDescriptorSet write{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+    write.dstSet = g_fsr.rcas_set;
+    write.descriptorCount = 1;
+    write.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    write.pImageInfo = &info;
+    vk.vkUpdateDescriptorSets(g.device, 1, &write, 0, nullptr);
+    return true;
+}
+
+u32 FloatBits(float value) {
+    u32 bits;
+    std::memcpy(&bits, &value, 4);
+    return bits;
+}
+
+// EASU: imagem do jogo -> intermediaria (fora de qualquer passagem de render). Devolve se o RCAS deve ser usado.
+void PointRcas(VkImageView view);
+
+bool FsrEasuPass(VkImageView source, u32 in_w, u32 in_h, u32 out_w, u32 out_h) {
+    if (g_upscaler.load(std::memory_order_relaxed) != 1 || !out_w || !out_h || (out_w <= in_w && out_h <= in_h) || !EnsureFsr() ||
+        !EnsureFsrImage(out_w, out_h)) {
+        return false;
+    }
+    VkDescriptorImageInfo info{g.sampler, source, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
+    VkWriteDescriptorSet write{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+    write.dstSet = g_fsr.easu_set;
+    write.descriptorCount = 1;
+    write.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    write.pImageInfo = &info;
+    vk.vkUpdateDescriptorSets(g.device, 1, &write, 0, nullptr);
+    Transition(g.command, g_fsr.image, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+    VkRenderingAttachmentInfo color{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
+    color.imageView = g_fsr.view;
+    color.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+    color.loadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+    color.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+    VkRenderingInfo rendering{VK_STRUCTURE_TYPE_RENDERING_INFO};
+    rendering.renderArea = {{0, 0}, {out_w, out_h}};
+    rendering.layerCount = 1;
+    rendering.colorAttachmentCount = 1;
+    rendering.pColorAttachments = &color;
+    vk.vkCmdBeginRendering(g.command, &rendering);
+    const VkViewport viewport{0.0f, 0.0f, static_cast<float>(out_w), static_cast<float>(out_h), 0.0f, 1.0f};
+    const VkRect2D scissor{{0, 0}, {out_w, out_h}};
+    vk.vkCmdBindPipeline(g.command, VK_PIPELINE_BIND_POINT_GRAPHICS, g_fsr.easu);
+    vk.vkCmdSetViewport(g.command, 0, 1, &viewport);
+    vk.vkCmdSetScissor(g.command, 0, 1, &scissor);
+    FsrPush push{};
+    const float iw = static_cast<float>(in_w), ih = static_cast<float>(in_h), ow = static_cast<float>(out_w), oh = static_cast<float>(out_h);
+    // FsrEasuCon (ffx_fsr1.h): a imagem inteira e a area renderizada
+    const float c[16] = {iw / ow, ih / oh, 0.5f * iw / ow - 0.5f, 0.5f * ih / oh - 0.5f,
+                         1.0f / iw, 1.0f / ih, 1.0f / iw, -1.0f / ih,
+                         -1.0f / iw, 2.0f / ih, 1.0f / iw, 2.0f / ih,
+                         0.0f, 4.0f / ih, 0.0f, 0.0f};
+    for (int i = 0; i < 16; ++i) {
+        push.con[i / 4][i % 4] = (i >= 14) ? 0u : FloatBits(c[i]);
+    }
+    vk.vkCmdPushConstants(g.command, g_fsr.layout, VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(push), &push);
+    vk.vkCmdBindDescriptorSets(g.command, VK_PIPELINE_BIND_POINT_GRAPHICS, g_fsr.layout, 0, 1, &g_fsr.easu_set, 0, nullptr);
+    vk.vkCmdDraw(g.command, 3, 1, 0, 0);
+    vk.vkCmdEndRendering(g.command);
+    Transition(g.command, g_fsr.image, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+    PointRcas(g_fsr.view);
+    return true;
+}
+
+// Imagem que o RCAS le (a saida do EASU, ou a do TAA quando nao ha ampliacao).
+void PointRcas(VkImageView view) {
+    VkDescriptorImageInfo info{g.sampler, view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
+    VkWriteDescriptorSet write{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+    write.dstSet = g_fsr.rcas_set;
+    write.descriptorCount = 1;
+    write.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    write.pImageInfo = &info;
+    vk.vkUpdateDescriptorSets(g.device, 1, &write, 0, nullptr);
+}
+
+// RCAS: intermediaria -> janela (dentro da passagem da janela), na area (x, y, w, h).
+void FsrRcasDraw(float x, float y, float w, float h) {
+    const VkViewport viewport{x, y, w, h, 0.0f, 1.0f};
+    const VkRect2D scissor{{static_cast<s32>(x), static_cast<s32>(y)}, {static_cast<u32>(w), static_cast<u32>(h)}};
+    vk.vkCmdBindPipeline(g.command, VK_PIPELINE_BIND_POINT_GRAPHICS, g_fsr.rcas);
+    vk.vkCmdSetViewport(g.command, 0, 1, &viewport);
+    vk.vkCmdSetScissor(g.command, 0, 1, &scissor);
+    FsrPush push{};
+    push.con[0][0] = FloatBits(std::exp2(-std::max(0.0f, g_fsr_sharpness.load(std::memory_order_relaxed)))); // FsrRcasCon
+    push.origin[0] = x;
+    push.origin[1] = y;
+    vk.vkCmdPushConstants(g.command, g_fsr.layout, VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(push), &push);
+    vk.vkCmdBindDescriptorSets(g.command, VK_PIPELINE_BIND_POINT_GRAPHICS, g_fsr.layout, 0, 1, &g_fsr.rcas_set, 0, nullptr);
+    vk.vkCmdDraw(g.command, 3, 1, 0, 0);
+}
+
+// ---- 1.9.1: anti-aliasing temporal (TAA) ----
+// O jogo desenha cada quadro com as matrizes de projecao deslocadas menos de um pixel (hle_gnm PatchProjection, Halton
+// 2/3 de 16 posicoes) e esta passagem mistura a imagem do quadro com o historico, reprojetado pela profundidade da cena e
+// pelas cameras deste quadro e do anterior (taa.frag). A camera da cena e a profundidade vem dos desenhos com o buffer de
+// camera nos alvos da tela (NoteSceneCamera): a que mais desenhou no quadro.
+std::atomic<int> g_aa_mode{0}; // 0 = nenhum, 1 = TAA
+std::atomic<float> g_jitter_x{0.0f}, g_jitter_y{0.0f};
+std::mutex g_scene_mutex;
+struct SceneCamera {
+    float m[16];
+    u64 depth;
+    u32 draws;
+};
+std::vector<SceneCamera> g_scene_cameras; // deste quadro
+
+struct OwnImage {
+    VkImage image = VK_NULL_HANDLE;
+    VkDeviceMemory memory = VK_NULL_HANDLE;
+    VkImageView view = VK_NULL_HANDLE;
+    VkImageLayout layout = VK_IMAGE_LAYOUT_UNDEFINED;
+    VkFormat format = VK_FORMAT_UNDEFINED;
+    u32 width = 0, height = 0;
+};
+
+void DestroyOwnImage(OwnImage& image) {
+    if (image.view) vk.vkDestroyImageView(g.device, image.view, nullptr);
+    if (image.image) vk.vkDestroyImage(g.device, image.image, nullptr);
+    if (image.memory) vk.vkFreeMemory(g.device, image.memory, nullptr);
+    image = OwnImage{};
+}
+
+bool EnsureOwnImage(OwnImage& image, u32 width, u32 height, VkFormat format, VkImageUsageFlags usage) {
+    if (image.image && image.width == width && image.height == height && image.format == format) {
+        return true;
+    }
+    DestroyOwnImage(image);
+    VkImageCreateInfo info{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+    info.imageType = VK_IMAGE_TYPE_2D;
+    info.format = format;
+    info.extent = {width, height, 1};
+    info.mipLevels = 1;
+    info.arrayLayers = 1;
+    info.samples = VK_SAMPLE_COUNT_1_BIT;
+    info.tiling = VK_IMAGE_TILING_OPTIMAL;
+    info.usage = usage;
+    if (vk.vkCreateImage(g.device, &info, nullptr, &image.image) != VK_SUCCESS) {
+        image.image = VK_NULL_HANDLE;
+        return false;
+    }
+    VkMemoryRequirements needs{};
+    vk.vkGetImageMemoryRequirements(g.device, image.image, &needs);
+    VkMemoryAllocateInfo allocate{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+    allocate.allocationSize = needs.size;
+    allocate.memoryTypeIndex = FindMemoryType(needs);
+    if (allocate.memoryTypeIndex == UINT32_MAX || vk.vkAllocateMemory(g.device, &allocate, nullptr, &image.memory) != VK_SUCCESS ||
+        vk.vkBindImageMemory(g.device, image.image, image.memory, 0) != VK_SUCCESS) {
+        DestroyOwnImage(image);
+        return false;
+    }
+    VkImageViewCreateInfo view{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+    view.image = image.image;
+    view.viewType = VK_IMAGE_VIEW_TYPE_2D;
+    view.format = format;
+    view.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    if (vk.vkCreateImageView(g.device, &view, nullptr, &image.view) != VK_SUCCESS) {
+        image.view = VK_NULL_HANDLE;
+        DestroyOwnImage(image);
+        return false;
+    }
+    image.width = width;
+    image.height = height;
+    image.format = format;
+    return true;
+}
+
+void MoveOwnImage(OwnImage& image, VkImageLayout to) {
+    if (image.layout != to) {
+        Transition(g.command, image.image, VK_IMAGE_ASPECT_COLOR_BIT, image.layout, to);
+        image.layout = to;
+    }
+}
+
+struct TaaState {
+    bool tried = false, ok = false;
+    VkShaderModule vert = VK_NULL_HANDLE, fs = VK_NULL_HANDLE;
+    VkDescriptorSetLayout set_layout = VK_NULL_HANDLE;
+    VkDescriptorPool pool = VK_NULL_HANDLE;
+    VkPipelineLayout layout = VK_NULL_HANDLE;
+    VkPipeline pipeline = VK_NULL_HANDLE;
+    VkSampler nearest = VK_NULL_HANDLE;
+    VkDescriptorSet sets[2]{};         // entradas da passagem que escreve na imagem i
+    VkDescriptorSet present_sets[2]{}; // a imagem i para a janela / FSR (layout do pipeline base)
+    VkImage images[2]{};
+    VkDeviceMemory memory[2]{};
+    VkImageView views[2]{};
+    VkImageLayout layouts[2] = {VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_UNDEFINED};
+    u32 width = 0, height = 0, current = 0;
+    bool history_valid = false, have_previous = false;
+    double previous[16]{};
+    u64 frame = 0;
+    OwnImage depth_copy[2];     // profundidade de cada quadro (R32F): a anterior mostra quem se moveu sozinho
+    bool depth_valid[2] = {};
+} g_taa;
+
+struct TaaPush {
+    float reproject[16];
+    float size[4];
+    float params[4];
+    float depth_scale[4];
+    float camera[4]; // P22 e P32 deste quadro e do anterior (distancia a partir da profundidade)
+};
+
+bool Invert4(const double m[16], double out[16]) {
+    double inv[16];
+    inv[0] = m[5] * m[10] * m[15] - m[5] * m[11] * m[14] - m[9] * m[6] * m[15] + m[9] * m[7] * m[14] + m[13] * m[6] * m[11] - m[13] * m[7] * m[10];
+    inv[4] = -m[4] * m[10] * m[15] + m[4] * m[11] * m[14] + m[8] * m[6] * m[15] - m[8] * m[7] * m[14] - m[12] * m[6] * m[11] + m[12] * m[7] * m[10];
+    inv[8] = m[4] * m[9] * m[15] - m[4] * m[11] * m[13] - m[8] * m[5] * m[15] + m[8] * m[7] * m[13] + m[12] * m[5] * m[11] - m[12] * m[7] * m[9];
+    inv[12] = -m[4] * m[9] * m[14] + m[4] * m[10] * m[13] + m[8] * m[5] * m[14] - m[8] * m[6] * m[13] - m[12] * m[5] * m[10] + m[12] * m[6] * m[9];
+    inv[1] = -m[1] * m[10] * m[15] + m[1] * m[11] * m[14] + m[9] * m[2] * m[15] - m[9] * m[3] * m[14] - m[13] * m[2] * m[11] + m[13] * m[3] * m[10];
+    inv[5] = m[0] * m[10] * m[15] - m[0] * m[11] * m[14] - m[8] * m[2] * m[15] + m[8] * m[3] * m[14] + m[12] * m[2] * m[11] - m[12] * m[3] * m[10];
+    inv[9] = -m[0] * m[9] * m[15] + m[0] * m[11] * m[13] + m[8] * m[1] * m[15] - m[8] * m[3] * m[13] - m[12] * m[1] * m[11] + m[12] * m[3] * m[9];
+    inv[13] = m[0] * m[9] * m[14] - m[0] * m[10] * m[13] - m[8] * m[1] * m[14] + m[8] * m[2] * m[13] + m[12] * m[1] * m[10] - m[12] * m[2] * m[9];
+    inv[2] = m[1] * m[6] * m[15] - m[1] * m[7] * m[14] - m[5] * m[2] * m[15] + m[5] * m[3] * m[14] + m[13] * m[2] * m[7] - m[13] * m[3] * m[6];
+    inv[6] = -m[0] * m[6] * m[15] + m[0] * m[7] * m[14] + m[4] * m[2] * m[15] - m[4] * m[3] * m[14] - m[12] * m[2] * m[7] + m[12] * m[3] * m[6];
+    inv[10] = m[0] * m[5] * m[15] - m[0] * m[7] * m[13] - m[4] * m[1] * m[15] + m[4] * m[3] * m[13] + m[12] * m[1] * m[7] - m[12] * m[3] * m[5];
+    inv[14] = -m[0] * m[5] * m[14] + m[0] * m[6] * m[13] + m[4] * m[1] * m[14] - m[4] * m[2] * m[13] - m[12] * m[1] * m[6] + m[12] * m[2] * m[5];
+    inv[3] = -m[1] * m[6] * m[11] + m[1] * m[7] * m[10] + m[5] * m[2] * m[11] - m[5] * m[3] * m[10] - m[9] * m[2] * m[7] + m[9] * m[3] * m[6];
+    inv[7] = m[0] * m[6] * m[11] - m[0] * m[7] * m[10] - m[4] * m[2] * m[11] + m[4] * m[3] * m[10] + m[8] * m[2] * m[7] - m[8] * m[3] * m[6];
+    inv[11] = -m[0] * m[5] * m[11] + m[0] * m[7] * m[9] + m[4] * m[1] * m[11] - m[4] * m[3] * m[9] - m[8] * m[1] * m[7] + m[8] * m[3] * m[5];
+    inv[15] = m[0] * m[5] * m[10] - m[0] * m[6] * m[9] - m[4] * m[1] * m[10] + m[4] * m[2] * m[9] + m[8] * m[1] * m[6] - m[8] * m[2] * m[5];
+    const double det = m[0] * inv[0] + m[1] * inv[4] + m[2] * inv[8] + m[3] * inv[12];
+    if (!(std::fabs(det) > 1e-30)) {
+        return false;
+    }
+    for (int i = 0; i < 16; ++i) {
+        out[i] = inv[i] / det;
+    }
+    return true;
+}
+
+float Halton(u32 index, u32 base) {
+    float f = 1.0f, r = 0.0f;
+    for (u32 i = index; i > 0; i /= base) {
+        f /= static_cast<float>(base);
+        r += f * static_cast<float>(i % base);
+    }
+    return r;
+}
+
+
+// Camera do quadro (a que mais desenhou nos alvos da tela), alvo de profundidade e a reprojecao para o quadro anterior.
+// Uma vez por quadro, antes do TAA / FSR 2-4 / DLSS.
+struct FrameTemporal {
+    bool camera = false, reprojected = false;
+    State::RenderTarget* depth = nullptr;
+    float reproject[16]{};
+    float fov_y = 0.0f;
+    float p22 = 0.0f, p32 = 0.0f, prev_p22 = 0.0f, prev_p32 = 0.0f; // distancia = P32 / (profundidade - P22)
+    bool prev_camera = false;
+} g_frame_temporal;
+float g_prev_p22 = 0.0f, g_prev_p32 = 0.0f;
+double g_previous_camera[16]{};
+bool g_have_previous_camera = false;
+
+void UpdateFrameTemporal() {
+    SceneCamera camera{};
+    bool have = false;
+    {
+        std::lock_guard lock(g_scene_mutex);
+        for (const SceneCamera& c : g_scene_cameras) {
+            if (c.draws > camera.draws) {
+                camera = c;
+                have = true;
+            }
+        }
+        g_scene_cameras.clear();
+    }
+    g_frame_temporal = FrameTemporal{};
+    if (!have) {
+        return;
+    }
+    g_frame_temporal.camera = true;
+    {   // projecao D3D (vetor-linha): coluna w = eixo z da vista; coluna z = P22 * coluna w (+ P32 na translacao)
+        const float* m = camera.m;
+        const float ww = m[3] * m[3] + m[7] * m[7] + m[11] * m[11];
+        const float p22 = ww > 0.0f ? (m[2] * m[3] + m[6] * m[7] + m[10] * m[11]) / ww : 0.0f;
+        g_frame_temporal.p22 = p22;
+        g_frame_temporal.p32 = m[14] - m[15] * p22;
+        g_frame_temporal.prev_p22 = g_prev_p22;
+        g_frame_temporal.prev_p32 = g_prev_p32;
+        g_frame_temporal.prev_camera = g_have_previous_camera;
+        g_prev_p22 = g_frame_temporal.p22;
+        g_prev_p32 = g_frame_temporal.p32;
+    }
+    if (const auto found = g.target_by_address.find(camera.depth); found != g.target_by_address.end() && found->second->depth &&
+                                                                  found->second->sample_view && found->second->layout != VK_IMAGE_LAYOUT_UNDEFINED) {
+        g_frame_temporal.depth = found->second;
+    }
+    const float p11 = std::sqrt(camera.m[1] * camera.m[1] + camera.m[5] * camera.m[5] + camera.m[9] * camera.m[9]);
+    g_frame_temporal.fov_y = p11 > 0.0f ? 2.0f * std::atan(1.0f / p11) : 0.0f;
+    double now[16], inverse[16];
+    for (int i = 0; i < 16; ++i) {
+        now[i] = camera.m[i];
+    }
+    if (g_frame_temporal.depth && g_have_previous_camera && Invert4(now, inverse)) {
+        // vetor-linha (o jogo faz posicao * matriz): recorte anterior = ndc * inverse(atual) * anterior
+        for (int r = 0; r < 4; ++r) {
+            for (int c = 0; c < 4; ++c) {
+                double sum = 0.0;
+                for (int k = 0; k < 4; ++k) {
+                    sum += inverse[r * 4 + k] * g_previous_camera[k * 4 + c];
+                }
+                g_frame_temporal.reproject[r * 4 + c] = static_cast<float>(sum);
+            }
+        }
+        g_frame_temporal.reprojected = true;
+    }
+    std::memcpy(g_previous_camera, now, sizeof(now));
+    g_have_previous_camera = true;
+}
+
+// Deslocamento do proximo quadro (Halton 2 / 3) em pixels do render e em NDC (o que o hle soma na projecao). Mesma
+// convencao do FSR: NDC x += 2 * px / largura, NDC y -= 2 * py / altura (Y do recorte para cima).
+float g_jitter_px_x = 0.0f, g_jitter_px_y = 0.0f; // o do quadro que esta sendo apresentado (depois: o do proximo)
+u64 g_jitter_index = 0;
+
+void SetNextJitter(u32 phases, u32 render_w, u32 render_h) {
+    const u32 phase = static_cast<u32>(g_jitter_index++ % std::max(phases, 1u)) + 1;
+    g_jitter_px_x = Halton(phase, 2) - 0.5f;
+    g_jitter_px_y = Halton(phase, 3) - 0.5f;
+    g_jitter_x = 2.0f * g_jitter_px_x / static_cast<float>(std::max(render_w, 1u));
+    g_jitter_y = -2.0f * g_jitter_px_y / static_cast<float>(std::max(render_h, 1u));
+}
+
+void ClearJitter() {
+    g_jitter_px_x = g_jitter_px_y = 0.0f;
+    g_jitter_x = 0.0f;
+    g_jitter_y = 0.0f;
+}
+
+bool EnsureTaa() {
+    if (g_taa.tried) {
+        return g_taa.ok;
+    }
+    g_taa.tried = true;
+    g_taa.vert = FsrModule(kFullscreenVert, sizeof(kFullscreenVert));
+    g_taa.fs = FsrModule(kTaaFrag, sizeof(kTaaFrag));
+    VkDescriptorSetLayoutBinding bindings[4]{};
+    for (u32 i = 0; i < 4; ++i) {
+        bindings[i] = {i, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr};
+    }
+    VkDescriptorSetLayoutCreateInfo set_layout{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+    set_layout.bindingCount = 4;
+    set_layout.pBindings = bindings;
+    VkDescriptorPoolSize pool_size{VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 10};
+    VkDescriptorPoolCreateInfo pool{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
+    pool.maxSets = 4;
+    pool.poolSizeCount = 1;
+    pool.pPoolSizes = &pool_size;
+    VkSamplerCreateInfo sampler{VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
+    sampler.magFilter = sampler.minFilter = VK_FILTER_NEAREST;
+    sampler.mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST;
+    sampler.addressModeU = sampler.addressModeV = sampler.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+    VkPushConstantRange range{VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(TaaPush)};
+    bool ok = g_taa.vert && g_taa.fs && vk.vkCreateDescriptorSetLayout(g.device, &set_layout, nullptr, &g_taa.set_layout) == VK_SUCCESS &&
+              vk.vkCreateDescriptorPool(g.device, &pool, nullptr, &g_taa.pool) == VK_SUCCESS &&
+              vk.vkCreateSampler(g.device, &sampler, nullptr, &g_taa.nearest) == VK_SUCCESS;
+    if (ok) {
+        VkPipelineLayoutCreateInfo layout{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+        layout.setLayoutCount = 1;
+        layout.pSetLayouts = &g_taa.set_layout;
+        layout.pushConstantRangeCount = 1;
+        layout.pPushConstantRanges = &range;
+        const VkDescriptorSetLayout layouts[4] = {g_taa.set_layout, g_taa.set_layout, g.set_layout, g.set_layout};
+        VkDescriptorSet sets[4]{};
+        VkDescriptorSetAllocateInfo allocate{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+        allocate.descriptorPool = g_taa.pool;
+        allocate.descriptorSetCount = 4;
+        allocate.pSetLayouts = layouts;
+        ok = vk.vkCreatePipelineLayout(g.device, &layout, nullptr, &g_taa.layout) == VK_SUCCESS &&
+             vk.vkAllocateDescriptorSets(g.device, &allocate, sets) == VK_SUCCESS;
+        g_taa.sets[0] = sets[0];
+        g_taa.sets[1] = sets[1];
+        g_taa.present_sets[0] = sets[2];
+        g_taa.present_sets[1] = sets[3];
+    }
+    if (ok) {
+        const VkFormat formats[2] = {VK_FORMAT_R16G16B16A16_SFLOAT, VK_FORMAT_R32_SFLOAT}; // + copia da profundidade
+        g_taa.pipeline = FsrPipeline(g_taa.fs, formats[0], g_taa.vert, g_taa.layout, 2, formats);
+        ok = g_taa.pipeline != VK_NULL_HANDLE;
+    }
+    g_taa.ok = ok;
+    std::printf("[TAA] temporal anti-aliasing: %s\n", ok ? "ready" : "FAILED (off)");
+    return ok;
+}
+
+bool EnsureTaaImages(u32 width, u32 height) {
+    if (g_taa.images[0] && g_taa.width == width && g_taa.height == height) {
+        return true;
+    }
+    for (u32 i = 0; i < 2; ++i) {
+        if (g_taa.views[i]) vk.vkDestroyImageView(g.device, g_taa.views[i], nullptr);
+        if (g_taa.images[i]) vk.vkDestroyImage(g.device, g_taa.images[i], nullptr);
+        if (g_taa.memory[i]) vk.vkFreeMemory(g.device, g_taa.memory[i], nullptr);
+        g_taa.views[i] = VK_NULL_HANDLE;
+        g_taa.images[i] = VK_NULL_HANDLE;
+        g_taa.memory[i] = VK_NULL_HANDLE;
+        g_taa.layouts[i] = VK_IMAGE_LAYOUT_UNDEFINED;
+    }
+    g_taa.history_valid = false;
+    g_taa.width = g_taa.height = 0;
+    for (u32 i = 0; i < 2; ++i) {
+        VkImageCreateInfo image{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+        image.imageType = VK_IMAGE_TYPE_2D;
+        image.format = VK_FORMAT_R16G16B16A16_SFLOAT;
+        image.extent = {width, height, 1};
+        image.mipLevels = 1;
+        image.arrayLayers = 1;
+        image.samples = VK_SAMPLE_COUNT_1_BIT;
+        image.tiling = VK_IMAGE_TILING_OPTIMAL;
+        image.usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+        if (vk.vkCreateImage(g.device, &image, nullptr, &g_taa.images[i]) != VK_SUCCESS) {
+            g_taa.images[i] = VK_NULL_HANDLE;
+            return false;
+        }
+        VkMemoryRequirements needs{};
+        vk.vkGetImageMemoryRequirements(g.device, g_taa.images[i], &needs);
+        VkMemoryAllocateInfo allocate{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+        allocate.allocationSize = needs.size;
+        allocate.memoryTypeIndex = FindMemoryType(needs);
+        if (allocate.memoryTypeIndex == UINT32_MAX || vk.vkAllocateMemory(g.device, &allocate, nullptr, &g_taa.memory[i]) != VK_SUCCESS ||
+            vk.vkBindImageMemory(g.device, g_taa.images[i], g_taa.memory[i], 0) != VK_SUCCESS) {
+            return false;
+        }
+        VkImageViewCreateInfo view{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+        view.image = g_taa.images[i];
+        view.viewType = VK_IMAGE_VIEW_TYPE_2D;
+        view.format = VK_FORMAT_R16G16B16A16_SFLOAT;
+        view.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+        if (vk.vkCreateImageView(g.device, &view, nullptr, &g_taa.views[i]) != VK_SUCCESS) {
+            g_taa.views[i] = VK_NULL_HANDLE;
+            return false;
+        }
+        VkDescriptorImageInfo info{g.sampler, g_taa.views[i], VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
+        VkWriteDescriptorSet write{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+        write.dstSet = g_taa.present_sets[i];
+        write.descriptorCount = 1;
+        write.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        write.pImageInfo = &info;
+        vk.vkUpdateDescriptorSets(g.device, 1, &write, 0, nullptr);
+    }
+    g_taa.width = width;
+    g_taa.height = height;
+    return true;
+}
+
+// Passagem do TAA (fora de qualquer passagem de render). Devolve a imagem resultante (view + set para a janela) ou falso
+// (TAA desligado / falhou: a janela usa a imagem do jogo como antes). Tambem escolhe o deslocamento do proximo quadro.
+bool TaaPass(State::RenderTarget* shown, VkImageView* out_view, VkDescriptorSet* out_set) {
+    if (g_aa_mode.load(std::memory_order_relaxed) != 1 || !shown || !EnsureTaa() || !EnsureTaaImages(shown->width, shown->height)) {
+        g_taa.history_valid = false;
+        return false;
+    }
+    const u32 out = g_taa.current ^ 1, past = g_taa.current;
+    State::RenderTarget* depth = g_frame_temporal.depth;
+    TaaPush push{};
+    std::memcpy(push.reproject, g_frame_temporal.reproject, sizeof(push.reproject));
+    const bool reprojected = g_frame_temporal.reprojected;
+    push.size[0] = static_cast<float>(shown->width);
+    push.size[1] = static_cast<float>(shown->height);
+    push.size[2] = 1.0f / push.size[0];
+    push.size[3] = 1.0f / push.size[1];
+    push.params[0] = g_taa.history_valid ? 1.0f : 0.0f;
+    push.params[1] = reprojected ? 1.0f : 0.0f;
+    push.params[2] = 0.1f;
+    push.depth_scale[0] = depth ? static_cast<float>(shown->width) / static_cast<float>(depth->width) : 1.0f;
+    push.depth_scale[1] = depth ? static_cast<float>(shown->height) / static_cast<float>(depth->height) : 1.0f;
+    const VkImageUsageFlags copy_usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+    if (!EnsureOwnImage(g_taa.depth_copy[0], shown->width, shown->height, VK_FORMAT_R32_SFLOAT, copy_usage) ||
+        !EnsureOwnImage(g_taa.depth_copy[1], shown->width, shown->height, VK_FORMAT_R32_SFLOAT, copy_usage)) {
+        return false;
+    }
+    const bool prev_depth = reprojected && g_frame_temporal.prev_camera && g_taa.depth_valid[past] && g_taa.history_valid;
+    push.params[3] = prev_depth ? 1.0f : 0.0f;
+    push.camera[0] = g_frame_temporal.p22;
+    push.camera[1] = g_frame_temporal.p32;
+    push.camera[2] = g_frame_temporal.prev_p22;
+    push.camera[3] = g_frame_temporal.prev_p32;
+    MoveOwnImage(g_taa.depth_copy[past], VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+
+    if (g_taa.layouts[past] != VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL) {
+        Transition(g.command, g_taa.images[past], VK_IMAGE_ASPECT_COLOR_BIT, g_taa.layouts[past], VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+        g_taa.layouts[past] = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    }
+    if (depth) {
+        TransitionTarget(depth, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+    }
+    VkDescriptorImageInfo infos[4] = {
+        {g.sampler, shown->raw_view ? shown->raw_view : shown->view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL},
+        {g.sampler, g_taa.views[past], VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL},
+        {g_taa.nearest, depth ? depth->sample_view : g_taa.views[past], VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL},
+        {g_taa.nearest, g_taa.depth_copy[past].view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL}};
+    VkWriteDescriptorSet writes[4]{};
+    for (u32 i = 0; i < 4; ++i) {
+        writes[i] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+        writes[i].dstSet = g_taa.sets[out];
+        writes[i].dstBinding = i;
+        writes[i].descriptorCount = 1;
+        writes[i].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        writes[i].pImageInfo = &infos[i];
+    }
+    vk.vkUpdateDescriptorSets(g.device, 4, writes, 0, nullptr);
+    Transition(g.command, g_taa.images[out], VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+    g_taa.depth_copy[out].layout = VK_IMAGE_LAYOUT_UNDEFINED;
+    MoveOwnImage(g_taa.depth_copy[out], VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+    VkRenderingAttachmentInfo color[2]{};
+    for (u32 i = 0; i < 2; ++i) {
+        color[i] = {VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
+        color[i].imageView = i ? g_taa.depth_copy[out].view : g_taa.views[out];
+        color[i].imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+        color[i].loadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+        color[i].storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+    }
+    VkRenderingInfo rendering{VK_STRUCTURE_TYPE_RENDERING_INFO};
+    rendering.renderArea = {{0, 0}, {shown->width, shown->height}};
+    rendering.layerCount = 1;
+    rendering.colorAttachmentCount = 2;
+    rendering.pColorAttachments = color;
+    vk.vkCmdBeginRendering(g.command, &rendering);
+    const VkViewport viewport{0.0f, 0.0f, push.size[0], push.size[1], 0.0f, 1.0f};
+    const VkRect2D scissor{{0, 0}, {shown->width, shown->height}};
+    vk.vkCmdBindPipeline(g.command, VK_PIPELINE_BIND_POINT_GRAPHICS, g_taa.pipeline);
+    vk.vkCmdSetViewport(g.command, 0, 1, &viewport);
+    vk.vkCmdSetScissor(g.command, 0, 1, &scissor);
+    vk.vkCmdPushConstants(g.command, g_taa.layout, VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(push), &push);
+    vk.vkCmdBindDescriptorSets(g.command, VK_PIPELINE_BIND_POINT_GRAPHICS, g_taa.layout, 0, 1, &g_taa.sets[out], 0, nullptr);
+    vk.vkCmdDraw(g.command, 3, 1, 0, 0);
+    vk.vkCmdEndRendering(g.command);
+    Transition(g.command, g_taa.images[out], VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+               VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+    g_taa.layouts[out] = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    MoveOwnImage(g_taa.depth_copy[out], VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+    g_taa.depth_valid[out] = reprojected;
+    g_taa.current = out;
+    g_taa.history_valid = true;
+    SetNextJitter(16, shown->width, shown->height); // TAA x16
+    *out_view = g_taa.views[out];
+    *out_set = g_taa.present_sets[out];
+    return true;
+}
+
+// ---- 1.9.1: AMD FSR 2 / 3 / 4 pela FFX API (SDK FSR 2.4.0: amd_fidelityfx_loader_vk.dll + amd_fidelityfx_upscaler_vk.dll) ----
+// Entradas na resolucao de render, feitas por temporal_inputs.frag: cor (RGBA16F), vetores de movimento (so da camera, em
+// uv) e profundidade (R32F). A saida (tamanho da area da imagem na janela) vai para a janela no lugar da imagem do jogo.
+// O deslocamento por quadro e o mesmo mecanismo do TAA (SetNextJitter), com o numero de fases que o FSR pede.
+std::atomic<int> g_ffx_wanted{0}; // 0 = desligado; 2 / 3 / 4 = versao maior do FSR; 9 = a mais nova
+std::atomic<bool> g_ffx_native{false}; // FSR AA: mesmo sem ampliar (escala 100%)
+
+struct FfxState {
+    bool tried = false, ok = false, failed_context = false;
+    HMODULE module = nullptr;
+    ffxFunctions fn{};
+    ffxContext context = nullptr;
+    VkDeviceContext device{};
+    u32 render_w = 0, render_h = 0, out_w = 0, out_h = 0;
+    int wanted = 0;
+    std::string version;
+    std::vector<std::pair<u64, std::string>> versions;
+    OwnImage color, motion, depth[2], reactive, output;
+    u32 depth_index = 0;
+    bool depth_valid[2] = {};
+    VkPipeline inputs = VK_NULL_HANDLE;
+    VkDescriptorPool pool = VK_NULL_HANDLE;
+    VkDescriptorSet inputs_set = VK_NULL_HANDLE, present_set = VK_NULL_HANDLE;
+    std::chrono::steady_clock::time_point last{};
+    bool reset = true;
+} g_ffx;
+
+void FfxMessage(uint32_t type, const wchar_t* message) {
+    static u32 count = 0;
+    if (++count <= 40) {
+        std::printf("[FSR] %s: %ls\n", type == FFX_API_MESSAGE_TYPE_ERROR ? "error" : "warning", message);
+    }
+}
+
+// Carrega a DLL e lista as versoes do upscaler (uma vez).
+bool LoadFfx() {
+    if (g_ffx.tried) {
+        return g_ffx.ok;
+    }
+    g_ffx.tried = true;
+    wchar_t path[MAX_PATH * 2] = {};
+    GetModuleFileNameW(nullptr, path, static_cast<DWORD>(std::size(path)));
+    const std::filesystem::path dll = std::filesystem::path(path).parent_path() / L"amd_fidelityfx_loader_vk.dll";
+    g_ffx.module = LoadLibraryW(dll.c_str());
+    if (!g_ffx.module) {
+        std::printf("[FSR] %ls not found: AMD FSR 2 / 3 / 4 unavailable\n", dll.c_str());
+        return false;
+    }
+    ffxLoadFunctions(&g_ffx.fn, g_ffx.module);
+    if (!g_ffx.fn.CreateContext || !g_ffx.fn.Dispatch || !g_ffx.fn.Query) {
+        std::printf("[FSR] amd_fidelityfx_loader_vk.dll without the FFX API functions\n");
+        return false;
+    }
+    g_ffx.device = {g.device, g.physical, vk.vkGetDeviceProcAddr};
+    u64 count = 0;
+    ffxQueryDescGetVersions versions{};
+    versions.header.type = FFX_API_QUERY_DESC_TYPE_GET_VERSIONS;
+    versions.createDescType = FFX_API_CREATE_CONTEXT_DESC_TYPE_UPSCALE;
+    versions.device = &g_ffx.device;
+    versions.outputCount = &count;
+    g_ffx.fn.Query(nullptr, &versions.header);
+    std::vector<u64> ids(count);
+    std::vector<const char*> names(count);
+    versions.versionIds = ids.data();
+    versions.versionNames = names.data();
+    if (count) {
+        g_ffx.fn.Query(nullptr, &versions.header);
+    }
+    std::string list;
+    for (u64 i = 0; i < count; ++i) {
+        g_ffx.versions.push_back({ids[i], names[i] ? names[i] : "?"});
+        list += (i ? ", " : "") + g_ffx.versions.back().second;
+    }
+    std::printf("[FSR] FFX API loaded: %llu upscaler version(s): %s\n", static_cast<unsigned long long>(count), list.c_str());
+    g_ffx.ok = count > 0;
+    return g_ffx.ok;
+}
+
+// Versao maior de um nome ("FSR 3.1.6", "4.1.2"...): o primeiro digito
+int FfxMajor(const std::string& name) {
+    for (char c : name) {
+        if (c >= '0' && c <= '9') {
+            return c - '0';
+        }
+    }
+    return 0;
+}
+
+void DestroyFfxContext() {
+    if (g_ffx.context) {
+        vk.vkDeviceWaitIdle(g.device);
+        g_ffx.fn.DestroyContext(&g_ffx.context, nullptr);
+        g_ffx.context = nullptr;
+    }
+}
+
+bool EnsureFfxContext(u32 render_w, u32 render_h, u32 out_w, u32 out_h) {
+    const int wanted = g_ffx_wanted.load(std::memory_order_relaxed);
+    if (g_ffx.context && g_ffx.render_w == render_w && g_ffx.render_h == render_h && g_ffx.out_w == out_w && g_ffx.out_h == out_h &&
+        g_ffx.wanted == wanted) {
+        return true;
+    }
+    if (g_ffx.failed_context && g_ffx.wanted == wanted && g_ffx.render_w == render_w && g_ffx.out_w == out_w) {
+        return false;
+    }
+    DestroyFfxContext();
+    g_ffx.render_w = render_w;
+    g_ffx.render_h = render_h;
+    g_ffx.out_w = out_w;
+    g_ffx.out_h = out_h;
+    g_ffx.wanted = wanted;
+    g_ffx.failed_context = false;
+    // versao: a maior com a versao maior pedida (9 = a mais nova de todas)
+    const std::pair<u64, std::string>* pick = nullptr;
+    for (const auto& v : g_ffx.versions) {
+        const int major = FfxMajor(v.second);
+        if ((wanted == 9 || major == wanted) && (!pick || major > FfxMajor(pick->second) ||
+                                                 (major == FfxMajor(pick->second) && v.second > pick->second))) {
+            pick = &v;
+        }
+    }
+    if (!pick) { // essa versao nao existe para esta GPU / DLL: a mais nova que houver
+        for (const auto& v : g_ffx.versions) {
+            if (!pick || FfxMajor(v.second) > FfxMajor(pick->second)) {
+                pick = &v;
+            }
+        }
+        if (!pick) {
+            g_ffx.failed_context = true;
+            return false;
+        }
+        std::printf("[FSR] no FSR %d upscaler in this AMD DLL: using %s\n", wanted, pick->second.c_str());
+    }
+    ffxCreateBackendVKDesc backend{};
+    backend.header.type = FFX_API_CREATE_CONTEXT_DESC_TYPE_BACKEND_VK;
+    backend.deviceContext = g_ffx.device;
+    ffxOverrideVersion version{};
+    version.header.type = FFX_API_DESC_TYPE_OVERRIDE_VERSION;
+    version.versionId = pick->first;
+    ffxCreateContextDescUpscaleVersion api{};
+    api.header.type = FFX_API_CREATE_CONTEXT_DESC_TYPE_UPSCALE_VERSION;
+    api.version = FFX_UPSCALER_VERSION;
+    ffxCreateContextDescUpscale create{};
+    create.header.type = FFX_API_CREATE_CONTEXT_DESC_TYPE_UPSCALE;
+    create.flags = FFX_UPSCALE_ENABLE_AUTO_EXPOSURE | FFX_UPSCALE_ENABLE_NON_LINEAR_COLORSPACE;
+    create.maxRenderSize = {render_w, render_h};
+    create.maxUpscaleSize = {out_w, out_h};
+    create.fpMessage = FfxMessage;
+    create.header.pNext = &backend.header;
+    backend.header.pNext = &version.header;
+    version.header.pNext = &api.header;
+    const ffxReturnCode_t result = g_ffx.fn.CreateContext(&g_ffx.context, &create.header, nullptr);
+    if (result != FFX_API_RETURN_OK || !g_ffx.context) {
+        std::printf("[FSR] %s: context creation failed (code %u) for %ux%u -> %ux%u\n", pick->second.c_str(), result, render_w, render_h,
+                    out_w, out_h);
+        g_ffx.context = nullptr;
+        g_ffx.failed_context = true;
+        return false;
+    }
+    g_ffx.version = pick->second;
+    g_ffx.reset = true;
+    std::printf("[FSR] AMD %s ready: %ux%u -> %ux%u\n", pick->second.c_str(), render_w, render_h, out_w, out_h);
+    return true;
+}
+
+bool EnsureFfxPipelines() {
+    if (g_ffx.inputs) {
+        return true;
+    }
+    static bool tried = false;
+    if (tried || !EnsureTaa()) {
+        return false;
+    }
+    tried = true;
+    static VkShaderModule fs = FsrModule(kTemporalInputsFrag, sizeof(kTemporalInputsFrag));
+    const VkFormat formats[4] = {VK_FORMAT_R16G16B16A16_SFLOAT, VK_FORMAT_R16G16_SFLOAT, VK_FORMAT_R32_SFLOAT, VK_FORMAT_R8_UNORM};
+    g_ffx.inputs = fs ? FsrPipeline(fs, formats[0], g_taa.vert, g_taa.layout, 4, formats) : VK_NULL_HANDLE;
+    VkDescriptorPoolSize pool_size{VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 5};
+    VkDescriptorPoolCreateInfo pool{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
+    pool.maxSets = 2;
+    pool.poolSizeCount = 1;
+    pool.pPoolSizes = &pool_size;
+    const VkDescriptorSetLayout layouts[2] = {g_taa.set_layout, g.set_layout};
+    VkDescriptorSet sets[2]{};
+    VkDescriptorSetAllocateInfo allocate{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+    allocate.descriptorSetCount = 2;
+    allocate.pSetLayouts = layouts;
+    if (!g_ffx.inputs || vk.vkCreateDescriptorPool(g.device, &pool, nullptr, &g_ffx.pool) != VK_SUCCESS) {
+        g_ffx.inputs = VK_NULL_HANDLE;
+        return false;
+    }
+    allocate.descriptorPool = g_ffx.pool;
+    if (vk.vkAllocateDescriptorSets(g.device, &allocate, sets) != VK_SUCCESS) {
+        g_ffx.inputs = VK_NULL_HANDLE;
+        return false;
+    }
+    g_ffx.inputs_set = sets[0];
+    g_ffx.present_set = sets[1];
+    return true;
+}
+
+FfxApiResource FfxImage(const OwnImage& image, u32 usage, u32 state) {
+    FfxApiResource resource{};
+    resource.resource = reinterpret_cast<void*>(image.image);
+    resource.state = state;
+    resource.description.type = FFX_API_RESOURCE_TYPE_TEXTURE2D;
+    resource.description.format = ffxApiGetSurfaceFormatVK(image.format);
+    resource.description.width = image.width;
+    resource.description.height = image.height;
+    resource.description.depth = 1;
+    resource.description.mipCount = 1;
+    resource.description.flags = FFX_API_RESOURCE_FLAGS_NONE;
+    resource.description.usage = usage;
+    return resource;
+}
+
+// FSR 2 / 3 / 4: imagem do jogo (render) -> saida (out_w x out_h). Devolve a saida para a janela, ou falso.
+bool FfxPass(State::RenderTarget* shown, u32 out_w, u32 out_h, VkImageView* out_view, VkDescriptorSet* out_set) {
+    if (!g_ffx_wanted.load(std::memory_order_relaxed) || !shown || !out_w || !out_h ||
+        (!g_ffx_native.load(std::memory_order_relaxed) && out_w <= shown->width && out_h <= shown->height)) {
+        return false;
+    }
+    if (!LoadFfx() || !EnsureFfxPipelines() || !EnsureFfxContext(shown->width, shown->height, out_w, out_h)) {
+        return false;
+    }
+    const VkImageUsageFlags input_usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+    if (!EnsureOwnImage(g_ffx.color, shown->width, shown->height, VK_FORMAT_R16G16B16A16_SFLOAT, input_usage) ||
+        !EnsureOwnImage(g_ffx.motion, shown->width, shown->height, VK_FORMAT_R16G16_SFLOAT, input_usage) ||
+        !EnsureOwnImage(g_ffx.depth[0], shown->width, shown->height, VK_FORMAT_R32_SFLOAT, input_usage) ||
+        !EnsureOwnImage(g_ffx.depth[1], shown->width, shown->height, VK_FORMAT_R32_SFLOAT, input_usage) ||
+        !EnsureOwnImage(g_ffx.reactive, shown->width, shown->height, VK_FORMAT_R8_UNORM, input_usage) ||
+        !EnsureOwnImage(g_ffx.output, out_w, out_h, VK_FORMAT_R16G16B16A16_SFLOAT, VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT)) {
+        return false;
+    }
+    // 1. entradas (cor, movimento, profundidade) numa passagem
+    const FrameTemporal& frame = g_frame_temporal;
+    State::RenderTarget* depth = frame.depth;
+    if (depth) {
+        TransitionTarget(depth, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+    }
+    const VkImageView color_view = shown->raw_view ? shown->raw_view : shown->view;
+    const u32 now_depth = g_ffx.depth_index ^ 1, past_depth = g_ffx.depth_index;
+    MoveOwnImage(g_ffx.depth[past_depth], VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+    VkDescriptorImageInfo infos[4] = {{g.sampler, color_view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL},
+                                      {g.sampler, color_view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL},
+                                      {g_taa.nearest, depth ? depth->sample_view : color_view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL},
+                                      {g_taa.nearest, g_ffx.depth[past_depth].view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL}};
+    VkWriteDescriptorSet writes[5]{};
+    for (u32 i = 0; i < 4; ++i) {
+        writes[i] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+        writes[i].dstSet = g_ffx.inputs_set;
+        writes[i].dstBinding = i;
+        writes[i].descriptorCount = 1;
+        writes[i].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        writes[i].pImageInfo = &infos[i];
+    }
+    static const bool show_reactive = std::getenv("LD_SHOW_REACTIVE") != nullptr; // DIAGNOSTICO: a mascara reativa na tela
+    VkDescriptorImageInfo present_info{g.sampler, show_reactive ? g_ffx.reactive.view : g_ffx.output.view,
+                                       VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
+    writes[4] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+    writes[4].dstSet = g_ffx.present_set;
+    writes[4].descriptorCount = 1;
+    writes[4].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    writes[4].pImageInfo = &present_info;
+    vk.vkUpdateDescriptorSets(g.device, 5, writes, 0, nullptr);
+    TaaPush push{};
+    std::memcpy(push.reproject, frame.reproject, sizeof(push.reproject));
+    push.size[0] = static_cast<float>(shown->width);
+    push.size[1] = static_cast<float>(shown->height);
+    push.size[2] = 1.0f / push.size[0];
+    push.size[3] = 1.0f / push.size[1];
+    push.params[1] = frame.reprojected ? 1.0f : 0.0f;
+    push.depth_scale[0] = depth ? push.size[0] / static_cast<float>(depth->width) : 1.0f;
+    push.depth_scale[1] = depth ? push.size[1] / static_cast<float>(depth->height) : 1.0f;
+    push.params[3] = frame.reprojected && frame.prev_camera && g_ffx.depth_valid[past_depth] && !g_ffx.reset ? 1.0f : 0.0f;
+    if (const char* show = std::getenv("LD_SHOW_REACTIVE"); show && show[0] == '2') {
+        push.params[0] = 2.0f; // DIAGNOSTICO: a diferenca em vez da mascara
+    }
+    push.camera[0] = frame.p22;
+    push.camera[1] = frame.p32;
+    push.camera[2] = frame.prev_p22;
+    push.camera[3] = frame.prev_p32;
+    OwnImage* attachments[4] = {&g_ffx.color, &g_ffx.motion, &g_ffx.depth[now_depth], &g_ffx.reactive};
+    VkRenderingAttachmentInfo color[4]{};
+    for (u32 i = 0; i < 4; ++i) {
+        attachments[i]->layout = VK_IMAGE_LAYOUT_UNDEFINED; // conteudo antigo descartado
+        MoveOwnImage(*attachments[i], VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+        color[i] = {VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
+        color[i].imageView = attachments[i]->view;
+        color[i].imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+        color[i].loadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+        color[i].storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+    }
+    VkRenderingInfo rendering{VK_STRUCTURE_TYPE_RENDERING_INFO};
+    rendering.renderArea = {{0, 0}, {shown->width, shown->height}};
+    rendering.layerCount = 1;
+    rendering.colorAttachmentCount = 4;
+    rendering.pColorAttachments = color;
+    vk.vkCmdBeginRendering(g.command, &rendering);
+    const VkViewport viewport{0.0f, 0.0f, push.size[0], push.size[1], 0.0f, 1.0f};
+    const VkRect2D scissor{{0, 0}, {shown->width, shown->height}};
+    vk.vkCmdBindPipeline(g.command, VK_PIPELINE_BIND_POINT_GRAPHICS, g_ffx.inputs);
+    vk.vkCmdSetViewport(g.command, 0, 1, &viewport);
+    vk.vkCmdSetScissor(g.command, 0, 1, &scissor);
+    vk.vkCmdPushConstants(g.command, g_taa.layout, VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(push), &push);
+    vk.vkCmdBindDescriptorSets(g.command, VK_PIPELINE_BIND_POINT_GRAPHICS, g_taa.layout, 0, 1, &g_ffx.inputs_set, 0, nullptr);
+    vk.vkCmdDraw(g.command, 3, 1, 0, 0);
+    vk.vkCmdEndRendering(g.command);
+    for (OwnImage* image : attachments) {
+        MoveOwnImage(*image, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+    }
+    g_ffx.depth_valid[now_depth] = frame.reprojected;
+    g_ffx.depth_index = now_depth;
+    g_ffx.output.layout = VK_IMAGE_LAYOUT_UNDEFINED;
+    MoveOwnImage(g_ffx.output, VK_IMAGE_LAYOUT_GENERAL);
+    // 2. o upscaler da AMD grava os comandos dele no mesmo command buffer
+    const auto now = std::chrono::steady_clock::now();
+    const float delta = g_ffx.last.time_since_epoch().count() ? std::chrono::duration<float, std::milli>(now - g_ffx.last).count() : 16.7f;
+    g_ffx.last = now;
+    ffxDispatchDescUpscale dispatch{};
+    dispatch.header.type = FFX_API_DISPATCH_DESC_TYPE_UPSCALE;
+    dispatch.commandList = g.command;
+    dispatch.color = FfxImage(g_ffx.color, FFX_API_RESOURCE_USAGE_READ_ONLY, FFX_API_RESOURCE_STATE_PIXEL_COMPUTE_READ);
+    dispatch.depth = FfxImage(g_ffx.depth[now_depth], FFX_API_RESOURCE_USAGE_READ_ONLY, FFX_API_RESOURCE_STATE_PIXEL_COMPUTE_READ);
+    dispatch.reactive = FfxImage(g_ffx.reactive, FFX_API_RESOURCE_USAGE_READ_ONLY, FFX_API_RESOURCE_STATE_PIXEL_COMPUTE_READ);
+    dispatch.motionVectors = FfxImage(g_ffx.motion, FFX_API_RESOURCE_USAGE_READ_ONLY, FFX_API_RESOURCE_STATE_PIXEL_COMPUTE_READ);
+    dispatch.output = FfxImage(g_ffx.output, FFX_API_RESOURCE_USAGE_UAV, FFX_API_RESOURCE_STATE_UNORDERED_ACCESS);
+    dispatch.jitterOffset = {g_jitter_px_x, g_jitter_px_y};
+    dispatch.motionVectorScale = {push.size[0], push.size[1]};
+    dispatch.renderSize = {shown->width, shown->height};
+    dispatch.upscaleSize = {out_w, out_h};
+    dispatch.enableSharpening = true;
+    dispatch.sharpness = std::clamp(1.0f - g_fsr_sharpness.load(std::memory_order_relaxed), 0.0f, 1.0f) * 0.6f;
+    dispatch.frameTimeDelta = std::clamp(delta, 1.0f, 100.0f);
+    dispatch.preExposure = 1.0f;
+    dispatch.reset = g_ffx.reset || !frame.reprojected;
+    dispatch.cameraNear = 0.2f;
+    dispatch.cameraFar = 500.0f;
+    dispatch.cameraFovAngleVertical = frame.fov_y > 0.0f ? frame.fov_y : 0.66f;
+    dispatch.viewSpaceToMetersFactor = 1.0f;
+    dispatch.flags = FFX_UPSCALE_FLAG_NON_LINEAR_COLOR_SRGB;
+    const ffxReturnCode_t result = g_ffx.fn.Dispatch(&g_ffx.context, &dispatch.header);
+    g_ffx.reset = false;
+    // o upscaler devolve os recursos nos estados informados
+    if (result != FFX_API_RETURN_OK) {
+        static u32 logged = 0;
+        if (logged++ < 5) {
+            std::printf("[FSR] dispatch failed (code %u)\n", result);
+        }
+        MoveOwnImage(g_ffx.output, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+        return false;
+    }
+    MoveOwnImage(g_ffx.output, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+    // 3. deslocamento do proximo quadro: as fases que o FSR pede para essa proporcao
+    int32_t phases = 16;
+    ffxQueryDescUpscaleGetJitterPhaseCount phase_query{};
+    phase_query.header.type = FFX_API_QUERY_DESC_TYPE_UPSCALE_GETJITTERPHASECOUNT;
+    phase_query.renderWidth = shown->width;
+    phase_query.displayWidth = out_w;
+    phase_query.pOutPhaseCount = &phases;
+    g_ffx.fn.Query(&g_ffx.context, &phase_query.header);
+    SetNextJitter(static_cast<u32>(std::max(phases, 1)), shown->width, shown->height);
+    *out_view = g_ffx.output.view;
+    *out_set = g_ffx.present_set;
+    return true;
+}
+} // namespace
+
 bool VulkanRenderer::DrawFrame(u64 display_address) {
     // Fase 59: etapas cronometradas (0 pipelines, 1 lock, 2 fence, 3 acquire, 4 gravacao, 5 submit, 6 present)
     auto lap_start = std::chrono::steady_clock::now();
@@ -4254,11 +5404,27 @@ bool VulkanRenderer::DrawFrame(u64 display_address) {
             vk.vkCmdBindPipeline(g.command, VK_PIPELINE_BIND_POINT_GRAPHICS, draw.pipeline);
             bound = draw.pipeline;
         }
-        if (!dynamic.valid || std::memcmp(&dynamic.viewport, &draw.viewport, sizeof(VkViewport))) {
-            vk.vkCmdSetViewport(g.command, 0, 1, &draw.viewport);
-            dynamic.viewport = draw.viewport;
-        }
+        // 1.9.1: alvo criado em outra resolucao (g_target_scale_*): viewport e scissor do jogo (em pixels de 1080p) escalados
+        VkViewport viewport = draw.viewport;
         VkRect2D scissor = draw.scissor;
+        if (const State::RenderTarget* sized = draw.color_count ? draw.colors[0] : draw.depth;
+            sized && sized->game_width && (sized->width != sized->game_width || sized->height != sized->game_height)) {
+            const float sx = static_cast<float>(sized->width) / sized->game_width, sy = static_cast<float>(sized->height) / sized->game_height;
+            viewport.x *= sx;
+            viewport.y *= sy;
+            viewport.width *= sx;
+            viewport.height *= sy;
+            const s32 x0 = static_cast<s32>(std::floor(scissor.offset.x * sx)), y0 = static_cast<s32>(std::floor(scissor.offset.y * sy));
+            const s64 x1 = static_cast<s64>(std::ceil((static_cast<double>(scissor.offset.x) + scissor.extent.width) * sx));
+            const s64 y1 = static_cast<s64>(std::ceil((static_cast<double>(scissor.offset.y) + scissor.extent.height) * sy));
+            scissor.offset = {x0, y0};
+            scissor.extent = {static_cast<u32>(std::max<s64>(0, std::min<s64>(x1, 0x7FFFFFFF) - x0)),
+                              static_cast<u32>(std::max<s64>(0, std::min<s64>(y1, 0x7FFFFFFF) - y0))};
+        }
+        if (!dynamic.valid || std::memcmp(&dynamic.viewport, &viewport, sizeof(VkViewport))) {
+            vk.vkCmdSetViewport(g.command, 0, 1, &viewport);
+            dynamic.viewport = viewport;
+        }
         scissor.offset.x = std::clamp<s32>(scissor.offset.x, 0, static_cast<s32>(area.width));
         scissor.offset.y = std::clamp<s32>(scissor.offset.y, 0, static_cast<s32>(area.height));
         scissor.extent.width = std::min<u32>(scissor.extent.width, area.width - scissor.offset.x);
@@ -4533,6 +5699,44 @@ bool VulkanRenderer::DrawFrame(u64 display_address) {
         present_pipeline = GetPipeline(quad);
         TransitionTarget(shown, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
     }
+    // 1.9.1: area da imagem do jogo na janela, na proporcao dela (16:9) - faixas pretas fora
+    float out_x = 0.0f, out_y = 0.0f, out_w = static_cast<float>(g.extent.width), out_h = static_cast<float>(g.extent.height);
+    if (shown && shown->width && shown->height) {
+        const float image_aspect = static_cast<float>(shown->width) / shown->height, window_aspect = out_w / out_h;
+        if (window_aspect > image_aspect * 1.01f) {
+            out_w = std::floor(out_h * image_aspect);
+            out_x = std::floor((static_cast<float>(g.extent.width) - out_w) * 0.5f);
+        } else if (window_aspect < image_aspect * 0.99f) {
+            out_h = std::floor(out_w / image_aspect);
+            out_y = std::floor((static_cast<float>(g.extent.height) - out_h) * 0.5f);
+        }
+    }
+    // 1.9.1: TAA (a imagem do jogo misturada com o historico); a janela e o FSR passam a ler o resultado
+    VkImageView present_view = shown ? (shown->raw_view ? shown->raw_view : shown->view) : VK_NULL_HANDLE;
+    VkDescriptorSet present_set = shown ? shown->present_set : VK_NULL_HANDLE;
+    bool taa = false;
+    UpdateFrameTemporal();
+    // 1.9.1: AMD FSR 2 / 3 / 4 (ampliacao temporal; ou FSR AA sem ampliar): a saida ja tem o tamanho da area na janela
+    bool ffx = false;
+    if (VkImageView ffx_view = VK_NULL_HANDLE;
+        present_pipeline && FfxPass(shown, static_cast<u32>(out_w), static_cast<u32>(out_h), &ffx_view, &present_set)) {
+        present_view = ffx_view;
+        ffx = true;
+    } else if (VkImageView taa_view = VK_NULL_HANDLE; TaaPass(present_pipeline ? shown : nullptr, &taa_view, &present_set)) {
+        present_view = taa_view;
+        taa = true;
+    }
+    if (!ffx && !taa) {
+        ClearJitter();
+    }
+    // 1.9.1: FSR 1 quando a imagem do jogo e menor que a area dela na janela (EASU aqui, RCAS na passagem da janela)
+    bool fsr = shown && present_pipeline && !ffx &&
+               FsrEasuPass(present_view, shown->width, shown->height, static_cast<u32>(out_w), static_cast<u32>(out_h));
+    // TAA sem ampliacao (imagem do tamanho da area dela): so a nitidez do RCAS, para compensar a suavidade do TAA
+    if (!fsr && taa && static_cast<u32>(out_w) == shown->width && static_cast<u32>(out_h) == shown->height && EnsureFsr()) {
+        PointRcas(present_view);
+        fsr = true;
+    }
     Transition(g.command, g.images[image_index], VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_UNDEFINED,
                VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
     VkRenderingAttachmentInfo window{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
@@ -4541,6 +5745,9 @@ bool VulkanRenderer::DrawFrame(u64 display_address) {
     window.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
     window.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
     window.clearValue.color = g.clear;
+    if (present_pipeline) {
+        window.clearValue.color = {{0.0f, 0.0f, 0.0f, 1.0f}}; // 1.9.1: faixas pretas fora da imagem do jogo
+    }
     VkRenderingInfo rendering{VK_STRUCTURE_TYPE_RENDERING_INFO};
     rendering.renderArea = {{0, 0}, g.extent};
     rendering.layerCount = 1;
@@ -4564,8 +5771,12 @@ bool VulkanRenderer::DrawFrame(u64 display_address) {
     static const float kTint[4] = {1.0f, 1.0f, 1.0f, 1.0f};
     static const float kIdentity[16] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};
     const VkBuffer vertex_buffers[2] = {g.vertices.buffer, g.vertices.buffer};
-    if (present_pipeline) {
-        const VkViewport viewport{0.0f, 0.0f, static_cast<float>(g.extent.width), static_cast<float>(g.extent.height), 0.0f, 1.0f};
+    if (fsr) {
+        FsrRcasDraw(out_x, out_y, out_w, out_h); // 1.9.1: FSR 1 (nitidez) direto na janela
+    } else if (present_pipeline) {
+        // 1.9.1: a imagem do jogo mantem a proporcao dela (16:9) numa janela de outra proporcao (ultrawide, 16:10, 4:3):
+        // centralizada, com faixas, em vez de esticada
+        const VkViewport viewport{out_x, out_y, out_w, out_h, 0.0f, 1.0f};
         const VkRect2D scissor{{0, 0}, g.extent};
         const VkDeviceSize offsets[2] = {kPresentQuadOffset, 0};
         vk.vkCmdBindPipeline(g.command, VK_PIPELINE_BIND_POINT_GRAPHICS, present_pipeline);
@@ -4573,20 +5784,24 @@ bool VulkanRenderer::DrawFrame(u64 display_address) {
         vk.vkCmdSetScissor(g.command, 0, 1, &scissor);
         vk.vkCmdPushConstants(g.command, g.pipeline_layout, VK_SHADER_STAGE_VERTEX_BIT, 0, 64, kIdentity);
         vk.vkCmdPushConstants(g.command, g.pipeline_layout, VK_SHADER_STAGE_VERTEX_BIT, 64, 16, kTint);
-        vk.vkCmdBindDescriptorSets(g.command, VK_PIPELINE_BIND_POINT_GRAPHICS, g.pipeline_layout, 0, 1, &shown->present_set, 0, nullptr);
+        vk.vkCmdBindDescriptorSets(g.command, VK_PIPELINE_BIND_POINT_GRAPHICS, g.pipeline_layout, 0, 1, &present_set, 0, nullptr);
         vk.vkCmdBindVertexBuffers(g.command, 0, 2, vertex_buffers, offsets);
         vk.vkCmdBindIndexBuffer(g.command, g.indices.buffer, 0, VK_INDEX_TYPE_UINT16);
         vk.vkCmdDrawIndexed(g.command, 6, 1, 0, 0, 0);
     }
-    bound = present_pipeline;
+    bound = fsr ? g_fsr.rcas : present_pipeline;
     for (const State::Queued& draw : g.queue_draws) {
         if (draw.pipeline != bound) {
             vk.vkCmdBindPipeline(g.command, VK_PIPELINE_BIND_POINT_GRAPHICS, draw.pipeline);
             bound = draw.pipeline;
         }
-        const VkRect2D scissor{{std::max<s32>(0, static_cast<s32>(draw.viewport.x)), std::max<s32>(0, static_cast<s32>(draw.viewport.y))},
-                               {std::min<u32>(g.extent.width, static_cast<u32>(draw.viewport.width + 0.5f)),
-                                std::min<u32>(g.extent.height, static_cast<u32>(draw.viewport.height + 0.5f))}};
+        // 1.9.1: deslocamento + tamanho dentro da imagem da janela (antes so o tamanho era limitado: com a janela de
+        // outro tamanho, o retangulo passava da area de render - invalido no Vulkan; suspeito do travamento no quadro 6)
+        const s32 sx0 = std::clamp<s32>(static_cast<s32>(draw.viewport.x), 0, static_cast<s32>(g.extent.width));
+        const s32 sy0 = std::clamp<s32>(static_cast<s32>(draw.viewport.y), 0, static_cast<s32>(g.extent.height));
+        const VkRect2D scissor{{sx0, sy0},
+                               {std::min<u32>(g.extent.width - sx0, static_cast<u32>(std::max(0.0f, draw.viewport.width) + 0.5f)),
+                                std::min<u32>(g.extent.height - sy0, static_cast<u32>(std::max(0.0f, draw.viewport.height) + 0.5f))}};
         vk.vkCmdSetScissor(g.command, 0, 1, &scissor);
         vk.vkCmdSetViewport(g.command, 0, 1, &draw.viewport);
         vk.vkCmdPushConstants(g.command, g.pipeline_layout, VK_SHADER_STAGE_VERTEX_BIT, 0, 64, draw.mvp);
@@ -5853,7 +7068,7 @@ std::string VulkanRenderer::Describe() const {
                   VK_API_VERSION_MAJOR(g.properties.apiVersion), VK_API_VERSION_MINOR(g.properties.apiVersion),
                   VK_API_VERSION_PATCH(g.properties.apiVersion), g.queue_family, g.extent.width, g.extent.height,
                   g.format.format == VK_FORMAT_B8G8R8A8_UNORM ? "B8G8R8A8_UNORM" : "other format", g.images.size(),
-                  g.present_mode == VK_PRESENT_MODE_FIFO_KHR ? "FIFO (VSync)" : "?", g.clear.float32[0], g.clear.float32[1],
+                  g.present_mode == VK_PRESENT_MODE_FIFO_KHR ? "FIFO (VSync)" : g.present_mode == VK_PRESENT_MODE_MAILBOX_KHR ? "MAILBOX (no VSync cap)" : g.present_mode == VK_PRESENT_MODE_IMMEDIATE_KHR ? "IMMEDIATE (no VSync)" : "?", g.clear.float32[0], g.clear.float32[1],
                   g.clear.float32[2], g.clear.float32[3]);
     return text;
 }
@@ -6155,6 +7370,110 @@ void VulkanRenderer::SetCurrentLevel(const std::string& name) {
 
 void VulkanRenderer::SetPrewarmPredicted(bool enabled) {
     g_prewarm_predicted = enabled;
+}
+
+// 1.9.1: resolucao em que o jogo e desenhado (antes de criar qualquer alvo). Por enquanto em 16:9: numa tela de outra
+// proporcao, o maior 16:9 que cabe nela (a imagem do jogo continua 16:9).
+u32 g_render_out_w = 1920, g_render_out_h = 1080, g_render_scale_pct = 100;
+
+void VulkanRenderer::SetUpscaler(int mode, float sharpness) {
+    g_upscaler = mode;
+    g_fsr_sharpness = sharpness;
+    std::printf("[RENDER] upscaler: %s (sharpness %.2f)\n", mode == 1 ? "AMD FidelityFX FSR 1" : "bilinear", sharpness);
+}
+
+void VulkanRenderer::SetUnlockedPresent(bool enabled) {
+    g_unlocked_present = enabled;
+}
+
+void VulkanRenderer::SetNoVsync(bool enabled) {
+    g_no_vsync = enabled;
+}
+
+void VulkanRenderer::SetRenderScale(u32 percent) {
+    g_render_scale_pct = std::clamp(percent, 25u, 400u);
+    SetRenderResolution(g_render_out_w, g_render_out_h);
+}
+
+void VulkanRenderer::SetFillScreen(bool enabled) {
+    g_fill_screen = enabled;
+    SetRenderResolution(g_render_out_w, g_render_out_h);
+}
+
+void VulkanRenderer::SetRenderResolution(u32 width, u32 height) {
+    if (!width || !height) {
+        return;
+    }
+    g_render_out_w = width;
+    g_render_out_h = height;
+    // --render-scale: interna = saida x porcentagem (acima de 100 = supersampling; abaixo = para o upscaler)
+    u32 w = static_cast<u32>(static_cast<u64>(width) * g_render_scale_pct / 100);
+    u32 h = static_cast<u32>(static_cast<u64>(height) * g_render_scale_pct / 100);
+    g_camera_scale_x = g_camera_scale_y = 1.0f;
+    const u64 wide = static_cast<u64>(w) * 9, tall = static_cast<u64>(h) * 16;
+    if (g_fill_screen && wide != tall) {
+        // r = proporcao da tela / 16:9. Ultrawide (r > 1): o x do recorte encolhe (Hor+). Mais estreita: o y (Vert-).
+        const float r = static_cast<float>(wide) / static_cast<float>(tall);
+        if (r > 1.0f) {
+            g_camera_scale_x = 1.0f / r;
+        } else {
+            g_camera_scale_y = r;
+        }
+    } else if (wide > tall) {
+        w = (h * 16 + 4) / 9;
+    } else {
+        h = (w * 9 + 8) / 16;
+    }
+    g_target_scale_x = std::clamp(static_cast<float>(w) / 1920.0f, 0.25f, 4.0f);
+    g_target_scale_y = std::clamp(static_cast<float>(h) / 1080.0f, 0.25f, 4.0f);
+    std::printf("[RENDER] game drawn at %ux%u (scale %.3f x %.3f of 1920x1080, camera x %.3f y %.3f)\n",
+                static_cast<u32>(1920 * g_target_scale_x + 0.5f), static_cast<u32>(1080 * g_target_scale_y + 0.5f), g_target_scale_x,
+                g_target_scale_y, g_camera_scale_x, g_camera_scale_y);
+}
+
+void NoteSceneCamera(const float matrix[16], u64 depth_address) {
+    std::lock_guard lock(g_scene_mutex);
+    for (SceneCamera& c : g_scene_cameras) {
+        if (c.depth == depth_address && !std::memcmp(c.m, matrix, sizeof(c.m))) {
+            ++c.draws;
+            return;
+        }
+    }
+    if (g_scene_cameras.size() < 16) {
+        SceneCamera c{};
+        std::memcpy(c.m, matrix, sizeof(c.m));
+        c.depth = depth_address;
+        c.draws = 1;
+        g_scene_cameras.push_back(c);
+    }
+}
+
+void TemporalJitter(float* x, float* y) {
+    *x = g_jitter_x.load(std::memory_order_relaxed);
+    *y = g_jitter_y.load(std::memory_order_relaxed);
+}
+
+void SetTemporalUpscaler(int major, bool native) {
+    g_ffx_wanted = major;
+    g_ffx_native = native;
+    if (major) {
+        std::printf("[RENDER] temporal upscaler: AMD FSR %s%s\n", major == 9 ? "(newest)" : std::to_string(major).c_str(),
+                    native ? " (native AA)" : "");
+    }
+}
+
+void SetAntiAliasing(int mode) {
+    g_aa_mode = mode;
+    std::printf("[RENDER] anti-aliasing: %s\n", mode == 1 ? "TAA (16 jitter positions)" : "off");
+}
+
+bool IsScreenTarget(u32 width, u32 height) {
+    return ScreenFamilyTarget(width, height);
+}
+
+void CameraAspectScale(float* x, float* y) {
+    *x = g_camera_scale_x;
+    *y = g_camera_scale_y;
 }
 
 void VulkanRenderer::PredictedStats(u32* built, u32* failed) const {
