@@ -93,7 +93,7 @@ def stage():
     if os.path.isfile(R('tools', 'LegoToypad.ini')):
         copy(R('tools', 'LegoToypad.ini'), S('tools', 'LegoToypad.ini'))
     # ferramentas de preparacao
-    for f in ('nu2_shader_extractor.py', 'gcn.py', 'nu2dat.py', 'nu2toc.py', 'winpack.py', 'nu2mat.py'):  # Fase 60: nu2toc le a tabela do .DAT; Fase 78: nu2mat os materiais
+    for f in ('nu2_shader_extractor.py', 'gcn.py', 'nu2dat.py', 'nu2toc.py', 'winpack.py', 'nu2mat.py', 'pssl_reflect.py'):  # Fase 60: nu2toc le a tabela do .DAT; Fase 78: nu2mat os materiais; 1.9.1: pssl_reflect a camera
         copy(R('tools', 'nu2_shader_extractor', f), S('tools', 'nu2_shader_extractor', f))
     copy(R('tools', 'check_binaries.py'), S('tools', 'check_binaries.py'))
     copy(R('tools', 'game_regions.py'), S('tools', 'game_regions.py'))

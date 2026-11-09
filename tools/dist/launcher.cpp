@@ -757,6 +757,48 @@ int RunSetupScript(const wchar_t* script, const std::wstring& args, const wchar_
 
 // Antes de abrir o jogo: tools\setup\mods.py prepara (ou confere que ja estao prontos) os mods da pasta mods\,
 // da <jogo>-mods do shadPS4 e da <jogo>\Mods. Sem mod nenhum, o manifesto fica vazio e o jogo abre normal.
+// 1.9.1: assets\shaders_aot\cameras.tsv = de onde vem a camera de cada vertex shader (ultrawide, TAA e FSR 2 / 3 / 4 precisam
+// dela). O Preparar da 1.9.1 ja grava; quem preparou numa versao anterior ganha o arquivo aqui, uma vez (~2 min: so le os
+// .ps4_shaders dos .DAT, nada e recompilado).
+void PrepareCameras() {
+    std::error_code ec;
+    const fs::path script = g_root / L"tools" / L"nu2_shader_extractor" / L"nu2_shader_extractor.py";
+    if (!Prepared() || g_game_dir.empty() || fs::is_regular_file(g_root / L"assets" / L"shaders_aot" / L"cameras.tsv", ec) ||
+        !fs::is_regular_file(script, ec)) {
+        return;
+    }
+    std::wstring args = L" cameras --app0 " + Quote(g_game_dir) + L" --addcont " + Quote(g_dlc_dir);
+    if (const std::wstring patch = g_patch_dir; !patch.empty()) {
+        args += L" --patch " + Quote(patch);
+    }
+    g_step = ui::T(L"Preparando a câmera (ultrawide / TAA / FSR), só desta vez: ~2 min...",
+                   L"Preparing the camera (ultrawide / TAA / FSR), only this once: ~2 min...");
+    Redraw();
+    UpdateWindow(g_main);
+    fs::create_directories(g_root / L"build" / L"logs", ec);
+    SECURITY_ATTRIBUTES sa{sizeof(sa), nullptr, TRUE};
+    HANDLE log = CreateFileW((g_root / L"build" / L"logs" / L"cameras.log").c_str(), GENERIC_WRITE, FILE_SHARE_READ, &sa, CREATE_ALWAYS,
+                             FILE_ATTRIBUTE_NORMAL, nullptr);
+    const fs::path python = g_root / L"tools" / L"python" / L"python.exe";
+    std::wstring command = (fs::is_regular_file(python, ec) ? Quote(python.wstring()) : L"python") + L" -I " + Quote(script.wstring()) + args;
+    STARTUPINFOW si{sizeof(si)};
+    si.dwFlags = STARTF_USESTDHANDLES;
+    si.hStdOutput = si.hStdError = log;
+    si.hStdInput = GetStdHandle(STD_INPUT_HANDLE);
+    PROCESS_INFORMATION pi{};
+    if (CreateProcessW(nullptr, command.data(), nullptr, nullptr, log != INVALID_HANDLE_VALUE, CREATE_NO_WINDOW, nullptr, g_root.c_str(), &si,
+                       &pi)) {
+        WaitForSingleObject(pi.hProcess, 900000);
+        CloseHandle(pi.hThread);
+        CloseHandle(pi.hProcess);
+    }
+    if (log != INVALID_HANDLE_VALUE) {
+        CloseHandle(log);
+    }
+    g_step.clear();
+    UpdateStatus();
+}
+
 void PrepareMods() {
     std::wstring args = L" --root " + Quote(g_root.wstring()) + L" --app0 " + Quote(g_game_dir);
     if (const std::wstring patch = g_patch_dir; !patch.empty()) {
@@ -1266,6 +1308,7 @@ void RunGame() {
         LaunchLegoToypad();
     }
     PrepareMods(); // Fase 64
+    PrepareCameras(); // 1.9.1
     std::wstring command = Quote((g_root / L"build" / L"lego_dimensions.exe").wstring()) + L" --app0 " + Quote(g_game_dir);
     const std::wstring dlc = g_dlc_dir;
     command += dlc.empty() ? L" --no-dlc" : L" --addcont " + Quote(dlc);
