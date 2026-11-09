@@ -68,7 +68,34 @@ enum class Task { kPrepare, kCheck, kUpdate, kPkg } g_task = Task::kPrepare;
 std::wstring g_version, g_new_version, g_notes;
 
 // Fase 61: tamanhos da janela do jogo (o jogo desenha em 1920x1080 e a imagem e escalada para a janela)
-const wchar_t* const kResolutions[] = {L"1920x1080", L"1280x720", L"1600x900", L"2560x1440", L"3840x2160"};
+// 1.9.1: o jogo passa a ser DESENHADO nessa resolucao (antes: 1920x1080 esticado). "nativa" = a do monitor. Fora de 16:9
+// o jogo fica 16:9 no meio da tela (faixas nas laterais / em cima e embaixo) ate o ultrawide de verdade.
+const wchar_t* const kResolutions[] = {
+    L"nativa",
+    // 16:9
+    L"1280x720", L"1366x768", L"1600x900", L"1920x1080", L"2560x1440", L"3200x1800", L"3840x2160", L"5120x2880", L"7680x4320",
+    // 16:10
+    L"1280x800", L"1440x900", L"1680x1050", L"1920x1200", L"2560x1600", L"2880x1800", L"3840x2400",
+    // 21:9 e 32:9 (ultrawide)
+    L"2560x1080", L"3440x1440", L"3840x1600", L"5120x2160", L"3840x1080", L"5120x1440", L"7680x2160",
+    // 4:3
+    L"1024x768", L"1600x1200"};
+// 1.9.1: escala de renderizacao (% da resolucao acima): acima de 100 = supersampling, abaixo = mais FPS
+const wchar_t* const kRenderScales[] = {L"50", L"67", L"75", L"85", L"100", L"125", L"150", L"200"};
+// 1.9.1: taxa de quadros (antes so "60 FPS" ligado / desligado)
+const wchar_t* const kFpsModes[] = {L"30", L"60", L"livre", L"livre_sem_vsync"}; // livre = ate os Hz do monitor
+// 1.9.1: ampliacao quando o jogo e desenhado abaixo da area na tela (escala < 100%)
+// FSR 1 = espacial; FSR 2 / 3 / 4 = temporais (DLL assinada da AMD, FFX API). FSR 4 numa GPU sem ele usa o mais novo que houver.
+const wchar_t* const kUpscalers[] = {L"off", L"fsr1", L"fsr2", L"fsr3", L"fsr4"};
+// 1.9.1: anti-aliasing (TAA = 16 posicoes de deslocamento por quadro + nitidez RCAS)
+const wchar_t* const kAntiAliasing[] = {L"off", L"taa", L"fsraa", L"fsraa4"}; // fsraa = FSR 3 sem ampliar; fsraa4 = FSR 4 (pesado)
+// 1.9.1: tela que nao e 16:9: imagem inteira (camera corrigida) ou 16:9 com faixas
+const wchar_t* const kAspectModes[] = {L"encher", L"16x9"};
+
+// Resolucao do monitor principal (para "nativa").
+std::wstring NativeResolution() {
+    return std::to_wstring(GetSystemMetrics(SM_CXSCREEN)) + L"x" + std::to_wstring(GetSystemMetrics(SM_CYSCREEN));
+}
 // Idioma do jogo e do port: codigo do --lang, nome no menu (pt / en). Fora pt / en, o port fala ingles.
 struct Language {
     const wchar_t *code, *pt, *en;
@@ -85,6 +112,8 @@ const Language kLanguages[] = {
     {L"da", L"Dansk", L"Dansk"},
 };
 std::wstring g_res_value = L"1920x1080", g_lang_value = L"en";
+std::wstring g_fps_value = L"60", g_scale_value = L"100", g_upscaler_value = L"fsr1"; // 1.9.1
+std::wstring g_aa_value = L"off", g_aspect_value = L"encher"; // 1.9.1
 // Fase 62: icones dos botoes (--button-icons): pelo controle ligado ou fixos numa plataforma
 struct IconChoice {
     const wchar_t *code, *pt, *en;
@@ -368,7 +397,12 @@ void SaveSettings() {
     WriteIni(L"jogo", g_game_dir);
     WriteIni(L"atualizacao", g_patch_dir);
     WriteIni(L"dlcs", g_dlc_dir);
-    WriteIni(L"fps60", g_opt_fps ? L"1" : L"0");
+    WriteIni(L"fps60", g_fps_value == L"30" ? L"0" : L"1"); // (versoes antigas do launcher leem esta)
+    WriteIni(L"fps", g_fps_value);                          // 1.9.1
+    WriteIni(L"escala", g_scale_value);                     // 1.9.1
+    WriteIni(L"upscaler", g_upscaler_value);                // 1.9.1
+    WriteIni(L"antialiasing", g_aa_value);                  // 1.9.1
+    WriteIni(L"proporcao", g_aspect_value);                 // 1.9.1
     WriteIni(L"console", g_opt_console ? L"1" : L"0");
     WriteIni(L"telacheia", g_opt_fullscreen ? L"1" : L"0");
     WriteIni(L"resolucao", g_res_value);
@@ -1238,13 +1272,26 @@ void RunGame() {
     if (const std::wstring patch = g_patch_dir; !patch.empty()) {
         command += L" --patch " + Quote(patch); // Fase 58
     }
-    if (g_opt_fps) {
+    if (g_fps_value == L"livre" || g_fps_value == L"livre_sem_vsync") {
+        command += L" --fps-unlocked"; // 1.9.1: sem o limite de 30 / 60 (VSync: ate os Hz do monitor)
+        if (g_fps_value == L"livre_sem_vsync") {
+            command += L" --no-vsync"; // sem VSync: mais FPS, mas a imagem pode rasgar (tearing)
+        }
+    } else if (g_fps_value == L"60") {
         command += L" --fps60";
+    }
+    if (g_scale_value != L"100") {
+        command += L" --render-scale " + g_scale_value; // 1.9.1
+    }
+    command += L" --upscaler " + g_upscaler_value; // 1.9.1
+    command += L" --aa " + (g_aa_value == L"fsraa" ? std::wstring(L"fsraa3") : g_aa_value); // 1.9.1 (FSR AA = FSR 3: o 4 pesa ~5 ms na RX 6600)
+    if (g_aspect_value == L"16x9") {
+        command += L" --keep-16x9"; // 1.9.1: faixas em vez de ampliar o campo de visao
     }
     if (g_opt_fullscreen) {
         command += L" --fullscreen"; // Fase 60: tela cheia sem bordas (F11 alterna dentro do jogo)
     }
-    command += L" --resolution " + g_res_value; // Fase 61: tamanho da janela
+    command += L" --resolution " + (g_res_value == L"nativa" ? NativeResolution() : g_res_value); // 1.9.1: resolucao do jogo
     command += L" --button-icons " + g_icons_value; // Fase 62
     if (g_gpl_value != L"auto") {
         command += g_gpl_value == L"ligado" ? L" --gpl" : L" --no-gpl"; // Fase 74
@@ -1676,7 +1723,7 @@ void EnsureLegoFont() {
 // ---- a tela (desenho do launcher do port de inFAMOUS Second Son, de Castlesea; ver o comeco do arquivo) ----
 enum class Screen { kMain, kSettings };
 Screen g_screen = Screen::kMain;
-enum SettingsTab { kTabFiles, kTabDisplay, kTabGame, kTabAdvanced, kTabCount };
+enum SettingsTab { kTabFiles, kTabDisplay, kTabGraphics, kTabGame, kTabAdvanced, kTabCount }; // 1.9.1: + GRAFICOS
 int g_tab = kTabFiles;
 
 enum Hot {
@@ -1771,14 +1818,63 @@ std::vector<Row> Rows() {
     }
     // Tela
     rows.push_back({kTabDisplay, RowKind::kChoice, ui::T(L"Resolução", L"Resolution"),
-                    ui::T(L"Tamanho da janela; o jogo desenha em 1920x1080.", L"Window size; the game renders at 1920x1080."), g_res_value,
+                    ui::T(L"O jogo é desenhado nessa resolução (ultrawide, 16:10 e 4:3 também).",
+                          L"The game is drawn at this resolution (ultrawide, 16:10 and 4:3 too)."),
+                    g_res_value == L"nativa" ? ui::T(L"Nativa (", L"Native (") + NativeResolution() + L")" : g_res_value,
                     [](int step) {
                         g_res_value = Step(kResolutions, g_res_value, step, [](const wchar_t* r) { return std::wstring(r); });
                         SaveSettings();
                     }});
+    rows.push_back({kTabGraphics, RowKind::kChoice, ui::T(L"Escala de renderização", L"Render scale"),
+                    ui::T(L"Acima de 100%: mais nitidez (supersampling). Abaixo: mais FPS.",
+                          L"Above 100%: sharper (supersampling). Below: more FPS."),
+                    g_scale_value + L"%", [](int step) {
+                        g_scale_value = Step(kRenderScales, g_scale_value, step, [](const wchar_t* r) { return std::wstring(r); });
+                        SaveSettings();
+                    }});
+    rows.push_back({kTabGraphics, RowKind::kChoice, L"Upscaler",
+                    ui::T(L"Com escala abaixo de 100%. FSR 2/3/4: temporal, mais nítido (4 = o mais novo).",
+                          L"With a scale below 100%. FSR 2/3/4: temporal, sharper (4 = the newest)."),
+                    g_upscaler_value == L"off" ? ui::T(L"Desligado (bilinear)", L"Off (bilinear)")
+                    : g_upscaler_value == L"fsr1" ? std::wstring(L"AMD FSR 1.0")
+                    : g_upscaler_value == L"fsr2" ? std::wstring(L"AMD FSR 2")
+                    : g_upscaler_value == L"fsr3" ? std::wstring(L"AMD FSR 3")
+                                                  : ui::T(L"AMD FSR 4 (pesado)", L"AMD FSR 4 (heavy)"),
+                    [](int step) {
+                        g_upscaler_value = Step(kUpscalers, g_upscaler_value, step, [](const wchar_t* r) { return std::wstring(r); });
+                        SaveSettings();
+                    }});
+    rows.push_back({kTabDisplay, RowKind::kChoice, ui::T(L"Proporção", L"Aspect ratio"),
+                    ui::T(L"Tela que não é 16:9: imagem inteira (mais campo de visão) ou com faixas.",
+                          L"Screen that isn't 16:9: full picture (wider view) or with bars."),
+                    g_aspect_value == L"16x9" ? ui::T(L"16:9 com faixas", L"16:9 with bars")
+                                              : ui::T(L"Encher a tela", L"Fill the screen"),
+                    [](int step) {
+                        g_aspect_value = Step(kAspectModes, g_aspect_value, step, [](const wchar_t* r) { return std::wstring(r); });
+                        SaveSettings();
+                    }});
+    rows.push_back({kTabGraphics, RowKind::kChoice, L"Anti-aliasing",
+                    ui::T(L"TAA: o mais leve. FSR 3 AA: melhor. FSR 4 AA: o melhor, mas pesado.",
+                          L"TAA: lightest. FSR 3 AA: better. FSR 4 AA: best, but heavy."),
+                    g_aa_value == L"taa"      ? std::wstring(L"TAA x16")
+                    : g_aa_value == L"fsraa"  ? std::wstring(L"AMD FSR 3 AA")
+                    : g_aa_value == L"fsraa4" ? ui::T(L"AMD FSR 4 AA (pesado)", L"AMD FSR 4 AA (heavy)")
+                                              : ui::T(L"Desligado", L"Off"),
+                    [](int step) {
+                        g_aa_value = Step(kAntiAliasing, g_aa_value, step, [](const wchar_t* r) { return std::wstring(r); });
+                        SaveSettings();
+                    }});
     rows.push_back({kTabDisplay, RowKind::kChoice, ui::T(L"Tela cheia", L"Fullscreen"),
                     ui::T(L"Sem bordas. F11 alterna dentro do jogo.", L"Borderless. F11 switches in game."), OnOff(g_opt_fullscreen), toggle(g_opt_fullscreen)});
-    rows.push_back({kTabDisplay, RowKind::kChoice, L"60 FPS", ui::T(L"Desligado: os 30 FPS do PS4.", L"Off: the PS4's 30 FPS."), OnOff(g_opt_fps), toggle(g_opt_fps)});
+    rows.push_back({kTabDisplay, RowKind::kChoice, ui::T(L"Taxa de quadros", L"Frame rate"),
+                    ui::T(L"30 = o do PS4. Desbloqueado: até os Hz do monitor. Sem VSync: mais FPS, imagem pode rasgar.",
+                          L"30 = the PS4's. Unlocked: up to the monitor's Hz. No VSync: more FPS, may tear."),
+                    g_fps_value == L"livre"             ? ui::T(L"Desbloqueado", L"Unlocked")
+                    : g_fps_value == L"livre_sem_vsync" ? ui::T(L"Desbloqueado sem VSync", L"Unlocked, no VSync")
+                                                        : g_fps_value + L" FPS", [](int step) {
+                        g_fps_value = Step(kFpsModes, g_fps_value, step, [](const wchar_t* r) { return std::wstring(r); });
+                        SaveSettings();
+                    }});
     rows.push_back({kTabDisplay, RowKind::kChoice, ui::T(L"Bibliotecas de pipeline (GPL)", L"Pipeline libraries (GPL)"),
                     ui::T(L"Automático: ligado na NVIDIA / Intel, desligado na AMD (pode deixar a tela preta).",
                           L"Automatic: on for NVIDIA / Intel, off for AMD (may give a black screen)."),
@@ -1825,6 +1921,7 @@ const wchar_t* TabName(int tab) {
     switch (tab) {
     case kTabFiles: return ui::T(L"ARQUIVOS", L"FILES");
     case kTabDisplay: return ui::T(L"TELA", L"DISPLAY");
+    case kTabGraphics: return ui::T(L"GRÁFICOS", L"GRAPHICS");
     case kTabGame: return ui::T(L"JOGO", L"GAME");
     default: return ui::T(L"AVANÇADO", L"ADVANCED");
     }
@@ -2451,6 +2548,26 @@ void LoadSettings() {
     }
     g_dlc_dir = CleanPath(dlc);
     g_opt_fps = ReadIni(L"fps60", L"1") == L"1";
+    g_fps_value = ReadIni(L"fps", g_opt_fps ? L"60" : L"30"); // 1.9.1 (sem a chave nova: a do 60 FPS antigo)
+    if (std::find(std::begin(kFpsModes), std::end(kFpsModes), g_fps_value) == std::end(kFpsModes)) {
+        g_fps_value = L"60";
+    }
+    g_upscaler_value = ReadIni(L"upscaler", L"fsr1");
+    if (std::find(std::begin(kUpscalers), std::end(kUpscalers), g_upscaler_value) == std::end(kUpscalers)) {
+        g_upscaler_value = L"fsr1";
+    }
+    g_aa_value = ReadIni(L"antialiasing", L"off");
+    if (std::find(std::begin(kAntiAliasing), std::end(kAntiAliasing), g_aa_value) == std::end(kAntiAliasing)) {
+        g_aa_value = L"off";
+    }
+    g_aspect_value = ReadIni(L"proporcao", L"encher");
+    if (std::find(std::begin(kAspectModes), std::end(kAspectModes), g_aspect_value) == std::end(kAspectModes)) {
+        g_aspect_value = L"encher";
+    }
+    g_scale_value = ReadIni(L"escala", L"100");
+    if (std::find(std::begin(kRenderScales), std::end(kRenderScales), g_scale_value) == std::end(kRenderScales)) {
+        g_scale_value = L"100";
+    }
     g_opt_console = ReadIni(L"console", L"0") == L"1";
     g_opt_fullscreen = ReadIni(L"telacheia", L"0") == L"1";
     g_opt_skip = ReadIni(L"pularcenas", L"0") == L"1";

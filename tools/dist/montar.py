@@ -75,6 +75,10 @@ def stage():
     print('port: ' + game)
     copy(game, S('build', 'lego_dimensions.exe'))
     copy(R('build', 'pkg_extractor.exe'), S('build', 'pkg_extractor.exe'))  # Fase 68: botao Extrair PKG do launcher
+    # 1.9.1: AMD FSR 2 / 3 / 4 (DLLs assinadas da AMD, carregadas pelo port) + os termos de redistribuicao
+    for f in ('amd_fidelityfx_loader_vk.dll', 'amd_fidelityfx_upscaler_vk.dll'):
+        copy(R('externals', 'fidelityfx-sdk', 'bin', f), S('build', f))
+    copy(R('externals', 'fidelityfx-sdk', 'license.md'), S('build', 'amd_fidelityfx_license.md'))
     # o compilador de shaders precisa do checkout do shadPS4 para compilar; sem o build local vai a copia pronta do repositorio
     tool = R('tools', 'shader_compiler_tool', 'build', 'shader_compiler_tool.exe')
     if not os.path.isfile(tool):
