@@ -1,0 +1,372 @@
+<!--Sce-Np-Trophy-Signature: 4c39b98c010000000000000037bbc7fd964c80347fca4a9a2955ad0d568522af72724163f6adbc382d67f2d865363a0b992b76678b3d5f9e5143c8fcd56fea29c7ffa68b7c167a81f9348981baea32d280bf9b02decae93c4cd9c0070497fd6406888e7d69a9871fa6ac3f00de09a395f391ab2400680c16d347586a2fff8edbc73b85f9d6dbb1e33bb0b85dfa97aa37b7210edd1f3b3468af0d8c7f3cee2de5-->
+<trophyconf version="1.1" platform="ps4" policy="large">
+ <npcommid>NPWR07423_00</npcommid>
+ <trophyset-version>01.09</trophyset-version>
+ <parental-level license-area="default">0</parental-level>
+ <title-name>LEGO® DIMENSIONS™</title-name>
+ <title-detail>LEGO® DIMENSIONS™</title-detail>
+ <group id="001">
+  <name>The Simpsons™ Level Pack</name>
+  <detail>The Simpsons™ Level Pack</detail>
+ </group>
+ <group id="002">
+  <name>Back to the Future™ Level Pack</name>
+  <detail>Back to the Future™ Level Pack</detail>
+ </group>
+ <group id="003">
+  <name>Portal™ Level Pack</name>
+  <detail>Portal™ Level Pack</detail>
+ </group>
+ <group id="004">
+  <name>Doctor Who Level Pack</name>
+  <detail>Doctor Who Level Pack</detail>
+ </group>
+ <group id="005">
+  <name>Ghostbusters™ Level Pack</name>
+  <detail>Ghostbusters™ Level Pack</detail>
+ </group>
+ <group id="006">
+  <name>Midway Arcade Level Pack</name>
+  <detail>Midway Arcade Level Pack</detail>
+ </group>
+ <group id="007">
+  <name>Adventure Time Level Pack</name>
+  <detail>Adventure Time Level Pack</detail>
+ </group>
+ <group id="008">
+  <name>Ghostbusters™ (2016) Story Pack</name>
+  <detail>Ghostbusters™ (2016) Story Pack</detail>
+ </group>
+ <group id="009">
+  <name>Mission: Impossible Level Pack</name>
+  <detail>Mission: Impossible Level Pack</detail>
+ </group>
+ <group id="010">
+  <name>Fantastic Beasts Story Pack</name>
+  <detail>Fantastic Beasts Story Pack</detail>
+ </group>
+ <group id="011">
+  <name>Sonic Level Pack</name>
+  <detail>Sonic Level Pack</detail>
+ </group>
+ <group id="012">
+  <name>The LEGO Batman Movie Story Pack</name>
+  <detail>The LEGO Batman Movie Story Pack</detail>
+ </group>
+ <group id="013">
+  <name>Goonies Level Pack</name>
+  <detail>Goonies Level Pack</detail>
+ </group>
+ <trophy id="000" hidden="no" ttype="P" pid="-1">
+  <name>Vortech's Bane</name>
+  <detail>Collect all the trophies</detail>
+ </trophy>
+ <trophy id="001" hidden="no" ttype="B" pid="000">
+  <name>There's no Place Like... This.</name>
+  <detail>Complete ''Follow the LEGO Brick Road''</detail>
+ </trophy>
+ <trophy id="002" hidden="no" ttype="B" pid="000">
+  <name>Chroma Simpson</name>
+  <detail>Complete ''Meltdown at Sector 7-G''</detail>
+ </trophy>
+ <trophy id="003" hidden="no" ttype="B" pid="000">
+  <name>Of Mice and Chen</name>
+  <detail>Complete ''Elements of Surprise''</detail>
+ </trophy>
+ <trophy id="004" hidden="no" ttype="B" pid="000">
+  <name>In the Nick of Timey-Wimey</name>
+  <detail>Complete ''A Dalektable Adventure''</detail>
+ </trophy>
+ <trophy id="005" hidden="no" ttype="B" pid="000">
+  <name>Simply Walked Into... Metropolis</name>
+  <detail>Complete ''Painting the Town Black''</detail>
+ </trophy>
+ <trophy id="006" hidden="no" ttype="B" pid="000">
+  <name>Interdimensional Showdown</name>
+  <detail>Complete ''Once Upon A Time Machine in the West''</detail>
+ </trophy>
+ <trophy id="007" hidden="no" ttype="B" pid="000">
+  <name>GLaD to be out of There!</name>
+  <detail>Complete ''Aperture Science Enrichment Center''</detail>
+ </trophy>
+ <trophy id="008" hidden="no" ttype="B" pid="000">
+  <name>Riddle Me That!</name>
+  <detail>Complete ''Riddle-earth''</detail>
+ </trophy>
+ <trophy id="009" hidden="no" ttype="B" pid="000">
+  <name>Ghost... busted!</name>
+  <detail>Complete ''The Phantom Zone''</detail>
+ </trophy>
+ <trophy id="010" hidden="no" ttype="B" pid="000">
+  <name>Enter Your Initials: ''AAA''</name>
+  <detail>Complete ''All Your Bricks Are Belong To Us''</detail>
+ </trophy>
+ <trophy id="011" hidden="no" ttype="B" pid="000">
+  <name>Zoinks!</name>
+  <detail>Complete ''Mystery Mansion Mash-Up''</detail>
+ </trophy>
+ <trophy id="012" hidden="no" ttype="B" pid="000">
+  <name>Tri Again Next Time</name>
+  <detail>Complete ''Prime Time''</detail>
+ </trophy>
+ <trophy id="013" hidden="no" ttype="B" pid="000">
+  <name>Tri Hard with a Vengeance!</name>
+  <detail>Complete ''The End is Tri''</detail>
+ </trophy>
+ <trophy id="014" hidden="no" ttype="B" pid="000">
+  <name>A Serious Loophole</name>
+  <detail>Complete ''The Final Dimension''</detail>
+ </trophy>
+ <trophy id="015" hidden="no" ttype="B" pid="000">
+  <name>Time to Break the Rules!</name>
+  <detail>Rebuild the LEGO Gateway</detail>
+ </trophy>
+ <trophy id="016" hidden="no" ttype="G" pid="000">
+  <name>Broke the Rules!</name>
+  <detail>Complete all story levels</detail>
+ </trophy>
+ <trophy id="017" hidden="no" ttype="B" pid="000">
+  <name>The Keystone to Victory</name>
+  <detail>Collect all of the Gateway Keystones</detail>
+ </trophy>
+ <trophy id="018" hidden="no" ttype="G" pid="000">
+  <name>Rare Artefacts, collected!</name>
+  <detail>Collect 30 Minikits from levels</detail>
+ </trophy>
+ <trophy id="019" hidden="no" ttype="S" pid="000">
+  <name>Na na na na na na na upgrades!</name>
+  <detail>Upgrade the Batmobile to Model 2</detail>
+ </trophy>
+ <trophy id="020" hidden="no" ttype="G" pid="000">
+  <name>Holy Upgrades, Batman!</name>
+  <detail>Upgrade the Batmobile to Model 3</detail>
+ </trophy>
+ <trophy id="021" hidden="no" ttype="B" pid="000">
+  <name>Home, Sweet Home</name>
+  <detail>Visit any Hub World for the First Time</detail>
+ </trophy>
+ <trophy id="022" hidden="no" ttype="B" pid="000">
+  <name>Dimensional Explorer</name>
+  <detail>Visit the homes of Batman, Gandalf and Wyldstyle</detail>
+ </trophy>
+ <trophy id="023" hidden="no" ttype="B" pid="000">
+  <name>Time for an Upgrade!</name>
+  <detail>Collect 5 Gold Bricks</detail>
+ </trophy>
+ <trophy id="024" hidden="no" ttype="S" pid="000">
+  <name>The Real Golden Master!</name>
+  <detail>Collect 30 Gold Bricks</detail>
+ </trophy>
+ <trophy id="025" hidden="no" ttype="B" pid="000">
+  <name>Dimensional Dasher</name>
+  <detail>Complete a race in any of the hub worlds</detail>
+ </trophy>
+ <trophy id="026" hidden="no" ttype="S" pid="000">
+  <name>Pedal to the Metal</name>
+  <detail>Complete 5 hub races</detail>
+ </trophy>
+ <trophy id="027" hidden="no" ttype="B" pid="000">
+  <name>The Heroes We Need</name>
+  <detail>Complete any hub world quest</detail>
+ </trophy>
+ <trophy id="028" hidden="no" ttype="B" pid="000">
+  <name>Restoring Order</name>
+  <detail>Complete any hub world renovation</detail>
+ </trophy>
+ <trophy id="029" hidden="no" ttype="S" pid="000">
+  <name>Official Master Builder</name>
+  <detail>Complete 15 hub world renovations</detail>
+ </trophy>
+ <trophy id="030" hidden="no" ttype="S" pid="000">
+  <name>Taking the Tube</name>
+  <detail>Travel through 20 rifts throughout the game</detail>
+ </trophy>
+ <trophy id="031" hidden="no" ttype="S" pid="000">
+  <name>Speedy Thing Goes In...</name>
+  <detail>Complete ''Aperture Science Enrichment Center'' within 25 minutes</detail>
+ </trophy>
+ <trophy id="032" hidden="no" ttype="S" pid="000">
+  <name>Forever Alone</name>
+  <detail>Complete a level while only ever keeping one character active on the Toy Pad</detail>
+ </trophy>
+ <trophy id="033" hidden="no" ttype="S" pid="000">
+  <name>Lost Property</name>
+  <detail>Complete 25 'Locate Mode' puzzles</detail>
+ </trophy>
+ <trophy id="034" hidden="no" ttype="S" pid="000">
+  <name>Painting by Numbers</name>
+  <detail>Complete 25 'Chroma Mode' puzzles</detail>
+ </trophy>
+ <trophy id="035" hidden="no" ttype="S" pid="000">
+  <name>Elemental, My Dear</name>
+  <detail>Enter 'Elemental Mode' on 25 unique occasions</detail>
+ </trophy>
+ <trophy id="036" hidden="no" ttype="S" pid="000">
+  <name>Too Old for This Shift</name>
+  <detail>Shift through 50 ''Shift Mode'' rifts</detail>
+ </trophy>
+ <trophy id="037" hidden="no" ttype="S" pid="000">
+  <name>But Does it Come in Pink?</name>
+  <detail>Give the Batmobile a pink paint job</detail>
+ </trophy>
+ <trophy id="038" hidden="no" ttype="G" pid="000">
+  <name>Do You Like Bling, Batman?</name>
+  <detail>Give the Batmobile a chrome paint job</detail>
+ </trophy>
+ <trophy id="039" hidden="no" ttype="B" pid="-1" gid="001">
+  <name>In your face, space coyote!</name>
+  <detail>Complete ''The Mysterious Voyage of Homer''</detail>
+ </trophy>
+ <trophy id="040" hidden="no" ttype="B" pid="-1" gid="001">
+  <name>Mmmm... collectables!</name>
+  <detail>Collect any Minikit within the 'The Mysterious Voyage of Homer' level</detail>
+ </trophy>
+ <trophy id="041" hidden="no" ttype="B" pid="-1" gid="001">
+  <name>Owww, rules? I hate rules!</name>
+  <detail>Achieve the ''Rule Breaker'' stud goal in the ''The Mysterious Voyage of Homer'' level</detail>
+ </trophy>
+ <trophy id="042" hidden="no" ttype="B" pid="-1" gid="002">
+  <name>That was heavy!</name>
+  <detail>Complete ''Back to the Future!''</detail>
+ </trophy>
+ <trophy id="043" hidden="no" ttype="B" pid="-1" gid="002">
+  <name>Mr. Fusion Home Energy Reactor</name>
+  <detail>Collect any Minikit within the 'Back to the Future!' level</detail>
+ </trophy>
+ <trophy id="044" hidden="no" ttype="B" pid="-1" gid="002">
+  <name>Rules? ...We don't need rules!</name>
+  <detail>Achieve the ''Rule Breaker'' stud goal in the ''Back to the Future!'' level</detail>
+ </trophy>
+ <trophy id="045" hidden="no" ttype="B" pid="-1" gid="003">
+  <name>It's been fun. Don't come back</name>
+  <detail>Complete ''Aperture Science''</detail>
+ </trophy>
+ <trophy id="046" hidden="no" ttype="B" pid="-1" gid="003">
+  <name>When life gives you Minikits...</name>
+  <detail>Collect any Minikit within the 'Aperture Science' level</detail>
+ </trophy>
+ <trophy id="047" hidden="no" ttype="B" pid="-1" gid="003">
+  <name>For science... you monster</name>
+  <detail>Achieve the ''Rule Breaker'' stud goal in the ''Aperture Science'' level</detail>
+ </trophy>
+ <trophy id="048" hidden="no" ttype="B" pid="-1" gid="004">
+  <name>Our destiny is in the stars</name>
+  <detail>Complete 'The Dalek Extermination of Earth'</detail>
+ </trophy>
+ <trophy id="049" hidden="no" ttype="B" pid="-1" gid="004">
+  <name>A Minikit! Minikits are cool!</name>
+  <detail>Collect any Minikit within the 'The Dalek Extermination of Earth' level</detail>
+ </trophy>
+ <trophy id="050" hidden="no" ttype="B" pid="-1" gid="004">
+  <name>People come along and break them</name>
+  <detail>Achieve the ''Rule Breaker'' stud goal in the 'The Dalek Extermination of Earth' level</detail>
+ </trophy>
+ <trophy id="051" hidden="no" ttype="B" pid="-1" gid="005">
+  <name>I ain't afraid of no Ghosts!</name>
+  <detail>Complete 'Ghostbusters!'</detail>
+ </trophy>
+ <trophy id="052" hidden="no" ttype="B" pid="-1" gid="005">
+  <name>WE GOT ONE!!!</name>
+  <detail>Collect any Minikit within the 'Ghostbusters!' level</detail>
+ </trophy>
+ <trophy id="053" hidden="no" ttype="B" pid="-1" gid="005">
+  <name>Rule breakin' makes me feel good</name>
+  <detail>Achieve the 'Rule Breaker' stud goal in the 'Ghostbusters!' level</detail>
+ </trophy>
+ <trophy id="054" hidden="no" ttype="B" pid="-1" gid="006">
+  <name>New High Score</name>
+  <detail>Complete 'Retro Wreckage'</detail>
+ </trophy>
+ <trophy id="055" hidden="no" ttype="B" pid="-1" gid="006">
+  <name>Power Up!</name>
+  <detail>Obtain any Minikit within 'Retro Wreckage'</detail>
+ </trophy>
+ <trophy id="056" hidden="no" ttype="B" pid="-1" gid="006">
+  <name>Insert Stud</name>
+  <detail>Achieve the 'Rule Breaker' stud goal in 'Retro Wreckage'</detail>
+ </trophy>
+ <trophy id="057" hidden="no" ttype="B" pid="-1" gid="007">
+  <name>The fun will never end!</name>
+  <detail>Complete 'A Book and a Bad Guy'</detail>
+ </trophy>
+ <trophy id="058" hidden="no" ttype="B" pid="-1" gid="007">
+  <name>Another for the Treasure Room!</name>
+  <detail>Collect any Minikit in the 'A Book and a Bad Guy' level</detail>
+ </trophy>
+ <trophy id="059" hidden="no" ttype="B" pid="-1" gid="007">
+  <name>Mathematical!</name>
+  <detail>Achieve the ''Rule Breaker'' stud goal in the 'A Book and a Bad Guy level</detail>
+ </trophy>
+ <trophy id="060" hidden="no" ttype="B" pid="-1" gid="008">
+  <name>Avoided The Cataclysm</name>
+  <detail>Complete all of the levels in the Ghostbusters (2016) Story Pack</detail>
+ </trophy>
+ <trophy id="061" hidden="no" ttype="B" pid="-1" gid="008">
+  <name>Quest Busters</name>
+  <detail>Complete any quest in the Ghostbusters (2016) Adventure World</detail>
+ </trophy>
+ <trophy id="062" hidden="no" ttype="B" pid="-1" gid="008">
+  <name>Rule-Breaking the Barrier</name>
+  <detail>Achieve the ''Rule Breaker'' stud goal in any Ghostbusters (2016) Story Pack level</detail>
+ </trophy>
+ <trophy id="063" hidden="no" ttype="B" pid="-1" gid="009">
+  <name>Mission: Accomplished</name>
+  <detail>Complete 'Mission: Impossible'</detail>
+ </trophy>
+ <trophy id="064" hidden="no" ttype="B" pid="-1" gid="009">
+  <name>Wouldn't have it any other way</name>
+  <detail>Collect any Minikit in the 'Mission: Impossible' level</detail>
+ </trophy>
+ <trophy id="065" hidden="no" ttype="B" pid="-1" gid="009">
+  <name>Good Morning, Mr Hunt...</name>
+  <detail>Achieve the ''Rule Breaker'' stud goal in the 'Mission: Impossible' level</detail>
+ </trophy>
+ <trophy id="066" hidden="no" ttype="B" pid="-1" gid="010">
+  <name>No-maj, No-problem</name>
+  <detail>Complete all of the levels in the Fantastic Beasts Story Pack</detail>
+ </trophy>
+ <trophy id="067" hidden="no" ttype="B" pid="-1" gid="010">
+  <name>Manhattan Tourist</name>
+  <detail>Complete any quest in the Fantastic Beasts Adventure World</detail>
+ </trophy>
+ <trophy id="068" hidden="no" ttype="B" pid="-1" gid="010">
+  <name>More shinies than a niffler</name>
+  <detail>Achieve the ''Rule Breaker'' stud goal in any Fantastic Beasts Story Pack level</detail>
+ </trophy>
+ <trophy id="069" hidden="no" ttype="B" pid="-1" gid="011">
+  <name>Chaos Theory</name>
+  <detail>Complete 'Sonic Dimensions'</detail>
+ </trophy>
+ <trophy id="070" hidden="no" ttype="B" pid="-1" gid="011">
+  <name>I usually collect Emeralds...</name>
+  <detail>Collect any Minikit in the 'Sonic Dimensions' level</detail>
+ </trophy>
+ <trophy id="071" hidden="no" ttype="B" pid="-1" gid="011">
+  <name>Ring Breaker</name>
+  <detail>Achieve the ''Rule Breaker'' stud goal in the 'Sonic Dimensions' level</detail>
+ </trophy>
+ <trophy id="072" hidden="no" ttype="B" pid="-1" gid="012">
+  <name>Make a change</name>
+  <detail>Complete all the levels in the The LEGO Batman Movie Story Pack.</detail>
+ </trophy>
+ <trophy id="073" hidden="no" ttype="B" pid="-1" gid="012">
+  <name>I've been 'Batmanning'</name>
+  <detail>Complete any quest in the The LEGO Batman Movie Adventure World.</detail>
+ </trophy>
+ <trophy id="074" hidden="no" ttype="B" pid="-1" gid="012">
+  <name>Bat-Dollars</name>
+  <detail>Achieve the ''Rule Breaker'' stud goal in any The LEGO Batman Movie Story Pack level</detail>
+ </trophy>
+ <trophy id="075" hidden="no" ttype="B" pid="-1" gid="013">
+  <name>Declared a fellow Goonie</name>
+  <detail>Complete 'The Goonies'</detail>
+ </trophy>
+ <trophy id="076" hidden="no" ttype="B" pid="-1" gid="013">
+  <name>A pirate's bounty</name>
+  <detail>Collect any Minikit in 'The Goonies' level</detail>
+ </trophy>
+ <trophy id="077" hidden="no" ttype="B" pid="-1" gid="013">
+  <name>Hey, you guys!</name>
+  <detail>Achieve the ''Rule Breaker'' stud goal in the 'The Goonies' level</detail>
+ </trophy>
+</trophyconf>

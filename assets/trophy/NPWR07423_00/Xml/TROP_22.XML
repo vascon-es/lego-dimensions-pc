@@ -1,0 +1,372 @@
+<!--Sce-Np-Trophy-Signature: 4c39b98c010000000000000047a2dff207383635d0e996445b36ddf45e2514814b584e9480734f410fef3204673c6ac034123132dd3eb2185c8b21ade93a29fdf4ecb40116cf08186577fbc9a718218a62b4507493bb65073a391e064e62292a6765fc87a53c24b5c15b3f3932a03ea660b9903cab151cb1bfd744c19b8aef20a70797b3e51aca90ca7e538bcd9c009c3e5b888cb34a6928c91a1e67d4244b50-->
+<trophyconf version="1.1" platform="ps4" policy="large">
+ <npcommid>NPWR07423_00</npcommid>
+ <trophyset-version>01.09</trophyset-version>
+ <parental-level license-area="default">0</parental-level>
+ <title-name>LEGO® DIMENSIONS™</title-name>
+ <title-detail>LEGO® DIMENSIONS™</title-detail>
+ <group id="001">
+  <name>Ensemble Niveau : The Simpsons™</name>
+  <detail>Ensemble Niveau : The Simpsons™</detail>
+ </group>
+ <group id="002">
+  <name>Ensemble Niveau : Back to the Future™</name>
+  <detail>Ensemble Niveau : Back to the Future™</detail>
+ </group>
+ <group id="003">
+  <name>Ensemble Niveau : Portal™</name>
+  <detail>Ensemble Niveau : Portal™</detail>
+ </group>
+ <group id="004">
+  <name>Ensemble Niveau : Doctor Who</name>
+  <detail>Ensemble Niveau : Doctor Who</detail>
+ </group>
+ <group id="005">
+  <name>Ensemble Niveau: Ghostbusters™</name>
+  <detail>Ensemble Niveau: Ghostbusters™</detail>
+ </group>
+ <group id="006">
+  <name>Ensemble Niveau : Midway Arcade</name>
+  <detail>Ensemble Niveau : Midway Arcade</detail>
+ </group>
+ <group id="007">
+  <name>Ensemble Niveau : Adventure Time</name>
+  <detail>Ensemble Niveau : Adventure Time</detail>
+ </group>
+ <group id="008">
+  <name>Ensemble Histoire: Ghostbusters™ (2016)</name>
+  <detail>Ensemble Histoire: Ghostbusters™ (2016)</detail>
+ </group>
+ <group id="009">
+  <name>Ensemble Niveau : Mission: Impossible</name>
+  <detail>Ensemble Niveau : Mission: Impossible</detail>
+ </group>
+ <group id="010">
+  <name>Ensemble Histoire : Les Animaux fantastiques</name>
+  <detail>Ensemble Histoire : Les Animaux fantastiques</detail>
+ </group>
+ <group id="011">
+  <name>Ensemble Niveau : Sonic</name>
+  <detail>Ensemble Niveau : Sonic</detail>
+ </group>
+ <group id="012">
+  <name>Ensemble Histoire: LEGO Batman: Le Film</name>
+  <detail>Ensemble Histoire: LEGO Batman: Le Film</detail>
+ </group>
+ <group id="013">
+  <name>Ensemble Niveau : Goonies</name>
+  <detail>Ensemble Niveau : Goonies</detail>
+ </group>
+ <trophy id="000" hidden="no" ttype="P" pid="-1">
+  <name>Le fléau de Vortech</name>
+  <detail>Récoltez tous les trophées.</detail>
+ </trophy>
+ <trophy id="001" hidden="no" ttype="B" pid="000">
+  <name>On est bien chez... ici</name>
+  <detail>Terminez ''Suivez la route de brique LEGO jaune''.</detail>
+ </trophy>
+ <trophy id="002" hidden="no" ttype="B" pid="000">
+  <name>Chroma Simpson</name>
+  <detail>Terminez ''Fusion dans le Secteur 7-G''.</detail>
+ </trophy>
+ <trophy id="003" hidden="no" ttype="B" pid="000">
+  <name>Des souris et des... Chen</name>
+  <detail>Terminez ''Éléments surprenants''.</detail>
+ </trophy>
+ <trophy id="004" hidden="no" ttype="B" pid="000">
+  <name>Juste à... timey-wimey</name>
+  <detail>Terminez ''Une aventure Dalek-table''.</detail>
+ </trophy>
+ <trophy id="005" hidden="no" ttype="B" pid="000">
+  <name>Entrée facile dans... Metropolis</name>
+  <detail>Terminez ''Peindre la ville en noir''.</detail>
+ </trophy>
+ <trophy id="006" hidden="no" ttype="B" pid="000">
+  <name>Combat interdimensionnel</name>
+  <detail>Terminez ''Il était une fois dans le temps dans l'Ouest''.</detail>
+ </trophy>
+ <trophy id="007" hidden="no" ttype="B" pid="000">
+  <name>GLaDOS s'adosse à la sortie</name>
+  <detail>Terminez ''Centre d'enrichissement d'Aperture Science''.</detail>
+ </trophy>
+ <trophy id="008" hidden="no" ttype="B" pid="000">
+  <name>Creuse-toi le ciboulot !</name>
+  <detail>Terminez ''La Terre des devinettes''.</detail>
+ </trophy>
+ <trophy id="009" hidden="no" ttype="B" pid="000">
+  <name>S.O.S. pour les fantômes !</name>
+  <detail>Terminez ''La Zone Fantôme''.</detail>
+ </trophy>
+ <trophy id="010" hidden="no" ttype="B" pid="000">
+  <name>Saisissez votre nom : ''AAA''</name>
+  <detail>Terminez ''Toutes vos briques sont à nous''.</detail>
+ </trophy>
+ <trophy id="011" hidden="no" ttype="B" pid="000">
+  <name>Mordicus !</name>
+  <detail>Terminez ''Bouleversement au manoir hanté''.</detail>
+ </trophy>
+ <trophy id="012" hidden="no" ttype="B" pid="000">
+  <name>Trois fois plus fort !</name>
+  <detail>Terminez ''Prime Time''.</detail>
+ </trophy>
+ <trophy id="013" hidden="no" ttype="B" pid="000">
+  <name>Trois fois la vengeance !</name>
+  <detail>Terminez ''La fin du Trois''.</detail>
+ </trophy>
+ <trophy id="014" hidden="no" ttype="B" pid="000">
+  <name>Une faille sérieuse</name>
+  <detail>Terminez ''Ultime dimension''.</detail>
+ </trophy>
+ <trophy id="015" hidden="no" ttype="B" pid="000">
+  <name>Temps de briser les règles !</name>
+  <detail>Reconstruisez le Gateway LEGO.</detail>
+ </trophy>
+ <trophy id="016" hidden="no" ttype="G" pid="000">
+  <name>Règles brisées !</name>
+  <detail>Terminez tous les niveaux Histoire.</detail>
+ </trophy>
+ <trophy id="017" hidden="no" ttype="B" pid="000">
+  <name>Maîtriser une Pierre maîtresse</name>
+  <detail>Récoltez toutes les Pierres maîtresses du Gateway.</detail>
+ </trophy>
+ <trophy id="018" hidden="no" ttype="G" pid="000">
+  <name>De rares artefacts récoltés</name>
+  <detail>Récoltez 30 minikits dans les niveaux.</detail>
+ </trophy>
+ <trophy id="019" hidden="no" ttype="S" pid="000">
+  <name>Na na na na na améliorations !</name>
+  <detail>Améliorez la Batmobile à la Maquette 2.</detail>
+ </trophy>
+ <trophy id="020" hidden="no" ttype="G" pid="000">
+  <name>Nom d'une amélioration, Batman !</name>
+  <detail>Améliorez la Batmobile à la Maquette 3.</detail>
+ </trophy>
+ <trophy id="021" hidden="no" ttype="B" pid="000">
+  <name>Home Sweet Home</name>
+  <detail>Visitez un monde Hub pour la première fois.</detail>
+ </trophy>
+ <trophy id="022" hidden="no" ttype="B" pid="000">
+  <name>Explorateur dimensionnel</name>
+  <detail>Visitez les mondes de Batman, Gandalf et Wyldstyle.</detail>
+ </trophy>
+ <trophy id="023" hidden="no" ttype="B" pid="000">
+  <name>Il est temps d'améliorer !</name>
+  <detail>Récoltez 5 briques dorées.</detail>
+ </trophy>
+ <trophy id="024" hidden="no" ttype="S" pid="000">
+  <name>Le véritable Maître doré !</name>
+  <detail>Récoltez 30 briques dorées.</detail>
+ </trophy>
+ <trophy id="025" hidden="no" ttype="B" pid="000">
+  <name>Précipitation dimensionnelle</name>
+  <detail>Terminez une course dans un monde Hub.</detail>
+ </trophy>
+ <trophy id="026" hidden="no" ttype="S" pid="000">
+  <name>Appuyer sur le champignon</name>
+  <detail>Terminez 5 courses du Hub.</detail>
+ </trophy>
+ <trophy id="027" hidden="no" ttype="B" pid="000">
+  <name>Mes héros !</name>
+  <detail>Terminez une quête dans un monde Hub.</detail>
+ </trophy>
+ <trophy id="028" hidden="no" ttype="B" pid="000">
+  <name>Restaurer l'ordre.</name>
+  <detail>Terminez une restauration dans un monde Hub.</detail>
+ </trophy>
+ <trophy id="029" hidden="no" ttype="S" pid="000">
+  <name>Maître Constructeur officiel</name>
+  <detail>Terminez 15 restaurations dans les mondes Hub.</detail>
+ </trophy>
+ <trophy id="030" hidden="no" ttype="S" pid="000">
+  <name>C'est comme le métro !</name>
+  <detail>Traversez 20 failles.</detail>
+ </trophy>
+ <trophy id="031" hidden="no" ttype="S" pid="000">
+  <name>Entrée rapide</name>
+  <detail>Terminez le niveau ''Centre d'enrichissement d'Aperture Science'' en moins de 25 minutes.</detail>
+ </trophy>
+ <trophy id="032" hidden="no" ttype="S" pid="000">
+  <name>Seul pour toujours</name>
+  <detail>Terminez un niveau en ne gardant qu'un seul personnage actif sur le Toy Pad.</detail>
+ </trophy>
+ <trophy id="033" hidden="no" ttype="S" pid="000">
+  <name>Objets trouvés</name>
+  <detail>Terminez 25 casse-têtes ''mode Repérage'' .</detail>
+ </trophy>
+ <trophy id="034" hidden="no" ttype="S" pid="000">
+  <name>Peinture par numéros</name>
+  <detail>Terminez 25 casse-têtes ''mode Chroma''.</detail>
+ </trophy>
+ <trophy id="035" hidden="no" ttype="S" pid="000">
+  <name>Élémentaire, mon cher</name>
+  <detail>Activez le ''mode Élémentaire'' 25 fois, séparément.</detail>
+ </trophy>
+ <trophy id="036" hidden="no" ttype="S" pid="000">
+  <name>J'ai failli tomber dedans !</name>
+  <detail>Traversez 50 failles en ''mode téléportation''.</detail>
+ </trophy>
+ <trophy id="037" hidden="no" ttype="S" pid="000">
+  <name>Ça vient en rose ?</name>
+  <detail>Peignez la Batmobile en rose.</detail>
+ </trophy>
+ <trophy id="038" hidden="no" ttype="G" pid="000">
+  <name>T'aimes le bling-bling, Batman ?</name>
+  <detail>Peignez la Batmobile chrome.</detail>
+ </trophy>
+ <trophy id="039" hidden="no" ttype="B" pid="-1" gid="001">
+  <name>Prends-ça, coyote de l'espace !</name>
+  <detail>Terminez ''Le Mystérieux Voyage d'Homer''.</detail>
+ </trophy>
+ <trophy id="040" hidden="no" ttype="B" pid="-1" gid="001">
+  <name>Mmmm... des objets de collection</name>
+  <detail>Récoltez un des minikits dans le niveau ''Le Mystérieux Voyage d'Homer''.</detail>
+ </trophy>
+ <trophy id="041" hidden="no" ttype="B" pid="-1" gid="001">
+  <name>Oh non, je déteste les règles !</name>
+  <detail>Atteignez l'objectif ''Briseur de règles'' dans le niveau ''Le Mystérieux Voyage d'Homer''.</detail>
+ </trophy>
+ <trophy id="042" hidden="no" ttype="B" pid="-1" gid="002">
+  <name>C'était bien lourd !</name>
+  <detail>Terminez ''Back to the Future!''</detail>
+ </trophy>
+ <trophy id="043" hidden="no" ttype="B" pid="-1" gid="002">
+  <name>M. Fusion, Réacteur de maison.</name>
+  <detail>Récoltez un des minikits dans le niveau ''Back to the Future!''</detail>
+ </trophy>
+ <trophy id="044" hidden="no" ttype="B" pid="-1" gid="002">
+  <name>Nous avons pas besoin de règles</name>
+  <detail>Atteignez l'objectif ''Briseur de règles'' dans le niveau ''Back to the Future!''</detail>
+ </trophy>
+ <trophy id="045" hidden="no" ttype="B" pid="-1" gid="003">
+  <name>Quel amusement. Ne revenez plus.</name>
+  <detail>Terminez ''Aperture Science''.</detail>
+ </trophy>
+ <trophy id="046" hidden="no" ttype="B" pid="-1" gid="003">
+  <name>La vie est pleine de minikits</name>
+  <detail>Récoltez un des minikits dans le niveau ''Aperture Science''.</detail>
+ </trophy>
+ <trophy id="047" hidden="no" ttype="B" pid="-1" gid="003">
+  <name>Pour la science... sale monstre.</name>
+  <detail>Atteignez l'objectif ''Briseur de règles'' dans le niveau ''Aperture Science''.</detail>
+ </trophy>
+ <trophy id="048" hidden="no" ttype="B" pid="-1" gid="004">
+  <name>Le destin est dans les étoiles</name>
+  <detail>Terminez ''Les Daleks exterminent la Terre''.</detail>
+ </trophy>
+ <trophy id="049" hidden="no" ttype="B" pid="-1" gid="004">
+  <name>Les minikits sont cools</name>
+  <detail>Récoltez un des minikits dans le niveau ''Les Daleks exterminent la Terre''.</detail>
+ </trophy>
+ <trophy id="050" hidden="no" ttype="B" pid="-1" gid="004">
+  <name>Les gens viennent les casser</name>
+  <detail>Atteignez l'objectif ''Briseur de règles'' dans le niveau ''Les Daleks exterminent la Terre''.</detail>
+ </trophy>
+ <trophy id="051" hidden="no" ttype="B" pid="-1" gid="005">
+  <name>J'ai pas peur des fantômes !</name>
+  <detail>Terminez ''Ghostbusters !''</detail>
+ </trophy>
+ <trophy id="052" hidden="no" ttype="B" pid="-1" gid="005">
+  <name>ON EN A UN !!</name>
+  <detail>Récoltez un minikit dans le niveau ''Ghostbusters !''</detail>
+ </trophy>
+ <trophy id="053" hidden="no" ttype="B" pid="-1" gid="005">
+  <name>J'adore briser les règles</name>
+  <detail>Atteignez l'objectif ''Briseur de règles'' dans le niveau ''Ghostbusters !''</detail>
+ </trophy>
+ <trophy id="054" hidden="no" ttype="B" pid="-1" gid="006">
+  <name>Nouveau Meilleur Score</name>
+  <detail>Terminez ''Retrograder''.</detail>
+ </trophy>
+ <trophy id="055" hidden="no" ttype="B" pid="-1" gid="006">
+  <name>Amélioration !</name>
+  <detail>Récoltez un minikit dans ''Retrograder''.</detail>
+ </trophy>
+ <trophy id="056" hidden="no" ttype="B" pid="-1" gid="006">
+  <name>Insérer pièce</name>
+  <detail>Atteignez l'objectif ''Briseur de règles'' dans ''Retrograder''.</detail>
+ </trophy>
+ <trophy id="057" hidden="no" ttype="B" pid="-1" gid="007">
+  <name>L'amusement n'en finit pas</name>
+  <detail>Terminez ''Un livre et un méchant''.</detail>
+ </trophy>
+ <trophy id="058" hidden="no" ttype="B" pid="-1" gid="007">
+  <name>Un pour la salle des trésors</name>
+  <detail>Récoltez un minikit dans le niveau ''Un livre et un méchant''.</detail>
+ </trophy>
+ <trophy id="059" hidden="no" ttype="B" pid="-1" gid="007">
+  <name>Mathémagique !</name>
+  <detail>Atteignez l'objectif ''Briseur de règles'' dans le niveau ''Un livre et un méchant''.</detail>
+ </trophy>
+ <trophy id="060" hidden="no" ttype="B" pid="-1" gid="008">
+  <name>Éviter le cataclysme</name>
+  <detail>Terminez tous les niveaux dans l'Ensemble Histoire : Ghostbusters (2016).</detail>
+ </trophy>
+ <trophy id="061" hidden="no" ttype="B" pid="-1" gid="008">
+  <name>Exterminateur de quêtes</name>
+  <detail>Terminez une quête dans le monde d'aventures Ghostbusters (2016).</detail>
+ </trophy>
+ <trophy id="062" hidden="no" ttype="B" pid="-1" gid="008">
+  <name>Briser le briseur de règles</name>
+  <detail>Atteignez ''Briseur de règles'' dans un niveau de l'Ensemble Histoire : Ghostbusters (2016).</detail>
+ </trophy>
+ <trophy id="063" hidden="no" ttype="B" pid="-1" gid="009">
+  <name>Mission: Accomplie</name>
+  <detail>Terminez ''Mission: Impossible''.</detail>
+ </trophy>
+ <trophy id="064" hidden="no" ttype="B" pid="-1" gid="009">
+  <name>Je ne le ferai pas autrement</name>
+  <detail>Récoltez un minikit dans le niveau ''Mission: Impossible''.</detail>
+ </trophy>
+ <trophy id="065" hidden="no" ttype="B" pid="-1" gid="009">
+  <name>Bonjour, M. Hunt...</name>
+  <detail>Atteignez l'objectif ''Briseur de règles'' dans le niveau ''Mission: Impossible''.</detail>
+ </trophy>
+ <trophy id="066" hidden="no" ttype="B" pid="-1" gid="010">
+  <name>Sans Moldus, problème résolu</name>
+  <detail>Terminez tous les niveaux de l'Ensemble Histoire : Les Animaux fantastiques.</detail>
+ </trophy>
+ <trophy id="067" hidden="no" ttype="B" pid="-1" gid="010">
+  <name>Touriste à Manhattan</name>
+  <detail>Terminez une quête dans le monde d'aventures Les Animaux fantastiques.</detail>
+ </trophy>
+ <trophy id="068" hidden="no" ttype="B" pid="-1" gid="010">
+  <name>Plus brillant qu'un Niffleur</name>
+  <detail>Achevez ''Briseur de règles'' dans un niveau de l'Ensemble Histoire : Les Animaux fantastiques.</detail>
+ </trophy>
+ <trophy id="069" hidden="no" ttype="B" pid="-1" gid="011">
+  <name>Théorie du chaos</name>
+  <detail>Terminez 'Dimensions Sonic'.</detail>
+ </trophy>
+ <trophy id="070" hidden="no" ttype="B" pid="-1" gid="011">
+  <name>J'aime bien les Emeralds...</name>
+  <detail>Récoltez un minikit dans le niveau 'Dimensions Sonic'.</detail>
+ </trophy>
+ <trophy id="071" hidden="no" ttype="B" pid="-1" gid="011">
+  <name>Briseur d'anneaux</name>
+  <detail>Atteignez le status ''Briseur de règles'' dans le niveau 'Dimensions Sonic'.</detail>
+ </trophy>
+ <trophy id="072" hidden="no" ttype="B" pid="-1" gid="012">
+  <name>De grands changements</name>
+  <detail>Terminez tous les niveaux de l'Ensemble Histoire : LEGO Batman : Le Film.</detail>
+ </trophy>
+ <trophy id="073" hidden="no" ttype="B" pid="-1" gid="012">
+  <name>Je 'Batmannais'</name>
+  <detail>Terminez une quête dans le monde d'aventures LEGO Batman : Le Film.</detail>
+ </trophy>
+ <trophy id="074" hidden="no" ttype="B" pid="-1" gid="012">
+  <name>Bat-Dollars</name>
+  <detail>Atteignez 'Briseur de règles' dans un niveau de l'Ensemble Histoire : LEGO Batman : Le Film.</detail>
+ </trophy>
+ <trophy id="075" hidden="no" ttype="B" pid="-1" gid="013">
+  <name>Confrère des Goonies</name>
+  <detail>Terminez 'Les Goonies'.</detail>
+ </trophy>
+ <trophy id="076" hidden="no" ttype="B" pid="-1" gid="013">
+  <name>Un butin de pirate</name>
+  <detail>Récoltez un minikit dans le niveau 'Les Goonies'.</detail>
+ </trophy>
+ <trophy id="077" hidden="no" ttype="B" pid="-1" gid="013">
+  <name>Hé, les gars !</name>
+  <detail>Atteignez le status ''Briseur de règles'' dans le niveau 'Les Goonies'.</detail>
+ </trophy>
+</trophyconf>

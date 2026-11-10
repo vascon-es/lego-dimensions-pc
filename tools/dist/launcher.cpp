@@ -165,6 +165,7 @@ std::wstring g_game_dir, g_patch_dir, g_dlc_dir;
 bool g_opt_fps = true, g_opt_console = false, g_opt_fullscreen = false, g_opt_skip = false, g_opt_overlay = false, g_opt_toypad = false;
 std::wstring g_lang_at_start; // o idioma do launcher mudou nas Configuracoes: ele reabre ao voltar
 std::wstring g_saves_value = L"savedata0"; // pasta dos saves dentro de assets (--saves-dir); savedata0 = os do jogador
+std::wstring g_trophy_sound_value = L"playstation"; // som ao desbloquear conquista: playstation, xbox, steam, desligado
 std::deque<std::wstring> g_log_lines; // o que a preparacao / os mods / o jogo disseram (as ultimas linhas)
 
 fs::path Ini() { return g_root / L"launcher.ini"; }
@@ -413,6 +414,7 @@ void SaveSettings() {
     WriteIni(L"contador", g_opt_overlay ? L"1" : L"0"); // Fase 65
     WriteIni(L"toypad_auto", g_opt_toypad ? L"1" : L"0");
     WriteIni(L"saves", g_saves_value);
+    WriteIni(L"trophy_sound", g_trophy_sound_value);
 }
 
 const Language& CurrentLanguage() {
@@ -1344,6 +1346,12 @@ void RunGame() {
     if (g_lang_value != L"auto") {
         command += L" --lang " + g_lang_value; // Fase 61: idioma do jogo (e do port)
     }
+    if (!g_trophy_sound_value.empty()) {
+        command += L" --trophy-sound " + g_trophy_sound_value;
+    }
+    if (!g_trophy_sound_value.empty()) {
+        command += L" --trophy-sound " + g_trophy_sound_value;
+    }
     if (g_opt_skip) {
         command += L" --skip-cutscenes"; // Fase 61: qualquer cutscene pode ser pulada, mesmo sem 100%
     }
@@ -1528,6 +1536,34 @@ void LaunchLegoToypad(bool notify_if_running) {
         CloseHandle(pi.hThread);
         CloseHandle(pi.hProcess);
         AppendLog(ui::T(L"LegoToypad v1.9 iniciado em segundo plano.", L"LegoToypad started in background."));
+    }
+}
+
+void ResetTrophiesAction() {
+    if (MessageBoxW(g_main,
+                    ui::T(L"Tem certeza que deseja reiniciar todas as conquistas do LEGO Dimensions PC?\n\nIsso apagará o arquivo de progresso dos troféus e permitirá conquistá-los novamente.",
+                          L"Are you sure you want to reset all achievements for LEGO Dimensions PC?\n\nThis will clear the trophy progress file."),
+                    L"LEGO Dimensions PC", MB_YESNO | MB_ICONWARNING) == IDYES) {
+        std::error_code ec;
+        fs::remove(g_root / L"assets" / L"trophy" / L"NPWR07423_00.xml", ec);
+        fs::remove(g_root / L"assets" / L"trophy" / L".retro_done", ec);
+        MessageBoxW(g_main,
+                    ui::T(L"Conquistas reiniciadas com sucesso!", L"Achievements successfully reset!"),
+                    L"LEGO Dimensions PC", MB_OK | MB_ICONINFORMATION);
+    }
+}
+
+void ResetTrophiesAction() {
+    if (MessageBoxW(g_main,
+                    ui::T(L"Tem certeza que deseja reiniciar todas as conquistas do LEGO Dimensions PC?\n\nIsso apagará o arquivo de progresso dos troféus e permitirá conquistá-los novamente.",
+                          L"Are you sure you want to reset all achievements for LEGO Dimensions PC?\n\nThis will clear the trophy progress file."),
+                    L"LEGO Dimensions PC", MB_YESNO | MB_ICONWARNING) == IDYES) {
+        std::error_code ec;
+        fs::remove(g_root / L"assets" / L"trophy" / L"NPWR07423_00.xml", ec);
+        fs::remove(g_root / L"assets" / L"trophy" / L".retro_done", ec);
+        MessageBoxW(g_main,
+                    ui::T(L"Conquistas reiniciadas com sucesso!", L"Achievements successfully reset!"),
+                    L"LEGO Dimensions PC", MB_OK | MB_ICONINFORMATION);
     }
 }
 
@@ -1950,6 +1986,38 @@ std::vector<Row> Rows() {
     rows.push_back({kTabGame, RowKind::kAction, ui::T(L"Apelidos dos jogadores", L"Player nicknames"),
                     ui::T(L"O nome no lugar de Player1, Player2... Enter: editar.", L"The name shown instead of Player1, Player2... Enter: edit."),
                     names.empty() ? ui::T(L"Padrão", L"Default") : names, [](int) { OpenNamesDialog(); }});
+    static const wchar_t* const kTrophySounds[] = {L"playstation", L"xbox", L"steam", L"desligado"};
+    rows.push_back({kTabGame, RowKind::kChoice, ui::T(L"Som de conquista", L"Trophy sound"),
+                    ui::T(L"Efeito sonoro ao desbloquear conquistas (PlayStation, Xbox, Steam).",
+                          L"Sound effect when unlocking achievements (PlayStation, Xbox, Steam)."),
+                    g_trophy_sound_value == L"xbox" ? std::wstring(L"Xbox") :
+                    g_trophy_sound_value == L"steam" ? std::wstring(L"Steam") :
+                    (g_trophy_sound_value == L"desligado" || g_trophy_sound_value == L"off") ? ui::T(L"Desligado", L"Off") : std::wstring(L"PlayStation"),
+                    [](int step) {
+                        g_trophy_sound_value = Step(kTrophySounds, g_trophy_sound_value, step, [](const wchar_t* s) { return std::wstring(s); });
+                        SaveSettings();
+                    }});
+    rows.push_back({kTabGame, RowKind::kAction, ui::T(L"Reiniciar conquistas", L"Reset achievements"),
+                    ui::T(L"Limpa todas as conquistas para recomeçar do zero. Enter: reiniciar.",
+                          L"Reset all achievements back to locked. Enter: reset."),
+                    ui::T(L"Reiniciar...", L"Reset..."),
+                    [](int) { ResetTrophiesAction(); }});
+    static const wchar_t* const kTrophySounds[] = {L"playstation", L"xbox", L"steam", L"desligado"};
+    rows.push_back({kTabGame, RowKind::kChoice, ui::T(L"Som de conquista", L"Trophy sound"),
+                    ui::T(L"Efeito sonoro ao desbloquear conquistas (PlayStation, Xbox, Steam).",
+                          L"Sound effect when unlocking achievements (PlayStation, Xbox, Steam)."),
+                    g_trophy_sound_value == L"xbox" ? std::wstring(L"Xbox") :
+                    g_trophy_sound_value == L"steam" ? std::wstring(L"Steam") :
+                    (g_trophy_sound_value == L"desligado" || g_trophy_sound_value == L"off") ? ui::T(L"Desligado", L"Off") : std::wstring(L"PlayStation"),
+                    [](int step) {
+                        g_trophy_sound_value = Step(kTrophySounds, g_trophy_sound_value, step, [](const wchar_t* s) { return std::wstring(s); });
+                        SaveSettings();
+                    }});
+    rows.push_back({kTabGame, RowKind::kAction, ui::T(L"Reiniciar conquistas", L"Reset achievements"),
+                    ui::T(L"Limpa todas as conquistas para recomeçar do zero. Enter: reiniciar.",
+                          L"Reset all achievements back to locked. Enter: reset."),
+                    ui::T(L"Reiniciar...", L"Reset..."),
+                    [](int) { ResetTrophiesAction(); }});
     // Avancado
     rows.push_back({kTabAdvanced, RowKind::kChoice, ui::T(L"Contador de desempenho (F10)", L"Performance overlay (F10)"),
                     ui::T(L"FPS, tempo de quadro, CPU / GPU e memória no jogo.", L"FPS, frame time, CPU / GPU and memory in game."), OnOff(g_opt_overlay),
@@ -2617,6 +2685,7 @@ void LoadSettings() {
     g_opt_overlay = ReadIni(L"contador", L"0") == L"1"; // Fase 65
     g_opt_toypad = ReadIni(L"toypad_auto", L"0") == L"1";
     g_saves_value = ReadIni(L"saves", L"savedata0");
+    g_trophy_sound_value = ReadIni(L"trophy_sound", L"playstation");
     if (const auto folders = SaveFolders(); std::find(folders.begin(), folders.end(), g_saves_value) == folders.end()) {
         g_saves_value = L"savedata0";
     }

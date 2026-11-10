@@ -14,6 +14,7 @@
 #include "hle/overrides/hle_videoout.h"
 #include "render/vulkan_backend.h"
 #include "runtime/lang.h"
+#include "hle/trophy_manager.h"
 
 #include <algorithm>
 #include <atomic>
@@ -130,7 +131,9 @@ static std::vector<MenuItem> g_menu_items = {
     {"ANTI-ALIASING", {"OFF", "TAA X16", "FSR 3 AA", "FSR 4 AA"}, 0},
     {"FRAME RATE (RESTART)", {"30 FPS", "60 FPS", "UNLOCKED", "UNLOCKED NO VSYNC"}, 1},
     {"FPS COUNTER (F10)", {"OFF", "ON"}, 0},
-    {"CONTROLLER ICONS", {"AUTO", "PS4", "XBOX", "SWITCH"}, 0}
+    {"CONTROLLER ICONS", {"AUTO", "PS4", "XBOX", "SWITCH"}, 0},
+    {"TROPHY SOUND", {"PLAYSTATION", "XBOX", "STEAM", "OFF"}, 0},
+    {"RESET TROPHIES", {"< PRESS ENTER >", "TROPHIES RESET!"}, 0}
 };
 
 static void WriteLauncherIni(const wchar_t* key, const wchar_t* val) {
@@ -252,6 +255,23 @@ static void ApplyAndSaveVideoSettings() {
         gnm::SetButtonIcons(kIconsAnsi[ic]);
     }
 
+    // Trophy sound
+    if (g_menu_items.size() > 6) {
+        static const wchar_t* const kSoundStr[] = {L"playstation", L"xbox", L"steam", L"off"};
+        static const char* const kSoundAnsi[] = {"playstation", "xbox", "steam", "off"};
+        const int ts = g_menu_items[6].selected;
+        if (ts >= 0 && ts < 4) {
+            WriteLauncherIni(L"trophy_sound", kSoundStr[ts]);
+            hle::trophy::TrophyManager::Instance().SetSoundType(kSoundAnsi[ts]);
+        }
+    }
+
+    // Reset trophies
+    if (g_menu_items.size() > 7 && g_menu_selected == 7) {
+        hle::trophy::TrophyManager::Instance().ResetTrophies();
+        g_menu_items[7].selected = 1;
+    }
+
     g_save_confirm_timer = 90;
 }
 
@@ -282,6 +302,12 @@ static void InitMenuDefaults() {
         else if (wcsstr(buf, L"xbox")) g_menu_items[5].selected = 2;
         else if (wcsstr(buf, L"wiiu") || wcsstr(buf, L"switch")) g_menu_items[5].selected = 3;
         else g_menu_items[5].selected = 0;
+
+        GetPrivateProfileStringW(L"launcher", L"trophy_sound", L"playstation", buf, 64, ini.wstring().c_str());
+        if (!_wcsicmp(buf, L"xbox")) g_menu_items[6].selected = 1;
+        else if (!_wcsicmp(buf, L"steam")) g_menu_items[6].selected = 2;
+        else if (!_wcsicmp(buf, L"off") || !_wcsicmp(buf, L"desligado")) g_menu_items[6].selected = 3;
+        else g_menu_items[6].selected = 0;
     }
     g_menu_items[1].selected = g_start_fullscreen.load() || g_fullscreen ? 0 : 1;
     int major = 0;
@@ -790,6 +816,23 @@ const u8* Glyph(char c) {
     if (c >= 'a' && c <= 'z') c = static_cast<char>(c - 'a' + 'A');
     if (c >= 'A' && c <= 'Z') return kLetters[c - 'A'];
     if (c >= '0' && c <= '9') return kDigits[c - '0'];
+    static const u8 kExcl[7] = {0x04, 0x04, 0x04, 0x04, 0x00, 0x04, 0x04};
+    static const u8 kQuest[7] = {0x0E, 0x11, 0x01, 0x02, 0x04, 0x00, 0x04};
+    static const u8 kComma[7] = {0x00, 0x00, 0x00, 0x00, 0x00, 0x04, 0x08};
+    static const u8 kApos[7] = {0x04, 0x04, 0x08, 0x00, 0x00, 0x00, 0x00};
+    static const u8 kQuote[7] = {0x0A, 0x0A, 0x14, 0x00, 0x00, 0x00, 0x00};
+    static const u8 kStar[7] = {0x00, 0x15, 0x0E, 0x1F, 0x0E, 0x15, 0x00};
+    static const u8 kUnder[7] = {0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x1F};
+
+    // Normalize accents
+    unsigned char uc = static_cast<unsigned char>(c);
+    if (uc == 0xC1 || uc == 0xC0 || uc == 0xC2 || uc == 0xC3 || uc == 0xE1 || uc == 0xE0 || uc == 0xE2 || uc == 0xE3) return kLetters['A' - 'A'];
+    if (uc == 0xC9 || uc == 0xCA || uc == 0xE9 || uc == 0xEA) return kLetters['E' - 'A'];
+    if (uc == 0xCD || uc == 0xED) return kLetters['I' - 'A'];
+    if (uc == 0xD3 || uc == 0xD4 || uc == 0xD5 || uc == 0xF3 || uc == 0xF4 || uc == 0xF5) return kLetters['O' - 'A'];
+    if (uc == 0xDA || uc == 0xFA) return kLetters['U' - 'A'];
+    if (uc == 0xC7 || uc == 0xE7) return kLetters['C' - 'A'];
+
     switch (c) {
     case '/': return kSlash;
     case '%': return kPercent;
@@ -805,6 +848,13 @@ const u8* Glyph(char c) {
     case ')': return kRightParen;
     case '+': return kPlus;
     case '=': return kEqual;
+    case '!': return kExcl;
+    case '?': return kQuest;
+    case ',': return kComma;
+    case ''': return kApos;
+    case '"': return kQuote;
+    case '*': return kStar;
+    case '_': return kUnder;
     default: return kSpace;
     }
 }
@@ -841,6 +891,150 @@ void Text(std::vector<LoadingVertex>& out, const std::string& text, float x, flo
 
 void DrawLoading(const std::vector<LoadingVertex>& vertices) {
     auto& renderer = render::VulkanRenderer::Instance();
+    if (has_toast) {
+        const auto toast = hle::trophy::TrophyManager::Instance().GetActiveToast();
+        float anim = 1.0f;
+        const float time_in = toast.total_duration - toast.time_remaining;
+        if (time_in < 0.35f) {
+            anim = time_in / 0.35f;
+        } else if (toast.time_remaining < 0.35f) {
+            anim = toast.time_remaining / 0.35f;
+        }
+
+        const float scale_ui = client.bottom >= 1400 ? 1.4f : (client.bottom >= 1000 ? 1.0f : 0.8f);
+        const float box_w = 460.0f * scale_ui;
+        const float box_h = 74.0f * scale_ui;
+        const float target_x = client.right - box_w - 24.0f * scale_ui;
+        const float target_y = 24.0f * scale_ui;
+        const float cur_y = target_y - (1.0f - anim) * (box_h + 35.0f * scale_ui);
+        const float cur_x = target_x;
+
+        u32 tier_col = 0xFFCD7F32; // Bronze
+        const char* tier_en = "BRONZE";
+        const char* tier_pt = "BRONZE";
+        if (toast.type == 'P') {
+            tier_col = 0xFF00E5FF; // Platinum
+            tier_en = "PLATINUM";
+            tier_pt = "PLATINA";
+        } else if (toast.type == 'G') {
+            tier_col = 0xFFFFD700; // Gold
+            tier_en = "GOLD";
+            tier_pt = "OURO";
+        } else if (toast.type == 'S') {
+            tier_col = 0xFFD0D0E0; // Silver
+            tier_en = "SILVER";
+            tier_pt = "PRATA";
+        }
+
+        // Outer border and dark slate background
+        c.Rect(cur_x - 3.0f * scale_ui, cur_y - 3.0f * scale_ui, cur_x + box_w + 3.0f * scale_ui, cur_y + box_h + 3.0f * scale_ui, tier_col);
+        c.Rect(cur_x, cur_y, cur_x + box_w, cur_y + box_h, 0xEE14141A);
+
+        // Badge area on left
+        const float badge_sz = box_h - 12.0f * scale_ui;
+        const float badge_x = cur_x + 6.0f * scale_ui;
+        const float badge_y = cur_y + 6.0f * scale_ui;
+        c.Rect(badge_x, badge_y, badge_x + badge_sz, badge_y + badge_sz, 0x44000000);
+        c.Rect(badge_x + 1.0f, badge_y + 1.0f, badge_x + badge_sz - 1.0f, badge_y + badge_sz - 1.0f, 0x33FFFFFF);
+
+        // Trophy cup icon
+        const float cup_p = scale_ui * 2.5f;
+        const float cup_x = badge_x + (badge_sz - 5.0f * cup_p) * 0.5f;
+        const float cup_y = badge_y + (badge_sz - 7.0f * cup_p) * 0.5f;
+        static const u8 kTrophyCup[7] = {0x1F, 0x1F, 0x0E, 0x04, 0x04, 0x0E, 0x1F};
+        for (int r = 0; r < 7; ++r) {
+            for (int col = 0; col < 5; ++col) {
+                if (kTrophyCup[r] & (0x10 >> col)) {
+                    c.Rect(cup_x + col * cup_p, cup_y + r * cup_p, cup_x + (col + 1) * cup_p, cup_y + (r + 1) * cup_p, tier_col);
+                }
+            }
+        }
+
+        // Text lines on right
+        const float text_x = badge_x + badge_sz + 12.0f * scale_ui;
+        const float font_hdr = 1.5f * scale_ui;
+        const float font_title = 2.0f * scale_ui;
+        const float font_desc = 1.35f * scale_ui;
+
+        std::string hdr = std::string(lang::Pt() ? "* CONQUISTA DESBLOQUEADA! [" : "* TROPHY UNLOCKED! [") +
+                          (lang::Pt() ? tier_pt : tier_en) + "]";
+        c.Write(hdr, text_x, cur_y + 9.0f * scale_ui, font_hdr, tier_col);
+        c.Write(toast.title, text_x, cur_y + 25.0f * scale_ui, font_title, 0xFFFFFFFF);
+        c.Write(toast.desc, text_x, cur_y + 48.0f * scale_ui, font_desc, 0xFFAAAAAA);
+    }
+
+    if (has_toast) {
+        const auto toast = hle::trophy::TrophyManager::Instance().GetActiveToast();
+        float anim = 1.0f;
+        const float time_in = toast.total_duration - toast.time_remaining;
+        if (time_in < 0.35f) {
+            anim = time_in / 0.35f;
+        } else if (toast.time_remaining < 0.35f) {
+            anim = toast.time_remaining / 0.35f;
+        }
+
+        const float scale_ui = client.bottom >= 1400 ? 1.4f : (client.bottom >= 1000 ? 1.0f : 0.8f);
+        const float box_w = 460.0f * scale_ui;
+        const float box_h = 74.0f * scale_ui;
+        const float target_x = client.right - box_w - 24.0f * scale_ui;
+        const float target_y = 24.0f * scale_ui;
+        const float cur_y = target_y - (1.0f - anim) * (box_h + 35.0f * scale_ui);
+        const float cur_x = target_x;
+
+        u32 tier_col = 0xFFCD7F32; // Bronze
+        const char* tier_en = "BRONZE";
+        const char* tier_pt = "BRONZE";
+        if (toast.type == 'P') {
+            tier_col = 0xFF00E5FF; // Platinum
+            tier_en = "PLATINUM";
+            tier_pt = "PLATINA";
+        } else if (toast.type == 'G') {
+            tier_col = 0xFFFFD700; // Gold
+            tier_en = "GOLD";
+            tier_pt = "OURO";
+        } else if (toast.type == 'S') {
+            tier_col = 0xFFD0D0E0; // Silver
+            tier_en = "SILVER";
+            tier_pt = "PRATA";
+        }
+
+        // Outer border and dark slate background
+        c.Rect(cur_x - 3.0f * scale_ui, cur_y - 3.0f * scale_ui, cur_x + box_w + 3.0f * scale_ui, cur_y + box_h + 3.0f * scale_ui, tier_col);
+        c.Rect(cur_x, cur_y, cur_x + box_w, cur_y + box_h, 0xEE14141A);
+
+        // Badge area on left
+        const float badge_sz = box_h - 12.0f * scale_ui;
+        const float badge_x = cur_x + 6.0f * scale_ui;
+        const float badge_y = cur_y + 6.0f * scale_ui;
+        c.Rect(badge_x, badge_y, badge_x + badge_sz, badge_y + badge_sz, 0x44000000);
+        c.Rect(badge_x + 1.0f, badge_y + 1.0f, badge_x + badge_sz - 1.0f, badge_y + badge_sz - 1.0f, 0x33FFFFFF);
+
+        // Trophy cup icon
+        const float cup_p = scale_ui * 2.5f;
+        const float cup_x = badge_x + (badge_sz - 5.0f * cup_p) * 0.5f;
+        const float cup_y = badge_y + (badge_sz - 7.0f * cup_p) * 0.5f;
+        static const u8 kTrophyCup[7] = {0x1F, 0x1F, 0x0E, 0x04, 0x04, 0x0E, 0x1F};
+        for (int r = 0; r < 7; ++r) {
+            for (int col = 0; col < 5; ++col) {
+                if (kTrophyCup[r] & (0x10 >> col)) {
+                    c.Rect(cup_x + col * cup_p, cup_y + r * cup_p, cup_x + (col + 1) * cup_p, cup_y + (r + 1) * cup_p, tier_col);
+                }
+            }
+        }
+
+        // Text lines on right
+        const float text_x = badge_x + badge_sz + 12.0f * scale_ui;
+        const float font_hdr = 1.5f * scale_ui;
+        const float font_title = 2.0f * scale_ui;
+        const float font_desc = 1.35f * scale_ui;
+
+        std::string hdr = std::string(lang::Pt() ? "* CONQUISTA DESBLOQUEADA! [" : "* TROPHY UNLOCKED! [") +
+                          (lang::Pt() ? tier_pt : tier_en) + "]";
+        c.Write(hdr, text_x, cur_y + 9.0f * scale_ui, font_hdr, tier_col);
+        c.Write(toast.title, text_x, cur_y + 25.0f * scale_ui, font_title, 0xFFFFFFFF);
+        c.Write(toast.desc, text_x, cur_y + 48.0f * scale_ui, font_desc, 0xFFAAAAAA);
+    }
+
     if (!vertices.empty()) {
         render::DrawCall draw;
         draw.vertex_data = vertices.data();
@@ -946,7 +1140,9 @@ void QueueStatsOverlay() {
     if (!hwnd || !GetClientRect(hwnd, &client) || client.right < 64 || client.bottom < 64) {
         return;
     }
-    if (!g_stats_overlay.load() && !g_video_menu_open.load()) {
+    const bool has_toast = hle::trophy::TrophyManager::Instance().HasActiveToast();
+    hle::trophy::TrophyManager::Instance().Update(ms * 0.001f);
+    if (!g_stats_overlay.load() && !g_video_menu_open.load() && !has_toast) {
         return;
     }
     static std::vector<LoadingVertex> vertices;
@@ -1062,6 +1258,150 @@ void QueueStatsOverlay() {
             float font_foot = 1.7f * scale_ui;
             c.Write(footer, box_x0 + (box_w - TextWidth(footer, font_foot)) / 2.0f, box_y1 - 40.0f * scale_ui, font_foot, kGray);
         }
+    }
+
+    if (has_toast) {
+        const auto toast = hle::trophy::TrophyManager::Instance().GetActiveToast();
+        float anim = 1.0f;
+        const float time_in = toast.total_duration - toast.time_remaining;
+        if (time_in < 0.35f) {
+            anim = time_in / 0.35f;
+        } else if (toast.time_remaining < 0.35f) {
+            anim = toast.time_remaining / 0.35f;
+        }
+
+        const float scale_ui = client.bottom >= 1400 ? 1.4f : (client.bottom >= 1000 ? 1.0f : 0.8f);
+        const float box_w = 460.0f * scale_ui;
+        const float box_h = 74.0f * scale_ui;
+        const float target_x = client.right - box_w - 24.0f * scale_ui;
+        const float target_y = 24.0f * scale_ui;
+        const float cur_y = target_y - (1.0f - anim) * (box_h + 35.0f * scale_ui);
+        const float cur_x = target_x;
+
+        u32 tier_col = 0xFFCD7F32; // Bronze
+        const char* tier_en = "BRONZE";
+        const char* tier_pt = "BRONZE";
+        if (toast.type == 'P') {
+            tier_col = 0xFF00E5FF; // Platinum
+            tier_en = "PLATINUM";
+            tier_pt = "PLATINA";
+        } else if (toast.type == 'G') {
+            tier_col = 0xFFFFD700; // Gold
+            tier_en = "GOLD";
+            tier_pt = "OURO";
+        } else if (toast.type == 'S') {
+            tier_col = 0xFFD0D0E0; // Silver
+            tier_en = "SILVER";
+            tier_pt = "PRATA";
+        }
+
+        // Outer border and dark slate background
+        c.Rect(cur_x - 3.0f * scale_ui, cur_y - 3.0f * scale_ui, cur_x + box_w + 3.0f * scale_ui, cur_y + box_h + 3.0f * scale_ui, tier_col);
+        c.Rect(cur_x, cur_y, cur_x + box_w, cur_y + box_h, 0xEE14141A);
+
+        // Badge area on left
+        const float badge_sz = box_h - 12.0f * scale_ui;
+        const float badge_x = cur_x + 6.0f * scale_ui;
+        const float badge_y = cur_y + 6.0f * scale_ui;
+        c.Rect(badge_x, badge_y, badge_x + badge_sz, badge_y + badge_sz, 0x44000000);
+        c.Rect(badge_x + 1.0f, badge_y + 1.0f, badge_x + badge_sz - 1.0f, badge_y + badge_sz - 1.0f, 0x33FFFFFF);
+
+        // Trophy cup icon
+        const float cup_p = scale_ui * 2.5f;
+        const float cup_x = badge_x + (badge_sz - 5.0f * cup_p) * 0.5f;
+        const float cup_y = badge_y + (badge_sz - 7.0f * cup_p) * 0.5f;
+        static const u8 kTrophyCup[7] = {0x1F, 0x1F, 0x0E, 0x04, 0x04, 0x0E, 0x1F};
+        for (int r = 0; r < 7; ++r) {
+            for (int col = 0; col < 5; ++col) {
+                if (kTrophyCup[r] & (0x10 >> col)) {
+                    c.Rect(cup_x + col * cup_p, cup_y + r * cup_p, cup_x + (col + 1) * cup_p, cup_y + (r + 1) * cup_p, tier_col);
+                }
+            }
+        }
+
+        // Text lines on right
+        const float text_x = badge_x + badge_sz + 12.0f * scale_ui;
+        const float font_hdr = 1.5f * scale_ui;
+        const float font_title = 2.0f * scale_ui;
+        const float font_desc = 1.35f * scale_ui;
+
+        std::string hdr = std::string(lang::Pt() ? "* CONQUISTA DESBLOQUEADA! [" : "* TROPHY UNLOCKED! [") +
+                          (lang::Pt() ? tier_pt : tier_en) + "]";
+        c.Write(hdr, text_x, cur_y + 9.0f * scale_ui, font_hdr, tier_col);
+        c.Write(toast.title, text_x, cur_y + 25.0f * scale_ui, font_title, 0xFFFFFFFF);
+        c.Write(toast.desc, text_x, cur_y + 48.0f * scale_ui, font_desc, 0xFFAAAAAA);
+    }
+
+    if (has_toast) {
+        const auto toast = hle::trophy::TrophyManager::Instance().GetActiveToast();
+        float anim = 1.0f;
+        const float time_in = toast.total_duration - toast.time_remaining;
+        if (time_in < 0.35f) {
+            anim = time_in / 0.35f;
+        } else if (toast.time_remaining < 0.35f) {
+            anim = toast.time_remaining / 0.35f;
+        }
+
+        const float scale_ui = client.bottom >= 1400 ? 1.4f : (client.bottom >= 1000 ? 1.0f : 0.8f);
+        const float box_w = 460.0f * scale_ui;
+        const float box_h = 74.0f * scale_ui;
+        const float target_x = client.right - box_w - 24.0f * scale_ui;
+        const float target_y = 24.0f * scale_ui;
+        const float cur_y = target_y - (1.0f - anim) * (box_h + 35.0f * scale_ui);
+        const float cur_x = target_x;
+
+        u32 tier_col = 0xFFCD7F32; // Bronze
+        const char* tier_en = "BRONZE";
+        const char* tier_pt = "BRONZE";
+        if (toast.type == 'P') {
+            tier_col = 0xFF00E5FF; // Platinum
+            tier_en = "PLATINUM";
+            tier_pt = "PLATINA";
+        } else if (toast.type == 'G') {
+            tier_col = 0xFFFFD700; // Gold
+            tier_en = "GOLD";
+            tier_pt = "OURO";
+        } else if (toast.type == 'S') {
+            tier_col = 0xFFD0D0E0; // Silver
+            tier_en = "SILVER";
+            tier_pt = "PRATA";
+        }
+
+        // Outer border and dark slate background
+        c.Rect(cur_x - 3.0f * scale_ui, cur_y - 3.0f * scale_ui, cur_x + box_w + 3.0f * scale_ui, cur_y + box_h + 3.0f * scale_ui, tier_col);
+        c.Rect(cur_x, cur_y, cur_x + box_w, cur_y + box_h, 0xEE14141A);
+
+        // Badge area on left
+        const float badge_sz = box_h - 12.0f * scale_ui;
+        const float badge_x = cur_x + 6.0f * scale_ui;
+        const float badge_y = cur_y + 6.0f * scale_ui;
+        c.Rect(badge_x, badge_y, badge_x + badge_sz, badge_y + badge_sz, 0x44000000);
+        c.Rect(badge_x + 1.0f, badge_y + 1.0f, badge_x + badge_sz - 1.0f, badge_y + badge_sz - 1.0f, 0x33FFFFFF);
+
+        // Trophy cup icon
+        const float cup_p = scale_ui * 2.5f;
+        const float cup_x = badge_x + (badge_sz - 5.0f * cup_p) * 0.5f;
+        const float cup_y = badge_y + (badge_sz - 7.0f * cup_p) * 0.5f;
+        static const u8 kTrophyCup[7] = {0x1F, 0x1F, 0x0E, 0x04, 0x04, 0x0E, 0x1F};
+        for (int r = 0; r < 7; ++r) {
+            for (int col = 0; col < 5; ++col) {
+                if (kTrophyCup[r] & (0x10 >> col)) {
+                    c.Rect(cup_x + col * cup_p, cup_y + r * cup_p, cup_x + (col + 1) * cup_p, cup_y + (r + 1) * cup_p, tier_col);
+                }
+            }
+        }
+
+        // Text lines on right
+        const float text_x = badge_x + badge_sz + 12.0f * scale_ui;
+        const float font_hdr = 1.5f * scale_ui;
+        const float font_title = 2.0f * scale_ui;
+        const float font_desc = 1.35f * scale_ui;
+
+        std::string hdr = std::string(lang::Pt() ? "* CONQUISTA DESBLOQUEADA! [" : "* TROPHY UNLOCKED! [") +
+                          (lang::Pt() ? tier_pt : tier_en) + "]";
+        c.Write(hdr, text_x, cur_y + 9.0f * scale_ui, font_hdr, tier_col);
+        c.Write(toast.title, text_x, cur_y + 25.0f * scale_ui, font_title, 0xFFFFFFFF);
+        c.Write(toast.desc, text_x, cur_y + 48.0f * scale_ui, font_desc, 0xFFAAAAAA);
     }
 
     if (!vertices.empty()) {

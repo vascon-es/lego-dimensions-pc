@@ -1,6 +1,7 @@
 // VFS do Orbis (/app0, /temp0, /savedata0) + I/O de arquivo do libkernel.
 #include "hle/overrides/hle_radar.h"
 #include "hle/overrides/hle_filesystem.h"
+#include "runtime/lang.h"
 
 #include <algorithm>
 #include <atomic>
@@ -34,6 +35,7 @@ std::filesystem::path g_writable_root;
 std::atomic<u64> g_dat_opened{0};
 // Fase 64: mods
 std::vector<std::filesystem::path> g_overlays;      // pastas no formato do /app0, a primeira vence
+std::filesystem::path g_locale_overlay;             // overlay para traducao em portugues
 std::map<std::string, PackRedirect> g_redirect_hdr;  // "data/chunk1/patch.hdr" -> pacote com arquivos de mod
 std::map<std::string, PackRedirect> g_redirect_dat;  // "data/chunk1/patch.dat" -> idem
 std::map<std::string, std::filesystem::path> g_anomaly_files; // Fase 67: "mods/allworld.dat" -> arquivo do mod
@@ -53,9 +55,24 @@ std::string LowerKey(const std::filesystem::path& rel) {
 // Arquivo do /app0 sem os pacotes renomeados: mods de arquivos soltos, depois a atualizacao, depois o jogo.
 std::filesystem::path FindApp0File(const std::filesystem::path& rel) {
     std::error_code ec;
+    if (!g_locale_overlay.empty()) {
+        if (const auto p = (g_locale_overlay / rel).lexically_normal(); std::filesystem::exists(p, ec)) {
+            return p;
+        }
+    }
     for (const auto& dir : g_overlays) {
         if (const auto p = (dir / rel).lexically_normal(); std::filesystem::exists(p, ec)) {
             return p;
+        }
+    }
+    if (!lang::Pt()) {
+        const std::string lower = LowerKey(rel);
+        if (lower == "data/chunk1/patch.dat") {
+            const auto bak = g_app0 / "data" / "chunk1" / "backup" / "PATCH.DAT";
+            if (std::filesystem::exists(bak, ec)) return bak;
+        } else if (lower == "data/chunk1/patch.hdr") {
+            const auto bak = g_app0 / "data" / "chunk1" / "backup" / "PATCH.HDR";
+            if (std::filesystem::exists(bak, ec)) return bak;
         }
     }
     if (!g_app0_patch.empty()) {
@@ -287,6 +304,16 @@ void SetApp0Patch(const std::filesystem::path& patch_dir) {
 void SetModOverlays(std::vector<std::filesystem::path> dirs) {
     std::lock_guard lock(g_mounts_mutex);
     g_overlays = std::move(dirs);
+}
+
+void SetLocaleOverlay(const std::filesystem::path& dir) {
+    std::lock_guard lock(g_mounts_mutex);
+    g_locale_overlay = dir;
+}
+
+void SetLocaleOverlay(const std::filesystem::path& dir) {
+    std::lock_guard lock(g_mounts_mutex);
+    g_locale_overlay = dir;
 }
 
 void SetPackRedirects(std::vector<PackRedirect> redirects) {

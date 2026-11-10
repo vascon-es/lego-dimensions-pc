@@ -1,0 +1,372 @@
+<!--Sce-Np-Trophy-Signature: 4c39b98c010000000000000020095161b02e1858ec224fc8c3e5078e898f8813756496fdc5b9d3d5e620ddca3f792c0a43206fd2628e83b94b4825dd3836e890b79379b05720b9988a1aa7d9a5d7720d592a987749482102fa9626fc586d127633698950e02dec9d2b185302994c56f837c2e8a4a542c7395b6b2e20cda99a8b598075c40cec473dd9c0527972037c8b092df93b1fa7c936db42198d0ab065f1-->
+<trophyconf version="1.1" platform="ps4" policy="large">
+ <npcommid>NPWR07423_00</npcommid>
+ <trophyset-version>01.09</trophyset-version>
+ <parental-level license-area="default">0</parental-level>
+ <title-name>LEGO® DIMENSIONS™</title-name>
+ <title-detail>LEGO® DIMENSIONS™</title-detail>
+ <group id="001">
+  <name>The Simpsons™ Level Pack</name>
+  <detail>The Simpsons™ Level Pack</detail>
+ </group>
+ <group id="002">
+  <name>Tilbage til Fremtiden™ Level Pack</name>
+  <detail>Tilbage til Fremtiden™ Level Pack</detail>
+ </group>
+ <group id="003">
+  <name>Portal™ Level Pack</name>
+  <detail>Portal™ Level Pack</detail>
+ </group>
+ <group id="004">
+  <name>Doktor Who Level Pack</name>
+  <detail>Doktor Who Level Pack</detail>
+ </group>
+ <group id="005">
+  <name>Ghostbusters™ Level Pack</name>
+  <detail>Ghostbusters™ Level Pack</detail>
+ </group>
+ <group id="006">
+  <name>Midway Arcade Level Pack</name>
+  <detail>Midway Arcade Level Pack</detail>
+ </group>
+ <group id="007">
+  <name>Eventyrtid Level Pack</name>
+  <detail>Eventyrtid Level Pack</detail>
+ </group>
+ <group id="008">
+  <name>Ghostbusters™ (2016) historiepakke</name>
+  <detail>Ghostbusters™ (2016) historiepakke</detail>
+ </group>
+ <group id="009">
+  <name>Mission: Impossible Level Pack</name>
+  <detail>Mission: Impossible Level Pack</detail>
+ </group>
+ <group id="010">
+  <name>Fantastiske skabninger historiepakke</name>
+  <detail>Fantastiske skabninger historiepakke</detail>
+ </group>
+ <group id="011">
+  <name>Sonic Level Pack</name>
+  <detail>Sonic Level Pack</detail>
+ </group>
+ <group id="012">
+  <name>LEGO Batman-Filmen historiepakke</name>
+  <detail>LEGO Batman-Filmen historiepakke</detail>
+ </group>
+ <group id="013">
+  <name>Goonierne Level Pack</name>
+  <detail>Goonierne Level Pack</detail>
+ </group>
+ <trophy id="000" hidden="no" ttype="P" pid="-1">
+  <name>Vortechs ømme punkt</name>
+  <detail>Indsaml alle trophies</detail>
+ </trophy>
+ <trophy id="001" hidden="no" ttype="B" pid="000">
+  <name>Ude godt, men hjemme...</name>
+  <detail>Gennemfør 'Følg LEGO klods-vejen'</detail>
+ </trophy>
+ <trophy id="002" hidden="no" ttype="B" pid="000">
+  <name>Chroma Simpson</name>
+  <detail>Gennemfør 'Nedsmeltning i sektor 7-G'</detail>
+ </trophy>
+ <trophy id="003" hidden="no" ttype="B" pid="000">
+  <name>Får som for-Chen-t</name>
+  <detail>Gennemfør 'Overraskelseselementet'</detail>
+ </trophy>
+ <trophy id="004" hidden="no" ttype="B" pid="000">
+  <name>I sidste øjeblik</name>
+  <detail>Gennemførte 'Et Dalekte Eventyr'</detail>
+ </trophy>
+ <trophy id="005" hidden="no" ttype="B" pid="000">
+  <name>Gik bare ind... i Metropolis</name>
+  <detail>Gennemfør 'Vi maler byen... sort?'</detail>
+ </trophy>
+ <trophy id="006" hidden="no" ttype="B" pid="000">
+  <name>Interdimensionelt opgør</name>
+  <detail>Gennemfør 'Tiden flyver i vesten'</detail>
+ </trophy>
+ <trophy id="007" hidden="no" ttype="B" pid="000">
+  <name>GLaD for at være ude derfra!</name>
+  <detail>Gennemfør ''Aperture Science berigelsescenter''</detail>
+ </trophy>
+ <trophy id="008" hidden="no" ttype="B" pid="000">
+  <name>Stil mig en gåde!</name>
+  <detail>Gennemfør 'Gådegård'</detail>
+ </trophy>
+ <trophy id="009" hidden="no" ttype="B" pid="000">
+  <name>Ghost... busted!</name>
+  <detail>Gennemfør 'Fantomzonen'</detail>
+ </trophy>
+ <trophy id="010" hidden="no" ttype="B" pid="000">
+  <name>Indtast dine initialer: AAA</name>
+  <detail>Gennemfør 'Alle dine sten tilhører os'</detail>
+ </trophy>
+ <trophy id="011" hidden="no" ttype="B" pid="000">
+  <name>Zoinks!</name>
+  <detail>Gennemfør 'Mystisk palæ-palaver'</detail>
+ </trophy>
+ <trophy id="012" hidden="no" ttype="B" pid="000">
+  <name>Prøv igen!</name>
+  <detail>Gennemfør 'Primuskernen'</detail>
+ </trophy>
+ <trophy id="013" hidden="no" ttype="B" pid="000">
+  <name>Prøv igen: Med Hævntørst!</name>
+  <detail>Gennemfør 'Enden er trefoldig'</detail>
+ </trophy>
+ <trophy id="014" hidden="no" ttype="B" pid="000">
+  <name>Et seriøst smuthul</name>
+  <detail>Gennemfør 'Sidste Dimension'</detail>
+ </trophy>
+ <trophy id="015" hidden="no" ttype="B" pid="000">
+  <name>Så skal reglerne brydes!</name>
+  <detail>Genopbyg din LEGO Gateway</detail>
+ </trophy>
+ <trophy id="016" hidden="no" ttype="G" pid="000">
+  <name>Brød alle reglerne!</name>
+  <detail>Gennemfør alle historie-baner</detail>
+ </trophy>
+ <trophy id="017" hidden="no" ttype="B" pid="000">
+  <name>Nøgleklodsen til sejr</name>
+  <detail>Indsaml alle Gateway-nøgleklodserne</detail>
+ </trophy>
+ <trophy id="018" hidden="no" ttype="G" pid="000">
+  <name>Fundet sjældne relikvier</name>
+  <detail>Indsaml 30 minikits på banerne</detail>
+ </trophy>
+ <trophy id="019" hidden="no" ttype="S" pid="000">
+  <name>Na na na na na na opgraderinger!</name>
+  <detail>Opgrader Batmobilen til model 2</detail>
+ </trophy>
+ <trophy id="020" hidden="no" ttype="G" pid="000">
+  <name>Sikke nogle opgraderinger Batman</name>
+  <detail>Opgrader Batmobilen til model 3</detail>
+ </trophy>
+ <trophy id="021" hidden="no" ttype="B" pid="000">
+  <name>Hjem kære hjem</name>
+  <detail>Besøg en hub-verden for første gang</detail>
+ </trophy>
+ <trophy id="022" hidden="no" ttype="B" pid="000">
+  <name>Dimensionsudforsker</name>
+  <detail>Besøgte Batman, Gandalf og Graffititøsens hjem</detail>
+ </trophy>
+ <trophy id="023" hidden="no" ttype="B" pid="000">
+  <name>Tid til en opgradering!</name>
+  <detail>Indsaml 5 guldklodser</detail>
+ </trophy>
+ <trophy id="024" hidden="no" ttype="S" pid="000">
+  <name>Den Sande Gyldne Mester!</name>
+  <detail>Indsaml 30 guldklodser</detail>
+ </trophy>
+ <trophy id="025" hidden="no" ttype="B" pid="000">
+  <name>Dimensionssprinter</name>
+  <detail>Fuldfør et ræs i en hub-verden</detail>
+ </trophy>
+ <trophy id="026" hidden="no" ttype="S" pid="000">
+  <name>Sømmet i bund</name>
+  <detail>Fuldfør 5 hub-ræs</detail>
+ </trophy>
+ <trophy id="027" hidden="no" ttype="B" pid="000">
+  <name>De helte vi har brug for</name>
+  <detail>Gennemfør en hub-verden mission</detail>
+ </trophy>
+ <trophy id="028" hidden="no" ttype="B" pid="000">
+  <name>Genopret orden</name>
+  <detail>Gennemfør en hub-verden renovering</detail>
+ </trophy>
+ <trophy id="029" hidden="no" ttype="S" pid="000">
+  <name>Officiel Mesterbygger</name>
+  <detail>Gennemfør 15 hub-verden renoveringer</detail>
+ </trophy>
+ <trophy id="030" hidden="no" ttype="S" pid="000">
+  <name>Igennem røret</name>
+  <detail>Rejs igennem 20 sprækker i spillet</detail>
+ </trophy>
+ <trophy id="031" hidden="no" ttype="S" pid="000">
+  <name>Hurtige ting ryger ind...</name>
+  <detail>Gennemfør ''Aperture Science berigelsescenter'' banen på 25 minutter eller mindre</detail>
+ </trophy>
+ <trophy id="032" hidden="no" ttype="S" pid="000">
+  <name>Altid alene</name>
+  <detail>Gennemfør en bane med kun en aktiv figur på din Toy Pad</detail>
+ </trophy>
+ <trophy id="033" hidden="no" ttype="S" pid="000">
+  <name>Mistet ejendom</name>
+  <detail>Fuldfør 'lokaliseringsmodus'-opgaver</detail>
+ </trophy>
+ <trophy id="034" hidden="no" ttype="S" pid="000">
+  <name>Mal på numrerne</name>
+  <detail>Fuldfør 25 'Chromamodus'-opgaver</detail>
+ </trophy>
+ <trophy id="035" hidden="no" ttype="S" pid="000">
+  <name>Elemental min kære</name>
+  <detail>Gå i 'elemental-modus' 25 unikke gange</detail>
+ </trophy>
+ <trophy id="036" hidden="no" ttype="S" pid="000">
+  <name>For gammel til det dersens Shift</name>
+  <detail>Brug 50 'shiftmodus'-sprækker</detail>
+ </trophy>
+ <trophy id="037" hidden="no" ttype="S" pid="000">
+  <name>Men kan man få den i pink?</name>
+  <detail>Giv Batmobilen et pink look</detail>
+ </trophy>
+ <trophy id="038" hidden="no" ttype="G" pid="000">
+  <name>Kan du lide bling, Batman?</name>
+  <detail>Mal Batmobilen kromfarvet</detail>
+ </trophy>
+ <trophy id="039" hidden="no" ttype="B" pid="-1" gid="001">
+  <name>Tag den, din prærieulv!</name>
+  <detail>Gennemfør ''Homers mystiske rejse''</detail>
+ </trophy>
+ <trophy id="040" hidden="no" ttype="B" pid="-1" gid="001">
+  <name>Mmm ... samlegenstande!</name>
+  <detail>Indsaml et minikit på banen ''Homers mystiske rejse''.</detail>
+ </trophy>
+ <trophy id="041" hidden="no" ttype="B" pid="-1" gid="001">
+  <name>Årh, regler? Jeg hader regler!</name>
+  <detail>Opnå stenmålet ''Regelbryder'' på banen ''Homers mystiske rejse''.</detail>
+ </trophy>
+ <trophy id="042" hidden="no" ttype="B" pid="-1" gid="002">
+  <name>Det var tungt!</name>
+  <detail>Gennemfør ''Tilbage til fremtiden!''</detail>
+ </trophy>
+ <trophy id="043" hidden="no" ttype="B" pid="-1" gid="002">
+  <name>Mr. Fusion hjemmereaktor</name>
+  <detail>Indsaml et minikit på banen ''Tilbage til fremtiden!''</detail>
+ </trophy>
+ <trophy id="044" hidden="no" ttype="B" pid="-1" gid="002">
+  <name>Regler? Nej tak!</name>
+  <detail>Opnå stenmålet ''Regelbryder'' på banen ''Tilbage til fremtiden''.</detail>
+ </trophy>
+ <trophy id="045" hidden="no" ttype="B" pid="-1" gid="003">
+  <name>Det var hyggeligt. Du må videre.</name>
+  <detail>Gennemfør ''Aperture Science''</detail>
+ </trophy>
+ <trophy id="046" hidden="no" ttype="B" pid="-1" gid="003">
+  <name>Når livet giver dig minikit ...</name>
+  <detail>Indsaml et minikit på banen ''Aperture Science''</detail>
+ </trophy>
+ <trophy id="047" hidden="no" ttype="B" pid="-1" gid="003">
+  <name>For videnskaben ... dit monster</name>
+  <detail>Opnå stenmålet ''Regelbryder'' på banen ''Aperture Science''.</detail>
+ </trophy>
+ <trophy id="048" hidden="no" ttype="B" pid="-1" gid="004">
+  <name>Vores skæbne står i stjernerne</name>
+  <detail>Gennemfør ''Dalekernes udryddelse af Jorden''</detail>
+ </trophy>
+ <trophy id="049" hidden="no" ttype="B" pid="-1" gid="004">
+  <name>Et minikit! Minikit er megaseje!</name>
+  <detail>Indsaml et minikit på banen ''Dalekernes udryddelse af Jorden''</detail>
+ </trophy>
+ <trophy id="050" hidden="no" ttype="B" pid="-1" gid="004">
+  <name>Folk kommer og ødelægger dem</name>
+  <detail>Opnå stenmålet ''Regelbryder'' på banen ''Dalekernes udryddelse af Jorden''.</detail>
+ </trophy>
+ <trophy id="051" hidden="no" ttype="B" pid="-1" gid="005">
+  <name>Jeg er ikke bange for spøgelser!</name>
+  <detail>Gennemfør ''Ghostbusters''</detail>
+ </trophy>
+ <trophy id="052" hidden="no" ttype="B" pid="-1" gid="005">
+  <name>VI FIK ÉT!</name>
+  <detail>Indsaml et minikit på ''Ghostbusters''-banen</detail>
+ </trophy>
+ <trophy id="053" hidden="no" ttype="B" pid="-1" gid="005">
+  <name>Jeg kan li' at bryde reglerne</name>
+  <detail>Opnå stenmålet ''Regelbryder'' på ''Ghostbusters''-banen</detail>
+ </trophy>
+ <trophy id="054" hidden="no" ttype="B" pid="-1" gid="006">
+  <name>Ny highscore</name>
+  <detail>Gennemfør ''Ødelæggelse i retrostil''</detail>
+ </trophy>
+ <trophy id="055" hidden="no" ttype="B" pid="-1" gid="006">
+  <name>Mere kraft!</name>
+  <detail>Opnå et minikit i '''Ødelæggelse i retrostiln''</detail>
+ </trophy>
+ <trophy id="056" hidden="no" ttype="B" pid="-1" gid="006">
+  <name>Indsæt sten</name>
+  <detail>Opnå stenmålet ''Regelbryder'' i '''Ødelæggelse i retrostil''</detail>
+ </trophy>
+ <trophy id="057" hidden="no" ttype="B" pid="-1" gid="007">
+  <name>Uendeligt sjov!</name>
+  <detail>Gennemfør 'En bog og en ond fyr'</detail>
+ </trophy>
+ <trophy id="058" hidden="no" ttype="B" pid="-1" gid="007">
+  <name>Endnu en til skattekammeret</name>
+  <detail>Indsaml et minikit på banen 'En bog og en ond fyr'</detail>
+ </trophy>
+ <trophy id="059" hidden="no" ttype="B" pid="-1" gid="007">
+  <name>Matematisk!</name>
+  <detail>Opnå stenmålet ''Regelbryder'' på banen 'En bog og en ond fyr'</detail>
+ </trophy>
+ <trophy id="060" hidden="no" ttype="B" pid="-1" gid="008">
+  <name>Undgik kataklysmen</name>
+  <detail>Gennemfør alle baner i Ghostbusters (2016) historiepakken</detail>
+ </trophy>
+ <trophy id="061" hidden="no" ttype="B" pid="-1" gid="008">
+  <name>Mission busters</name>
+  <detail>Gennemfør en mission i Ghostbusters (2016) eventyrverden</detail>
+ </trophy>
+ <trophy id="062" hidden="no" ttype="B" pid="-1" gid="008">
+  <name>Regelbryder barrieren</name>
+  <detail>Opnå stenmålet ''Regelbryder'' i en Ghostbusters (2016) historiepakke-bane</detail>
+ </trophy>
+ <trophy id="063" hidden="no" ttype="B" pid="-1" gid="009">
+  <name>Mission: Fuldført</name>
+  <detail>Gennemfør 'Mission: Impossible' banen</detail>
+ </trophy>
+ <trophy id="064" hidden="no" ttype="B" pid="-1" gid="009">
+  <name>Frisk som en hemmelig havørn</name>
+  <detail>Indsaml et minikit på banen 'Mission: Impossible'</detail>
+ </trophy>
+ <trophy id="065" hidden="no" ttype="B" pid="-1" gid="009">
+  <name>Godmorgen hr. Hunt</name>
+  <detail>Opnå stenmålet ''Regelbryder'' på banen 'Mission: Impossible'</detail>
+ </trophy>
+ <trophy id="066" hidden="no" ttype="B" pid="-1" gid="010">
+  <name>Ingen mugglere, ingen problemer</name>
+  <detail>Gennemfør alle baner i Fantastiske skabninger historiepakken</detail>
+ </trophy>
+ <trophy id="067" hidden="no" ttype="B" pid="-1" gid="010">
+  <name>Turist i Manhattan</name>
+  <detail>Gennemfør en mission i Fantastiske skabninger eventyrverden</detail>
+ </trophy>
+ <trophy id="068" hidden="no" ttype="B" pid="-1" gid="010">
+  <name>Slip din indre niffler fri</name>
+  <detail>Opnå stenmålet ''Regelbryder'' på en bane fra ''Fantastiske skabninger''</detail>
+ </trophy>
+ <trophy id="069" hidden="no" ttype="B" pid="-1" gid="011">
+  <name>Kaosteori</name>
+  <detail>Gennemfør 'Sonic Dimensions'</detail>
+ </trophy>
+ <trophy id="070" hidden="no" ttype="B" pid="-1" gid="011">
+  <name>Jeg samler normalt på smaragder</name>
+  <detail>Indsaml et minikit på 'Sonic Dimensions'-banen</detail>
+ </trophy>
+ <trophy id="071" hidden="no" ttype="B" pid="-1" gid="011">
+  <name>Ringbryder</name>
+  <detail>Opnå stenmålet ''Regelbryder'' på banen 'Sonic Dimensions'</detail>
+ </trophy>
+ <trophy id="072" hidden="no" ttype="B" pid="-1" gid="012">
+  <name>Gør en forskel</name>
+  <detail>Gennemfør alle baner i LEGO Batman Filmen historiepakken.</detail>
+ </trophy>
+ <trophy id="073" hidden="no" ttype="B" pid="-1" gid="012">
+  <name>Jeg laver Batman-ting</name>
+  <detail>Gennemfør en mission i LEGO Batman Filmen eventyrverdenen.</detail>
+ </trophy>
+ <trophy id="074" hidden="no" ttype="B" pid="-1" gid="012">
+  <name>Bat-dollars</name>
+  <detail>Opnå stenmålet ''Regelbryder'' på en bane fra LEGO Batman Filmen historiepakken</detail>
+ </trophy>
+ <trophy id="075" hidden="no" ttype="B" pid="-1" gid="013">
+  <name>Erklæret et mellem af Goonierne</name>
+  <detail>Gennemfør 'Goonierne'</detail>
+ </trophy>
+ <trophy id="076" hidden="no" ttype="B" pid="-1" gid="013">
+  <name>En pirats skat</name>
+  <detail>Indsaml et minikit på 'Goonierne'-banen</detail>
+ </trophy>
+ <trophy id="077" hidden="no" ttype="B" pid="-1" gid="013">
+  <name>Hey, gutter!</name>
+  <detail>Opnå stenmålet ''Regelbryder'' på banen 'Goonierne'</detail>
+ </trophy>
+</trophyconf>

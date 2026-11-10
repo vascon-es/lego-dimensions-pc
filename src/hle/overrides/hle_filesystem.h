@@ -109,6 +109,7 @@ const std::filesystem::path& WritableRoot();
 // Pastas no formato do /app0 (arquivos soltos, como a CUSA01176-mods do shadPS4): a primeira vence, e todas
 // vencem a atualizacao e o jogo base; as listagens de pasta juntam tudo.
 void SetModOverlays(std::vector<std::filesystem::path> dirs);
+void SetLocaleOverlay(const std::filesystem::path& dir);
 // Pacote do jogo com arquivos trocados por mods (preparado pelo tools/setup/mods.py): o jogo ve a tabela mudada
 // (.HDR do cache) e o .DAT de verdade com a "cauda" dos bytes dos mods depois do fim dele.
 // Vale para qualquer mount (o /app0 e as pastas de DLC): a troca e pelo arquivo do host.

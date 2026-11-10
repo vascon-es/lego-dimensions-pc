@@ -141,6 +141,8 @@ def stage():
     print('areas dos pipelines: %d' % len(entries))
     copy(levels, S('assets', 'shaders_spv', 'pipeline_levels_base.txt'))
     copy(R('assets', 'shaders_spv', 'pair_warm.tsv'), S('assets', 'shaders_spv', 'pair_warm.tsv'))
+    if os.path.isdir(R('assets', 'trophy')):
+        copy_tree(R('assets', 'trophy'), S('assets', 'trophy'))
     for d in ('shaders_aot', 'decrypted_elfs', 'dumped_shaders', 'savedata0', 'temp0', 'download0', os.path.join('shaders_spv', 'pairs')):
         keep(S('assets', d))
     keep(S('build', 'logs'))

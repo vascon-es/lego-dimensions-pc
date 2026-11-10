@@ -16,6 +16,7 @@
 #include <string>
 
 #include "hle/overrides/hle_override.h"
+#include "hle/trophy_manager.h"
 
 namespace {
 
@@ -90,21 +91,22 @@ HLE_OVERRIDE(sceNpTrophyRegisterContext);
 
 HLE_IMPL(int, sceNpTrophyUnlockTrophy, s32 context, s32 handle, s32 trophy_id, s32* platinum_id) {
     HLE_TRACE("TROPHY %d unlocked (context=%d)", trophy_id, context);
+    int plat = -1;
+    hle::trophy::TrophyManager::Instance().UnlockTrophy(trophy_id, &plat);
     if (platinum_id) {
-        *platinum_id = -1; // nenhuma platina concedida junto
+        *platinum_id = plat;
     }
     return err::OK;
 }
 HLE_OVERRIDE(sceNpTrophyUnlockTrophy);
 
-// Mapa de 128 bits de trofeus desbloqueados: todos bloqueados.
+// Mapa de 128 bits de trofeus desbloqueados
 HLE_IMPL(int, sceNpTrophyGetTrophyUnlockState, s32 context, s32 handle, u32* flags, u32* count) {
     HLE_TRACE("contexto=%d", context);
     if (!flags || !count) {
         return kTrophyErrorInvalidArgument;
     }
-    std::memset(flags, 0, 16);
-    *count = 0;
+    hle::trophy::TrophyManager::Instance().GetUnlockState(flags, count);
     return err::OK;
 }
 HLE_OVERRIDE(sceNpTrophyGetTrophyUnlockState);

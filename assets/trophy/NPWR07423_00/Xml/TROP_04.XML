@@ -1,0 +1,372 @@
+<!--Sce-Np-Trophy-Signature: 4c39b98c0100000000000000f59ad8be56db50f0fc67a87f2bdfb875f601fdb6533fb014c8fdac88f5334ad3b4785991f82a1f2525189c06301db133c7bfbee152df184e43dcb2e542430672c698ffabc4886a0ba904ecf203e6ba75e426405a387d024f6f868bd23a24b219c6c460eea37f7141c47c243d674903e2e1b662dd6c183027fa80c00f4424ceb01e8b02049d6f239e0b44f06128058c279650f04c-->
+<trophyconf version="1.1" platform="ps4" policy="large">
+ <npcommid>NPWR07423_00</npcommid>
+ <trophyset-version>01.09</trophyset-version>
+ <parental-level license-area="default">0</parental-level>
+ <title-name>LEGO® DIMENSIONS™</title-name>
+ <title-detail>LEGO® DIMENSIONS™</title-detail>
+ <group id="001">
+  <name>Level-Paket Die Simpsons</name>
+  <detail>Level-Paket Die Simpsons</detail>
+ </group>
+ <group id="002">
+  <name>Level-Paket Zurück in die Zukunft</name>
+  <detail>Level-Paket Zurück in die Zukunft</detail>
+ </group>
+ <group id="003">
+  <name>Level-Paket Portal™</name>
+  <detail>Level-Paket Portal™</detail>
+ </group>
+ <group id="004">
+  <name>Level-Paket Doctor Who</name>
+  <detail>Level-Paket Doctor Who</detail>
+ </group>
+ <group id="005">
+  <name>Level-Paket Ghostbusters - Die Geisterjäger</name>
+  <detail>Level-Paket Ghostbusters - Die Geisterjäger</detail>
+ </group>
+ <group id="006">
+  <name>Level-Paket Midway Arcade</name>
+  <detail>Level-Paket Midway Arcade</detail>
+ </group>
+ <group id="007">
+  <name>Level-Paket Adventure Time</name>
+  <detail>Level-Paket Adventure Time</detail>
+ </group>
+ <group id="008">
+  <name>Story-Paket Ghostbusters™ (2016)</name>
+  <detail>Story-Paket Ghostbusters™ (2016)</detail>
+ </group>
+ <group id="009">
+  <name>Level-Paket Mission: Impossible</name>
+  <detail>Level-Paket Mission: Impossible</detail>
+ </group>
+ <group id="010">
+  <name>Story-Paket Phantastische Tierwesen</name>
+  <detail>Story-Paket Phantastische Tierwesen</detail>
+ </group>
+ <group id="011">
+  <name>Level-Paket Sonic</name>
+  <detail>Level-Paket Sonic</detail>
+ </group>
+ <group id="012">
+  <name>Story-Paket The LEGO Batman Movie</name>
+  <detail>Story-Paket The LEGO Batman Movie</detail>
+ </group>
+ <group id="013">
+  <name>Level-Paket Goonies</name>
+  <detail>Level-Paket Goonies</detail>
+ </group>
+ <trophy id="000" hidden="no" ttype="P" pid="-1">
+  <name>Vortechs Verderben</name>
+  <detail>Sammle alle Trophäen</detail>
+ </trophy>
+ <trophy id="001" hidden="no" ttype="B" pid="000">
+  <name>Nirgends ist es so wie ... hier</name>
+  <detail>Beende „Folge dem LEGO-Stein-Weg“</detail>
+ </trophy>
+ <trophy id="002" hidden="no" ttype="B" pid="000">
+  <name>Wen nennst du einen Dummy?</name>
+  <detail>Beende „Kernschmelze in Sektor 7-G“</detail>
+ </trophy>
+ <trophy id="003" hidden="no" ttype="B" pid="000">
+  <name>Chens Arena</name>
+  <detail>Beende „Überraschungselemente“</detail>
+ </trophy>
+ <trophy id="004" hidden="no" ttype="B" pid="000">
+  <name>Wibbelig-wobbelig-rechtzeitig</name>
+  <detail>Beende „Der Doctor hört ein Who“</detail>
+ </trophy>
+ <trophy id="005" hidden="no" ttype="B" pid="000">
+  <name>Einfach nach Metropolis spaziert</name>
+  <detail>Beende „Ärger in der Innenstadt“</detail>
+ </trophy>
+ <trophy id="006" hidden="no" ttype="B" pid="000">
+  <name>Das interdimensionale Halbfinale</name>
+  <detail>Beende „Es war einmal eine Zeitmaschine im Westen“</detail>
+ </trophy>
+ <trophy id="007" hidden="no" ttype="B" pid="000">
+  <name>Unwissenschaftlich</name>
+  <detail>Beende „Aperture Science Enrichment Centre“</detail>
+ </trophy>
+ <trophy id="008" hidden="no" ttype="B" pid="000">
+  <name>Rat doch mal!</name>
+  <detail>Beende „Knobelerde“</detail>
+ </trophy>
+ <trophy id="009" hidden="no" ttype="B" pid="000">
+  <name>Geister gejagt!</name>
+  <detail>Beende „Die Phantomzone“</detail>
+ </trophy>
+ <trophy id="010" hidden="no" ttype="B" pid="000">
+  <name>Gib deinen Namen ein: AAA</name>
+  <detail>Beende „Alle deine Steine sind gehören uns“</detail>
+ </trophy>
+ <trophy id="011" hidden="no" ttype="B" pid="000">
+  <name>Zoinks!</name>
+  <detail>Beende „Mystery Mansion“</detail>
+ </trophy>
+ <trophy id="012" hidden="no" ttype="B" pid="000">
+  <name>Vielleicht beim nächsten Mal</name>
+  <detail>Beende „Die Ur-Zeit“</detail>
+ </trophy>
+ <trophy id="013" hidden="no" ttype="B" pid="000">
+  <name>Ein gräuliches Wiedersehen</name>
+  <detail>Beende „Die Tri sind hie“</detail>
+ </trophy>
+ <trophy id="014" hidden="no" ttype="B" pid="000">
+  <name>Ein Schlupfloch ohne Ausweg</name>
+  <detail>Beende „Die letzte Dimension“</detail>
+ </trophy>
+ <trophy id="015" hidden="no" ttype="B" pid="000">
+  <name>Zeit, die Regeln zu brechen!</name>
+  <detail>Bau das LEGO-Tor wieder auf</detail>
+ </trophy>
+ <trophy id="016" hidden="no" ttype="G" pid="000">
+  <name>Die Regeln gebrochen!</name>
+  <detail>Beende alle Geschichten-Levels</detail>
+ </trophy>
+ <trophy id="017" hidden="no" ttype="B" pid="000">
+  <name>Der Schlüsselstein zum Sieg</name>
+  <detail>Sammle alle Schlüsselsteine ein</detail>
+ </trophy>
+ <trophy id="018" hidden="no" ttype="G" pid="000">
+  <name>Seltene Artefakte: eingesammelt!</name>
+  <detail>Sammle in Levels 30 Minikits ein</detail>
+ </trophy>
+ <trophy id="019" hidden="no" ttype="S" pid="000">
+  <name>Na-na-na-na-na-na-na-na, BESSER!</name>
+  <detail>Rüste das Batmobil zu Modell 2 auf</detail>
+ </trophy>
+ <trophy id="020" hidden="no" ttype="G" pid="000">
+  <name>Heilige Aufrüstung, Batman!</name>
+  <detail>Rüste das Batmobil zu Modell 3 auf</detail>
+ </trophy>
+ <trophy id="021" hidden="no" ttype="B" pid="000">
+  <name>Trautes Heim</name>
+  <detail>Besuche eine der Welten zum ersten Mal</detail>
+ </trophy>
+ <trophy id="022" hidden="no" ttype="B" pid="000">
+  <name>Dimensionenforscher</name>
+  <detail>Besuch die Welten von Batman, Gandalf und Wyldstyle</detail>
+ </trophy>
+ <trophy id="023" hidden="no" ttype="B" pid="000">
+  <name>Zeit zum Aufrüsten!</name>
+  <detail>Sammle 5 Goldene Steine</detail>
+ </trophy>
+ <trophy id="024" hidden="no" ttype="S" pid="000">
+  <name>Der wahre Meister des Goldes!</name>
+  <detail>Sammle 30 Goldene Steine</detail>
+ </trophy>
+ <trophy id="025" hidden="no" ttype="B" pid="000">
+  <name>Dimensionen-Raser</name>
+  <detail>Beende ein Rennen in einer beliebigen Welt</detail>
+ </trophy>
+ <trophy id="026" hidden="no" ttype="S" pid="000">
+  <name>Auf die Tube gedrückt</name>
+  <detail>Beende fünf Rennen</detail>
+ </trophy>
+ <trophy id="027" hidden="no" ttype="B" pid="000">
+  <name>Die Helden, die wir brauchen</name>
+  <detail>Schließ einen beliebigen Auftrag ab</detail>
+ </trophy>
+ <trophy id="028" hidden="no" ttype="B" pid="000">
+  <name>Ordnung wiederherstellen</name>
+  <detail>Schließ eins der Renovierungsprojekte ab</detail>
+ </trophy>
+ <trophy id="029" hidden="no" ttype="S" pid="000">
+  <name>Offizieller Meisterbauer</name>
+  <detail>Schließ 15 Renovierungsprojekte ab</detail>
+ </trophy>
+ <trophy id="030" hidden="no" ttype="S" pid="000">
+  <name>Die bequemste Art zu reisen?</name>
+  <detail>Reise im Spiel durch 20 Tunnel</detail>
+ </trophy>
+ <trophy id="031" hidden="no" ttype="S" pid="000">
+  <name>Was schnell rein geht ...</name>
+  <detail>Beende „Aperture Science Enrichment Centre“ innerhalb von 25 Minuten</detail>
+ </trophy>
+ <trophy id="032" hidden="no" ttype="S" pid="000">
+  <name>Für immer allein</name>
+  <detail>Beende ein Level mit jeweils einem aktiven Charakter</detail>
+ </trophy>
+ <trophy id="033" hidden="no" ttype="S" pid="000">
+  <name>Gefunden!</name>
+  <detail>Löse 25 Rätsel im Positionsmodus</detail>
+ </trophy>
+ <trophy id="034" hidden="no" ttype="S" pid="000">
+  <name>Auswaschbar</name>
+  <detail>Löse 25 Chroma-Aufgaben</detail>
+ </trophy>
+ <trophy id="035" hidden="no" ttype="S" pid="000">
+  <name>Ganz in deinem Element</name>
+  <detail>Wechsle 25 Mal in den Elementarmodus</detail>
+ </trophy>
+ <trophy id="036" hidden="no" ttype="S" pid="000">
+  <name>Bald wird ihnen schwindlig</name>
+  <detail>Versetz Charaktere durch 50 „Versetzen“-Tunnel</detail>
+ </trophy>
+ <trophy id="037" hidden="no" ttype="S" pid="000">
+  <name>Aber gibts das auch in rosa?</name>
+  <detail>Lackier das Batmobil rosa</detail>
+ </trophy>
+ <trophy id="038" hidden="no" ttype="G" pid="000">
+  <name>Magst du Gefunkel, Batman?</name>
+  <detail>Verchrome das Batmobil</detail>
+ </trophy>
+ <trophy id="039" hidden="no" ttype="B" pid="-1" gid="001">
+  <name>Nimm das, Weltraumkojote!</name>
+  <detail>Beende „Die geheimnisvolle Reise des Homer“</detail>
+ </trophy>
+ <trophy id="040" hidden="no" ttype="B" pid="-1" gid="001">
+  <name>Mmmh, Sammelgegenstände!</name>
+  <detail>Sammle ein Minikit im Level „Die geheimnisvolle Reise des Homer“ ein</detail>
+ </trophy>
+ <trophy id="041" hidden="no" ttype="B" pid="-1" gid="001">
+  <name>Och, Regeln? Ich hasse Regeln!</name>
+  <detail>Erfülle die „Regellos“-Steinchenvorgabe im Level „Die geheimnisvolle Reise des Homer“</detail>
+ </trophy>
+ <trophy id="042" hidden="no" ttype="B" pid="-1" gid="002">
+  <name>Das war vielleicht heftig!</name>
+  <detail>Beende „Zurück in die Zukunft!“</detail>
+ </trophy>
+ <trophy id="043" hidden="no" ttype="B" pid="-1" gid="002">
+  <name>Herr Fusionsgenerator</name>
+  <detail>Sammle ein Minikit im Level „Zurück in die Zukunft!“ ein</detail>
+ </trophy>
+ <trophy id="044" hidden="no" ttype="B" pid="-1" gid="002">
+  <name>Regeln? Die brauchen wir nicht!</name>
+  <detail>Erfülle die „Regellos“-Steinchenvorgabe im Level „Zurück in die Zukunft!“</detail>
+ </trophy>
+ <trophy id="045" hidden="no" ttype="B" pid="-1" gid="003">
+  <name>Es war schön. Komm nie zurück</name>
+  <detail>Beende „Aperture Science“</detail>
+ </trophy>
+ <trophy id="046" hidden="no" ttype="B" pid="-1" gid="003">
+  <name>Gibt das Leben dir Minikits ...</name>
+  <detail>Sammle ein Minikit im Level „Aperture Science“ ein</detail>
+ </trophy>
+ <trophy id="047" hidden="no" ttype="B" pid="-1" gid="003">
+  <name>Für die Wissenschaft. Monster.</name>
+  <detail>Erfülle die „Regellos“-Steinchenvorgabe im Level „Aperture Science“</detail>
+ </trophy>
+ <trophy id="048" hidden="no" ttype="B" pid="-1" gid="004">
+  <name>Unser Schicksal in den Sternen</name>
+  <detail>Beende „Die Eliminierung der Erde durch die Daleks“</detail>
+ </trophy>
+ <trophy id="049" hidden="no" ttype="B" pid="-1" gid="004">
+  <name>Ein Minikit! Minikits sind cool!</name>
+  <detail>Sammle ein Minikit im Level „Die Eliminierung der Erde durch die Daleks“ ein</detail>
+ </trophy>
+ <trophy id="050" hidden="no" ttype="B" pid="-1" gid="004">
+  <name>Und dann macht es jemand kaputt</name>
+  <detail>Erfülle die Steinchenvorgabe im Level „Die Eliminierung der Erde durch die Daleks“</detail>
+ </trophy>
+ <trophy id="051" hidden="no" ttype="B" pid="-1" gid="005">
+  <name>Vor Geistern hab ich keine Angst</name>
+  <detail>Beende „Ghostbusters - Die Geisterjäger“</detail>
+ </trophy>
+ <trophy id="052" hidden="no" ttype="B" pid="-1" gid="005">
+  <name>WIR HABEN EINS!!!</name>
+  <detail>Sammle ein Minikit im Level  „Ghostbusters - Die Geisterjäger“ ein</detail>
+ </trophy>
+ <trophy id="053" hidden="no" ttype="B" pid="-1" gid="005">
+  <name>Regeln brechen macht mir Spaß</name>
+  <detail>Erfülle die „Regellos“-Steinchenvorgabe im Level „Ghostbusters - Die Geisterjäger“</detail>
+ </trophy>
+ <trophy id="054" hidden="no" ttype="B" pid="-1" gid="006">
+  <name>Neuer Highscore</name>
+  <detail>Beende „Retrorauferei“</detail>
+ </trophy>
+ <trophy id="055" hidden="no" ttype="B" pid="-1" gid="006">
+  <name>Power-Up!</name>
+  <detail>Sammle in „Retrorauferei“ ein Minikit ein</detail>
+ </trophy>
+ <trophy id="056" hidden="no" ttype="B" pid="-1" gid="006">
+  <name>Steinchen einwerfen</name>
+  <detail>Erfülle die „Regellos“-Steinchenvorgabe in „Retrorauferei“</detail>
+ </trophy>
+ <trophy id="057" hidden="no" ttype="B" pid="-1" gid="007">
+  <name>Der Spaß hört niemals auf!</name>
+  <detail>Beende „Ein Buch, ein Bösewicht“</detail>
+ </trophy>
+ <trophy id="058" hidden="no" ttype="B" pid="-1" gid="007">
+  <name>Noch was für die Schatzkammer!</name>
+  <detail>Sammle ein Minikit in „Ein Buch, ein Bösewicht“ ein</detail>
+ </trophy>
+ <trophy id="059" hidden="no" ttype="B" pid="-1" gid="007">
+  <name>Mathematisch!</name>
+  <detail>Erfülle die „Regellos“-Steinchenvorgabe in „Ein Buch, ein Bösewicht“</detail>
+ </trophy>
+ <trophy id="060" hidden="no" ttype="B" pid="-1" gid="008">
+  <name>Den Kataklysmus abgewendet</name>
+  <detail>Beende alle Levels im Story-Paket: Ghostbusters (2016)</detail>
+ </trophy>
+ <trophy id="061" hidden="no" ttype="B" pid="-1" gid="008">
+  <name>Questbusters</name>
+  <detail>Erfülle eine Aufgabe in der Abenteuerwelt für Ghostbusters (2016)</detail>
+ </trophy>
+ <trophy id="062" hidden="no" ttype="B" pid="-1" gid="008">
+  <name>Steinchenbarriere durchbrechen</name>
+  <detail>Erfülle die „Regellos“-Steinchenvorgabe in einem Level aus Story-Paket: Ghostbusters</detail>
+ </trophy>
+ <trophy id="063" hidden="no" ttype="B" pid="-1" gid="009">
+  <name>Mission: Erfolgreich</name>
+  <detail>Beende „Mission: Impossible“</detail>
+ </trophy>
+ <trophy id="064" hidden="no" ttype="B" pid="-1" gid="009">
+  <name>Nichts lieber als das</name>
+  <detail>Sammle ein Minikit in „Mission: Impossible“ ein</detail>
+ </trophy>
+ <trophy id="065" hidden="no" ttype="B" pid="-1" gid="009">
+  <name>Guten Morgen, Mr. Hunt</name>
+  <detail>Erfülle die „Regellos“-Steinchenvorgabe in „Mission: Impossible“</detail>
+ </trophy>
+ <trophy id="066" hidden="no" ttype="B" pid="-1" gid="010">
+  <name>Sind alle No-Majs so wie du?</name>
+  <detail>Beende alle Levels im Story-Paket: Phantastische Tierwesen</detail>
+ </trophy>
+ <trophy id="067" hidden="no" ttype="B" pid="-1" gid="010">
+  <name>Tourist in Manhattan</name>
+  <detail>Erfülle eine Aufgabe in der Abenteuerwelt für Phantastische Tierwesen</detail>
+ </trophy>
+ <trophy id="068" hidden="no" ttype="B" pid="-1" gid="010">
+  <name>Mehr Glitzerkram als ein Niffler</name>
+  <detail>Erfülle die „Regellos“-Steinchenvorgabe in einem Level aus Phantastische Tierwesen</detail>
+ </trophy>
+ <trophy id="069" hidden="no" ttype="B" pid="-1" gid="011">
+  <name>Chaostheorie</name>
+  <detail>Beende „Sonic Dimensions“</detail>
+ </trophy>
+ <trophy id="070" hidden="no" ttype="B" pid="-1" gid="011">
+  <name>Eigentlich sammle ich Emeralds!</name>
+  <detail>Sammle in „Sonic Dimensions“ ein Minikit ein</detail>
+ </trophy>
+ <trophy id="071" hidden="no" ttype="B" pid="-1" gid="011">
+  <name>Alle Ringe</name>
+  <detail>Erfülle die „Regellos“-Steinchenvorgabe in „Sonic Dimensions“</detail>
+ </trophy>
+ <trophy id="072" hidden="no" ttype="B" pid="-1" gid="012">
+  <name>Eine Verbesserung</name>
+  <detail>Beende alle Level im Story-Paket: The LEGO Batman Movie</detail>
+ </trophy>
+ <trophy id="073" hidden="no" ttype="B" pid="-1" gid="012">
+  <name>Ich war Batman</name>
+  <detail>Erfülle eine Aufgabe in der Abenteuerwelt für The LEGO Batman Movie</detail>
+ </trophy>
+ <trophy id="074" hidden="no" ttype="B" pid="-1" gid="012">
+  <name>Bat-Dollar</name>
+  <detail>Erfülle die „Regellos“-Steinchenvorgabe in einem Level aus The LEGO Batman Movie</detail>
+ </trophy>
+ <trophy id="075" hidden="no" ttype="B" pid="-1" gid="013">
+  <name>Zum Mit-Goonie erkoren</name>
+  <detail>Beende „Die Goonies“</detail>
+ </trophy>
+ <trophy id="076" hidden="no" ttype="B" pid="-1" gid="013">
+  <name>Der Piratenschatz</name>
+  <detail>Sammle in „Die Goonies“ ein Minikit ein</detail>
+ </trophy>
+ <trophy id="077" hidden="no" ttype="B" pid="-1" gid="013">
+  <name>He, Leute!</name>
+  <detail>Erfülle die „Regellos“-Steinchenvorgabe in „Die Goonies“</detail>
+ </trophy>
+</trophyconf>

@@ -1,0 +1,372 @@
+<!--Sce-Np-Trophy-Signature: 4c39b98c01000000000000006da40027db8e2cee41f0b6dad69de7a8f147df97397721c39812df4763a447627051a390c3a81a8df906c0460ce2e26aa1bcf6a3c41bdfdc8fe91eda6f510459cdb81aed75a76de9c888ed7048e571c168e91eadf473d085bff4313e2e166cd7f8e32a9e569e45a727c46b9eee2ecb938587ee4f7561e9b9469126f24ee1018418336347042c2abb25fafedc2d7f28e409355815-->
+<trophyconf version="1.1" platform="ps4" policy="large">
+ <npcommid>NPWR07423_00</npcommid>
+ <trophyset-version>01.09</trophyset-version>
+ <parental-level license-area="default">0</parental-level>
+ <title-name>LEGO® DIMENSIONS™</title-name>
+ <title-detail>LEGO® DIMENSIONS™</title-detail>
+ <group id="001">
+  <name>Paquete de nivel: Los Simpson</name>
+  <detail>Paquete de nivel: Los Simpson</detail>
+ </group>
+ <group id="002">
+  <name>Paquete de nivel: Regreso al futuro</name>
+  <detail>Paquete de nivel: Regreso al futuro</detail>
+ </group>
+ <group id="003">
+  <name>Paquete de nivel: Portal™</name>
+  <detail>Paquete de nivel: Portal™</detail>
+ </group>
+ <group id="004">
+  <name>Paquete de nivel: Doctor Who</name>
+  <detail>Paquete de nivel: Doctor Who</detail>
+ </group>
+ <group id="005">
+  <name>Paquete de nivel: Cazafantasmas</name>
+  <detail>Paquete de nivel: Cazafantasmas</detail>
+ </group>
+ <group id="006">
+  <name>Paquete de nivel: Midway Arcade</name>
+  <detail>Paquete de nivel: Midway Arcade</detail>
+ </group>
+ <group id="007">
+  <name>Paquete de nivel: Hora de aventuras</name>
+  <detail>Paquete de nivel: Hora de aventuras</detail>
+ </group>
+ <group id="008">
+  <name>Paquete de historia: Cazafantasmas (2016)</name>
+  <detail>Paquete de historia: Cazafantasmas (2016)</detail>
+ </group>
+ <group id="009">
+  <name>Paquete de nivel: Misión: Imposible</name>
+  <detail>Paquete de nivel: Misión: Imposible</detail>
+ </group>
+ <group id="010">
+  <name>Paquete de historia: Animales fantásticos</name>
+  <detail>Paquete de historia: Animales fantásticos</detail>
+ </group>
+ <group id="011">
+  <name>Paquete de nivel: Sonic</name>
+  <detail>Paquete de nivel: Sonic</detail>
+ </group>
+ <group id="012">
+  <name>Paquete de historia: Batman La LEGO Película</name>
+  <detail>Paquete de historia: Batman La LEGO Película</detail>
+ </group>
+ <group id="013">
+  <name>Paquete de nivel: Los Goonies</name>
+  <detail>Paquete de nivel: Los Goonies</detail>
+ </group>
+ <trophy id="000" hidden="no" ttype="P" pid="-1">
+  <name>La pesadilla de Vortech</name>
+  <detail>Colecciona todos los trofeos</detail>
+ </trophy>
+ <trophy id="001" hidden="no" ttype="B" pid="000">
+  <name>No hay como estar... aquí</name>
+  <detail>Completa «Sigue el camino de ladrillos de LEGO»</detail>
+ </trophy>
+ <trophy id="002" hidden="no" ttype="B" pid="000">
+  <name>Croma Simpson</name>
+  <detail>Completa «Fusión en el sector 7-G»</detail>
+ </trophy>
+ <trophy id="003" hidden="no" ttype="B" pid="000">
+  <name>De ratones y Chen</name>
+  <detail>Completa «Elementos de sorpresa»</detail>
+ </trophy>
+ <trophy id="004" hidden="no" ttype="B" pid="000">
+  <name>Justo a tiempo</name>
+  <detail>Completa «Una aventura dalekciosa»</detail>
+ </trophy>
+ <trophy id="005" hidden="no" ttype="B" pid="000">
+  <name>Entré fácilmente en Metrópolis</name>
+  <detail>Completa «Pintar la ciudad de negro»</detail>
+ </trophy>
+ <trophy id="006" hidden="no" ttype="B" pid="000">
+  <name>Confrontación interdimensional</name>
+  <detail>Completa «Érase una vez una máquina del tiempo en el oeste»</detail>
+ </trophy>
+ <trophy id="007" hidden="no" ttype="B" pid="000">
+  <name>¡Me aGLaDA no estar ahí!</name>
+  <detail>Completa «Centro de desarrollo de Aperture Science»</detail>
+ </trophy>
+ <trophy id="008" hidden="no" ttype="B" pid="000">
+  <name>Adivina, adivinanza</name>
+  <detail>Completa «Acertijos de la Tierra Media»</detail>
+ </trophy>
+ <trophy id="009" hidden="no" ttype="B" pid="000">
+  <name>Fantasmas cazados</name>
+  <detail>Completa «La Zona fantasma»</detail>
+ </trophy>
+ <trophy id="010" hidden="no" ttype="B" pid="000">
+  <name>Introduce tus iniciales: «AAA»</name>
+  <detail>Completa «Todos tus ladrillos nos pertenecen»</detail>
+ </trophy>
+ <trophy id="011" hidden="no" ttype="B" pid="000">
+  <name>¡Córcholis!</name>
+  <detail>Completa «Mezcla en la mansión misteriosa»</detail>
+ </trophy>
+ <trophy id="012" hidden="no" ttype="B" pid="000">
+  <name>La próxima será un trío</name>
+  <detail>Completa «Horario supremo»</detail>
+ </trophy>
+ <trophy id="013" hidden="no" ttype="B" pid="000">
+  <name>La venganza del Trío</name>
+  <detail>Completa «El fin del Trío»</detail>
+ </trophy>
+ <trophy id="014" hidden="no" ttype="B" pid="000">
+  <name>Un fallo serio</name>
+  <detail>Completa «La dimensión final»</detail>
+ </trophy>
+ <trophy id="015" hidden="no" ttype="B" pid="000">
+  <name>¡Hora de romper las reglas!</name>
+  <detail>Reconstruye el portal de LEGO</detail>
+ </trophy>
+ <trophy id="016" hidden="no" ttype="G" pid="000">
+  <name>¡Rompiste las reglas!</name>
+  <detail>Completa todos los niveles de la historia</detail>
+ </trophy>
+ <trophy id="017" hidden="no" ttype="B" pid="000">
+  <name>La Piedra angular de la victoria</name>
+  <detail>Recoge todas las Piedras angulares del portal</detail>
+ </trophy>
+ <trophy id="018" hidden="no" ttype="G" pid="000">
+  <name>Artefactos raros... recogidos</name>
+  <detail>Recoge 30 minikits de los niveles</detail>
+ </trophy>
+ <trophy id="019" hidden="no" ttype="S" pid="000">
+  <name>¡Na na na na na na na mejoras!</name>
+  <detail>Mejora el Batmóvil a modelo 2</detail>
+ </trophy>
+ <trophy id="020" hidden="no" ttype="G" pid="000">
+  <name>¡Santas mejoras, Batman!</name>
+  <detail>Mejora el Batmóvil a modelo 3</detail>
+ </trophy>
+ <trophy id="021" hidden="no" ttype="B" pid="000">
+  <name>Hogar, dulce hogar</name>
+  <detail>Visita un mundo del centro por primera vez</detail>
+ </trophy>
+ <trophy id="022" hidden="no" ttype="B" pid="000">
+  <name>Explorador dimensional</name>
+  <detail>Visita los mundos de Batman, Gandalf y Supercool</detail>
+ </trophy>
+ <trophy id="023" hidden="no" ttype="B" pid="000">
+  <name>¡Hora de una mejora!</name>
+  <detail>Colecciona 5 ladrillos dorados</detail>
+ </trophy>
+ <trophy id="024" hidden="no" ttype="S" pid="000">
+  <name>¡El auténtico maestro dorado!</name>
+  <detail>Colecciona 30 ladrillos dorados</detail>
+ </trophy>
+ <trophy id="025" hidden="no" ttype="B" pid="000">
+  <name>Velocista dimensional</name>
+  <detail>Completa una carrera en cualquier mundo central</detail>
+ </trophy>
+ <trophy id="026" hidden="no" ttype="S" pid="000">
+  <name>Acelera a fondo</name>
+  <detail>Completa 5 carreras en el centro</detail>
+ </trophy>
+ <trophy id="027" hidden="no" ttype="B" pid="000">
+  <name>Los héroes que necesitamos</name>
+  <detail>Completa una misión de cualquier mundo central</detail>
+ </trophy>
+ <trophy id="028" hidden="no" ttype="B" pid="000">
+  <name>Restaurando el orden</name>
+  <detail>Completa la renovación de cualquier mundo central</detail>
+ </trophy>
+ <trophy id="029" hidden="no" ttype="S" pid="000">
+  <name>Maestro constructor oficial</name>
+  <detail>Completa 15 renovaciones en los mundos centrales</detail>
+ </trophy>
+ <trophy id="030" hidden="no" ttype="S" pid="000">
+  <name>Por el túnel</name>
+  <detail>Viaja por 20 fisuras en todo el juego</detail>
+ </trophy>
+ <trophy id="031" hidden="no" ttype="S" pid="000">
+  <name>Cosa rápida entra...</name>
+  <detail>Completa «Centro de desarrollo de Aperture Science» en menos de 25 minutos</detail>
+ </trophy>
+ <trophy id="032" hidden="no" ttype="S" pid="000">
+  <name>Solo para siempre</name>
+  <detail>Completa un nivel con solo un personaje activo en la plataforma en todo momento</detail>
+ </trophy>
+ <trophy id="033" hidden="no" ttype="S" pid="000">
+  <name>Objetos perdidos</name>
+  <detail>Completa 25 puzles del «modo localizar»</detail>
+ </trophy>
+ <trophy id="034" hidden="no" ttype="S" pid="000">
+  <name>Pintar por números</name>
+  <detail>Completa 25 puzles en «modo croma»</detail>
+ </trophy>
+ <trophy id="035" hidden="no" ttype="S" pid="000">
+  <name>Elemental, querido</name>
+  <detail>Activa el «modo elemental» en 25 ocasiones únicas</detail>
+ </trophy>
+ <trophy id="036" hidden="no" ttype="S" pid="000">
+  <name>Demasiado viejo para el cambio</name>
+  <detail>Cambia entre 50 fisuras en el «modo de cambio»</detail>
+ </trophy>
+ <trophy id="037" hidden="no" ttype="S" pid="000">
+  <name>¿Pero viene en rosa?</name>
+  <detail>Pinta el Batmóvil de color rosa</detail>
+ </trophy>
+ <trophy id="038" hidden="no" ttype="G" pid="000">
+  <name>¿Te gustan las cosas llamativas?</name>
+  <detail>Pinta el Batmóvil de color cromo</detail>
+ </trophy>
+ <trophy id="039" hidden="no" ttype="B" pid="-1" gid="001">
+  <name>¡Chúpate esa, coyote espacial!</name>
+  <detail>Completa «El misterioso viaje de Homer»</detail>
+ </trophy>
+ <trophy id="040" hidden="no" ttype="B" pid="-1" gid="001">
+  <name>Mmm... ¡Objetos de colección!</name>
+  <detail>Recoge cualquier minikit en el nivel «El misterioso viaje de Homer»</detail>
+ </trophy>
+ <trophy id="041" hidden="no" ttype="B" pid="-1" gid="001">
+  <name>Oh, ¿reglas? ¡Odio las reglas!</name>
+  <detail>Consigue el objetivo de «Romper las reglas» en el nivel «El misterioso viaje de Homer»</detail>
+ </trophy>
+ <trophy id="042" hidden="no" ttype="B" pid="-1" gid="002">
+  <name>¡Es muy pesado!</name>
+  <detail>Completa «Regreso al futuro»</detail>
+ </trophy>
+ <trophy id="043" hidden="no" ttype="B" pid="-1" gid="002">
+  <name>Reactor de fusión</name>
+  <detail>Recoge cualquier minikit en el nivel «Regreso al futuro»</detail>
+ </trophy>
+ <trophy id="044" hidden="no" ttype="B" pid="-1" gid="002">
+  <name>¿Reglas? ¡No necesitamos reglas!</name>
+  <detail>Consigue el objetivo de «Romper las reglas» en el nivel «Regreso al futuro»</detail>
+ </trophy>
+ <trophy id="045" hidden="no" ttype="B" pid="-1" gid="003">
+  <name>Fue divertido, no vuelvas</name>
+  <detail>Completa «Aperture Science»</detail>
+ </trophy>
+ <trophy id="046" hidden="no" ttype="B" pid="-1" gid="003">
+  <name>Cuando la vida te da minikits...</name>
+  <detail>Recoge cualquier minikit en el nivel «Aperture Science»</detail>
+ </trophy>
+ <trophy id="047" hidden="no" ttype="B" pid="-1" gid="003">
+  <name>¡Por la ciencia, monstruo!</name>
+  <detail>Consigue el objetivo de «Romper las reglas» en el nivel «Aperture Science»</detail>
+ </trophy>
+ <trophy id="048" hidden="no" ttype="B" pid="-1" gid="004">
+  <name>El destino está en las estrellas</name>
+  <detail>Completa «Los Daleks exterminan la Tierra»</detail>
+ </trophy>
+ <trophy id="049" hidden="no" ttype="B" pid="-1" gid="004">
+  <name>¡Un minikit, los minikits molan!</name>
+  <detail>Recoge cualquier minikit en el nivel «Los Daleks exterminan la Tierra»</detail>
+ </trophy>
+ <trophy id="050" hidden="no" ttype="B" pid="-1" gid="004">
+  <name>Viene gente y las rompen</name>
+  <detail>Consigue el objetivo de «Romper las reglas» en el nivel «Los Daleks exterminan la Tierra»</detail>
+ </trophy>
+ <trophy id="051" hidden="no" ttype="B" pid="-1" gid="005">
+  <name>No me dan miedo los fantasmas</name>
+  <detail>Completa «Cazafantasmas»</detail>
+ </trophy>
+ <trophy id="052" hidden="no" ttype="B" pid="-1" gid="005">
+  <name>¡¡Tenemos uno!!</name>
+  <detail>Recoge cualquier minikit en el nivel «Cazafantasmas»</detail>
+ </trophy>
+ <trophy id="053" hidden="no" ttype="B" pid="-1" gid="005">
+  <name>Me encanta romper las reglas</name>
+  <detail>Consigue el objetivo de «Romper las reglas» en el nivel «Cazafantasmas»</detail>
+ </trophy>
+ <trophy id="054" hidden="no" ttype="B" pid="-1" gid="006">
+  <name>Nueva mejor puntuación</name>
+  <detail>Completa «Retroruinas»</detail>
+ </trophy>
+ <trophy id="055" hidden="no" ttype="B" pid="-1" gid="006">
+  <name>¡Mejora!</name>
+  <detail>Recoge cualquier minikit en «Retroruinas»</detail>
+ </trophy>
+ <trophy id="056" hidden="no" ttype="B" pid="-1" gid="006">
+  <name>Insertar pieza</name>
+  <detail>Consigue el objetivo de «Romper las reglas» en el nivel «Retroruinas»</detail>
+ </trophy>
+ <trophy id="057" hidden="no" ttype="B" pid="-1" gid="007">
+  <name>La diversión nunca acabará</name>
+  <detail>Completa «Un libro y un villano»</detail>
+ </trophy>
+ <trophy id="058" hidden="no" ttype="B" pid="-1" gid="007">
+  <name>Otro más para la sala de tesoros</name>
+  <detail>Recoge cualquier minikit en el nivel «Un libro y un villano»</detail>
+ </trophy>
+ <trophy id="059" hidden="no" ttype="B" pid="-1" gid="007">
+  <name>¡Matemático!</name>
+  <detail>Consigue el objetivo de «Romper las reglas» en el nivel «Un libro y un villano»</detail>
+ </trophy>
+ <trophy id="060" hidden="no" ttype="B" pid="-1" gid="008">
+  <name>Evitar el cataclismo</name>
+  <detail>Completa todos los niveles en el «Paquete de historia: Cazafantasmas (2016)»</detail>
+ </trophy>
+ <trophy id="061" hidden="no" ttype="B" pid="-1" gid="008">
+  <name>Destructor de misiones</name>
+  <detail>Completa una misión en el mundo de aventura de Cazafantasmas (2016)</detail>
+ </trophy>
+ <trophy id="062" hidden="no" ttype="B" pid="-1" gid="008">
+  <name>Romper la barrera de reglas</name>
+  <detail>Consigue el objetivo de «Romper las reglas» en un nivel del «Paquete de historia: Cazafantasmas»</detail>
+ </trophy>
+ <trophy id="063" hidden="no" ttype="B" pid="-1" gid="009">
+  <name>Misión: Cumplida</name>
+  <detail>Completa el nivel «Misión: Imposible»</detail>
+ </trophy>
+ <trophy id="064" hidden="no" ttype="B" pid="-1" gid="009">
+  <name>No lo aceptaría de otra forma</name>
+  <detail>Recoge cualquier minikit en el nivel «Misión: Imposible»</detail>
+ </trophy>
+ <trophy id="065" hidden="no" ttype="B" pid="-1" gid="009">
+  <name>Buenos días, Sr. Hunt...</name>
+  <detail>Consigue el objetivo de «Romper las reglas» en el nivel «Misión: Imposible»</detail>
+ </trophy>
+ <trophy id="066" hidden="no" ttype="B" pid="-1" gid="010">
+  <name>Nomaj, sin problema</name>
+  <detail>Completa todos los niveles en el «Paquete de historia: Animales fantásticos»</detail>
+ </trophy>
+ <trophy id="067" hidden="no" ttype="B" pid="-1" gid="010">
+  <name>Turista en Manhattan</name>
+  <detail>Completa cualquier misión en el mundo de aventura de Animales fantásticos</detail>
+ </trophy>
+ <trophy id="068" hidden="no" ttype="B" pid="-1" gid="010">
+  <name>Más brillante que un escarbato</name>
+  <detail>Consigue «Romper las reglas» en cualquier nivel del «Paquete de historia: Animales fantásticos»</detail>
+ </trophy>
+ <trophy id="069" hidden="no" ttype="B" pid="-1" gid="011">
+  <name>Teoría Chaos</name>
+  <detail>Completa «Dimensiones Sonic»</detail>
+ </trophy>
+ <trophy id="070" hidden="no" ttype="B" pid="-1" gid="011">
+  <name>Normalmente recojo esmeraldas</name>
+  <detail>Recoge cualquier minikit en el nivel «Dimensiones Sonic»</detail>
+ </trophy>
+ <trophy id="071" hidden="no" ttype="B" pid="-1" gid="011">
+  <name>Romper los anillos</name>
+  <detail>Consigue el objetivo de «Romper las reglas» en el nivel «Dimensiones Sonic»</detail>
+ </trophy>
+ <trophy id="072" hidden="no" ttype="B" pid="-1" gid="012">
+  <name>Hacer un cambio</name>
+  <detail>Completa todos los niveles en el «Paquete de historia: Batman La LEGO Película»</detail>
+ </trophy>
+ <trophy id="073" hidden="no" ttype="B" pid="-1" gid="012">
+  <name>Estuve haciendo de Batman</name>
+  <detail>Completa una misión en el mundo de aventura de Batman La LEGO Película</detail>
+ </trophy>
+ <trophy id="074" hidden="no" ttype="B" pid="-1" gid="012">
+  <name>Batdólares</name>
+  <detail>Consigue «Romper las reglas» en un nivel del «Paquete de historia: Batman La LEGO Película»</detail>
+ </trophy>
+ <trophy id="075" hidden="no" ttype="B" pid="-1" gid="013">
+  <name>Declarado uno de los Goonies</name>
+  <detail>Completa «Los Goonies»</detail>
+ </trophy>
+ <trophy id="076" hidden="no" ttype="B" pid="-1" gid="013">
+  <name>Un botín pirático</name>
+  <detail>Recoge cualquier minikit en el nivel «Los Goonies»</detail>
+ </trophy>
+ <trophy id="077" hidden="no" ttype="B" pid="-1" gid="013">
+  <name>¡¡Eh, chicos!!</name>
+  <detail>Consigue el objetivo de «Romper las reglas» en el nivel «Los Goonies»</detail>
+ </trophy>
+</trophyconf>
