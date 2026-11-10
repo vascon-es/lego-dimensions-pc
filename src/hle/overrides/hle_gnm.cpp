@@ -2985,16 +2985,21 @@ void PatchProjection(u8* data, u32 bytes, float sx, float sy, float jx, float jy
                 m[row * 4 + 1] += jy * m[row * 4 + 3];
             }
         }
-        if (sx != 1.0f || sy != 1.0f) {
-            RememberProjection(l0, l1);
-            g_aspect_last.store((static_cast<u64>(std::bit_cast<u32>(l0)) << 32) | std::bit_cast<u32>(l1), std::memory_order_relaxed);
-        }
+        RememberProjection(l0, l1);
+        g_aspect_last.store((static_cast<u64>(std::bit_cast<u32>(l0)) << 32) | std::bit_cast<u32>(l1), std::memory_order_relaxed);
         found = true;
         i += 12; // a matriz inteira ja foi vista
     }
-    if (sx == 1.0f && sy == 1.0f) {
-        return; // so o deslocamento do TAA: os pares (1 / P00, 1 / P11) nao mudam
+    if (sx == 1.0f && sy == 1.0f && jx == 0.0f && jy == 0.0f) {
+        return;
     }
+    // 2.0: com o deslocamento do TAA / FSR, o float4 (1 / P00, 1 / P11, deslocamento x, deslocamento y) que os passes de luz e
+    // sombra usam para reconstruir a posicao a partir da profundidade recebe o mesmo deslocamento da projecao. Sem isso a
+    // posicao reconstruida mudava um pouco a cada quadro e a sombra do chao ligava / desligava em areas inteiras.
+    static const int offset_mode = [] {
+        const char* env = std::getenv("LD_JITTER_OFFSET"); // DIAGNOSTICO: 0 = nao mexe, 1 = +j, 2 = -j, 3 = -j / P, 4 = +j / P
+        return env ? std::atoi(env) : 1;
+    }();
     // pares (1 / P00, 1 / P11) de QUALQUER projecao do jogo vista recentemente (nao so a ultima)
     float known[kAspectSlots][2];
     u32 known_count = 0;
@@ -3029,6 +3034,13 @@ void PatchProjection(u8* data, u32 bytes, float sx, float sy, float jx, float jy
                                 "one drawn\n", static_cast<unsigned long long>(frame), static_cast<unsigned long long>(total.load()),
                                 static_cast<unsigned long long>(old_miss.load()));
                 }
+            }
+            if ((jx != 0.0f || jy != 0.0f) && offset_mode && i % 4 == 0 && i + 4 <= count && std::fabs(f[i + 2]) < 0.05f &&
+                std::fabs(f[i + 3]) < 0.05f) {
+                const float px = offset_mode >= 3 ? f[i] : 1.0f, py = offset_mode >= 3 ? f[i + 1] : 1.0f; // 1 / P00, 1 / P11
+                const float sign = offset_mode == 2 || offset_mode == 3 ? -1.0f : 1.0f;
+                f[i + 2] = sign * jx * px;
+                f[i + 3] = sign * jy * py;
             }
             f[i] /= sx;
             f[i + 1] /= sy;

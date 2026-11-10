@@ -4761,7 +4761,7 @@ bool TaaPass(State::RenderTarget* shown, VkImageView* out_view, VkDescriptorSet*
     push.size[3] = 1.0f / push.size[1];
     push.params[0] = g_taa.history_valid ? 1.0f : 0.0f;
     push.params[1] = reprojected ? 1.0f : 0.0f;
-    push.params[2] = 0.1f;
+    push.params[2] = 0.08f; // 2.0: um pouco mais de historico (mais estavel)
     push.depth_scale[0] = depth ? static_cast<float>(shown->width) / static_cast<float>(g_frame_temporal.depth_w) : 1.0f;
     push.depth_scale[1] = depth ? static_cast<float>(shown->height) / static_cast<float>(g_frame_temporal.depth_h) : 1.0f;
     const VkImageUsageFlags copy_usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
@@ -4997,6 +4997,19 @@ bool EnsureFfxContext(u32 render_w, u32 render_h, u32 out_w, u32 out_h) {
     }
     g_ffx.version = pick->second;
     g_ffx.reset = true;
+    {   // 2.0: estabilidade em vez de reacao rapida (o jogo tem sombras / brilhos finos que, com o deslocamento por quadro, o FSR
+        // tomava por 'mudanca de iluminacao' e mostrava crus - piscando). fVelocityFactor 0 = "melhora a estabilidade de
+        // pixels claros" (ffx_upscale.h); fShadingChangeScale menor = menos descarte do historico por mudanca de sombreado.
+        static float velocity = 0.0f, shading = 0.35f;
+        ffxConfigureDescUpscaleKeyValue key{};
+        key.header.type = FFX_API_CONFIGURE_DESC_TYPE_UPSCALE_KEYVALUE;
+        key.key = FFX_API_CONFIGURE_UPSCALE_KEY_FVELOCITYFACTOR;
+        key.ptr = &velocity;
+        g_ffx.fn.Configure(&g_ffx.context, &key.header);
+        key.key = FFX_API_CONFIGURE_UPSCALE_KEY_FSHADINGCHANGESCALE;
+        key.ptr = &shading;
+        g_ffx.fn.Configure(&g_ffx.context, &key.header);
+    }
     std::printf("[FSR] AMD %s ready: %ux%u -> %ux%u\n", pick->second.c_str(), render_w, render_h, out_w, out_h);
     return true;
 }
@@ -5171,8 +5184,9 @@ bool FfxPass(State::RenderTarget* shown, u32 out_w, u32 out_h, VkImageView* out_
     dispatch.motionVectorScale = {push.size[0], push.size[1]};
     dispatch.renderSize = {shown->width, shown->height};
     dispatch.upscaleSize = {out_w, out_h};
-    dispatch.enableSharpening = true;
-    dispatch.sharpness = std::clamp(1.0f - g_fsr_sharpness.load(std::memory_order_relaxed), 0.0f, 1.0f) * 0.6f;
+    // 2.0: sem nitidez extra no FSR AA (mesmo tamanho): ela amplificava o tremor de sombras e texturas finas. Ampliando, leve.
+    dispatch.enableSharpening = out_w > shown->width;
+    dispatch.sharpness = 0.2f;
     dispatch.frameTimeDelta = std::clamp(delta, 1.0f, 100.0f);
     dispatch.preExposure = 1.0f;
     dispatch.reset = g_ffx.reset || !frame.reprojected;
@@ -6047,7 +6061,8 @@ bool VulkanRenderer::DrawFrame(u64 display_address) {
     bool fsr = shown && present_pipeline && !ffx &&
                FsrEasuPass(present_view, shown->width, shown->height, static_cast<u32>(out_w), static_cast<u32>(out_h));
     // TAA sem ampliacao (imagem do tamanho da area dela): so a nitidez do RCAS, para compensar a suavidade do TAA
-    if (!fsr && taa && static_cast<u32>(out_w) == shown->width && static_cast<u32>(out_h) == shown->height && EnsureFsr()) {
+    if (false && !fsr && taa && static_cast<u32>(out_w) == shown->width && static_cast<u32>(out_h) == shown->height && EnsureFsr()) {
+        // 2.0: desligado - a nitidez do RCAS sobre o TAA amplificava o tremor de sombras e texturas finas
         PointRcas(present_view);
         fsr = true;
     }

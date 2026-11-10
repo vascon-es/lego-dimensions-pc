@@ -128,7 +128,7 @@ static std::vector<MenuItem> g_menu_items = {
     {"RESOLUTION (RESTART)", {"1280X720", "1600X900", "1920X1080", "2560X1080", "2560X1440", "3440X1440", "3840X2160"}, 2},
     {"DISPLAY MODE", {"FULLSCREEN", "WINDOWED"}, 0},
     {"ANTI-ALIASING", {"OFF", "TAA X16", "FSR 3 AA", "FSR 4 AA"}, 0},
-    {"FRAME RATE", {"30 FPS", "60 FPS", "UNLOCKED", "UNLOCKED NO VSYNC"}, 1},
+    {"FRAME RATE (RESTART)", {"30 FPS", "60 FPS", "UNLOCKED", "UNLOCKED NO VSYNC"}, 1},
     {"FPS COUNTER (F10)", {"OFF", "ON"}, 0},
     {"CONTROLLER ICONS", {"AUTO", "PS4", "XBOX", "SWITCH"}, 0}
 };

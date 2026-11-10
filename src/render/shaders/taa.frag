@@ -71,7 +71,9 @@ void main() {
     vec3 mean = m1 / 9.0;
     vec3 sigma = sqrt(max(m2 / 9.0 - mean * mean, vec3(0.0)));
     // caixa = min / max da vizinhanca cruzada com media +- desvio (mais justa: menos fantasma em quem se move sozinho)
-    vec3 lo = max(box_min, mean - sigma), hi = min(box_max, mean + sigma);
+    // 2.0: caixa um pouco mais larga (1,25 desvio): o deslocamento por quadro muda sombras / texturas finas e a caixa justa
+    // descartava o historico ali - piscava
+    vec3 lo = max(box_min, mean - 1.25 * sigma), hi = min(box_max, mean + 1.25 * sigma);
 
     vec2 previous_uv = uv;
     float moved = 0.0;
@@ -103,6 +105,6 @@ void main() {
     vec3 past = outside > 1.0 ? center + offset / outside : raw;
     // mais peso ao quadro atual quando o historico foi muito recortado (algo se moveu ou apareceu) - menos rastro
     float rejected = clamp(length(raw - past) / max(mean.x, 0.02) * 0.5, 0.0, 1.0);
-    float weight = max(mix(pc.params.z, 0.6, rejected), moved);
+    float weight = max(mix(pc.params.z, 0.35, rejected), moved);
     color = vec4(max(mix(FromYCoCg(past), now, weight), vec3(0.0)), 1.0);
 }
