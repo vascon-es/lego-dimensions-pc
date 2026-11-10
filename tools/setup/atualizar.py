@@ -81,6 +81,8 @@ def latest_release():
                'could not reach GitHub (%s). Check the internet connection and try again.' % e))
     asset = next((a for a in release.get('assets', []) if a.get('name', '').endswith(ASSET_SUFFIX)), None)
     if not asset:
+        asset = next((a for a in release.get('assets', []) if a.get('name', '').endswith('.zip') and 'portatil' in a.get('name', '').lower()), None)
+    if not asset:
         fail(T('a ultima release (%s) nao tem o zip portatil.' % release.get('tag_name'),
                'the latest release (%s) has no portable zip.' % release.get('tag_name')))
     return release, asset

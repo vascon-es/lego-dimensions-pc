@@ -596,24 +596,31 @@ bool GameRunning() {
     return running;
 }
 
-void CheckUpdate() {
+bool g_manual_check = false;
+
+void CheckUpdate(bool manual = false) {
     if (g_busy) {
         return;
     }
+    g_manual_check = manual;
     if (g_dev_tree) { // Fase 66: a release do GitHub trocaria o build e as ferramentas da pasta de desenvolvimento
-        MessageBoxW(g_main,
-                    ui::T(L"Este launcher está na pasta de desenvolvimento: ele usa o build\\lego_dimensions.exe compilado aqui, com os seus shaders e "
-                          L"pipelines. Atualize compilando (build.bat); o Atualizar do GitHub só vale na versão instalada.",
-                          L"This launcher is in the development folder: it uses the build\\lego_dimensions.exe built here, with your shaders and pipelines. "
-                          L"Update by building (build.bat); Check updates from GitHub only applies to the installed version."),
-                    L"LEGO Dimensions PC", MB_ICONINFORMATION);
+        if (manual) {
+            MessageBoxW(g_main,
+                        ui::T(L"Este launcher está na pasta de desenvolvimento: ele usa o build\\lego_dimensions.exe compilado aqui, com os seus shaders e "
+                              L"pipelines. Atualize compilando (build.bat); o Atualizar do GitHub só vale na versão instalada.",
+                              L"This launcher is in the development folder: it uses the build\\lego_dimensions.exe built here, with your shaders and pipelines. "
+                              L"Update by building (build.bat); Check updates from GitHub only applies to the installed version."),
+                        L"LEGO Dimensions PC", MB_ICONINFORMATION);
+        }
         return;
     }
     g_new_version.clear();
     g_notes.clear();
     if (RunPython(L"atualizar.py", L" --check", Task::kCheck)) {
-        g_step = ui::T(L"Procurando atualiza\u00e7\u00f5es...", L"Looking for updates...");
-        UpdateStatus();
+        if (manual) {
+            g_step = ui::T(L"Procurando atualizações...", L"Looking for updates...");
+            UpdateStatus();
+        }
     }
 }
 
@@ -2383,7 +2390,7 @@ void ToolsMenu(POINT at) {
     case kToolPipelines: AskPipelines(); break;
     case kToolPkg: ExtractPkgs(); break;
     case kToolTransfer: OpenTransfer(); break;
-    case kToolUpdate: CheckUpdate(); break;
+    case kToolUpdate: CheckUpdate(true); break;
     }
 }
 
@@ -2475,6 +2482,7 @@ void Back() {
 }
 
 constexpr UINT_PTR kPadTimer = 3;
+constexpr UINT_PTR kUpdateCheckTimer = 4;
 enum PadDir { kPadNone = -1, kPadUp, kPadDown, kPadLeft, kPadRight };
 WORD g_pad_buttons = 0;
 int g_pad_dir = kPadNone;
@@ -2965,13 +2973,16 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             g_step.clear();
             UpdateStatus();
             if (wp == 2) {
-                MessageBoxW(hwnd, (ui::T(L"Voc\u00ea j\u00e1 tem a vers\u00e3o mais nova (", L"You already have the latest version (") + g_version + L").").c_str(),
-                            L"LEGO Dimensions PC", MB_ICONINFORMATION);
+                if (g_manual_check) {
+                    MessageBoxW(hwnd, (ui::T(L"Você já tem a versão mais nova (", L"You already have the latest version (") + g_version + L").").c_str(),
+                                L"LEGO Dimensions PC", MB_ICONINFORMATION);
+                }
             } else if (wp == 0 && !g_new_version.empty()) {
-                std::wstring text = ui::T(L"A vers\u00e3o ", L"Version ") + g_new_version + ui::T(L" est\u00e1 dispon\u00edvel (voc\u00ea tem a ", L" is available (you have ") +
-                                    g_version + L").\n\n" + g_notes + (g_notes.empty() ? L"" : L"\n") +
-                                    ui::T(L"Baixar e instalar agora? Seus saves, os arquivos preparados e as op\u00e7\u00f5es ficam como est\u00e3o; o launcher reabre no fim.",
-                                          L"Download and install it now? Your saves, the prepared files and the options stay as they are; the launcher reopens at the end.");
+                std::wstring text = ui::T(L"Uma nova versão está disponível!\n\nVersão atual: ", L"A new version is available!\n\nCurrent version: ") +
+                                    g_version + ui::T(L"\nNova versão: ", L"\nNew version: ") + g_new_version + L"\n\n" +
+                                    (g_notes.empty() ? L"" : (g_notes + L"\n")) +
+                                    ui::T(L"Deseja atualizar agora?\n\nSeus saves, arquivos preparados e configurações serão mantidos intactos. O launcher será reiniciado ao concluir.",
+                                          L"Do you want to update now?\n\nYour saves, prepared files, and settings will remain intact. The launcher will restart when complete.");
                 if (MessageBoxW(hwnd, text.c_str(), L"LEGO Dimensions PC", MB_YESNO | MB_ICONQUESTION) == IDYES) {
                     ApplyUpdate();
                 }
@@ -3019,6 +3030,13 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         if (wp == kPadTimer) {
             if (g_animating && !IsIconic(hwnd)) Redraw();
             PollPad();
+            return 0;
+        }
+        if (wp == kUpdateCheckTimer) {
+            KillTimer(hwnd, kUpdateCheckTimer);
+            if (!g_busy) {
+                CheckUpdate(false);
+            }
             return 0;
         }
         break;
@@ -3094,8 +3112,12 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show) {
     }
     LoadSettings();
     ShowWindow(g_main, show);
+    if (const std::wstring custom_repo = ReadIni(L"repo", L""); !custom_repo.empty()) {
+        SetEnvironmentVariableW(L"LD_REPO", custom_repo.c_str());
+    }
     LoadXInput(); // issue #3: controle no launcher
     SetTimer(g_main, kPadTimer, 16, nullptr);
+    SetTimer(g_main, kUpdateCheckTimer, 1000, nullptr); // verifica atualizacao ao abrir
     MSG msg;
     while (GetMessageW(&msg, nullptr, 0, 0)) {
         if (!g_names_window || !IsDialogMessageW(g_names_window, &msg)) {
