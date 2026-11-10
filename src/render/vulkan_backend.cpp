@@ -4418,7 +4418,9 @@ float Halton(u32 index, u32 base) {
 // Uma vez por quadro, antes do TAA / FSR 2-4 / DLSS.
 struct FrameTemporal {
     bool camera = false, reprojected = false;
-    State::RenderTarget* depth = nullptr;
+    State::RenderTarget* depth = nullptr; // nao nulo = ha profundidade (view / tamanho abaixo)
+    VkImageView depth_view = VK_NULL_HANDLE;
+    u32 depth_w = 0, depth_h = 0;
     float reproject[16]{};
     float fov_y = 0.0f;
     float p22 = 0.0f, p32 = 0.0f, prev_p22 = 0.0f, prev_p32 = 0.0f; // distancia = P32 / (profundidade - P22)
@@ -4427,6 +4429,102 @@ struct FrameTemporal {
 float g_prev_p22 = 0.0f, g_prev_p32 = 0.0f;
 double g_previous_camera[16]{};
 bool g_have_previous_camera = false;
+
+// 2.0: copia da profundidade da CENA. Depois de desenhar o cenario o jogo limpa o buffer de profundidade para o HUD 3D
+// (rostos, pecas): no fim do quadro ele so tem o HUD, e o TAA / FSR reprojetavam tudo como se fosse ceu - certo parado,
+// errado andando (sombras e texturas tremendo). A copia e tirada na primeira limpeza depois do cenario (DrawFrame).
+struct DepthSnapshot {
+    VkImage image = VK_NULL_HANDLE;
+    VkDeviceMemory memory = VK_NULL_HANDLE;
+    VkImageView view = VK_NULL_HANDLE; // so profundidade, para amostrar
+    VkFormat format = VK_FORMAT_UNDEFINED;
+    u32 width = 0, height = 0;
+    u64 address = 0;
+    bool valid = false; // tirada neste quadro
+} g_depth_snap;
+
+// Endereco da profundidade da camera que mais desenhou ate agora no quadro (sem consumir a lista).
+u64 PeekSceneDepth() {
+    std::lock_guard lock(g_scene_mutex);
+    u64 address = 0;
+    u32 best = 0;
+    for (const SceneCamera& c : g_scene_cameras) {
+        if (c.draws > best) {
+            best = c.draws;
+            address = c.depth;
+        }
+    }
+    return address;
+}
+
+bool EnsureDepthSnapshot(const State::RenderTarget* target) {
+    if (g_depth_snap.image && g_depth_snap.width == target->width && g_depth_snap.height == target->height &&
+        g_depth_snap.format == target->format) {
+        return true;
+    }
+    if (g_depth_snap.view) vk.vkDestroyImageView(g.device, g_depth_snap.view, nullptr);
+    if (g_depth_snap.image) vk.vkDestroyImage(g.device, g_depth_snap.image, nullptr);
+    if (g_depth_snap.memory) vk.vkFreeMemory(g.device, g_depth_snap.memory, nullptr);
+    g_depth_snap = DepthSnapshot{};
+    VkImageCreateInfo info{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+    info.imageType = VK_IMAGE_TYPE_2D;
+    info.format = target->format;
+    info.extent = {target->width, target->height, 1};
+    info.mipLevels = 1;
+    info.arrayLayers = 1;
+    info.samples = VK_SAMPLE_COUNT_1_BIT;
+    info.tiling = VK_IMAGE_TILING_OPTIMAL;
+    info.usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+    if (vk.vkCreateImage(g.device, &info, nullptr, &g_depth_snap.image) != VK_SUCCESS) {
+        g_depth_snap.image = VK_NULL_HANDLE;
+        return false;
+    }
+    VkMemoryRequirements needs{};
+    vk.vkGetImageMemoryRequirements(g.device, g_depth_snap.image, &needs);
+    VkMemoryAllocateInfo allocate{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+    allocate.allocationSize = needs.size;
+    allocate.memoryTypeIndex = FindMemoryType(needs);
+    if (allocate.memoryTypeIndex == UINT32_MAX || vk.vkAllocateMemory(g.device, &allocate, nullptr, &g_depth_snap.memory) != VK_SUCCESS ||
+        vk.vkBindImageMemory(g.device, g_depth_snap.image, g_depth_snap.memory, 0) != VK_SUCCESS) {
+        return false;
+    }
+    VkImageViewCreateInfo view{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+    view.image = g_depth_snap.image;
+    view.viewType = VK_IMAGE_VIEW_TYPE_2D;
+    view.format = target->format;
+    view.subresourceRange = {VK_IMAGE_ASPECT_DEPTH_BIT, 0, 1, 0, 1};
+    if (vk.vkCreateImageView(g.device, &view, nullptr, &g_depth_snap.view) != VK_SUCCESS) {
+        g_depth_snap.view = VK_NULL_HANDLE;
+        return false;
+    }
+    g_depth_snap.width = target->width;
+    g_depth_snap.height = target->height;
+    g_depth_snap.format = target->format;
+    return true;
+}
+
+void SnapshotSceneDepth(State::RenderTarget* target) {
+    if (!EnsureDepthSnapshot(target)) {
+        return;
+    }
+    TransitionTarget(target, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+    const VkImageAspectFlags whole = VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT;
+    Transition(g.command, g_depth_snap.image, whole, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+    VkImageCopy region{};
+    region.srcSubresource = {VK_IMAGE_ASPECT_DEPTH_BIT, 0, 0, 1};
+    region.dstSubresource = {VK_IMAGE_ASPECT_DEPTH_BIT, 0, 0, 1};
+    region.extent = {target->width, target->height, 1};
+    vk.vkCmdCopyImage(g.command, target->image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, g_depth_snap.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                      1, &region);
+    Transition(g.command, g_depth_snap.image, whole, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+    g_depth_snap.address = target->address;
+    g_depth_snap.valid = true;
+    static bool logged = false;
+    if (!logged) {
+        logged = true;
+        std::printf("[TAA] scene depth saved before the game clears it for the HUD (%ux%u)\n", target->width, target->height);
+    }
+}
 
 void UpdateFrameTemporal() {
     SceneCamera camera{};
@@ -4458,10 +4556,35 @@ void UpdateFrameTemporal() {
         g_prev_p22 = g_frame_temporal.p22;
         g_prev_p32 = g_frame_temporal.p32;
     }
-    if (const auto found = g.target_by_address.find(camera.depth); found != g.target_by_address.end() && found->second->depth &&
-                                                                  found->second->sample_view && found->second->layout != VK_IMAGE_LAYOUT_UNDEFINED) {
-        g_frame_temporal.depth = found->second;
+    {   // a cada 600 quadros: de onde veio a profundidade dos passes temporais
+        static u64 calls = 0, from_copy = 0;
+        ++calls;
+        from_copy += g_depth_snap.valid && g_depth_snap.address == camera.depth;
+        if (calls % 600 == 0) {
+            std::printf("[TAA] depth from the copy taken before the HUD clear in %llu of the last 600 frames (scene depth 0x%llx, copy 0x%llx)\n",
+                        static_cast<unsigned long long>(from_copy), static_cast<unsigned long long>(camera.depth),
+                        static_cast<unsigned long long>(g_depth_snap.address));
+            from_copy = 0;
+        }
     }
+    if (g_depth_snap.valid && g_depth_snap.address == camera.depth) {
+        // a copia tirada antes da limpeza do HUD (ja em SHADER_READ_ONLY)
+        if (const auto found = g.target_by_address.find(camera.depth); found != g.target_by_address.end()) {
+            g_frame_temporal.depth = found->second;
+            g_frame_temporal.depth_view = g_depth_snap.view;
+            g_frame_temporal.depth_w = g_depth_snap.width;
+            g_frame_temporal.depth_h = g_depth_snap.height;
+        }
+    } else if (const auto found = g.target_by_address.find(camera.depth); found != g.target_by_address.end() && found->second->depth &&
+                                                                         found->second->sample_view &&
+                                                                         found->second->layout != VK_IMAGE_LAYOUT_UNDEFINED) {
+        g_frame_temporal.depth = found->second;
+        g_frame_temporal.depth_view = found->second->sample_view;
+        g_frame_temporal.depth_w = found->second->width;
+        g_frame_temporal.depth_h = found->second->height;
+        TransitionTarget(found->second, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+    }
+    g_depth_snap.valid = false;
     const float p11 = std::sqrt(camera.m[1] * camera.m[1] + camera.m[5] * camera.m[5] + camera.m[9] * camera.m[9]);
     g_frame_temporal.fov_y = p11 > 0.0f ? 2.0f * std::atan(1.0f / p11) : 0.0f;
     double now[16], inverse[16];
@@ -4639,8 +4762,8 @@ bool TaaPass(State::RenderTarget* shown, VkImageView* out_view, VkDescriptorSet*
     push.params[0] = g_taa.history_valid ? 1.0f : 0.0f;
     push.params[1] = reprojected ? 1.0f : 0.0f;
     push.params[2] = 0.1f;
-    push.depth_scale[0] = depth ? static_cast<float>(shown->width) / static_cast<float>(depth->width) : 1.0f;
-    push.depth_scale[1] = depth ? static_cast<float>(shown->height) / static_cast<float>(depth->height) : 1.0f;
+    push.depth_scale[0] = depth ? static_cast<float>(shown->width) / static_cast<float>(g_frame_temporal.depth_w) : 1.0f;
+    push.depth_scale[1] = depth ? static_cast<float>(shown->height) / static_cast<float>(g_frame_temporal.depth_h) : 1.0f;
     const VkImageUsageFlags copy_usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
     if (!EnsureOwnImage(g_taa.depth_copy[0], shown->width, shown->height, VK_FORMAT_R32_SFLOAT, copy_usage) ||
         !EnsureOwnImage(g_taa.depth_copy[1], shown->width, shown->height, VK_FORMAT_R32_SFLOAT, copy_usage)) {
@@ -4658,13 +4781,10 @@ bool TaaPass(State::RenderTarget* shown, VkImageView* out_view, VkDescriptorSet*
         Transition(g.command, g_taa.images[past], VK_IMAGE_ASPECT_COLOR_BIT, g_taa.layouts[past], VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
         g_taa.layouts[past] = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
     }
-    if (depth) {
-        TransitionTarget(depth, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
-    }
     VkDescriptorImageInfo infos[4] = {
         {g.sampler, shown->raw_view ? shown->raw_view : shown->view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL},
         {g.sampler, g_taa.views[past], VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL},
-        {g_taa.nearest, depth ? depth->sample_view : g_taa.views[past], VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL},
+        {g_taa.nearest, depth ? g_frame_temporal.depth_view : g_taa.views[past], VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL},
         {g_taa.nearest, g_taa.depth_copy[past].view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL}};
     VkWriteDescriptorSet writes[4]{};
     for (u32 i = 0; i < 4; ++i) {
@@ -4859,7 +4979,8 @@ bool EnsureFfxContext(u32 render_w, u32 render_h, u32 out_w, u32 out_h) {
     api.version = FFX_UPSCALER_VERSION;
     ffxCreateContextDescUpscale create{};
     create.header.type = FFX_API_CREATE_CONTEXT_DESC_TYPE_UPSCALE;
-    create.flags = FFX_UPSCALE_ENABLE_AUTO_EXPOSURE | FFX_UPSCALE_ENABLE_NON_LINEAR_COLORSPACE;
+    // 2.0: a projecao do jogo tem o plano distante praticamente no infinito (P22 ~ 1): o FSR precisa saber disso
+    create.flags = FFX_UPSCALE_ENABLE_AUTO_EXPOSURE | FFX_UPSCALE_ENABLE_NON_LINEAR_COLORSPACE | FFX_UPSCALE_ENABLE_DEPTH_INFINITE;
     create.maxRenderSize = {render_w, render_h};
     create.maxUpscaleSize = {out_w, out_h};
     create.fpMessage = FfxMessage;
@@ -4959,15 +5080,12 @@ bool FfxPass(State::RenderTarget* shown, u32 out_w, u32 out_h, VkImageView* out_
     // 1. entradas (cor, movimento, profundidade) numa passagem
     const FrameTemporal& frame = g_frame_temporal;
     State::RenderTarget* depth = frame.depth;
-    if (depth) {
-        TransitionTarget(depth, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
-    }
     const VkImageView color_view = shown->raw_view ? shown->raw_view : shown->view;
     const u32 now_depth = g_ffx.depth_index ^ 1, past_depth = g_ffx.depth_index;
     MoveOwnImage(g_ffx.depth[past_depth], VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
     VkDescriptorImageInfo infos[4] = {{g.sampler, color_view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL},
                                       {g.sampler, color_view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL},
-                                      {g_taa.nearest, depth ? depth->sample_view : color_view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL},
+                                      {g_taa.nearest, depth ? frame.depth_view : color_view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL},
                                       {g_taa.nearest, g_ffx.depth[past_depth].view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL}};
     VkWriteDescriptorSet writes[5]{};
     for (u32 i = 0; i < 4; ++i) {
@@ -4994,8 +5112,8 @@ bool FfxPass(State::RenderTarget* shown, u32 out_w, u32 out_h, VkImageView* out_
     push.size[2] = 1.0f / push.size[0];
     push.size[3] = 1.0f / push.size[1];
     push.params[1] = frame.reprojected ? 1.0f : 0.0f;
-    push.depth_scale[0] = depth ? push.size[0] / static_cast<float>(depth->width) : 1.0f;
-    push.depth_scale[1] = depth ? push.size[1] / static_cast<float>(depth->height) : 1.0f;
+    push.depth_scale[0] = depth ? push.size[0] / static_cast<float>(frame.depth_w) : 1.0f;
+    push.depth_scale[1] = depth ? push.size[1] / static_cast<float>(frame.depth_h) : 1.0f;
     push.params[3] = frame.reprojected && frame.prev_camera && g_ffx.depth_valid[past_depth] && !g_ffx.reset ? 1.0f : 0.0f;
     if (const char* show = std::getenv("LD_SHOW_REACTIVE"); show && show[0] == '2') {
         push.params[0] = 2.0f; // DIAGNOSTICO: a diferenca em vez da mascara
@@ -5058,8 +5176,10 @@ bool FfxPass(State::RenderTarget* shown, u32 out_w, u32 out_h, VkImageView* out_
     dispatch.frameTimeDelta = std::clamp(delta, 1.0f, 100.0f);
     dispatch.preExposure = 1.0f;
     dispatch.reset = g_ffx.reset || !frame.reprojected;
-    dispatch.cameraNear = 0.2f;
-    dispatch.cameraFar = 500.0f;
+    // 2.0: plano proximo da propria matriz do jogo (z_ndc = P22 + P32 / z -> 0 em z = -P32 / P22; ~0,05 em Vorton). Antes
+    // 0,2 / 500 fixos: o FSR via 'pixel novo' onde nao havia e mostrava o quadro cru com o deslocamento - tremia andando.
+    dispatch.cameraNear = frame.p22 != 0.0f && -frame.p32 / frame.p22 > 0.0f ? -frame.p32 / frame.p22 : 0.05f;
+    dispatch.cameraFar = 1.0e6f;
     dispatch.cameraFovAngleVertical = frame.fov_y > 0.0f ? frame.fov_y : 0.66f;
     dispatch.viewSpaceToMetersFactor = 1.0f;
     dispatch.flags = FFX_UPSCALE_FLAG_NON_LINEAR_COLOR_SRGB;
@@ -5424,8 +5544,25 @@ bool VulkanRenderer::DrawFrame(u64 display_address) {
         float blend[4]{};
         u32 stencil_values[6]{};
     } dynamic;
+    // 2.0: profundidade da cena guardada antes da limpeza do HUD (TAA / FSR). So com um deles ligado.
+    const u64 scene_depth = (g_aa_mode.load(std::memory_order_relaxed) || g_ffx_wanted.load(std::memory_order_relaxed)) ? PeekSceneDepth() : 0;
+    u32 scene_depth_draws = 0;
+    bool scene_depth_saved = false;
     for (const State::QueuedGame& draw : g.queue_game) {
         ++queue_index;
+        if (scene_depth && !scene_depth_saved && draw.pipeline && !draw.pending_images && draw.depth &&
+            draw.depth->address == scene_depth) {
+            if (draw.clear_depth) {
+                if (scene_depth_draws >= 20) { // a cena ja foi desenhada: esta limpeza e a do HUD
+                    end_pass();
+                    SnapshotSceneDepth(draw.depth);
+                    scene_depth_saved = true;
+                }
+                scene_depth_draws = 0;
+            } else {
+                ++scene_depth_draws;
+            }
+        }
         if (!draw.pipeline || draw.pending_images) {
             continue; // Fase 45: pipeline ainda compilando ou textura ainda sendo lida
         }
@@ -7576,6 +7713,10 @@ void VulkanRenderer::SetNoVsync(bool enabled) {
     g_no_vsync = enabled;
 }
 
+bool VulkanRenderer::NoVsync() const {
+    return g_no_vsync.load(std::memory_order_relaxed);
+}
+
 void VulkanRenderer::SetRenderScale(u32 percent) {
     g_render_scale_pct = std::clamp(percent, 25u, 400u);
     SetRenderResolution(g_render_out_w, g_render_out_h);
@@ -7646,6 +7787,15 @@ void SetTemporalUpscaler(int major, bool native) {
         std::printf("[RENDER] temporal upscaler: AMD FSR %s%s\n", major == 9 ? "(newest)" : std::to_string(major).c_str(),
                     native ? " (native AA)" : "");
     }
+}
+
+int GetAntiAliasing() {
+    return g_aa_mode.load(std::memory_order_relaxed);
+}
+
+void GetTemporalUpscaler(int* major, bool* native) {
+    *major = g_ffx_wanted.load(std::memory_order_relaxed);
+    *native = g_ffx_native.load(std::memory_order_relaxed);
 }
 
 void SetAntiAliasing(int mode) {
