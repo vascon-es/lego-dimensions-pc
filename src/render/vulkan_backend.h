@@ -364,6 +364,7 @@ public:
     void SetRenderScale(u32 percent);                    // 1.9.1: interna = saida x porcentagem (25-400)
     void SetUnlockedPresent(bool enabled);               // 1.9.1: FPS desbloqueado (MAILBOX ou VSync)
     void SetNoVsync(bool enabled);                       // 1.9.1: sem VSync (IMMEDIATE, pode rasgar)
+    bool NoVsync() const;
     void SetUpscaler(int mode, float sharpness);         // 1.9.1: 0 = bilinear, 1 = AMD FidelityFX FSR 1
     void SetFillScreen(bool enabled);                    // 1.9.1: tela de outra proporcao = imagem inteira (camera Hor+ / Vert-)
     void PredictedStats(u32* built, u32* failed) const; // Fase 77: receitas cujo par de shaders nao foi registrado (fora do pacote AOT)
@@ -424,6 +425,8 @@ void CameraAspectScale(float* x, float* y);
 void NoteSceneCamera(const float matrix[16], u64 depth_address);
 void TemporalJitter(float* x, float* y);
 void SetAntiAliasing(int mode);
+int GetAntiAliasing();
+void GetTemporalUpscaler(int* major, bool* native);
 // 1.9.1: AMD FSR 2 / 3 / 4 (versao maior; 9 = a mais nova; 0 = desligado). native = FSR AA (sem ampliar).
 void SetTemporalUpscaler(int major, bool native);
 

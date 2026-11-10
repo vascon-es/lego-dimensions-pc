@@ -123,13 +123,14 @@ struct MenuItem {
     int selected = 0;
 };
 
+// F2 menu (2.0: in English, with the options the port really has; they match the launcher's)
 static std::vector<MenuItem> g_menu_items = {
-    {"RESOLUCAO", {"1280X720", "1600X900", "1920X1080", "2560X1440", "3840X2160"}, 2},
-    {"MODO DE TELA", {"TELA CHEIA", "JANELA"}, 0},
-    {"ANTI-ALIASING", {"DESLIGADO", "MSAA 2X", "MSAA 4X", "MSAA 8X"}, 2},
-    {"LIMITE FPS", {"60 FPS", "30 FPS", "DESBLOQUEADO"}, 0},
-    {"CONTADOR FPS (F10)", {"DESLIGADO", "LIGADO"}, 0},
-    {"ICONES CONTROLE", {"AUTO", "PS4", "XBOX", "SWITCH"}, 0}
+    {"RESOLUTION (RESTART)", {"1280X720", "1600X900", "1920X1080", "2560X1080", "2560X1440", "3440X1440", "3840X2160"}, 2},
+    {"DISPLAY MODE", {"FULLSCREEN", "WINDOWED"}, 0},
+    {"ANTI-ALIASING", {"OFF", "TAA X16", "FSR 3 AA", "FSR 4 AA"}, 0},
+    {"FRAME RATE", {"30 FPS", "60 FPS", "UNLOCKED", "UNLOCKED NO VSYNC"}, 1},
+    {"FPS COUNTER (F10)", {"OFF", "ON"}, 0},
+    {"CONTROLLER ICONS", {"AUTO", "PS4", "XBOX", "SWITCH"}, 0}
 };
 
 static void WriteLauncherIni(const wchar_t* key, const wchar_t* val) {
@@ -186,63 +187,76 @@ namespace {
 
 static void ApplyAndSaveVideoSettings() {
     HWND hwnd = static_cast<HWND>(WindowHandle());
-    
-    // Resolucao
-    static const u32 kResW[] = {1280, 1600, 1920, 2560, 3840};
-    static const u32 kResH[] = {720, 900, 1080, 1440, 2160};
-    static const wchar_t* const kResStr[] = {L"1280x720", L"1600x900", L"1920x1080", L"2560x1440", L"3840x2160"};
-    int r = g_menu_items[0].selected;
-    if (r >= 0 && r < 5) {
+
+    // Resolution: the window changes now; the game is drawn at the new resolution from the next start
+    static const u32 kResW[] = {1280, 1600, 1920, 2560, 2560, 3440, 3840};
+    static const u32 kResH[] = {720, 900, 1080, 1080, 1440, 1440, 2160};
+    static const wchar_t* const kResStr[] = {L"1280x720", L"1600x900", L"1920x1080", L"2560x1080", L"2560x1440", L"3440x1440", L"3840x2160"};
+    const int r = g_menu_items[0].selected;
+    if (r >= 0 && r < 7) {
         WriteLauncherIni(L"resolucao", kResStr[r]);
         SetWindowResolution(kResW[r], kResH[r]);
     }
-    
-    // Modo de Tela
-    bool want_full = (g_menu_items[1].selected == 0);
+
+    // Display mode
+    const bool want_full = g_menu_items[1].selected == 0;
     WriteLauncherIni(L"telacheia", want_full ? L"1" : L"0");
     if (hwnd) {
         SetFullscreen(hwnd, want_full);
     }
-    
-    // Anti-Aliasing (MSAA)
-    static const wchar_t* const kMsaaStr[] = {L"1", L"2", L"4", L"8"};
-    int m = g_menu_items[2].selected;
-    if (m >= 0 && m < 4) {
-        WriteLauncherIni(L"msaa", kMsaaStr[m]);
+
+    // Anti-aliasing (2.0: the real options; it used to offer MSAA, which the port never had). Applies right away.
+    static const wchar_t* const kAaStr[] = {L"off", L"taa", L"fsraa", L"fsraa4"};
+    const int aa = g_menu_items[2].selected;
+    if (aa >= 0 && aa < 4) {
+        WriteLauncherIni(L"antialiasing", kAaStr[aa]);
+        render::SetAntiAliasing(aa == 1 ? 1 : 0);
+        if (aa >= 2) {
+            render::SetTemporalUpscaler(aa == 3 ? 4 : 3, true);
+        } else {
+            // back to the launcher's upscaler (FSR 2 / 3 / 4 only work below 100% render scale)
+            wchar_t exe[MAX_PATH]{}, buf[32]{};
+            int major = 0;
+            if (GetModuleFileNameW(nullptr, exe, MAX_PATH)) {
+                std::filesystem::path root = std::filesystem::path(exe).parent_path();
+                if (root.filename() == L"build") root = root.parent_path();
+                GetPrivateProfileStringW(L"launcher", L"upscaler", L"off", buf, 32, (root / L"launcher.ini").wstring().c_str());
+                major = !_wcsicmp(buf, L"fsr2") ? 2 : !_wcsicmp(buf, L"fsr3") ? 3 : !_wcsicmp(buf, L"fsr4") ? 4 : 0;
+            }
+            render::SetTemporalUpscaler(major, false);
+        }
     }
-    
-    // Limite FPS: 0 = 60 FPS, 1 = 30 FPS, 2 = DESBLOQUEADO
-    int f = g_menu_items[3].selected;
-    if (f == 0) {
-        WriteLauncherIni(L"fps60", L"1");
-        SetForce60Hz(true);
-        SetUnlockedFps(false);
-    } else if (f == 1) {
-        WriteLauncherIni(L"fps60", L"0");
-        SetForce60Hz(false);
-        SetUnlockedFps(false);
-    } else if (f == 2) {
-        WriteLauncherIni(L"fps60", L"2");
-        SetForce60Hz(true);
-        SetUnlockedFps(true);
+
+    // Frame rate: 30 / 60 / unlocked (up to the monitor's refresh, no tearing) / unlocked without VSync. Applies right away.
+    const int f = g_menu_items[3].selected;
+    static const wchar_t* const kFpsStr[] = {L"30", L"60", L"livre", L"livre_sem_vsync"};
+    if (f >= 0 && f < 4) {
+        WriteLauncherIni(L"fps", kFpsStr[f]);
+        WriteLauncherIni(L"fps60", f == 0 ? L"0" : f == 1 ? L"1" : L"2");
+        SetForce60Hz(f != 0);
+        SetUnlockedFps(f >= 2);
+        render::VulkanRenderer::Instance().SetUnlockedPresent(f >= 2);
+        render::VulkanRenderer::Instance().SetNoVsync(f == 3);
+        render::VulkanRenderer::Instance().RequestSwapchainRebuild(); // the present mode is picked with the swapchain
     }
-    
-    // Contador FPS
-    bool stats = (g_menu_items[4].selected == 1);
-    SetStatsOverlay(stats);
-    
-    // Icones
+
+    // FPS counter
+    SetStatsOverlay(g_menu_items[4].selected == 1);
+
+    // Controller icons
     static const char* const kIconsAnsi[] = {"auto", "ps4", "xboxone", "wiiu"};
     static const wchar_t* const kIconsStr[] = {L"auto", L"ps4", L"xboxone", L"wiiu"};
-    int ic = g_menu_items[5].selected;
+    const int ic = g_menu_items[5].selected;
     if (ic >= 0 && ic < 4) {
         WriteLauncherIni(L"icones", kIconsStr[ic]);
         gnm::SetButtonIcons(kIconsAnsi[ic]);
     }
-    
+
     g_save_confirm_timer = 90;
 }
 
+// 2.0: the menu shows what the game is running with (the launcher's command line). It used to read the old fps60 key of
+// launcher.ini and turn the unlocked frame rate back off at start-up - the launcher writes fps60=1 for "unlocked".
 static void InitMenuDefaults() {
     static bool s_init = false;
     if (s_init) return;
@@ -253,46 +267,30 @@ static void InitMenuDefaults() {
         if (root.filename() == L"build") root = root.parent_path();
         std::filesystem::path ini = root / L"launcher.ini";
         wchar_t buf[64]{};
-        
+
         GetPrivateProfileStringW(L"launcher", L"resolucao", L"1920x1080", buf, 64, ini.wstring().c_str());
-        if (wcsstr(buf, L"1280x720")) g_menu_items[0].selected = 0;
-        else if (wcsstr(buf, L"1600x900")) g_menu_items[0].selected = 1;
-        else if (wcsstr(buf, L"1920x1080")) g_menu_items[0].selected = 2;
-        else if (wcsstr(buf, L"2560x1440")) g_menu_items[0].selected = 3;
-        else if (wcsstr(buf, L"3840x2160")) g_menu_items[0].selected = 4;
-        
-        GetPrivateProfileStringW(L"launcher", L"telacheia", L"1", buf, 64, ini.wstring().c_str());
-        g_menu_items[1].selected = (_wcsicmp(buf, L"0") == 0) ? 1 : 0;
-        
-        GetPrivateProfileStringW(L"launcher", L"msaa", L"4", buf, 64, ini.wstring().c_str());
-        if (wcsstr(buf, L"1")) g_menu_items[2].selected = 0;
-        else if (wcsstr(buf, L"2")) g_menu_items[2].selected = 1;
-        else if (wcsstr(buf, L"4")) g_menu_items[2].selected = 2;
-        else if (wcsstr(buf, L"8")) g_menu_items[2].selected = 3;
-        
-        GetPrivateProfileStringW(L"launcher", L"fps60", L"1", buf, 64, ini.wstring().c_str());
-        if (wcsstr(buf, L"0")) {
-            g_menu_items[3].selected = 1; // 30 FPS
-            SetForce60Hz(false);
-            SetUnlockedFps(false);
-        } else if (wcsstr(buf, L"2")) {
-            g_menu_items[3].selected = 2; // DESBLOQUEADO
-            SetForce60Hz(true);
-            SetUnlockedFps(true);
-        } else {
-            g_menu_items[3].selected = 0; // 60 FPS
-            SetForce60Hz(true);
-            SetUnlockedFps(false);
+        static const wchar_t* const kRes[] = {L"1280x720", L"1600x900", L"1920x1080", L"2560x1080", L"2560x1440", L"3440x1440", L"3840x2160"};
+        g_menu_items[0].selected = 2;
+        for (int i = 0; i < 7; ++i) {
+            if (!_wcsicmp(buf, kRes[i])) {
+                g_menu_items[0].selected = i;
+            }
         }
-        
-        g_menu_items[4].selected = g_stats_overlay.load() ? 1 : 0;
-        
+
         GetPrivateProfileStringW(L"launcher", L"icones", L"auto", buf, 64, ini.wstring().c_str());
         if (wcsstr(buf, L"ps4") || wcsstr(buf, L"ps3")) g_menu_items[5].selected = 1;
         else if (wcsstr(buf, L"xbox")) g_menu_items[5].selected = 2;
         else if (wcsstr(buf, L"wiiu") || wcsstr(buf, L"switch")) g_menu_items[5].selected = 3;
         else g_menu_items[5].selected = 0;
     }
+    g_menu_items[1].selected = g_start_fullscreen.load() || g_fullscreen ? 0 : 1;
+    int major = 0;
+    bool native = false;
+    render::GetTemporalUpscaler(&major, &native);
+    g_menu_items[2].selected = native ? (major == 4 ? 3 : 2) : render::GetAntiAliasing() == 1 ? 1 : 0;
+    g_menu_items[3].selected = !g_unlocked_fps.load() ? (g_force_60hz.load() ? 1 : 0)
+                                                       : (render::VulkanRenderer::Instance().NoVsync() ? 3 : 2);
+    g_menu_items[4].selected = g_stats_overlay.load() ? 1 : 0;
 }
 
 } // namespace
@@ -300,7 +298,7 @@ static void InitMenuDefaults() {
 void ToggleVideoSettingsMenu() {
     InitMenuDefaults();
     g_video_menu_open = !g_video_menu_open;
-    log::Tagged("VIDEO-MENU", "%s", g_video_menu_open ? "aberto" : "fechado");
+    log::Tagged("VIDEO-MENU", "%s", g_video_menu_open ? "open" : "closed");
 }
 
 bool IsVideoSettingsMenuOpen() {
@@ -1031,7 +1029,7 @@ void QueueStatsOverlay() {
         c.Rect(box_x0 - 4.0f, box_y0 - 4.0f, box_x1 + 4.0f, box_y1 + 4.0f, kBorder);
         c.Rect(box_x0, box_y0, box_x1, box_y1, kBg);
         
-        const std::string title = "CONFIGURACOES DE VIDEO";
+        const std::string title = "VIDEO SETTINGS";
         float font_title = 3.5f * scale_ui;
         c.Write(title, box_x0 + (box_w - TextWidth(title, font_title)) / 2.0f, box_y0 + 20.0f * scale_ui, font_title, kTitleYellow);
         
@@ -1057,10 +1055,10 @@ void QueueStatsOverlay() {
         c.Rect(box_x0 + 20.0f * scale_ui, box_y1 - 60.0f * scale_ui, box_x1 - 20.0f * scale_ui, box_y1 - 58.0f * scale_ui, kGray);
         if (g_save_confirm_timer > 0) {
             --g_save_confirm_timer;
-            const std::string saved_msg = "CONFIGURACOES SALVAS COM SUCESSO!";
+            const std::string saved_msg = "SETTINGS SAVED!";
             c.Write(saved_msg, box_x0 + (box_w - TextWidth(saved_msg, font_item)) / 2.0f, box_y1 - 42.0f * scale_ui, font_item, kBorder);
         } else {
-            const std::string footer = "[CIMA/BAIXO] NAVEGAR  [ESQ/DIR] ALTERAR  [ENTER/A] SALVAR  [F2/ESC/B] SAIR";
+            const std::string footer = "[UP/DOWN] SELECT  [LEFT/RIGHT] CHANGE  [ENTER] SAVE  [F2/ESC] CLOSE";
             float font_foot = 1.7f * scale_ui;
             c.Write(footer, box_x0 + (box_w - TextWidth(footer, font_foot)) / 2.0f, box_y1 - 40.0f * scale_ui, font_foot, kGray);
         }

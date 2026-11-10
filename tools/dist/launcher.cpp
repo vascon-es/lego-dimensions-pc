@@ -397,7 +397,7 @@ void SaveSettings() {
     WriteIni(L"jogo", g_game_dir);
     WriteIni(L"atualizacao", g_patch_dir);
     WriteIni(L"dlcs", g_dlc_dir);
-    WriteIni(L"fps60", g_fps_value == L"30" ? L"0" : L"1"); // (versoes antigas do launcher leem esta)
+    WriteIni(L"fps60", g_fps_value == L"30" ? L"0" : g_fps_value == L"60" ? L"1" : L"2"); // (versoes antigas do launcher e o F2 antigo leem esta)
     WriteIni(L"fps", g_fps_value);                          // 1.9.1
     WriteIni(L"escala", g_scale_value);                     // 1.9.1
     WriteIni(L"upscaler", g_upscaler_value);                // 1.9.1
