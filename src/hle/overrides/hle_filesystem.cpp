@@ -311,11 +311,6 @@ void SetLocaleOverlay(const std::filesystem::path& dir) {
     g_locale_overlay = dir;
 }
 
-void SetLocaleOverlay(const std::filesystem::path& dir) {
-    std::lock_guard lock(g_mounts_mutex);
-    g_locale_overlay = dir;
-}
-
 void SetPackRedirects(std::vector<PackRedirect> redirects) {
     std::lock_guard lock(g_mounts_mutex);
     g_redirect_hdr.clear();
