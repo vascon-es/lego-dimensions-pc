@@ -1553,20 +1553,6 @@ void ResetTrophiesAction() {
     }
 }
 
-void ResetTrophiesAction() {
-    if (MessageBoxW(g_main,
-                    ui::T(L"Tem certeza que deseja reiniciar todas as conquistas do LEGO Dimensions PC?\n\nIsso apagará o arquivo de progresso dos troféus e permitirá conquistá-los novamente.",
-                          L"Are you sure you want to reset all achievements for LEGO Dimensions PC?\n\nThis will clear the trophy progress file."),
-                    L"LEGO Dimensions PC", MB_YESNO | MB_ICONWARNING) == IDYES) {
-        std::error_code ec;
-        fs::remove(g_root / L"assets" / L"trophy" / L"NPWR07423_00.xml", ec);
-        fs::remove(g_root / L"assets" / L"trophy" / L".retro_done", ec);
-        MessageBoxW(g_main,
-                    ui::T(L"Conquistas reiniciadas com sucesso!", L"Achievements successfully reset!"),
-                    L"LEGO Dimensions PC", MB_OK | MB_ICONINFORMATION);
-    }
-}
-
 void OpenTransfer() {
     wchar_t self[MAX_PATH * 4];
     GetModuleFileNameW(nullptr, self, MAX_PATH * 4);
@@ -1986,22 +1972,6 @@ std::vector<Row> Rows() {
     rows.push_back({kTabGame, RowKind::kAction, ui::T(L"Apelidos dos jogadores", L"Player nicknames"),
                     ui::T(L"O nome no lugar de Player1, Player2... Enter: editar.", L"The name shown instead of Player1, Player2... Enter: edit."),
                     names.empty() ? ui::T(L"Padrão", L"Default") : names, [](int) { OpenNamesDialog(); }});
-    static const wchar_t* const kTrophySounds[] = {L"playstation", L"xbox", L"steam", L"desligado"};
-    rows.push_back({kTabGame, RowKind::kChoice, ui::T(L"Som de conquista", L"Trophy sound"),
-                    ui::T(L"Efeito sonoro ao desbloquear conquistas (PlayStation, Xbox, Steam).",
-                          L"Sound effect when unlocking achievements (PlayStation, Xbox, Steam)."),
-                    g_trophy_sound_value == L"xbox" ? std::wstring(L"Xbox") :
-                    g_trophy_sound_value == L"steam" ? std::wstring(L"Steam") :
-                    (g_trophy_sound_value == L"desligado" || g_trophy_sound_value == L"off") ? ui::T(L"Desligado", L"Off") : std::wstring(L"PlayStation"),
-                    [](int step) {
-                        g_trophy_sound_value = Step(kTrophySounds, g_trophy_sound_value, step, [](const wchar_t* s) { return std::wstring(s); });
-                        SaveSettings();
-                    }});
-    rows.push_back({kTabGame, RowKind::kAction, ui::T(L"Reiniciar conquistas", L"Reset achievements"),
-                    ui::T(L"Limpa todas as conquistas para recomeçar do zero. Enter: reiniciar.",
-                          L"Reset all achievements back to locked. Enter: reset."),
-                    ui::T(L"Reiniciar...", L"Reset..."),
-                    [](int) { ResetTrophiesAction(); }});
     static const wchar_t* const kTrophySounds[] = {L"playstation", L"xbox", L"steam", L"desligado"};
     rows.push_back({kTabGame, RowKind::kChoice, ui::T(L"Som de conquista", L"Trophy sound"),
                     ui::T(L"Efeito sonoro ao desbloquear conquistas (PlayStation, Xbox, Steam).",
