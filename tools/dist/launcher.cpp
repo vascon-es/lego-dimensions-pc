@@ -1681,7 +1681,7 @@ bool ParseLegoFont(const std::vector<BYTE>& d, LegoFont* font) {
     for (uint32_t i = 0; i < n2; ++i) {
         const wchar_t c = wchar_t((d[r2 + 8 + i * 4] << 8) | d[r2 + 9 + i * 4]);
         const int g = (d[r2 + 10 + i * 4] << 8) | d[r2 + 11 + i * 4];
-        if (g < int(n1)) font->chars[c] = g;
+        if (c > 32 && g < int(n1)) font->chars[c] = g;
     }
     font->argb.resize(size_t(font->width) * font->height);
     DecodeDxt5(d.data() + dds + 128, font->width, font->height, font->argb.data());
@@ -1733,6 +1733,10 @@ float LegoTextWidth(Gdiplus::Graphics& g, const std::wstring& text, float size) 
     const float k = S(size) / g_lego->line, overlap = g_lego->line * 0.05f;
     float w = 0;
     for (wchar_t c : text) {
+        if (c <= 32) {
+            w += g_lego->line * 0.28f * k;
+            continue;
+        }
         const auto it = g_lego->chars.find(c);
         w += it == g_lego->chars.end() ? g_lego->line * 0.3f * k : (g_lego->glyphs[it->second].w - overlap) * k;
     }
@@ -1750,6 +1754,10 @@ void LegoText(Gdiplus::Graphics& g, const std::wstring& text, float x, float y, 
     }
     const float k = S(size) / g_lego->line, overlap = g_lego->line * 0.05f;
     for (wchar_t c : text) {
+        if (c <= 32) {
+            x += g_lego->line * 0.28f * k;
+            continue;
+        }
         const auto it = g_lego->chars.find(c);
         if (it == g_lego->chars.end()) {
             x += g_lego->line * 0.3f * k;
@@ -1795,7 +1803,7 @@ void EnsureLegoFont() {
 // ---- a tela (desenho do launcher do port de inFAMOUS Second Son, de Castlesea; ver o comeco do arquivo) ----
 enum class Screen { kMain, kSettings };
 Screen g_screen = Screen::kMain;
-enum SettingsTab { kTabFiles, kTabDisplay, kTabGraphics, kTabGame, kTabAdvanced, kTabCount }; // 1.9.1: + GRAFICOS
+enum SettingsTab { kTabFiles, kTabDisplay, kTabGraphics, kTabGame, kTabTrophies, kTabAdvanced, kTabCount }; // 1.9.1: + GRAFICOS
 int g_tab = kTabFiles;
 
 enum Hot {
@@ -1979,8 +1987,9 @@ std::vector<Row> Rows() {
     rows.push_back({kTabGame, RowKind::kAction, ui::T(L"Apelidos dos jogadores", L"Player nicknames"),
                     ui::T(L"O nome no lugar de Player1, Player2... Enter: editar.", L"The name shown instead of Player1, Player2... Enter: edit."),
                     names.empty() ? ui::T(L"Padrão", L"Default") : names, [](int) { OpenNamesDialog(); }});
+    // Conquistas
     static const wchar_t* const kTrophySounds[] = {L"playstation", L"xbox", L"steam", L"desligado"};
-    rows.push_back({kTabGame, RowKind::kChoice, ui::T(L"Som de conquista", L"Trophy sound"),
+    rows.push_back({kTabTrophies, RowKind::kChoice, ui::T(L"Som de conquista", L"Trophy sound"),
                     ui::T(L"Efeito sonoro ao desbloquear conquistas (PlayStation, Xbox, Steam).",
                           L"Sound effect when unlocking achievements (PlayStation, Xbox, Steam)."),
                     g_trophy_sound_value == L"xbox" ? std::wstring(L"Xbox") :
@@ -1990,7 +1999,7 @@ std::vector<Row> Rows() {
                         g_trophy_sound_value = Step(kTrophySounds, g_trophy_sound_value, step, [](const wchar_t* s) { return std::wstring(s); });
                         SaveSettings();
                     }});
-    rows.push_back({kTabGame, RowKind::kAction, ui::T(L"Reiniciar conquistas", L"Reset achievements"),
+    rows.push_back({kTabTrophies, RowKind::kAction, ui::T(L"Reiniciar conquistas", L"Reset achievements"),
                     ui::T(L"Limpa todas as conquistas para recomeçar do zero. Enter: reiniciar.",
                           L"Reset all achievements back to locked. Enter: reset."),
                     ui::T(L"Reiniciar...", L"Reset..."),
@@ -2011,6 +2020,7 @@ const wchar_t* TabName(int tab) {
     case kTabDisplay: return ui::T(L"TELA", L"DISPLAY");
     case kTabGraphics: return ui::T(L"GRÁFICOS", L"GRAPHICS");
     case kTabGame: return ui::T(L"JOGO", L"GAME");
+    case kTabTrophies: return ui::T(L"CONQUISTAS", L"ACHIEVEMENTS");
     default: return ui::T(L"AVANÇADO", L"ADVANCED");
     }
 }
@@ -2277,34 +2287,38 @@ void Paint(Gdiplus::Graphics& g, int width, int height) {
         g.FillRectangle(&panel_bg, panel);
         Gdiplus::Pen panel_pen(ui::C(ui::kAccent, 200), float(S(1)));
         g.DrawRectangle(&panel_pen, panel);
-        float ry = kBar + 176;
+        std::vector<size_t> tab_rows;
         const std::vector<Row> rows = Rows();
         for (size_t i = 0; i < rows.size(); ++i) {
-            const Row& row = rows[i];
-            if (row.tab != g_tab) continue;
-            const int id = kHotRow0 + int(i);
-            const bool lit = g_focus == id || g_hover == id || g_hover == kHotLeft0 + int(i) || g_hover == kHotRight0 + int(i);
+            if (rows[i].tab == g_tab) tab_rows.push_back(i);
+        }
+        const float row_spacing = tab_rows.size() > 5 ? (280.0f / float(tab_rows.size())) : 58.0f;
+        float ry = kBar + 176;
+        for (size_t idx : tab_rows) {
+            const Row& row = rows[idx];
+            const int id = kHotRow0 + int(idx);
+            const bool lit = g_focus == id || g_hover == id || g_hover == kHotLeft0 + int(idx) || g_hover == kHotRight0 + int(idx);
             LegoText(g, row.label, float(S(left + 8 + (lit ? 4 : 0))), float(S(ry + 2)), 24.0f, kTintWhite);
             PlainText(g, row.hint, U(left + 10, ry + 28, 470, 18), 11.5f, ui::kMuted);
-            g_spots.push_back({U(left - 10, ry - 4, 812, 54), id});
+            g_spots.push_back({U(left - 10, ry - 4, 812, std::min(54.0f, row_spacing)), id});
             if (row.kind == RowKind::kChoice) {
                 const float vw = LegoTextWidth(g, row.value, 22.0f) / ui::g_scale;
                 LegoText(g, row.value, float(S(727 - vw / 2)), float(S(ry + 9)), 22.0f, kTintYellow);
                 for (int side = 0; side < 2; ++side) {
                     const Gdiplus::RectF arrow = U(side ? 830 : 594, ry + 6, 30, 34);
-                    const bool hot = g_hover == (side ? kHotRight0 : kHotLeft0) + int(i);
+                    const bool hot = g_hover == (side ? kHotRight0 : kHotLeft0) + int(idx);
                     Gdiplus::SolidBrush brush(ui::C(hot || lit ? ui::kAccent : ui::kMuted));
                     const float cx = arrow.X + arrow.Width / 2, cy = arrow.Y + arrow.Height / 2, r = float(S(6));
                     Gdiplus::PointF tri[3] = {Gdiplus::PointF(cx + (side ? -r / 2 : r / 2), cy - r), Gdiplus::PointF(cx + (side ? -r / 2 : r / 2), cy + r),
                                               Gdiplus::PointF(cx + (side ? r : -r), cy)};
                     g.FillPolygon(&brush, tri, 3);
-                    g_spots.push_back({arrow, (side ? kHotRight0 : kHotLeft0) + int(i)});
+                    g_spots.push_back({arrow, (side ? kHotRight0 : kHotLeft0) + int(idx)});
                 }
             } else {
                 PlainText(g, row.value, U(560, ry + 13, 300, 22), 13.0f, ui::kAccent, true, Gdiplus::StringAlignmentFar, false, 255,
                           row.kind == RowKind::kFolder);
             }
-            ry += 58;
+            ry += row_spacing;
         }
         menu_item(ui::T(L"VOLTAR", L"BACK"), kHotBack, kH - 92);
     }
