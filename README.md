@@ -66,6 +66,7 @@ The languages other than Portuguese and English need the game's original text fi
 - The story, Vorton and the DLC levels are playable at 60 fps (the "60 FPS" option in the launcher).
 - Audio, saves, controller and the portal (the real Toy Pad on USB, the LegoToypad app or a virtual Toy Pad) work.
 - Local co-op: up to 4 controllers, player 2 joins in split screen by pressing Options.
+- Keyboard and mouse buttons: rebind every key under **Settings > Controls** (mouse buttons can be bound too), and choose whether the keyboard controls Player 1 or Player 2. The keyboard is an extra way to control that player; controller order does not change. With the keyboard on Player 2, Player 2 is available even without a second controller.
 - Button icons follow your controller (Xbox 360, Xbox One/Series, PS3, PS4/PS5, Wii U for Nintendo controllers), built from the game's own files; the launcher can also lock one set.
 - **LD PC Transfer** (button in the launcher): converts the progress between the port, PS4 / shadPS4, Xbox 360 (Xenia), Wii U (Cemu) and PS3 (RPCS3, experimental). The original save is not changed and whatever the destination had goes to the `saves_backup` folder. Xbox One is not possible: its saves live in the cloud, encrypted.
 - **FPS and info counter** (launcher option, F10 in game): FPS, frame-time graph, graphics card temperature / load / clock / power / video memory (AMD via ADL, NVIDIA via NVML), CPU load and RAM in the top-left corner.

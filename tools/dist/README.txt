@@ -78,6 +78,8 @@ TIPS
     keyboard icons.
   - Local co-op: plug in a second controller and press Options on it; player 2 joins in split screen
     (up to 4 controllers, one per player).
+  - Keyboard: Settings > Controls changes every key (mouse buttons can be bound too) and chooses whether
+    the keyboard controls player 1 or player 2.
   - Real Toy Pad: plugged into USB before the game starts, it is used on its own, with no extra driver
     (portal.json and the app are left out). If you installed the WinUSB driver with Zadig (Cemu /
     RPCS3), switch the portal back to the default Windows driver. --no-real-toypad uses the virtual one.

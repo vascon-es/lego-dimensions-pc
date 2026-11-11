@@ -2,8 +2,9 @@
 //
 // Fontes de entrada, combinadas (OR dos botoes; analogico = o de maior deflexao):
 //   1. Controle XInput 0 (Xbox ou compativel).
-//   2. Teclado, SO quando a janela do jogo esta em foco (GetAsyncKeyState e global: sem esse
-//      filtro, digitar em outro programa apertaria botoes no jogo).
+//   2. Teclado (e botoes do mouse), SO quando a janela do jogo esta em foco (GetAsyncKeyState e global: sem esse
+//      filtro, digitar em outro programa apertaria botoes no jogo). Fase 79: teclas do launcher.ini, no jogador 1
+//      ou no 2.
 //   3. Roteiro de --input-script "seg:botao[:ms],...", para testes sem ninguem no teclado.
 //
 // Layout de ScePadData conferido na Fase 9 contra o consumidor do jogo (eboot+0x4b9040 e
@@ -26,6 +27,8 @@
 #include <cmath>
 #include <cstddef>
 #include <cstring>
+#include <filesystem>
+#include <iterator>
 #include <mutex>
 #include <string>
 #include <vector>
@@ -298,7 +301,29 @@ void ReadXInput(Input& in, DWORD index = 0) {
     }
 }
 
+// Fase 79: botoes do mouse so contam com o ponteiro dentro da area do jogo (arrastar a janela pela barra de
+// titulo nao aperta nada). GetAsyncKeyState le os botoes FISICOS: com os botoes trocados no Windows, o
+// "esquerdo" que o launcher gravou e o fisico direito.
+bool MouseInClient() {
+    const HWND hwnd = static_cast<HWND>(videoout::WindowHandle());
+    POINT p;
+    if (!hwnd || !GetCursorPos(&p) || WindowFromPoint(p) != hwnd || !ScreenToClient(hwnd, &p)) {
+        return false;
+    }
+    RECT client;
+    return GetClientRect(hwnd, &client) && PtInRect(&client, p);
+}
+
 bool Key(int vk) {
+    const bool mouse = vk == VK_LBUTTON || vk == VK_RBUTTON || vk == VK_MBUTTON || vk == VK_XBUTTON1 || vk == VK_XBUTTON2;
+    if (mouse) {
+        if (!MouseInClient()) {
+            return false;
+        }
+        if ((vk == VK_LBUTTON || vk == VK_RBUTTON) && GetSystemMetrics(SM_SWAPBUTTON)) {
+            vk = vk == VK_LBUTTON ? VK_RBUTTON : VK_LBUTTON;
+        }
+    }
     return (GetAsyncKeyState(vk) & 0x8000) != 0;
 }
 
@@ -318,6 +343,66 @@ bool FreshKey(int vk) {
     return down;
 }
 
+// Fase 79: teclas configuraveis (secao [keyboard] do launcher.ini, gravada pelo launcher). Cada acao tem um
+// codigo de tecla virtual do Windows (botoes do mouse incluidos: 1, 2, 4, 5, 6); 0 = sem tecla. Os nomes das
+// chaves sao o contrato com o launcher (tools/dist/launcher.cpp, kKeyActions): a ordem e os padroes tambem.
+struct KeyAction {
+    const char* name;
+    u32 button;    // bit de botao, ou 0 se a acao e de eixo
+    int axis = -1; // 0 = LeftX, 1 = LeftY, 2 = RightX, 3 = RightY
+    u8 value = 0x80;
+    int default_vk = 0;
+};
+const KeyAction kKeyActions[] = {
+    {"cross", kCross, -1, 0x80, VK_SPACE},     {"circle", kCircle, -1, 0x80, VK_ESCAPE},
+    {"square", kSquare, -1, 0x80, 'X'},        {"triangle", kTriangle, -1, 0x80, 'Y'},
+    {"options", kOptions, -1, 0x80, VK_RETURN}, {"touchpad", kTouchPad, -1, 0x80, VK_TAB},
+    {"up", kUp, -1, 0x80, VK_UP},              {"down", kDown, -1, 0x80, VK_DOWN},
+    {"left", kLeft, -1, 0x80, VK_LEFT},        {"right", kRight, -1, 0x80, VK_RIGHT},
+    {"l1", kL1, -1, 0x80, 'Q'},                {"r1", kR1, -1, 0x80, 'E'},
+    {"l2", kL2, -1, 0x80, '1'},                {"r2", kR2, -1, 0x80, '3'},
+    {"l3", kL3, -1, 0x80, 0},                  {"r3", kR3, -1, 0x80, 0},
+    {"ls_up", 0, 1, 0x00, 'W'},                {"ls_down", 0, 1, 0xFF, 'S'},
+    {"ls_left", 0, 0, 0x00, 'A'},              {"ls_right", 0, 0, 0xFF, 'D'},
+    {"rs_up", 0, 3, 0x00, 'I'},                {"rs_down", 0, 3, 0xFF, 'K'},
+    {"rs_left", 0, 2, 0x00, 'J'},              {"rs_right", 0, 2, 0xFF, 'L'},
+};
+constexpr int kKeyActionCount = static_cast<int>(std::size(kKeyActions));
+int g_key_vk[kKeyActionCount] = {};
+int g_keyboard_slot = 0; // Fase 79: jogador do teclado (0 = jogador 1, 1 = jogador 2)
+std::once_flag g_keyboard_config_once;
+
+// Uma vez, na primeira consulta (o UserService pergunta pelos jogadores antes do scePadInit).
+void LoadKeyboardConfig() {
+    for (int i = 0; i < kKeyActionCount; ++i) {
+        g_key_vk[i] = kKeyActions[i].default_vk;
+    }
+    wchar_t exe[MAX_PATH];
+    if (!GetModuleFileNameW(nullptr, exe, MAX_PATH)) {
+        return;
+    }
+    std::filesystem::path root = std::filesystem::path(exe).parent_path();
+    if (root.filename() == L"build") {
+        root = root.parent_path(); // mesma regra do F2 (hle_videoout.cpp)
+    }
+    const std::wstring ini = (root / L"launcher.ini").wstring();
+    g_keyboard_slot = GetPrivateProfileIntW(L"keyboard", L"player", 1, ini.c_str()) == 2 ? 1 : 0;
+    std::string custom;
+    for (int i = 0; i < kKeyActionCount; ++i) {
+        const std::wstring key(kKeyActions[i].name, kKeyActions[i].name + std::strlen(kKeyActions[i].name));
+        const int vk = static_cast<int>(GetPrivateProfileIntW(L"keyboard", key.c_str(), -1, ini.c_str()));
+        if (vk >= 0 && vk < 256) {
+            g_key_vk[i] = vk;
+        }
+        if (g_key_vk[i] != kKeyActions[i].default_vk) {
+            char item[32];
+            std::snprintf(item, sizeof(item), "%s%s=0x%02x", custom.empty() ? "" : " ", kKeyActions[i].name, g_key_vk[i]);
+            custom += item;
+        }
+    }
+    log::Tagged("PAD", "keyboard: player %d, %s", g_keyboard_slot + 1, custom.empty() ? "default keys" : ("custom keys: " + custom).c_str());
+}
+
 void ReadKeyboard(Input& in) {
     if (!g_keyboard_enabled || !videoout::WindowHasFocus()) {
         g_had_focus = false;
@@ -329,17 +414,17 @@ void ReadKeyboard(Input& in) {
             g_blocked[vk] = Key(vk); // tambem descarta o bit "apertada desde a ultima consulta"
         }
     }
-    const struct {
-        int vk;
-        u32 orbis;
-    } map[] = {
-        {VK_RETURN, kOptions}, {VK_SPACE, kCross}, {VK_ESCAPE, kCircle}, {'X', kSquare}, {'Y', kTriangle},
-        {VK_UP, kUp},          {VK_RIGHT, kRight}, {VK_DOWN, kDown},     {VK_LEFT, kLeft},
-        {'Q', kL1},            {'E', kR1},         {'1', kL2},           {'3', kR2},     {VK_TAB, kTouchPad},
-    };
-    for (const auto& m : map) {
-        if (FreshKey(m.vk)) {
-            in.buttons |= m.orbis;
+    // eixos: direcoes opostas apertadas juntas = centro
+    int toward[4][2] = {}; // [eixo][0 = cima/esquerda, 1 = baixo/direita]
+    for (int i = 0; i < kKeyActionCount; ++i) {
+        const KeyAction& action = kKeyActions[i];
+        if (!g_key_vk[i] || !FreshKey(g_key_vk[i])) {
+            continue;
+        }
+        if (action.axis < 0) {
+            in.buttons |= action.button;
+        } else {
+            toward[action.axis][action.value == 0xFF] = 1;
         }
     }
     if (in.buttons & kL2) {
@@ -348,15 +433,12 @@ void ReadKeyboard(Input& in) {
     if (in.buttons & kR2) {
         in.r2 = 255;
     }
-    // WASD = analogico esquerdo, IJKL = direito
-    if (FreshKey('A')) in.lx = 0x00;
-    if (FreshKey('D')) in.lx = 0xFF;
-    if (FreshKey('W')) in.ly = 0x00;
-    if (FreshKey('S')) in.ly = 0xFF;
-    if (FreshKey('J')) in.rx = 0x00;
-    if (FreshKey('L')) in.rx = 0xFF;
-    if (FreshKey('I')) in.ry = 0x00;
-    if (FreshKey('K')) in.ry = 0xFF;
+    u8* const axes[4] = {&in.lx, &in.ly, &in.rx, &in.ry};
+    for (int axis = 0; axis < 4; ++axis) {
+        if (toward[axis][0] != toward[axis][1]) {
+            *axes[axis] = toward[axis][0] ? 0x00 : 0xFF;
+        }
+    }
 }
 
 std::mutex g_script_mutex; // o macro acrescenta passos de outra thread
@@ -515,7 +597,7 @@ void ReadScript(Input& in, int player = 0) {
 // Fase 61 (co-op local): ha controle para a vaga (0 = jogador 1)? SDL primeiro; sem nenhum controle no SDL (ou com
 // --no-sdl-pad), o XInput do mesmo indice. XInputGetState num indice vazio e lento (o driver procura o aparelho):
 // vaga vazia e conferida de novo so a cada 2 s.
-bool SlotPresent(int slot) {
+bool DevicePresent(int slot) {
     if (slot < 0 || slot >= padsdl::kSlots) {
         return false;
     }
@@ -542,7 +624,19 @@ bool SlotPresent(int slot) {
     return present[slot];
 }
 
-// Jogadores 2 a 4: so o controle da propria vaga (o teclado, os roteiros e o portal sao do jogador 1).
+int KeyboardSlot() {
+    std::call_once(g_keyboard_config_once, LoadKeyboardConfig);
+    return g_keyboard_slot;
+}
+
+// Fase 79: o jogador existe se tem controle na vaga ou se o teclado e dele (teclado no jogador 2 = o jogador 2 entra
+// mesmo sem segundo controle; o jogador 1 sempre existe).
+bool SlotPresent(int slot) {
+    return DevicePresent(slot) || (g_keyboard_enabled && slot == KeyboardSlot());
+}
+
+// Jogadores 2 a 4: so o controle da propria vaga (os roteiros de teste e o portal sao do jogador 1); o teclado, se
+// for o jogador 2 (Fase 79).
 bool ReadOtherPlayer(int slot, Input& in) {
     if (!SlotPresent(slot)) {
         return false;
@@ -562,6 +656,9 @@ bool ReadOtherPlayer(int slot, Input& in) {
     } else if (padsdl::Count() == 0) {
         ReadXInput(in, static_cast<DWORD>(slot));
     }
+    if (slot == KeyboardSlot()) {
+        ReadKeyboard(in);
+    }
     if (slot == 1) {
         ReadScript(in, 1);
     }
@@ -571,6 +668,7 @@ bool ReadOtherPlayer(int slot, Input& in) {
 HLE_IMPL(int, scePadInit) {
     HLE_TRACE("");
     padsdl::Start(); // Fase 24.5: thread do SDL (DualShock 4, touchpad)
+    KeyboardSlot();  // Fase 79: teclas e jogador do teclado (launcher.ini), ja no log da abertura
     return err::OK;
 }
 HLE_OVERRIDE(scePadInit);
@@ -656,7 +754,9 @@ HLE_IMPL(int, scePadReadState, int handle, PadData* data, u64 guest_rbp) {
         ReadXInput(in);
     }
     in.buttons &= ~PadHeldSinceFocus(in.buttons);
-    ReadKeyboard(in);
+    if (KeyboardSlot() == 0) { // Fase 79: o teclado pode ser do jogador 2
+        ReadKeyboard(in);
+    }
     ReadScript(in);
 
     // Menu de Configuracoes de Video (L3 + R3 no controle)

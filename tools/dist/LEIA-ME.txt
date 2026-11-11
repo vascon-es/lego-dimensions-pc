@@ -67,6 +67,8 @@ DICAS
     saem do seu proprio jogo (o Preparar monta; o JOGAR monta na hora se faltar). Nao ha icones de teclado.
   - Co-op local: ligue um segundo controle e aperte Options nele; o jogador 2 entra em tela dividida
     (ate 4 controles, um por jogador).
+  - Teclado: Configuracoes > Controles troca cada tecla (botoes do mouse tambem valem) e escolhe se o
+    teclado controla o jogador 1 ou o jogador 2.
   - Toy Pad real: ligado no USB antes de abrir o jogo, ele e usado sozinho, sem driver extra (o
     portal.json e o app ficam de fora). Se voce instalou o driver WinUSB pelo Zadig (Cemu / RPCS3),
     volte o driver do portal para o padrao do Windows. --no-real-toypad usa o portal virtual.

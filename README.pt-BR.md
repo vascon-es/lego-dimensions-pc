@@ -38,6 +38,7 @@ Detalhes e dicas no [LEIA-ME](tools/dist/LEIA-ME.txt).
 - Dá para jogar a história, Vorton e as fases com DLCs, a 60 fps (opção "60 FPS" no launcher).
 - Áudio, saves, controle e portal (o Toy Pad de verdade no USB, o app LegoToypad ou um Toy Pad virtual) funcionam.
 - Co-op local: até 4 controles; o jogador 2 entra em tela dividida apertando Options.
+- Teclado e botões do mouse: cada tecla pode ser trocada em **Configurações > Controles** (os botões do mouse também valem), e dá para escolher se o teclado controla o jogador 1 ou o jogador 2. O teclado é um jeito a mais de controlar esse jogador; a ordem dos controles não muda. Com o teclado no jogador 2, o jogador 2 existe mesmo sem segundo controle.
 - Ícones dos botões conforme o controle (Xbox 360, Xbox One/Series, PS3, PS4/PS5, Wii U para controles da Nintendo), montados a partir dos arquivos do próprio jogo; o launcher também deixa fixar um conjunto.
 - **LD PC Transfer** (botão no launcher): converte o progresso entre o port, PS4 / shadPS4, Xbox 360 (Xenia), Wii U (Cemu) e PS3 (RPCS3, experimental). O save original não é alterado e o que o destino já tinha vai para a pasta `saves_backup`. Xbox One não dá: os saves dele ficam na nuvem, criptografados.
 - **Contador de FPS e info** (opção do launcher, F10 no jogo): FPS, gráfico do tempo de cada quadro, temperatura / uso / clock / consumo / memória da placa de vídeo (AMD pelo ADL, NVIDIA pelo NVML), uso da CPU e RAM no canto de cima, à esquerda.

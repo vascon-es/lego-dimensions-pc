@@ -1255,6 +1255,371 @@ void OpenNamesDialog() {
     SetFocus(g_name_edits[0]);
 }
 
+void Redraw();
+
+// ---- Fase 79: teclas do teclado e botoes do mouse ----
+// Secao [keyboard] do launcher.ini: player = 1 / 2 (o jogador que o teclado controla) e, por acao, o codigo de tecla
+// virtual do Windows (0 = sem tecla). O jogo le na abertura (src/hle/overrides/hle_pad.cpp, kKeyActions): os nomes
+// e os padroes tem de ser os mesmos dos dois lados.
+struct KeyAction {
+    const wchar_t* key;
+    const wchar_t *pt, *en;
+    int default_vk;
+};
+constexpr KeyAction kKeyActions[] = {
+    {L"cross", L"Cruz / A", L"Cross / A", VK_SPACE},
+    {L"circle", L"Círculo / B", L"Circle / B", VK_ESCAPE},
+    {L"square", L"Quadrado / X", L"Square / X", 'X'},
+    {L"triangle", L"Triângulo / Y", L"Triangle / Y", 'Y'},
+    {L"options", L"Options / Start", L"Options / Start", VK_RETURN},
+    {L"touchpad", L"Touchpad / Back", L"Touchpad / Back", VK_TAB},
+    {L"up", L"Direcional: cima", L"D-pad up", VK_UP},
+    {L"down", L"Direcional: baixo", L"D-pad down", VK_DOWN},
+    {L"left", L"Direcional: esquerda", L"D-pad left", VK_LEFT},
+    {L"right", L"Direcional: direita", L"D-pad right", VK_RIGHT},
+    {L"l1", L"L1 / LB", L"L1 / LB", 'Q'},
+    {L"r1", L"R1 / RB", L"R1 / RB", 'E'},
+    {L"l2", L"L2 / LT", L"L2 / LT", '1'},
+    {L"r2", L"R2 / RT", L"R2 / RT", '3'},
+    {L"l3", L"L3 (clique esquerdo)", L"L3 (left stick click)", 0},
+    {L"r3", L"R3 (clique direito)", L"R3 (right stick click)", 0},
+    {L"ls_up", L"Analógico esq.: cima", L"Left stick up", 'W'},
+    {L"ls_down", L"Analógico esq.: baixo", L"Left stick down", 'S'},
+    {L"ls_left", L"Analógico esq.: esquerda", L"Left stick left", 'A'},
+    {L"ls_right", L"Analógico esq.: direita", L"Left stick right", 'D'},
+    {L"rs_up", L"Analógico dir.: cima", L"Right stick up", 'I'},
+    {L"rs_down", L"Analógico dir.: baixo", L"Right stick down", 'K'},
+    {L"rs_left", L"Analógico dir.: esquerda", L"Right stick left", 'J'},
+    {L"rs_right", L"Analógico dir.: direita", L"Right stick right", 'L'},
+};
+constexpr int kKeyActionCount = int(std::size(kKeyActions));
+int g_key_vk[kKeyActionCount];
+int g_keyboard_player = 1;
+
+void LoadKeyboardSettings() {
+    g_keyboard_player = GetPrivateProfileIntW(L"keyboard", L"player", 1, Ini().c_str()) == 2 ? 2 : 1;
+    for (int i = 0; i < kKeyActionCount; ++i) {
+        const int vk = int(GetPrivateProfileIntW(L"keyboard", kKeyActions[i].key, -1, Ini().c_str()));
+        g_key_vk[i] = vk >= 0 && vk < 256 ? vk : kKeyActions[i].default_vk;
+    }
+}
+
+void SaveKeyboardSettings() {
+    if (g_self_test) return;
+    WritePrivateProfileStringW(L"keyboard", L"player", std::to_wstring(g_keyboard_player).c_str(), Ini().c_str());
+    for (int i = 0; i < kKeyActionCount; ++i) {
+        WritePrivateProfileStringW(L"keyboard", kKeyActions[i].key, std::to_wstring(g_key_vk[i]).c_str(), Ini().c_str());
+    }
+}
+
+int ChangedKeys(const int* vk) {
+    int changed = 0;
+    for (int i = 0; i < kKeyActionCount; ++i) changed += vk[i] != kKeyActions[i].default_vk;
+    return changed;
+}
+
+// F2 / F10 / F11 sao atalhos do proprio jogo; as teclas do Windows abrem o menu Iniciar.
+bool ReservedKey(int vk) { return vk == VK_F2 || vk == VK_F10 || vk == VK_F11 || vk == VK_LWIN || vk == VK_RWIN; }
+
+std::wstring KeyName(int vk) {
+    switch (vk) {
+    case 0: return ui::T(L"(nenhuma)", L"(none)");
+    case VK_LBUTTON: return ui::T(L"Mouse: esquerdo", L"Left mouse button");
+    case VK_RBUTTON: return ui::T(L"Mouse: direito", L"Right mouse button");
+    case VK_MBUTTON: return ui::T(L"Mouse: meio", L"Middle mouse button");
+    case VK_XBUTTON1: return ui::T(L"Mouse: lateral 1", L"Mouse button 4");
+    case VK_XBUTTON2: return ui::T(L"Mouse: lateral 2", L"Mouse button 5");
+    default: break;
+    }
+    // GetKeyNameText precisa do bit "estendida" para as setas, Insert / Delete / Home / End / PgUp / PgDn e o lado
+    // direito de Ctrl / Alt; sem ele as setas viram as do teclado numerico.
+    LONG scan = LONG(MapVirtualKeyW(UINT(vk), MAPVK_VK_TO_VSC)) << 16;
+    switch (vk) {
+    case VK_UP: case VK_DOWN: case VK_LEFT: case VK_RIGHT: case VK_INSERT: case VK_DELETE: case VK_HOME: case VK_END:
+    case VK_PRIOR: case VK_NEXT: case VK_RCONTROL: case VK_RMENU: case VK_DIVIDE: case VK_NUMLOCK: case VK_APPS:
+        scan |= 1 << 24;
+        break;
+    default: break;
+    }
+    wchar_t name[64] = {};
+    if (scan && GetKeyNameTextW(scan, name, 64) > 0) return name;
+    wchar_t code[32];
+    swprintf(code, 32, ui::T(L"Tecla 0x%02X", L"Key 0x%02X"), vk);
+    return code;
+}
+
+// WM_KEYDOWN diz so "Shift" / "Ctrl" / "Alt": o lado vem do codigo de varredura / do bit "estendida".
+int SpecificKey(WPARAM wp, LPARAM lp) {
+    const UINT scan = (lp >> 16) & 0xFF;
+    const bool extended = (lp >> 24) & 1;
+    switch (wp) {
+    case VK_SHIFT: return int(MapVirtualKeyW(scan, MAPVK_VSC_TO_VK_EX));
+    case VK_CONTROL: return extended ? VK_RCONTROL : VK_LCONTROL;
+    case VK_MENU: return extended ? VK_RMENU : VK_LMENU;
+    default: return int(wp);
+    }
+}
+
+HWND g_keys_window = nullptr;
+int g_keys_edit[kKeyActionCount];   // copia em edicao (Salvar grava, Cancelar descarta)
+int g_keys_sel = 0;                 // a linha escolhida pelo teclado
+int g_keys_hover = -1;
+int g_keys_capture = -1;            // esperando a tecla desta acao
+bool g_keys_wait_release = false;   // o clique / Enter que comecou a espera ainda nao foi solto
+std::wstring g_keys_note;           // linha de aviso (tecla reservada, tecla tirada de outra acao)
+constexpr int kKeysW = 720, kKeysRows = 12, kKeysRowH = 38, kKeysTop = 112, kKeysH = kKeysTop + kKeysRows * kKeysRowH + 112;
+enum KeysId { kKeysSave = 1, kKeysCancel = 2, kKeysReset = 3 };
+
+RECT KeyBox(int i) {
+    const int column = i / kKeysRows, row = i % kKeysRows;
+    const int x = 28 + column * 340, y = kKeysTop + row * kKeysRowH;
+    return RECT{S(float(x + 186)), S(float(y + 3)), S(float(x + 330)), S(float(y + kKeysRowH - 5))};
+}
+
+int KeyBoxAt(int x, int y) {
+    const POINT p{x, y};
+    for (int i = 0; i < kKeyActionCount; ++i) {
+        const RECT r = KeyBox(i);
+        if (PtInRect(&r, p)) return i;
+    }
+    return -1;
+}
+
+void StartKeyCapture(HWND hwnd, int i) {
+    g_keys_sel = i;
+    g_keys_capture = i;
+    g_keys_wait_release = true;
+    g_keys_note.clear();
+    SetFocus(hwnd); // as teclas vem para a janela, nao para um botao
+    InvalidateRect(hwnd, nullptr, FALSE);
+}
+
+// Uma tecla / botao do mouse durante a espera. Repetida em outra acao, sai de la (cada tecla faz uma coisa so).
+void AssignKey(HWND hwnd, int vk) {
+    if (g_keys_capture < 0 || g_keys_wait_release) return;
+    if (ReservedKey(vk)) {
+        g_keys_note = KeyName(vk) + ui::T(L" é um atalho do jogo / do Windows: escolha outra tecla.",
+                                          L" is a game / Windows shortcut: choose another key.");
+        InvalidateRect(hwnd, nullptr, FALSE);
+        return;
+    }
+    for (int i = 0; i < kKeyActionCount; ++i) {
+        if (i != g_keys_capture && g_keys_edit[i] == vk) {
+            g_keys_edit[i] = 0;
+            g_keys_note = KeyName(vk) + ui::T(L" saiu de \"", L" was removed from \"") + ui::T(kKeyActions[i].pt, kKeyActions[i].en) + L"\".";
+        }
+    }
+    g_keys_edit[g_keys_capture] = vk;
+    g_keys_capture = -1;
+    InvalidateRect(hwnd, nullptr, FALSE);
+}
+
+LRESULT CALLBACK KeysProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
+    switch (msg) {
+    case WM_PAINT: {
+        PAINTSTRUCT ps;
+        HDC target = BeginPaint(hwnd, &ps);
+        RECT client;
+        GetClientRect(hwnd, &client);
+        {
+            ui::Buffered buffer(target, client);
+            HBRUSH bg = CreateSolidBrush(ui::kBg);
+            FillRect(buffer.dc, &client, bg);
+            DeleteObject(bg);
+            {
+                Gdiplus::Graphics g(buffer.dc);
+                g.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
+                for (int i = 0; i < kKeyActionCount; ++i) {
+                    const RECT box = KeyBox(i);
+                    const bool capturing = g_keys_capture == i;
+                    Gdiplus::SolidBrush fill(ui::C(capturing ? ui::kPanel : ui::kField));
+                    ui::FillRound(g, box, float(S(6)), fill);
+                    const bool lit = capturing || g_keys_hover == i || g_keys_sel == i;
+                    ui::StrokeRound(g, box, float(S(6)), capturing ? ui::kAccent : lit ? ui::kMuted : ui::kBorder, capturing ? 2.0f : 1.0f);
+                }
+            }
+            RECT title{S(28), S(18), S(kKeysW - 28), S(46)};
+            ui::Text(buffer.dc, ui::T(L"Controles do teclado", L"Keyboard controls"), title, g_button, ui::kText);
+            RECT hint{S(28), S(48), S(kKeysW - 28), S(100)};
+            ui::Text(buffer.dc,
+                     ui::T(L"Clique numa caixa (ou Enter) e aperte a tecla ou o botão do mouse. Clique direito ou Delete: sem tecla. "
+                           L"Os botões do mouse só contam com o ponteiro dentro do jogo.",
+                           L"Click a box (or press Enter), then press the key or mouse button. Right-click or Delete: no key. "
+                           L"Mouse buttons only count with the pointer inside the game."),
+                     hint, g_small, ui::kMuted, DT_LEFT | DT_TOP | DT_WORDBREAK);
+            for (int i = 0; i < kKeyActionCount; ++i) {
+                const RECT box = KeyBox(i);
+                RECT label{box.left - S(186), box.top, box.left - S(8), box.bottom};
+                ui::Text(buffer.dc, ui::T(kKeyActions[i].pt, kKeyActions[i].en), label, g_small,
+                         g_keys_sel == i || g_keys_capture == i ? ui::kText : ui::kMuted);
+                const bool capturing = g_keys_capture == i;
+                const std::wstring value = capturing ? ui::T(L"Aperte uma tecla...", L"Press a key...") : KeyName(g_keys_edit[i]);
+                RECT text = box;
+                InflateRect(&text, -S(8), 0);
+                ui::Text(buffer.dc, value, text, g_small,
+                         capturing ? ui::kAccent : g_keys_edit[i] ? ui::kText : ui::kMuted, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+            }
+            RECT note{S(28), S(float(kKeysTop + kKeysRows * kKeysRowH + 6)), S(kKeysW - 28), S(float(kKeysTop + kKeysRows * kKeysRowH + 30))};
+            ui::Text(buffer.dc, g_keys_note, note, g_small, ui::kAmber);
+        }
+        EndPaint(hwnd, &ps);
+        return 0;
+    }
+    case WM_ERASEBKGND:
+        return 1;
+    case WM_DRAWITEM:
+        ui::DrawButton(reinterpret_cast<const DRAWITEMSTRUCT*>(lp));
+        return TRUE;
+    case WM_MOUSEMOVE: {
+        const int hover = KeyBoxAt(GET_X_LPARAM(lp), GET_Y_LPARAM(lp));
+        if (hover != g_keys_hover) {
+            g_keys_hover = hover;
+            InvalidateRect(hwnd, nullptr, FALSE);
+        }
+        TRACKMOUSEEVENT tme{sizeof(tme), TME_LEAVE, hwnd, 0};
+        TrackMouseEvent(&tme);
+        return 0;
+    }
+    case WM_MOUSELEAVE:
+        g_keys_hover = -1;
+        InvalidateRect(hwnd, nullptr, FALSE);
+        return 0;
+    case WM_LBUTTONDOWN:
+    case WM_RBUTTONDOWN:
+    case WM_MBUTTONDOWN:
+    case WM_XBUTTONDOWN: {
+        const int vk = msg == WM_LBUTTONDOWN   ? VK_LBUTTON
+                       : msg == WM_RBUTTONDOWN ? VK_RBUTTON
+                       : msg == WM_MBUTTONDOWN ? VK_MBUTTON
+                       : GET_XBUTTON_WPARAM(wp) == XBUTTON1 ? VK_XBUTTON1 : VK_XBUTTON2;
+        if (g_keys_capture >= 0 && !g_keys_wait_release) {
+            AssignKey(hwnd, vk); // qualquer botao, em qualquer lugar da janela, vira a tecla
+            return msg == WM_XBUTTONDOWN ? TRUE : 0;
+        }
+        const int at = KeyBoxAt(GET_X_LPARAM(lp), GET_Y_LPARAM(lp));
+        if (msg == WM_LBUTTONDOWN && at >= 0) {
+            StartKeyCapture(hwnd, at);
+        } else if (msg == WM_RBUTTONDOWN && at >= 0 && g_keys_capture < 0) {
+            g_keys_sel = at;
+            g_keys_edit[at] = 0;
+            InvalidateRect(hwnd, nullptr, FALSE);
+        } else if (g_keys_capture >= 0 && at < 0) {
+            g_keys_capture = -1; // clique fora das caixas: desiste
+            InvalidateRect(hwnd, nullptr, FALSE);
+        }
+        return msg == WM_XBUTTONDOWN ? TRUE : 0;
+    }
+    case WM_LBUTTONUP:
+    case WM_RBUTTONUP:
+    case WM_MBUTTONUP:
+    case WM_XBUTTONUP:
+    case WM_KEYUP:
+        g_keys_wait_release = false;
+        return msg == WM_XBUTTONUP ? TRUE : 0;
+    case WM_SYSKEYUP:
+        g_keys_wait_release = false;
+        return 0; // sem isto, soltar Alt abre o menu da janela
+    case WM_KEYDOWN:
+    case WM_SYSKEYDOWN: {
+        const bool repeat = (lp >> 30) & 1;
+        if (msg == WM_SYSKEYDOWN && wp == VK_F4) {
+            return DefWindowProcW(hwnd, msg, wp, lp); // Alt+F4 fecha
+        }
+        if (g_keys_capture >= 0) {
+            if (!repeat) AssignKey(hwnd, SpecificKey(wp, lp));
+            return 0;
+        }
+        // navegacao: setas, Enter = escolher, Delete / Backspace = sem tecla, Esc = cancelar
+        const int row = g_keys_sel % kKeysRows, column = g_keys_sel / kKeysRows;
+        switch (wp) {
+        case VK_UP: g_keys_sel = column * kKeysRows + (row + kKeysRows - 1) % kKeysRows; break;
+        case VK_DOWN: g_keys_sel = column * kKeysRows + (row + 1) % kKeysRows; break;
+        case VK_LEFT:
+        case VK_RIGHT: g_keys_sel = (1 - column) * kKeysRows + row; break;
+        case VK_RETURN: StartKeyCapture(hwnd, g_keys_sel); break;
+        case VK_DELETE:
+        case VK_BACK: g_keys_edit[g_keys_sel] = 0; break;
+        case VK_ESCAPE: DestroyWindow(hwnd); return 0;
+        default: return 0;
+        }
+        g_keys_note.clear();
+        InvalidateRect(hwnd, nullptr, FALSE);
+        return 0;
+    }
+    case WM_COMMAND:
+        if (LOWORD(wp) == kKeysSave) {
+            std::copy(std::begin(g_keys_edit), std::end(g_keys_edit), g_key_vk);
+            SaveKeyboardSettings();
+            const int changed = ChangedKeys(g_key_vk);
+            AppendLog(changed ? ui::T(L"Teclado: ", L"Keyboard: ") + std::to_wstring(changed) + ui::T(L" tecla(s) mudada(s)", L" key(s) changed")
+                              : ui::T(L"Teclado: teclas padrão", L"Keyboard: default keys"));
+            DestroyWindow(hwnd);
+        } else if (LOWORD(wp) == kKeysCancel) {
+            DestroyWindow(hwnd);
+        } else if (LOWORD(wp) == kKeysReset) {
+            for (int i = 0; i < kKeyActionCount; ++i) g_keys_edit[i] = kKeyActions[i].default_vk;
+            g_keys_capture = -1;
+            g_keys_note = ui::T(L"Teclas padrão restauradas (Salvar para gravar).", L"Default keys restored (Save to keep them).");
+            SetFocus(hwnd);
+            InvalidateRect(hwnd, nullptr, FALSE);
+        }
+        return 0;
+    case WM_CLOSE:
+        DestroyWindow(hwnd);
+        return 0;
+    case WM_DESTROY:
+        EnableWindow(g_main, TRUE);
+        SetForegroundWindow(g_main);
+        g_keys_window = nullptr;
+        Redraw();
+        return 0;
+    }
+    return DefWindowProcW(hwnd, msg, wp, lp);
+}
+
+// Janela das teclas; o launcher fica travado enquanto ela esta aberta (como a dos apelidos).
+void OpenKeysDialog() {
+    if (g_keys_window) {
+        SetForegroundWindow(g_keys_window);
+        return;
+    }
+    static bool registered = false;
+    if (!registered) {
+        WNDCLASSEXW wc{sizeof(wc)};
+        wc.lpfnWndProc = KeysProc;
+        wc.hInstance = GetModuleHandleW(nullptr);
+        wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+        wc.hbrBackground = g_bg_brush;
+        wc.hIcon = LoadIconW(wc.hInstance, MAKEINTRESOURCEW(1));
+        wc.lpszClassName = L"LegoDimensionsPcKeys";
+        RegisterClassExW(&wc);
+        registered = true;
+    }
+    std::copy(std::begin(g_key_vk), std::end(g_key_vk), g_keys_edit);
+    g_keys_sel = 0;
+    g_keys_hover = -1;
+    g_keys_capture = -1;
+    g_keys_wait_release = false;
+    g_keys_note.clear();
+    const DWORD style = WS_POPUP | WS_CAPTION | WS_SYSMENU | WS_CLIPCHILDREN;
+    RECT size{0, 0, S(kKeysW), S(kKeysH)};
+    AdjustWindowRect(&size, style, FALSE);
+    RECT owner;
+    GetWindowRect(g_main, &owner);
+    const int w = size.right - size.left, h = size.bottom - size.top;
+    g_keys_window = CreateWindowExW(WS_EX_DLGMODALFRAME, L"LegoDimensionsPcKeys", ui::T(L"Teclado", L"Keyboard"), style,
+                                    owner.left + ((owner.right - owner.left) - w) / 2, owner.top + ((owner.bottom - owner.top) - h) / 2, w, h, g_main,
+                                    nullptr, GetModuleHandleW(nullptr), nullptr);
+    ui::DarkTitle(g_keys_window);
+    ui::Button(g_keys_window, ui::T(L"Restaurar padrão", L"Reset to defaults"), ui::Style::kSecondary, S(28), S(kKeysH - 62), S(190), S(44), kKeysReset,
+               g_button);
+    ui::Button(g_keys_window, ui::T(L"Cancelar", L"Cancel"), ui::Style::kSecondary, S(kKeysW - 316), S(kKeysH - 62), S(130), S(44), kKeysCancel, g_button);
+    ui::Button(g_keys_window, ui::T(L"Salvar", L"Save"), ui::Style::kPrimary, S(kKeysW - 176), S(kKeysH - 62), S(148), S(44), kKeysSave, g_button);
+    EnableWindow(g_main, FALSE);
+    ShowWindow(g_keys_window, SW_SHOW);
+    SetFocus(g_keys_window);
+}
+
 void LaunchLegoToypad(bool notify_if_running = false);
 
 // ---- jogar ----
@@ -1803,7 +2168,7 @@ void EnsureLegoFont() {
 // ---- a tela (desenho do launcher do port de inFAMOUS Second Son, de Castlesea; ver o comeco do arquivo) ----
 enum class Screen { kMain, kSettings };
 Screen g_screen = Screen::kMain;
-enum SettingsTab { kTabFiles, kTabDisplay, kTabGraphics, kTabGame, kTabTrophies, kTabAdvanced, kTabCount }; // 1.9.1: + GRAFICOS
+enum SettingsTab { kTabFiles, kTabDisplay, kTabGraphics, kTabGame, kTabControls, kTabTrophies, kTabAdvanced, kTabCount }; // 1.9.1: + GRAFICOS; Fase 79: + CONTROLES
 int g_tab = kTabFiles;
 
 enum Hot {
@@ -1841,6 +2206,7 @@ struct Row {
 
 std::wstring OnOff(bool on) { return on ? ui::T(L"Ligado", L"On") : ui::T(L"Desligado", L"Off"); }
 void OpenNamesDialog();
+void OpenKeysDialog();
 std::vector<std::wstring> ReadPlayerNames();
 
 // As pastas de saves: assets\savedata0 (a do jogador, sempre) e as outras assets\savedata* com um Slot00 dentro
@@ -1987,6 +2353,20 @@ std::vector<Row> Rows() {
     rows.push_back({kTabGame, RowKind::kAction, ui::T(L"Apelidos dos jogadores", L"Player nicknames"),
                     ui::T(L"O nome no lugar de Player1, Player2... Enter: editar.", L"The name shown instead of Player1, Player2... Enter: edit."),
                     names.empty() ? ui::T(L"Padrão", L"Default") : names, [](int) { OpenNamesDialog(); }});
+    // Controles (Fase 79): o teclado (e os botoes do mouse) e um jeito a mais de controlar o jogador 1 ou o 2; a ordem
+    // dos controles nao muda (o primeiro ligado e o jogador 1, o segundo o jogador 2)
+    rows.push_back({kTabControls, RowKind::kChoice, ui::T(L"Jogador do teclado", L"Keyboard player"),
+                    ui::T(L"O jogador que o teclado e o mouse controlam, junto com o controle dele.",
+                          L"The player the keyboard and mouse control, alongside that player's controller."),
+                    g_keyboard_player == 2 ? ui::T(L"Jogador 2", L"Player 2") : ui::T(L"Jogador 1", L"Player 1"), [](int) {
+                        g_keyboard_player = g_keyboard_player == 2 ? 1 : 2;
+                        SaveKeyboardSettings();
+                    }});
+    const int changed_keys = ChangedKeys(g_key_vk);
+    rows.push_back({kTabControls, RowKind::kAction, ui::T(L"Teclas do teclado e do mouse", L"Keyboard and mouse keys"),
+                    ui::T(L"Mudar o que cada tecla ou botão do mouse faz. Enter: editar.", L"Change what each key or mouse button does. Enter: edit."),
+                    changed_keys ? std::to_wstring(changed_keys) + ui::T(L" mudada(s)", L" changed") : ui::T(L"Padrão", L"Default"),
+                    [](int) { OpenKeysDialog(); }});
     // Conquistas
     static const wchar_t* const kTrophySounds[] = {L"playstation", L"xbox", L"steam", L"desligado"};
     rows.push_back({kTabTrophies, RowKind::kChoice, ui::T(L"Som de conquista", L"Trophy sound"),
@@ -2020,6 +2400,7 @@ const wchar_t* TabName(int tab) {
     case kTabDisplay: return ui::T(L"TELA", L"DISPLAY");
     case kTabGraphics: return ui::T(L"GRÁFICOS", L"GRAPHICS");
     case kTabGame: return ui::T(L"JOGO", L"GAME");
+    case kTabControls: return ui::T(L"CONTROLES", L"CONTROLS");
     case kTabTrophies: return ui::T(L"CONQUISTAS", L"ACHIEVEMENTS");
     default: return ui::T(L"AVANÇADO", L"ADVANCED");
     }
@@ -2628,6 +3009,7 @@ void PadKey(WORD vk) {
 
 
 void LoadSettings() {
+    LoadKeyboardSettings(); // Fase 79
     std::wstring game = ReadIni(L"jogo");
     std::wstring dlc = ReadIni(L"dlcs", L"\x01");
     if (dlc == L"\x01") { // primeira vez: a pasta de DLCs do shadPS4, se existir
