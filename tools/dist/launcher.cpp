@@ -24,6 +24,7 @@
 #include <xinput.h>
 #include <hidsdi.h>
 #include <setupapi.h>
+#include <winhttp.h>
 
 #include <algorithm>
 #include <atomic>
@@ -45,6 +46,7 @@
 #pragma comment(lib, "user32.lib")
 #pragma comment(lib, "hid.lib")
 #pragma comment(lib, "setupapi.lib")
+#pragma comment(lib, "winhttp.lib")
 #pragma comment(linker, "\"/manifestdependency:type='win32' name='Microsoft.Windows.Common-Controls' version='6.0.0.0' "      \
                         "processorArchitecture='amd64' publicKeyToken='6595b64144ccf1df' language='*'\"")
 
@@ -1555,6 +1557,139 @@ void LaunchLegoToypad(bool notify_if_running) {
     }
 }
 
+// ---- Persistencia de estado do LegoToypad (Harrysof) ----
+std::atomic<bool> g_toypad_api_restored{false};
+std::string g_last_saved_toypad_state;
+
+std::string ToypadHttpGet(int port, const wchar_t* path) {
+    std::string result;
+    HINTERNET hSession = WinHttpOpen(L"LegoDimensionsLauncher/1.0", WINHTTP_ACCESS_TYPE_NO_PROXY, WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
+    if (!hSession) return result;
+    WinHttpSetTimeouts(hSession, 400, 400, 400, 400);
+    HINTERNET hConnect = WinHttpConnect(hSession, L"127.0.0.1", port, 0);
+    if (hConnect) {
+        HINTERNET hRequest = WinHttpOpenRequest(hConnect, L"GET", path, nullptr, WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES, 0);
+        if (hRequest) {
+            if (WinHttpSendRequest(hRequest, WINHTTP_NO_ADDITIONAL_HEADERS, 0, WINHTTP_NO_REQUEST_DATA, 0, 0, 0) &&
+                WinHttpReceiveResponse(hRequest, nullptr)) {
+                DWORD size = 0;
+                while (WinHttpQueryDataAvailable(hRequest, &size) && size > 0) {
+                    std::vector<char> buf(size);
+                    DWORD downloaded = 0;
+                    if (WinHttpReadData(hRequest, buf.data(), size, &downloaded) && downloaded > 0) {
+                        result.append(buf.data(), downloaded);
+                    }
+                }
+            }
+            WinHttpCloseHandle(hRequest);
+        }
+        WinHttpCloseHandle(hConnect);
+    }
+    WinHttpCloseHandle(hSession);
+    return result;
+}
+
+bool ToypadHttpPost(int port, const wchar_t* path, const std::string& json_body) {
+    bool ok = false;
+    HINTERNET hSession = WinHttpOpen(L"LegoDimensionsLauncher/1.0", WINHTTP_ACCESS_TYPE_NO_PROXY, WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
+    if (!hSession) return false;
+    WinHttpSetTimeouts(hSession, 800, 800, 800, 800);
+    HINTERNET hConnect = WinHttpConnect(hSession, L"127.0.0.1", port, 0);
+    if (hConnect) {
+        HINTERNET hRequest = WinHttpOpenRequest(hConnect, L"POST", path, nullptr, WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES, 0);
+        if (hRequest) {
+            const wchar_t headers[] = L"Content-Type: application/json\r\n";
+            if (WinHttpSendRequest(hRequest, headers, (DWORD)-1, (LPVOID)json_body.data(), (DWORD)json_body.size(), (DWORD)json_body.size(), 0) &&
+                WinHttpReceiveResponse(hRequest, nullptr)) {
+                ok = true;
+            }
+            WinHttpCloseHandle(hRequest);
+        }
+        WinHttpCloseHandle(hConnect);
+    }
+    WinHttpCloseHandle(hSession);
+    return ok;
+}
+
+fs::path ToypadLastStatePath() {
+    return g_root / L"assets" / L"toypad_last_state.json";
+}
+
+void SyncLegoToypadState() {
+    static std::atomic<bool> in_sync{false};
+    if (in_sync.exchange(true)) return;
+    struct Guard {
+        std::atomic<bool>& flag;
+        ~Guard() { flag.store(false); }
+    } guard{in_sync};
+
+    const bool running = IsProcessRunning(L"LegoToypad.exe") || IsProcessRunning(L"LegoToypad.v1.9.Web.App.Extended.exe");
+    if (!running) {
+        g_toypad_api_restored = false;
+        return;
+    }
+
+    const std::string state = ToypadHttpGet(8765, L"/api/state");
+    if (state.empty()) return;
+
+    const bool game_running = IsProcessRunning(L"lego_dimensions.exe");
+    if (!g_toypad_api_restored) {
+        if (game_running) {
+            // Restaura o estado salvo no app do portal
+            std::error_code ec;
+            const fs::path p = ToypadLastStatePath();
+            if (fs::is_regular_file(p, ec)) {
+                std::ifstream in(p);
+                std::string saved((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+                size_t pos = 0;
+                int count = 0;
+                while ((pos = saved.find("{\"slot\":", pos)) != std::string::npos) {
+                    size_t end = saved.find('}', pos);
+                    if (end == std::string::npos) break;
+                    std::string obj = saved.substr(pos, end - pos + 1);
+                    ToypadHttpPost(8765, L"/api/load", obj);
+                    pos = end + 1;
+                    ++count;
+                }
+                if (count == 0 && saved.find("[]") != std::string::npos) {
+                    ToypadHttpPost(8765, L"/api/clearall", "{}");
+                }
+            }
+            g_toypad_api_restored = true;
+        }
+        return;
+    }
+
+    // Extrai figuras ocupadas de state: "index": X ... "occupied": true ... "bin": Y
+    std::string new_state = "[";
+    bool first = true;
+    size_t pos = 0;
+    while ((pos = state.find("\"index\":", pos)) != std::string::npos) {
+        size_t next_idx = state.find("\"index\":", pos + 8);
+        std::string pad_str = state.substr(pos, (next_idx != std::string::npos ? next_idx : state.size()) - pos);
+        if (pad_str.find("\"occupied\":true") != std::string::npos) {
+            int slot = std::atoi(pad_str.c_str() + 8);
+            size_t bin_pos = pad_str.find("\"bin\":");
+            int bin = bin_pos != std::string::npos ? std::atoi(pad_str.c_str() + bin_pos + 6) : 0;
+            if (bin > 0) {
+                if (!first) new_state += ",";
+                first = false;
+                new_state += "{\"slot\":" + std::to_string(slot) + ",\"bin\":" + std::to_string(bin) + "}";
+            }
+        }
+        pos = next_idx != std::string::npos ? next_idx : state.size();
+    }
+    new_state += "]";
+
+    if (new_state != g_last_saved_toypad_state) {
+        g_last_saved_toypad_state = new_state;
+        std::ofstream out(ToypadLastStatePath(), std::ios::trunc);
+        if (out) {
+            out << new_state << "\n";
+        }
+    }
+}
+
 
 HWND g_trophies_window = nullptr;
 HWND g_trophies_list = nullptr;
@@ -1834,12 +1969,15 @@ void ResetTrophiesAction() {
                     L"LEGO Dimensions PC", MB_YESNO | MB_ICONWARNING) == IDYES) {
         std::error_code ec;
         fs::remove(g_root / L"assets" / g_saves_value / L"trophies.dat", ec);
-        fs::remove(g_root / L"assets" / g_saves_value / L".retro_done", ec);
         fs::remove(g_root / L"assets" / L"savedata0" / L"trophies.dat", ec);
-        fs::remove(g_root / L"assets" / L"savedata0" / L".retro_done", ec);
         fs::remove(g_root / L"assets" / L"trophy" / L"trophies.dat", ec);
         fs::remove(g_root / L"assets" / L"trophy" / L"NPWR07423_00.xml", ec);
-        fs::remove(g_root / L"assets" / L"trophy" / L".retro_done", ec);
+
+        // Mark retro check as completed so it will not auto-unlock upon fresh game start
+        fs::create_directories(g_root / L"assets" / L"trophy", ec);
+        std::ofstream m(g_root / L"assets" / L"trophy" / L".retro_done");
+        if (m) m << "done\n";
+
         MessageBoxW(g_main,
                     ui::T(L"Conquistas reiniciadas com sucesso!", L"Achievements successfully reset!"),
                     L"LEGO Dimensions PC", MB_OK | MB_ICONINFORMATION);
@@ -2828,6 +2966,7 @@ void Back() {
 
 constexpr UINT_PTR kPadTimer = 3;
 constexpr UINT_PTR kUpdateCheckTimer = 4;
+constexpr UINT_PTR kToypadSyncTimer = 5;
 enum PadDir { kPadNone = -1, kPadUp, kPadDown, kPadLeft, kPadRight };
 WORD g_pad_buttons = 0;
 int g_pad_dir = kPadNone;
@@ -3386,6 +3525,10 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             }
             return 0;
         }
+        if (wp == kToypadSyncTimer) {
+            SyncLegoToypadState();
+            return 0;
+        }
         break;
     case WM_CLOSE:
         if (g_busy && MessageBoxW(hwnd, ui::T(L"A preparacao ainda esta rodando. Fechar mesmo assim?", L"The preparation is still running. Close anyway?"), L"LEGO Dimensions PC", MB_YESNO) != IDYES) {
@@ -3465,6 +3608,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show) {
     LoadXInput(); // issue #3: controle no launcher
     SetTimer(g_main, kPadTimer, 16, nullptr);
     SetTimer(g_main, kUpdateCheckTimer, 1000, nullptr); // verifica atualizacao ao abrir
+    SetTimer(g_main, kToypadSyncTimer, 1000, nullptr);  // sincroniza persistencia do toypad (harrysof)
     MSG msg;
     while (GetMessageW(&msg, nullptr, 0, 0)) {
         if (!g_names_window || !IsDialogMessageW(g_names_window, &msg)) {
