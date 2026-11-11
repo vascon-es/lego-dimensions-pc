@@ -266,10 +266,11 @@ void TrophyManager::ResetTrophies() {
     m_toast_queue.clear();
     m_active_toast.active = false;
 
-    // Remove retroactive marker so check could re-run if requested
+    // Ensure marker exists so retroactive scan will not re-grant reset trophies
     std::error_code ec;
     auto marker = m_root_path / "assets" / "trophy" / ".retro_done";
-    std::filesystem::remove(marker, ec);
+    std::ofstream m(marker);
+    if (m) m << "done\n";
 
     SaveTrophyXml();
     log::Tagged("TROPHY", "All trophies reset to locked state.");
@@ -392,98 +393,60 @@ void TrophyManager::SaveTrophyXml() {
 }
 
 void TrophyManager::CheckRetroactiveSaves() {
-    log::Tagged("TROPHY", "Scanning save files for retroactive milestone progress...");
-
     std::error_code ec;
+    auto marker = m_root_path / "assets" / "trophy" / ".retro_done";
+    if (std::filesystem::exists(marker, ec)) {
+        return; // Already checked or user reset
+    }
+
+    // If trophies.dat already exists, preserve it and mark retro check done
+    const std::filesystem::path dat_paths[] = {
+        m_root_path / "assets" / "trophy" / "trophies.dat",
+        m_saves_dir / "trophies.dat",
+        m_root_path / "assets" / "savedata0" / "trophies.dat"
+    };
+    for (const auto& p : dat_paths) {
+        if (std::filesystem::exists(p, ec)) {
+            std::ofstream m(marker);
+            if (m) m << "done\n";
+            return;
+        }
+    }
+
+    log::Tagged("TROPHY", "Initial setup: checking save files for retroactive milestone progress...");
+
     std::vector<std::filesystem::path> check_dirs = {
         m_saves_dir / "Slot00",
         m_root_path / "assets" / "savedata0" / "Slot00",
         m_saves_dir / "Slot01",
-        m_root_path / "assets" / "savedata0" / "Slot01",
-        m_saves_dir / "Slot02",
-        m_root_path / "assets" / "savedata0" / "Slot02",
-        m_saves_dir / "Slot03",
-        m_root_path / "assets" / "savedata0" / "Slot03",
+        m_root_path / "assets" / "savedata0" / "Slot01"
     };
 
-    // Dynamically discover all slot folders
-    for (const auto& base : {m_saves_dir, m_root_path / "assets" / "savedata0"}) {
-        if (std::filesystem::exists(base, ec)) {
-            for (const auto& entry : std::filesystem::directory_iterator(base, ec)) {
-                if (entry.is_directory(ec)) {
-                    check_dirs.push_back(entry.path());
-                }
-            }
-        }
-    }
-
     bool has_save = false;
-    int unlocked_count = 0;
     for (const auto& slot_dir : check_dirs) {
         auto v2game = slot_dir / "V2GAME01";
         auto game = slot_dir / "GAME01";
 
         if (std::filesystem::exists(v2game, ec) || std::filesystem::exists(game, ec)) {
-            has_save = true;
             auto target = std::filesystem::exists(v2game, ec) ? v2game : game;
-            std::ifstream f(target, std::ios::binary | std::ios::ate);
-            if (f) {
-                const auto sz = static_cast<size_t>(f.tellg());
-                if (sz > 1024) {
-                    std::vector<uint8_t> data(sz);
-                    f.seekg(0);
-                    f.read(reinterpret_cast<char*>(data.data()), sz);
-
-                    // Scan chunks for milestone Tag 0xAB02DAA3
-                    const size_t preamble = 24 + 0x440;
-                    size_t pos = preamble + 8;
-                    while (pos + 8 <= sz) {
-                        uint32_t tag = 0, csize = 0;
-                        std::memcpy(&tag, data.data() + pos, 4);
-                        std::memcpy(&csize, data.data() + pos + 4, 4);
-                        if (tag == 0x075BCD15) break; // Sentinel
-
-                        if (tag == 0xAB02DAA3 && csize <= sz && pos + 8 + csize <= sz) {
-                            const size_t num_ints = csize / 4;
-                            for (size_t k = 0; k < num_ints; ++k) {
-                                uint32_t val = 0;
-                                std::memcpy(&val, data.data() + pos + 8 + k * 4, 4);
-                                if (val >= 1 && val <= 77) {
-                                    int plat = -1;
-                                    if (UnlockTrophy(static_cast<int>(val), &plat, false)) {
-                                        ++unlocked_count;
-                                    }
-                                }
-                            }
-                        }
-                        if (csize > sz || pos + 8 + csize + 4 > sz) {
-                            break;
-                        }
-                        pos += 8 + csize + 4;
-                    }
-                }
+            if (std::filesystem::file_size(target, ec) > 1024) {
+                has_save = true;
+                break;
             }
         }
     }
 
     if (has_save) {
-        // Base milestones guaranteed by any saved game progress
+        // Player has an existing save: the story prologue is completed (Follow the LEGO Brick Road)
         int plat = -1;
-        if (UnlockTrophy(1, &plat, false)) ++unlocked_count;
-        if (UnlockTrophy(15, &plat, false)) ++unlocked_count;
-        if (UnlockTrophy(21, &plat, false)) ++unlocked_count;
+        UnlockTrophy(1, &plat, false);
+        log::Tagged("TROPHY", "Retroactive save check: unlocked Trophy 1 (Follow the LEGO Brick Road).");
     }
 
-    // Always ensure trophies.dat and XML are up to date with found achievements
     SaveTrophyXml();
 
-    // Clean up any stale marker so future checks won't be suppressed
-    auto marker = m_root_path / "assets" / "trophy" / ".retro_done";
-    std::filesystem::remove(marker, ec);
-
-    if (unlocked_count > 0) {
-        log::Tagged("TROPHY", "Retroactive save check unlocked %d trophies.", unlocked_count);
-    }
+    std::ofstream m(marker);
+    if (m) m << "done\n";
 }
 
 } // namespace hle::trophy

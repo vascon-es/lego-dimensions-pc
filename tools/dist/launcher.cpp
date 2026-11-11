@@ -1832,12 +1832,15 @@ void ResetTrophiesAction() {
                     L"LEGO Dimensions PC", MB_YESNO | MB_ICONWARNING) == IDYES) {
         std::error_code ec;
         fs::remove(g_root / L"assets" / g_saves_value / L"trophies.dat", ec);
-        fs::remove(g_root / L"assets" / g_saves_value / L".retro_done", ec);
         fs::remove(g_root / L"assets" / L"savedata0" / L"trophies.dat", ec);
-        fs::remove(g_root / L"assets" / L"savedata0" / L".retro_done", ec);
         fs::remove(g_root / L"assets" / L"trophy" / L"trophies.dat", ec);
         fs::remove(g_root / L"assets" / L"trophy" / L"NPWR07423_00.xml", ec);
-        fs::remove(g_root / L"assets" / L"trophy" / L".retro_done", ec);
+
+        // Mark retro check as completed so it will not auto-unlock upon fresh game start
+        fs::create_directories(g_root / L"assets" / L"trophy", ec);
+        std::ofstream m(g_root / L"assets" / L"trophy" / L".retro_done");
+        if (m) m << "done\n";
+
         MessageBoxW(g_main,
                     ui::T(L"Conquistas reiniciadas com sucesso!", L"Achievements successfully reset!"),
                     L"LEGO Dimensions PC", MB_OK | MB_ICONINFORMATION);
