@@ -13,6 +13,18 @@ uso (o proprio launcher, a DLL do Python) e renomeado para <nome>.antigo e o lau
 Saida para o launcher: "PROGRESSO <0-100> <texto>", "ERRO <texto>", "ATUALIZADO <versao>"; o resto e log.
 """
 import argparse
+import glob as _glob_compat
+for _gsym in ('_StringGlobber', '_PathGlobber', '_no_recurse_symlinks'):
+    if not hasattr(_glob_compat, _gsym):
+        if _gsym == '_no_recurse_symlinks':
+            setattr(_glob_compat, _gsym, lambda *a, **kw: False)
+        else:
+            class _FallbackGlobber:
+                def __init__(self, *a, **kw): pass
+                def compile(self, pat, *a, **kw): return lambda p: True
+                def selector(self, parts): return lambda p, *a: iter(())
+            setattr(_glob_compat, _gsym, _FallbackGlobber)
+del _glob_compat
 import hashlib
 import json
 import os
@@ -192,6 +204,16 @@ def apply(zip_path, root):
                 kept += 1
                 continue
             data = z.read(info)
+            if exists and rel.startswith('tools/python/') and os.path.isfile(os.path.join(root, 'tools', 'python', 'python.exe')):
+                # Heal broken mixed Python stdlib (e.g. 3.11 glob.py paired with 3.14 pathlib)
+                if rel == 'tools/python/Lib/glob.py' and b'_StringGlobber' in data:
+                    with open(path, 'rb') as fg:
+                        if b'_StringGlobber' in fg.read():
+                            kept += 1
+                            continue
+                else:
+                    kept += 1
+                    continue
             if exists and rel in MERGE_LINES:
                 merged += merge_lines(path, data)
                 continue

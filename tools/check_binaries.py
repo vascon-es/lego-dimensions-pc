@@ -20,6 +20,18 @@ import sys
 import zlib
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
+import glob as _glob_compat
+for _gsym in ('_StringGlobber', '_PathGlobber', '_no_recurse_symlinks'):
+    if not hasattr(_glob_compat, _gsym):
+        if _gsym == '_no_recurse_symlinks':
+            setattr(_glob_compat, _gsym, lambda *a, **kw: False)
+        else:
+            class _FallbackGlobber:
+                def __init__(self, *a, **kw): pass
+                def compile(self, pat, *a, **kw): return lambda p: True
+                def selector(self, parts): return lambda p, *a: iter(())
+            setattr(_glob_compat, _gsym, _FallbackGlobber)
+del _glob_compat
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent

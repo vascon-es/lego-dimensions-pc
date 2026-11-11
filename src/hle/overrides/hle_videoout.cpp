@@ -33,6 +33,8 @@
 #include <vector>
 
 #include <windows.h>
+#include <objidl.h>
+#include <gdiplus.h>
 
 #include <intrin.h>
 
@@ -120,6 +122,7 @@ std::atomic<bool> g_achievements_overlay_open{false};
 int g_achievements_selected = 0;
 int g_achievements_scroll = 0;
 int g_achievements_filter = 0; // 0 = all, 1 = unearned, 2 = earned
+int g_achievements_visible_count = 8;
 int g_menu_selected = 0;
 int g_save_confirm_timer = 0;
 WINDOWPLACEMENT g_windowed_placement{sizeof(WINDOWPLACEMENT)};
@@ -481,10 +484,10 @@ void HandleAchievementsMenuController(u32 pressed) {
         if (g_achievements_selected + 1 < total_items) ++g_achievements_selected;
         last_nav = now;
     } else if (pressed & 0x400) { // LB: Page Up
-        g_achievements_selected = std::max(0, g_achievements_selected - 5);
+        g_achievements_selected = std::max(0, g_achievements_selected - g_achievements_visible_count);
         last_nav = now;
     } else if (pressed & 0x800) { // RB: Page Down
-        g_achievements_selected = std::min(std::max(0, total_items - 1), g_achievements_selected + 5);
+        g_achievements_selected = std::min(std::max(0, total_items - 1), g_achievements_selected + g_achievements_visible_count);
         last_nav = now;
     } else if (pressed & 0x8000) { // Square / X: Cycle Filter
         g_achievements_filter = (g_achievements_filter + 1) % 3;
@@ -499,8 +502,8 @@ void HandleAchievementsMenuController(u32 pressed) {
     if (g_achievements_selected < g_achievements_scroll) {
         g_achievements_scroll = g_achievements_selected;
     }
-    if (g_achievements_selected >= g_achievements_scroll + 5) {
-        g_achievements_scroll = std::max(0, g_achievements_selected - 4);
+    if (g_achievements_selected >= g_achievements_scroll + g_achievements_visible_count) {
+        g_achievements_scroll = std::max(0, g_achievements_selected - g_achievements_visible_count + 1);
     }
 }
 
@@ -563,9 +566,9 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
             } else if (wparam == VK_DOWN) {
                 if (g_achievements_selected + 1 < total_items) ++g_achievements_selected;
             } else if (wparam == VK_PRIOR) {
-                g_achievements_selected = std::max(0, g_achievements_selected - 5);
+                g_achievements_selected = std::max(0, g_achievements_selected - g_achievements_visible_count);
             } else if (wparam == VK_NEXT) {
-                g_achievements_selected = std::min(std::max(0, total_items - 1), g_achievements_selected + 5);
+                g_achievements_selected = std::min(std::max(0, total_items - 1), g_achievements_selected + g_achievements_visible_count);
             } else if (wparam == 'X' || wparam == VK_TAB) {
                 g_achievements_filter = (g_achievements_filter + 1) % 3;
                 g_achievements_selected = 0;
@@ -574,7 +577,7 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
                 g_achievements_overlay_open = false;
             }
             if (g_achievements_selected < g_achievements_scroll) g_achievements_scroll = g_achievements_selected;
-            if (g_achievements_selected >= g_achievements_scroll + 5) g_achievements_scroll = std::max(0, g_achievements_selected - 4);
+            if (g_achievements_selected >= g_achievements_scroll + g_achievements_visible_count) g_achievements_scroll = std::max(0, g_achievements_selected - g_achievements_visible_count + 1);
             return 0;
         }
         if (g_video_menu_open.load()) {
@@ -1104,6 +1107,73 @@ void DrawLoading(const std::vector<LoadingVertex>& vertices) {
 
 // ---------------- Fase 65: contador de FPS / info (canto de cima, a esquerda) ----------------
 
+constexpr u32 Rgba(u8 r, u8 g, u8 b, u8 a = 255) {
+    return static_cast<u32>(r) | (static_cast<u32>(g) << 8) | (static_cast<u32>(b) << 16) | (static_cast<u32>(a) << 24);
+}
+
+struct TrophyThumbnail {
+    static constexpr int kSize = 28; // crisp 28x28 downscaled PNG thumbnail
+    u32 pixels[kSize * kSize] = {};
+    bool loaded = false;
+    bool tried = false;
+};
+
+static TrophyThumbnail g_trophy_thumbs[129]; // 0..127 = trophies, 128 = ICON0.PNG
+static bool g_gdiplus_inited = false;
+static std::mutex g_thumb_mutex;
+
+static const TrophyThumbnail* GetTrophyThumbnail(int slot_id, const char* icon_name) {
+    if (!icon_name || !*icon_name) return nullptr;
+    const int idx = (slot_id < 0) ? 128 : slot_id;
+    if (idx < 0 || idx >= 129) return nullptr;
+
+    std::lock_guard lock(g_thumb_mutex);
+    auto& thumb = g_trophy_thumbs[idx];
+    if (thumb.loaded) return &thumb;
+    if (thumb.tried) return nullptr;
+
+    const auto root = hle::trophy::TrophyManager::Instance().GetRootPath();
+    if (root.empty()) return nullptr;
+    thumb.tried = true;
+
+    if (!g_gdiplus_inited) {
+        static ULONG_PTR s_token = 0;
+        Gdiplus::GdiplusStartupInput input;
+        Gdiplus::GdiplusStartup(&s_token, &input, nullptr);
+        g_gdiplus_inited = true;
+    }
+
+    const std::filesystem::path icon_paths[] = {
+        root / "assets" / "trophy" / "NPWR07423_00" / "Icons" / icon_name,
+        root / "assets" / "trophy" / icon_name,
+        root / "assets" / "trophy" / "Icons" / icon_name
+    };
+
+    for (const auto& p : icon_paths) {
+        std::error_code ec;
+        if (!std::filesystem::exists(p, ec)) continue;
+
+        Gdiplus::Bitmap bmp(p.c_str());
+        if (bmp.GetLastStatus() != Gdiplus::Ok) continue;
+
+        Gdiplus::Bitmap small_bmp(TrophyThumbnail::kSize, TrophyThumbnail::kSize, PixelFormat32bppARGB);
+        Gdiplus::Graphics g(&small_bmp);
+        g.SetInterpolationMode(Gdiplus::InterpolationModeHighQualityBicubic);
+        g.DrawImage(&bmp, 0, 0, TrophyThumbnail::kSize, TrophyThumbnail::kSize);
+
+        for (int y = 0; y < TrophyThumbnail::kSize; ++y) {
+            for (int x = 0; x < TrophyThumbnail::kSize; ++x) {
+                Gdiplus::Color c;
+                small_bmp.GetPixel(x, y, &c);
+                thumb.pixels[y * TrophyThumbnail::kSize + x] = Rgba(c.GetR(), c.GetG(), c.GetB(), c.GetA());
+            }
+        }
+        thumb.loaded = true;
+        return &thumb;
+    }
+    return nullptr;
+}
+
 struct OverlayCanvas {
     std::vector<LoadingVertex>& out;
     float w, h; // tamanho da janela em pixels
@@ -1122,14 +1192,59 @@ struct OverlayCanvas {
         }
     }
     void Pill(float x0, float y0, float x1, float y1, u32 rgba) {
-        float r = (y1 - y0) * 0.5f;
-        Rect(x0 + r, y0, x1 - r, y1, rgba);
-        const int steps = static_cast<int>(r);
-        for (int dy = -steps; dy <= steps; ++dy) {
-            float fdy = static_cast<float>(dy);
-            float dx = std::sqrt(std::max(0.0f, r * r - fdy * fdy));
-            Rect(x0 + r - dx, y0 + r + fdy, x0 + r, y0 + r + fdy + 1.0f, rgba);
-            Rect(x1 - r, y0 + r + fdy, x1 - r + dx, y0 + r + fdy + 1.0f, rgba);
+        const float box_w = x1 - x0;
+        const float box_h = y1 - y0;
+        if (box_w <= 0.0f || box_h <= 0.0f) return;
+        if (box_w >= box_h) {
+            float r = box_h * 0.5f;
+            Rect(x0 + r, y0, x1 - r, y1, rgba);
+            const int steps = static_cast<int>(r);
+            for (int dy = -steps; dy <= steps; ++dy) {
+                float fdy = static_cast<float>(dy);
+                float dx = std::sqrt(std::max(0.0f, r * r - fdy * fdy));
+                Rect(x0 + r - dx, y0 + r + fdy, x0 + r, y0 + r + fdy + 1.0f, rgba);
+                Rect(x1 - r, y0 + r + fdy, x1 - r + dx, y0 + r + fdy + 1.0f, rgba);
+            }
+        } else {
+            float r = box_w * 0.5f;
+            Rect(x0, y0 + r, x1, y1 - r, rgba);
+            const int steps = static_cast<int>(r);
+            for (int dx = -steps; dx <= steps; ++dx) {
+                float fdx = static_cast<float>(dx);
+                float dy = std::sqrt(std::max(0.0f, r * r - fdx * fdx));
+                Rect(x0 + r + fdx, y0 + r - dy, x0 + r + fdx + 1.0f, y0 + r, rgba);
+                Rect(x0 + r + fdx, y1 - r, x0 + r + fdx + 1.0f, y1 - r + dy, rgba);
+            }
+        }
+    }
+    void DrawThumbnail(const TrophyThumbnail* thumb, float x0, float y0, float size, float brightness = 1.0f) {
+        if (!thumb || !thumb->loaded) return;
+        const float px = size / static_cast<float>(TrophyThumbnail::kSize);
+        for (int y = 0; y < TrophyThumbnail::kSize; ++y) {
+            int x = 0;
+            while (x < TrophyThumbnail::kSize) {
+                u32 col = thumb->pixels[y * TrophyThumbnail::kSize + x];
+                u8 a = static_cast<u8>((col >> 24) & 0xFF);
+                if (a < 16) {
+                    ++x;
+                    continue;
+                }
+                int end_x = x + 1;
+                while (end_x < TrophyThumbnail::kSize) {
+                    if (thumb->pixels[y * TrophyThumbnail::kSize + end_x] != col) break;
+                    ++end_x;
+                }
+                u8 r = static_cast<u8>(col & 0xFF);
+                u8 g = static_cast<u8>((col >> 8) & 0xFF);
+                u8 b = static_cast<u8>((col >> 16) & 0xFF);
+                if (brightness < 0.99f) {
+                    r = static_cast<u8>(r * brightness);
+                    g = static_cast<u8>(g * brightness);
+                    b = static_cast<u8>(b * brightness);
+                }
+                Rect(x0 + x * px, y0 + y * px, x0 + end_x * px, y0 + (y + 1) * px, Rgba(r, g, b, a));
+                x = end_x;
+            }
         }
     }
     // pixels acesos seguidos na mesma linha viram um retangulo so
@@ -1191,26 +1306,28 @@ constexpr u8 kPadlock[5] = {0x0E, 0x0A, 0x1F, 0x1F, 0x1F};
 constexpr u8 kTriangleUp[3] = {0x04, 0x0E, 0x1F};
 
 static void RenderTrophyToast(OverlayCanvas& c, const RECT& client, float scale_ui,
-                              const std::string& style, char type,
+                              const std::string& style, int trophy_id, char type,
                               const std::string& title, const std::string& desc,
                               float anim, bool is_preview) {
-    u32 tier_col = 0xFFCD7F32; // Bronze
+    u32 tier_col = Rgba(205, 127, 50); // Bronze
     const char* tier_en = "BRONZE";
     const char* tier_pt = "BRONZE";
     if (type == 'P') {
-        tier_col = 0xFF00E5FF;
+        tier_col = Rgba(0, 229, 255); // Platinum
         tier_en = "PLATINUM";
         tier_pt = "PLATINA";
     } else if (type == 'G') {
-        tier_col = 0xFFFFD700;
+        tier_col = Rgba(255, 215, 0); // Gold
         tier_en = "GOLD";
         tier_pt = "OURO";
     } else if (type == 'S') {
-        tier_col = 0xFFD0D0E0;
+        tier_col = Rgba(208, 212, 224); // Silver
         tier_en = "SILVER";
         tier_pt = "PRATA";
     }
     const char* tier_name = lang::Pt() ? tier_pt : tier_en;
+    const TrophyDef* tdef = hle::trophy::TrophyManager::Instance().FindDef(trophy_id);
+    const TrophyThumbnail* thumb = GetTrophyThumbnail(trophy_id >= 0 ? trophy_id : 16, tdef ? tdef->icon : "TROP016.PNG");
 
     if (style == "xbox") {
         const float box_w = 480.0f * scale_ui;
@@ -1218,29 +1335,29 @@ static void RenderTrophyToast(OverlayCanvas& c, const RECT& client, float scale_
         const float cur_x = (client.right - box_w) * 0.5f;
         const float cur_y = is_preview ? (24.0f * scale_ui) : (24.0f * scale_ui - (1.0f - anim) * (box_h + 35.0f * scale_ui));
 
-        c.Pill(cur_x, cur_y + 3.0f * scale_ui, cur_x + box_w, cur_y + box_h + 3.0f * scale_ui, 0x66000000);
-        c.Pill(cur_x, cur_y, cur_x + box_w, cur_y + box_h, 0xFF107C10);
+        c.Pill(cur_x, cur_y + 3.0f * scale_ui, cur_x + box_w, cur_y + box_h + 3.0f * scale_ui, Rgba(0, 0, 0, 102));
+        c.Pill(cur_x, cur_y, cur_x + box_w, cur_y + box_h, Rgba(16, 124, 16));
 
         const float cr = (box_h - 16.0f * scale_ui) * 0.5f;
         const float cx = cur_x + 14.0f * scale_ui + cr;
         const float cy = cur_y + box_h * 0.5f;
-        c.Circle(cx, cy, cr, 0xFF0C620C);
+        c.Circle(cx, cy, cr, Rgba(12, 98, 12));
 
         const float cup_p = scale_ui * 2.0f;
-        c.DrawBitmap(kTrophyCup, 7, cx - 2.5f * cup_p, cy - 3.5f * cup_p, cup_p, 0xFFFFFFFF);
+        c.DrawBitmap(kTrophyCup, 7, cx - 2.5f * cup_p, cy - 3.5f * cup_p, cup_p, Rgba(255, 255, 255));
 
         const float text_x = cx + cr + 14.0f * scale_ui;
         std::string hdr = lang::Pt() ? "Conquista desbloqueada" : "Achievement unlocked";
-        c.Write(hdr, text_x, cur_y + 11.0f * scale_ui, 1.8f * scale_ui, 0xFFFFFFFF);
-        c.Write(title, text_x, cur_y + 35.0f * scale_ui, 1.6f * scale_ui, 0xFFD8FFD8);
+        c.Write(hdr, text_x, cur_y + 11.0f * scale_ui, 1.8f * scale_ui, Rgba(255, 255, 255));
+        c.Write(title, text_x, cur_y + 35.0f * scale_ui, 1.6f * scale_ui, Rgba(216, 255, 216));
 
         if (is_preview) {
             const float lbl_w = 210.0f * scale_ui;
             const float lbl_x = cur_x + (box_w - lbl_w) * 0.5f;
             const float lbl_y = cur_y + box_h + 8.0f * scale_ui;
-            c.Pill(lbl_x, lbl_y, lbl_x + lbl_w, lbl_y + 22.0f * scale_ui, 0xEE10141E);
+            c.Pill(lbl_x, lbl_y, lbl_x + lbl_w, lbl_y + 22.0f * scale_ui, Rgba(16, 20, 30, 238));
             std::string p_txt = lang::Pt() ? "[ PRE-VISUALIZACAO: XBOX ]" : "[ PREVIEW: XBOX ]";
-            c.Write(p_txt, lbl_x + 10.0f * scale_ui, lbl_y + 5.0f * scale_ui, 1.25f * scale_ui, 0xFF107C10);
+            c.Write(p_txt, lbl_x + 10.0f * scale_ui, lbl_y + 5.0f * scale_ui, 1.25f * scale_ui, Rgba(80, 220, 80));
         }
     } else if (style == "xbox360") {
         const float box_w = 460.0f * scale_ui;
@@ -1248,32 +1365,32 @@ static void RenderTrophyToast(OverlayCanvas& c, const RECT& client, float scale_
         const float cur_x = (client.right - box_w) * 0.5f;
         const float cur_y = is_preview ? (24.0f * scale_ui) : (24.0f * scale_ui - (1.0f - anim) * (box_h + 35.0f * scale_ui));
 
-        c.Pill(cur_x - 1.5f * scale_ui, cur_y - 1.5f * scale_ui, cur_x + box_w + 1.5f * scale_ui, cur_y + box_h + 1.5f * scale_ui, 0xFF505054);
-        c.Pill(cur_x, cur_y, cur_x + box_w, cur_y + box_h, 0xF21C1C1F);
+        c.Pill(cur_x - 1.5f * scale_ui, cur_y - 1.5f * scale_ui, cur_x + box_w + 1.5f * scale_ui, cur_y + box_h + 1.5f * scale_ui, Rgba(80, 80, 84));
+        c.Pill(cur_x, cur_y, cur_x + box_w, cur_y + box_h, Rgba(28, 28, 31, 242));
 
         const float cr = (box_h - 16.0f * scale_ui) * 0.5f;
         const float cx = cur_x + 14.0f * scale_ui + cr;
         const float cy = cur_y + box_h * 0.5f;
-        c.Circle(cx, cy, cr, 0xFF353538);
-        c.Circle(cx, cy, cr - 3.0f * scale_ui, 0xFF7D7D85);
+        c.Circle(cx, cy, cr, Rgba(53, 53, 56));
+        c.Circle(cx, cy, cr - 3.0f * scale_ui, Rgba(125, 125, 133));
 
         for (float dy = -cr + 1.0f; dy <= 0.0f; dy += 1.0f) {
             float dx = std::sqrt(std::max(0.0f, (cr - 1.0f) * (cr - 1.0f) - dy * dy));
-            c.Rect(cx - dx, cy + dy, cx, cy + dy + 1.0f, 0xFF52B022);
+            c.Rect(cx - dx, cy + dy, cx, cy + dy + 1.0f, Rgba(82, 176, 34));
         }
 
         const float text_x = cx + cr + 14.0f * scale_ui;
         std::string hdr = lang::Pt() ? "Conquista desbloqueada" : "Achievement unlocked";
-        c.Write(hdr, text_x, cur_y + 11.0f * scale_ui, 1.8f * scale_ui, 0xFFE0E0E0);
-        c.Write(title, text_x, cur_y + 34.0f * scale_ui, 1.6f * scale_ui, 0xFFFFFFFF);
+        c.Write(hdr, text_x, cur_y + 11.0f * scale_ui, 1.8f * scale_ui, Rgba(224, 224, 224));
+        c.Write(title, text_x, cur_y + 34.0f * scale_ui, 1.6f * scale_ui, Rgba(255, 255, 255));
 
         if (is_preview) {
             const float lbl_w = 230.0f * scale_ui;
             const float lbl_x = cur_x + (box_w - lbl_w) * 0.5f;
             const float lbl_y = cur_y + box_h + 8.0f * scale_ui;
-            c.Pill(lbl_x, lbl_y, lbl_x + lbl_w, lbl_y + 22.0f * scale_ui, 0xEE10141E);
+            c.Pill(lbl_x, lbl_y, lbl_x + lbl_w, lbl_y + 22.0f * scale_ui, Rgba(16, 20, 30, 238));
             std::string p_txt = lang::Pt() ? "[ PRE-VISUALIZACAO: XBOX 360 ]" : "[ PREVIEW: XBOX 360 ]";
-            c.Write(p_txt, lbl_x + 10.0f * scale_ui, lbl_y + 5.0f * scale_ui, 1.25f * scale_ui, 0xFF52B022);
+            c.Write(p_txt, lbl_x + 10.0f * scale_ui, lbl_y + 5.0f * scale_ui, 1.25f * scale_ui, Rgba(82, 176, 34));
         }
     } else if (style == "ps4") {
         const float box_w = 460.0f * scale_ui;
@@ -1281,29 +1398,35 @@ static void RenderTrophyToast(OverlayCanvas& c, const RECT& client, float scale_
         const float cur_x = client.right - box_w - 24.0f * scale_ui;
         const float cur_y = is_preview ? (24.0f * scale_ui) : (24.0f * scale_ui - (1.0f - anim) * (box_h + 35.0f * scale_ui));
 
-        c.Rect(cur_x - 2.0f * scale_ui, cur_y - 2.0f * scale_ui, cur_x + box_w + 2.0f * scale_ui, cur_y + box_h + 2.0f * scale_ui, 0xFF363842);
-        c.Rect(cur_x, cur_y, cur_x + box_w, cur_y + box_h, 0xEE16181E);
+        c.Rect(cur_x - 2.0f * scale_ui, cur_y - 2.0f * scale_ui, cur_x + box_w + 2.0f * scale_ui, cur_y + box_h + 2.0f * scale_ui, Rgba(54, 56, 66));
+        c.Rect(cur_x, cur_y, cur_x + box_w, cur_y + box_h, Rgba(22, 24, 30, 238));
 
         const float badge_sz = box_h - 16.0f * scale_ui;
         const float badge_x = cur_x + 8.0f * scale_ui;
         const float badge_y = cur_y + 8.0f * scale_ui;
-        c.Rect(badge_x, badge_y, badge_x + badge_sz, badge_y + badge_sz, 0xFF242630);
+        c.Rect(badge_x, badge_y, badge_x + badge_sz, badge_y + badge_sz, Rgba(36, 38, 48));
 
-        const float cup_p = scale_ui * 2.2f;
-        c.DrawBitmap(kTrophyCup, 7, badge_x + (badge_sz - 5.0f * cup_p) * 0.5f, badge_y + (badge_sz - 7.0f * cup_p) * 0.5f, cup_p, tier_col);
+        if (thumb && thumb->loaded) {
+            c.DrawThumbnail(thumb, badge_x + 2.0f * scale_ui, badge_y + 2.0f * scale_ui, badge_sz - 4.0f * scale_ui, 1.0f);
+        } else {
+            const float cup_p = scale_ui * 2.2f;
+            c.DrawBitmap(kTrophyCup, 7, badge_x + (badge_sz - 5.0f * cup_p) * 0.5f, badge_y + (badge_sz - 7.0f * cup_p) * 0.5f, cup_p, tier_col);
+        }
 
         const float text_x = badge_x + badge_sz + 12.0f * scale_ui;
-        c.Write(title, text_x, cur_y + 14.0f * scale_ui, 2.0f * scale_ui, 0xFFFFFFFF);
+        c.Write(title, text_x, cur_y + 14.0f * scale_ui, 2.0f * scale_ui, Rgba(255, 255, 255));
+        const float mini_p = scale_ui * 1.4f;
+        c.DrawBitmap(kTrophyCup, 7, text_x, cur_y + 40.0f * scale_ui, mini_p, tier_col);
         std::string sub = lang::Pt() ? "Trofeu conquistado!" : "Trophy earned!";
-        c.Write(sub, text_x, cur_y + 40.0f * scale_ui, 1.4f * scale_ui, 0xFFA0A0B2);
+        c.Write(sub, text_x + 12.0f * scale_ui, cur_y + 40.0f * scale_ui, 1.4f * scale_ui, Rgba(160, 160, 178));
 
         if (is_preview) {
             const float lbl_w = 200.0f * scale_ui;
             const float lbl_x = cur_x + (box_w - lbl_w) * 0.5f;
             const float lbl_y = cur_y + box_h + 8.0f * scale_ui;
-            c.Pill(lbl_x, lbl_y, lbl_x + lbl_w, lbl_y + 22.0f * scale_ui, 0xEE10141E);
+            c.Pill(lbl_x, lbl_y, lbl_x + lbl_w, lbl_y + 22.0f * scale_ui, Rgba(16, 20, 30, 238));
             std::string p_txt = lang::Pt() ? "[ PRE-VISUALIZACAO: PS4 ]" : "[ PREVIEW: PS4 ]";
-            c.Write(p_txt, lbl_x + 10.0f * scale_ui, lbl_y + 5.0f * scale_ui, 1.25f * scale_ui, 0xFF00A2FF);
+            c.Write(p_txt, lbl_x + 10.0f * scale_ui, lbl_y + 5.0f * scale_ui, 1.25f * scale_ui, Rgba(0, 162, 255));
         }
     } else if (style == "steam") {
         const float box_w = 420.0f * scale_ui;
@@ -1311,30 +1434,34 @@ static void RenderTrophyToast(OverlayCanvas& c, const RECT& client, float scale_
         const float cur_x = client.right - box_w - 24.0f * scale_ui;
         const float cur_y = is_preview ? (client.bottom - box_h - 24.0f * scale_ui) : (client.bottom - box_h - 24.0f * scale_ui + (1.0f - anim) * (box_h + 35.0f * scale_ui));
 
-        c.Rect(cur_x - 2.0f * scale_ui, cur_y - 2.0f * scale_ui, cur_x + box_w + 2.0f * scale_ui, cur_y + box_h + 2.0f * scale_ui, 0xFF2B475D);
-        c.Rect(cur_x, cur_y, cur_x + box_w, cur_y + box_h, 0xFA171A21);
+        c.Rect(cur_x - 2.0f * scale_ui, cur_y - 2.0f * scale_ui, cur_x + box_w + 2.0f * scale_ui, cur_y + box_h + 2.0f * scale_ui, Rgba(43, 71, 93));
+        c.Rect(cur_x, cur_y, cur_x + box_w, cur_y + box_h, Rgba(23, 26, 33, 250));
 
         const float badge_sz = box_h - 16.0f * scale_ui;
         const float badge_x = cur_x + 8.0f * scale_ui;
         const float badge_y = cur_y + 8.0f * scale_ui;
-        c.Rect(badge_x, badge_y, badge_x + badge_sz, badge_y + badge_sz, 0xFF0E141B);
+        c.Rect(badge_x, badge_y, badge_x + badge_sz, badge_y + badge_sz, Rgba(14, 20, 27));
 
-        const float cup_p = scale_ui * 2.2f;
-        c.DrawBitmap(kTrophyCup, 7, badge_x + (badge_sz - 5.0f * cup_p) * 0.5f, badge_y + (badge_sz - 7.0f * cup_p) * 0.5f, cup_p, 0xFF66C0F4);
+        if (thumb && thumb->loaded) {
+            c.DrawThumbnail(thumb, badge_x + 2.0f * scale_ui, badge_y + 2.0f * scale_ui, badge_sz - 4.0f * scale_ui, 1.0f);
+        } else {
+            const float cup_p = scale_ui * 2.2f;
+            c.DrawBitmap(kTrophyCup, 7, badge_x + (badge_sz - 5.0f * cup_p) * 0.5f, badge_y + (badge_sz - 7.0f * cup_p) * 0.5f, cup_p, Rgba(102, 192, 244));
+        }
 
         const float text_x = badge_x + badge_sz + 12.0f * scale_ui;
         std::string hdr = lang::Pt() ? "Steam - Conquista Desbloqueada" : "Steam - Achievement Unlocked";
-        c.Write(hdr, text_x, cur_y + 9.0f * scale_ui, 1.4f * scale_ui, 0xFF66C0F4);
-        c.Write(title, text_x, cur_y + 26.0f * scale_ui, 1.8f * scale_ui, 0xFFFFFFFF);
-        c.Write(desc, text_x, cur_y + 48.0f * scale_ui, 1.2f * scale_ui, 0xFF8F98A0);
+        c.Write(hdr, text_x, cur_y + 9.0f * scale_ui, 1.4f * scale_ui, Rgba(102, 192, 244));
+        c.Write(title, text_x, cur_y + 26.0f * scale_ui, 1.8f * scale_ui, Rgba(255, 255, 255));
+        c.Write(desc, text_x, cur_y + 48.0f * scale_ui, 1.2f * scale_ui, Rgba(143, 152, 160));
 
         if (is_preview) {
             const float lbl_w = 210.0f * scale_ui;
             const float lbl_x = cur_x + (box_w - lbl_w) * 0.5f;
             const float lbl_y = cur_y - 26.0f * scale_ui;
-            c.Pill(lbl_x, lbl_y, lbl_x + lbl_w, lbl_y + 22.0f * scale_ui, 0xEE10141E);
+            c.Pill(lbl_x, lbl_y, lbl_x + lbl_w, lbl_y + 22.0f * scale_ui, Rgba(16, 20, 30, 238));
             std::string p_txt = lang::Pt() ? "[ PRE-VISUALIZACAO: STEAM ]" : "[ PREVIEW: STEAM ]";
-            c.Write(p_txt, lbl_x + 10.0f * scale_ui, lbl_y + 5.0f * scale_ui, 1.25f * scale_ui, 0xFF66C0F4);
+            c.Write(p_txt, lbl_x + 10.0f * scale_ui, lbl_y + 5.0f * scale_ui, 1.25f * scale_ui, Rgba(102, 192, 244));
         }
     } else {
         // PS5 style (qualified tier)
@@ -1343,30 +1470,37 @@ static void RenderTrophyToast(OverlayCanvas& c, const RECT& client, float scale_
         const float cur_x = (client.right - box_w) * 0.5f;
         const float cur_y = is_preview ? (24.0f * scale_ui) : (24.0f * scale_ui - (1.0f - anim) * (box_h + 35.0f * scale_ui));
 
-        c.Pill(cur_x - 3.0f * scale_ui, cur_y - 3.0f * scale_ui, cur_x + box_w + 3.0f * scale_ui, cur_y + box_h + 3.0f * scale_ui, tier_col);
-        c.Pill(cur_x, cur_y, cur_x + box_w, cur_y + box_h, 0xF20F1218);
+        c.Pill(cur_x - 2.5f * scale_ui, cur_y - 2.5f * scale_ui, cur_x + box_w + 2.5f * scale_ui, cur_y + box_h + 2.5f * scale_ui, tier_col);
+        c.Pill(cur_x, cur_y, cur_x + box_w, cur_y + box_h, Rgba(15, 18, 24, 244));
 
-        c.Pill(cur_x + 8.0f * scale_ui, cur_y + 12.0f * scale_ui, cur_x + 14.0f * scale_ui, cur_y + box_h - 12.0f * scale_ui, tier_col);
+        // Left vertical accent pill strictly inside rounded cap
+        c.Pill(cur_x + 15.0f * scale_ui, cur_y + 18.0f * scale_ui, cur_x + 19.0f * scale_ui, cur_y + box_h - 18.0f * scale_ui, tier_col);
 
-        const float cr = (box_h - 18.0f * scale_ui) * 0.5f;
-        const float cx = cur_x + 22.0f * scale_ui + cr;
-        const float cy = cur_y + box_h * 0.5f;
-        c.Circle(cx, cy, cr, 0x44000000);
+        const float badge_sz = box_h - 22.0f * scale_ui;
+        const float bx = cur_x + 26.0f * scale_ui;
+        const float by = cur_y + 11.0f * scale_ui;
+        c.Rect(bx - 1.0f, by - 1.0f, bx + badge_sz + 1.0f, by + badge_sz + 1.0f, tier_col);
+        c.Rect(bx, by, bx + badge_sz, by + badge_sz, Rgba(22, 26, 36));
+        if (thumb && thumb->loaded) {
+            c.DrawThumbnail(thumb, bx + 2.0f * scale_ui, by + 2.0f * scale_ui, badge_sz - 4.0f * scale_ui, 1.0f);
+        } else {
+            const float cup_p = scale_ui * 2.2f;
+            c.DrawBitmap(kTrophyCup, 7, bx + (badge_sz - 5.0f * cup_p) * 0.5f, by + (badge_sz - 7.0f * cup_p) * 0.5f, cup_p, tier_col);
+        }
 
-        const float cup_p = scale_ui * 2.4f;
-        c.DrawBitmap(kTrophyCup, 7, cx - 2.5f * cup_p, cy - 3.5f * cup_p, cup_p, tier_col);
-
-        const float text_x = cx + cr + 14.0f * scale_ui;
-        std::string hdr = std::string(lang::Pt() ? "* TROFEU DE " : "* ") + tier_name + (lang::Pt() ? " CONQUISTADO!" : " TROPHY EARNED!");
-        c.Write(hdr, text_x, cur_y + 10.0f * scale_ui, 1.55f * scale_ui, tier_col);
-        c.Write(title, text_x, cur_y + 28.0f * scale_ui, 2.1f * scale_ui, 0xFFFFFFFF);
-        c.Write(desc, text_x, cur_y + 52.0f * scale_ui, 1.35f * scale_ui, 0xFFAAAAAA);
+        const float text_x = bx + badge_sz + 14.0f * scale_ui;
+        const float mini_p = scale_ui * 1.4f;
+        c.DrawBitmap(kTrophyCup, 7, text_x, cur_y + 10.0f * scale_ui, mini_p, tier_col);
+        std::string hdr = std::string(lang::Pt() ? "TROFEU DE " : "") + tier_name + (lang::Pt() ? " CONQUISTADO!" : " TROPHY EARNED!");
+        c.Write(hdr, text_x + 12.0f * scale_ui, cur_y + 10.0f * scale_ui, 1.5f * scale_ui, tier_col);
+        c.Write(title, text_x, cur_y + 29.0f * scale_ui, 2.0f * scale_ui, Rgba(255, 255, 255));
+        c.Write(desc, text_x, cur_y + 53.0f * scale_ui, 1.3f * scale_ui, Rgba(170, 175, 185));
 
         if (is_preview) {
             const float lbl_w = 260.0f * scale_ui;
             const float lbl_x = cur_x + (box_w - lbl_w) * 0.5f;
             const float lbl_y = cur_y + box_h + 8.0f * scale_ui;
-            c.Pill(lbl_x, lbl_y, lbl_x + lbl_w, lbl_y + 22.0f * scale_ui, 0xEE10141E);
+            c.Pill(lbl_x, lbl_y, lbl_x + lbl_w, lbl_y + 22.0f * scale_ui, Rgba(16, 20, 30, 238));
             std::string p_txt = lang::Pt() ? "[ PRE-VISUALIZACAO: PS5 ]" : "[ PREVIEW: PS5 ]";
             c.Write(p_txt, lbl_x + 12.0f * scale_ui, lbl_y + 5.0f * scale_ui, 1.25f * scale_ui, tier_col);
         }
@@ -1530,7 +1664,7 @@ void QueueStatsOverlay() {
         int sel = g_menu_items[8].selected;
         if (sel >= 0 && sel < 5) {
             float scale_toast = client.bottom >= 1400 ? 1.4f : (client.bottom >= 1000 ? 1.0f : 0.8f);
-            RenderTrophyToast(c, client, scale_toast, kStyles[sel], 'G',
+            RenderTrophyToast(c, client, scale_toast, kStyles[sel], 16, 'G',
                               lang::Pt() ? "Exemplo de Conquista" : "Sample Achievement",
                               lang::Pt() ? "Pre-visualizacao do estilo selecionado" : "Selected popup style preview",
                               1.0f, true);
@@ -1546,65 +1680,69 @@ void QueueStatsOverlay() {
         const float box_y0 = pad_y;
         const float box_y1 = client.bottom - pad_y;
         const float box_w = box_x1 - box_x0;
-        const float box_h = box_y1 - box_y0;
 
         // Dark full backdrop with PS5 atmospheric ambient radiance
-        c.Rect(0, 0, client.right, client.bottom, 0xF40A0C11);
-        c.Rect(client.right * 0.55f, 0, client.right, client.bottom * 0.45f, 0x127A2518);
-        c.Rect(client.right * 0.70f, client.bottom * 0.45f, client.right, client.bottom, 0x0E501810);
+        c.Rect(0, 0, client.right, client.bottom, Rgba(10, 12, 17, 245));
+        c.Rect(client.right * 0.55f, 0, client.right, client.bottom * 0.45f, Rgba(122, 42, 24, 18));
+        c.Rect(client.right * 0.70f, client.bottom * 0.45f, client.right, client.bottom, Rgba(80, 26, 16, 14));
 
         int unlocked = 0, total = 77, n_plat = 0, n_gold = 0, n_silv = 0, n_brz = 0;
         hle::trophy::TrophyManager::Instance().GetProgress(&unlocked, &total, &n_plat, &n_gold, &n_silv, &n_brz);
         const int pct = total > 0 ? (unlocked * 100 / total) : 0;
 
         // Top Header
-        const float header_y = box_y0 + 12.0f * scale_ui;
+        const float header_y = box_y0 + 10.0f * scale_ui;
 
-        // Game Thumbnail
-        const float thumb_sz = 46.0f * scale_ui;
+        // Game Thumbnail (ICON0.PNG)
+        const float thumb_sz = 48.0f * scale_ui;
         const float thumb_x = box_x0 + 14.0f * scale_ui;
         const float thumb_y = header_y;
-        c.Rect(thumb_x - 1.0f, thumb_y - 1.0f, thumb_x + thumb_sz + 1.0f, thumb_y + thumb_sz + 1.0f, 0xFF2A3142);
-        c.Rect(thumb_x, thumb_y, thumb_x + thumb_sz, thumb_y + thumb_sz, 0xFF161A24);
-        c.Circle(thumb_x + thumb_sz * 0.5f, thumb_y + thumb_sz * 0.5f, thumb_sz * 0.35f, 0x66FFD700);
-        c.Circle(thumb_x + thumb_sz * 0.5f, thumb_y + thumb_sz * 0.5f, thumb_sz * 0.22f, 0x9900E5FF);
+        c.Rect(thumb_x - 1.0f, thumb_y - 1.0f, thumb_x + thumb_sz + 1.0f, thumb_y + thumb_sz + 1.0f, Rgba(42, 49, 66));
+        c.Rect(thumb_x, thumb_y, thumb_x + thumb_sz, thumb_y + thumb_sz, Rgba(22, 26, 36));
+        const TrophyThumbnail* game_thumb = GetTrophyThumbnail(-1, "ICON0.PNG");
+        if (game_thumb && game_thumb->loaded) {
+            c.DrawThumbnail(game_thumb, thumb_x + 2.0f * scale_ui, thumb_y + 2.0f * scale_ui, thumb_sz - 4.0f * scale_ui, 1.0f);
+        } else {
+            c.Circle(thumb_x + thumb_sz * 0.5f, thumb_y + thumb_sz * 0.5f, thumb_sz * 0.35f, Rgba(255, 215, 0, 102));
+            c.Circle(thumb_x + thumb_sz * 0.5f, thumb_y + thumb_sz * 0.5f, thumb_sz * 0.22f, Rgba(0, 229, 255, 153));
+        }
 
         // Game Title
         const float title_x = thumb_x + thumb_sz + 16.0f * scale_ui;
-        c.Write("LEGO(R) DIMENSIONS(TM)", title_x, thumb_y + 14.0f * scale_ui, 2.3f * scale_ui, 0xFFFFFFFF);
+        c.Write("LEGO(R) DIMENSIONS(TM)", title_x, thumb_y + 14.0f * scale_ui, 2.3f * scale_ui, Rgba(255, 255, 255));
 
         // Header Right: "Progresso" and "Conquistados"
         const float p_x = box_x1 - 430.0f * scale_ui;
-        c.Write(lang::Pt() ? "Progresso" : "Progress", p_x, header_y, 1.35f * scale_ui, 0xFF8E95A5);
+        c.Write(lang::Pt() ? "Progresso" : "Progress", p_x, header_y, 1.35f * scale_ui, Rgba(142, 149, 165));
         std::string p_str = std::to_string(pct) + "%";
-        c.Write(p_str, p_x, header_y + 16.0f * scale_ui, 2.1f * scale_ui, 0xFFFFFFFF);
+        c.Write(p_str, p_x, header_y + 16.0f * scale_ui, 2.1f * scale_ui, Rgba(255, 255, 255));
         const float u_w = 48.0f * scale_ui;
-        c.Rect(p_x, header_y + 36.0f * scale_ui, p_x + u_w, header_y + 38.0f * scale_ui, 0xFF2E3544);
+        c.Rect(p_x, header_y + 36.0f * scale_ui, p_x + u_w, header_y + 38.0f * scale_ui, Rgba(46, 53, 68));
         if (pct > 0) {
-            c.Rect(p_x, header_y + 36.0f * scale_ui, p_x + u_w * (pct / 100.0f), header_y + 38.0f * scale_ui, 0xFFFFFFFF);
+            c.Rect(p_x, header_y + 36.0f * scale_ui, p_x + u_w * (pct / 100.0f), header_y + 38.0f * scale_ui, Rgba(255, 255, 255));
         }
 
         const float c_x = box_x1 - 320.0f * scale_ui;
-        c.Write(lang::Pt() ? "Conquistados" : "Earned", c_x, header_y, 1.35f * scale_ui, 0xFF8E95A5);
+        c.Write(lang::Pt() ? "Conquistados" : "Earned", c_x, header_y, 1.35f * scale_ui, Rgba(142, 149, 165));
         std::string r_str = std::to_string(unlocked) + "/" + std::to_string(total);
-        float rx = c.Write(r_str, c_x, header_y + 16.0f * scale_ui, 2.0f * scale_ui, 0xFFFFFFFF) + 16.0f * scale_ui;
+        float rx = c.Write(r_str, c_x, header_y + 16.0f * scale_ui, 2.0f * scale_ui, Rgba(255, 255, 255)) + 16.0f * scale_ui;
 
         // 4 trophy cups in header
-        auto draw_header_cup = [&](u32 col, int count) {
+        auto draw_header_cup = [&](u32 col, int count_val) {
             const float cp = scale_ui * 1.8f;
             c.DrawBitmap(kTrophyCup, 7, rx, header_y + 18.0f * scale_ui, cp, col);
             rx += 6.0f * cp + 4.0f * scale_ui;
-            rx = c.Write(std::to_string(count), rx, header_y + 17.0f * scale_ui, 1.6f * scale_ui, 0xFFFFFFFF) + 12.0f * scale_ui;
+            rx = c.Write(std::to_string(count_val), rx, header_y + 17.0f * scale_ui, 1.6f * scale_ui, Rgba(255, 255, 255)) + 12.0f * scale_ui;
         };
-        draw_header_cup(0xFF00E5FF, n_plat);
-        draw_header_cup(0xFFFFD700, n_gold);
-        draw_header_cup(0xFFD0D0E0, n_silv);
-        draw_header_cup(0xFFCD7F32, n_brz);
+        draw_header_cup(Rgba(0, 229, 255), n_plat);   // Platinum
+        draw_header_cup(Rgba(255, 215, 0), n_gold);   // Gold
+        draw_header_cup(Rgba(208, 212, 224), n_silv); // Silver
+        draw_header_cup(Rgba(205, 127, 50), n_brz);   // Bronze
 
         // Subheader row
         const float sub_y = header_y + 54.0f * scale_ui;
         const float fx = box_x0 + 14.0f * scale_ui;
-        c.DrawBitmap(kTriangleUp, 3, fx, sub_y + 3.0f * scale_ui, scale_ui * 1.5f, 0xFF8E95A5);
+        c.DrawBitmap(kTriangleUp, 3, fx, sub_y + 3.0f * scale_ui, scale_ui * 1.5f, Rgba(142, 149, 165));
 
         std::string filter_lbl;
         if (g_achievements_filter == 1) {
@@ -1614,7 +1752,7 @@ void QueueStatsOverlay() {
         } else {
             filter_lbl = (lang::Pt() ? "Todas as conquistas: " : "All trophies: ") + std::to_string(total);
         }
-        c.Write(filter_lbl, fx + 16.0f * scale_ui, sub_y, 1.4f * scale_ui, 0xFF8E95A5);
+        c.Write(filter_lbl, fx + 16.0f * scale_ui, sub_y, 1.4f * scale_ui, Rgba(142, 149, 165));
 
         std::string sort_str;
         if (g_achievements_filter == 1) {
@@ -1625,7 +1763,7 @@ void QueueStatsOverlay() {
             sort_str = lang::Pt() ? "Classificar por: Padrao" : "Sort by: Default";
         }
         const float sort_w = TextWidth(sort_str, 1.4f * scale_ui);
-        c.Write(sort_str, box_x1 - sort_w - 14.0f * scale_ui, sub_y, 1.4f * scale_ui, 0xFF8E95A5);
+        c.Write(sort_str, box_x1 - sort_w - 14.0f * scale_ui, sub_y, 1.4f * scale_ui, Rgba(142, 149, 165));
 
         // Filtered items
         const auto filtered = GetFilteredAchievements(g_achievements_filter);
@@ -1635,9 +1773,17 @@ void QueueStatsOverlay() {
 
         const float card_y0 = sub_y + 24.0f * scale_ui;
         const float card_w = box_w - 28.0f * scale_ui;
-        const float card_h = 86.0f * scale_ui;
+        const float card_h = 84.0f * scale_ui;
         const float card_gap = 10.0f * scale_ui;
-        const int kVisibleCards = 5;
+        const float footer_y = box_y1 - 24.0f * scale_ui;
+        const float avail_cards_h = footer_y - card_y0 - 8.0f * scale_ui;
+        const int kVisibleCards = std::clamp(static_cast<int>((avail_cards_h + card_gap) / (card_h + card_gap)), 5, 12);
+        g_achievements_visible_count = kVisibleCards;
+
+        // Clamp scroll if screen grew or filter changed
+        if (g_achievements_scroll > std::max(0, filtered_count - kVisibleCards)) {
+            g_achievements_scroll = std::max(0, filtered_count - kVisibleCards);
+        }
 
         for (int v = 0; v < kVisibleCards; ++v) {
             const int f_idx = g_achievements_scroll + v;
@@ -1655,23 +1801,23 @@ void QueueStatsOverlay() {
             const float cy0 = card_y0 + v * (card_h + card_gap);
             const float cy1 = cy0 + card_h;
 
-            u32 tier_color = 0xFFCD7F32;
+            u32 tier_color = Rgba(205, 127, 50); // Bronze
             const char* tier_label = lang::Pt() ? "Bronze" : "Bronze";
             float rarity_pct = 28.3f;
             const char* rarity_tier = lang::Pt() ? "Raro" : "Rare";
 
             if (def.type == 'P') {
-                tier_color = 0xFF00E5FF;
+                tier_color = Rgba(0, 229, 255); // Platinum
                 tier_label = lang::Pt() ? "Platina" : "Platinum";
                 rarity_pct = 1.8f;
                 rarity_tier = lang::Pt() ? "Ultra Raro" : "Ultra Rare";
             } else if (def.type == 'G') {
-                tier_color = 0xFFFFD700;
+                tier_color = Rgba(255, 215, 0); // Gold
                 tier_label = lang::Pt() ? "Ouro" : "Gold";
                 rarity_pct = 6.4f;
                 rarity_tier = lang::Pt() ? "Muito Raro" : "Very Rare";
             } else if (def.type == 'S') {
-                tier_color = 0xFFD0D0E0;
+                tier_color = Rgba(208, 212, 224); // Silver
                 tier_label = lang::Pt() ? "Prata" : "Silver";
                 rarity_pct = 16.2f;
                 rarity_tier = lang::Pt() ? "Raro" : "Rare";
@@ -1679,54 +1825,65 @@ void QueueStatsOverlay() {
 
             // Card background
             if (is_sel) {
-                c.Rect(cx0 - 1.5f, cy0 - 1.5f, cx1 + 1.5f, cy1 + 1.5f, 0xFFFFFFFF);
-                c.Rect(cx0, cy0, cx1, cy1, 0xFA222734);
-                c.Rect(cx1 - card_w * 0.32f, cy0, cx1, cy1, 0x22803822);
+                c.Rect(cx0 - 1.5f, cy0 - 1.5f, cx1 + 1.5f, cy1 + 1.5f, Rgba(255, 255, 255));
+                c.Rect(cx0, cy0, cx1, cy1, Rgba(34, 39, 52, 250));
+                c.Rect(cx1 - card_w * 0.32f, cy0, cx1, cy1, Rgba(128, 56, 34, 34));
             } else {
-                c.Rect(cx0, cy0, cx1, cy1, 0xD4151820);
-                c.Rect(cx1 - card_w * 0.32f, cy0, cx1, cy1, 0x14702D1E);
+                c.Rect(cx0, cy0, cx1, cy1, Rgba(21, 24, 32, 212));
+                c.Rect(cx1 - card_w * 0.32f, cy0, cx1, cy1, Rgba(112, 45, 30, 20));
             }
 
-            // Left Badge (Square Tile)
+            // Left Badge (Square Tile with trophy artwork)
             const float badge_sz = card_h - 18.0f * scale_ui;
             const float bx0 = cx0 + 10.0f * scale_ui;
             const float by0 = cy0 + 9.0f * scale_ui;
-            c.Rect(bx0 - 1.0f, by0 - 1.0f, bx0 + badge_sz + 1.0f, by0 + badge_sz + 1.0f, 0xFF222836);
-            c.Rect(bx0, by0, bx0 + badge_sz, by0 + badge_sz, 0xFF191D27);
+            c.Rect(bx0 - 1.0f, by0 - 1.0f, bx0 + badge_sz + 1.0f, by0 + badge_sz + 1.0f, is_unlocked ? tier_color : Rgba(34, 40, 54));
+            c.Rect(bx0, by0, bx0 + badge_sz, by0 + badge_sz, Rgba(25, 29, 39));
 
-            // Trophy cup in badge
-            const float cup_p = scale_ui * 2.3f;
-            const float cup_x = bx0 + (badge_sz - 5.0f * cup_p) * 0.5f;
-            const float cup_y = by0 + (badge_sz - 7.0f * cup_p) * 0.5f;
-
-            if (is_unlocked) {
-                c.DrawBitmap(kTrophyCup, 7, cup_x, cup_y, cup_p, tier_color);
+            const TrophyThumbnail* thumb = GetTrophyThumbnail(def.id, def.icon);
+            if (thumb && thumb->loaded) {
+                if (is_unlocked) {
+                    c.DrawThumbnail(thumb, bx0 + 2.0f * scale_ui, by0 + 2.0f * scale_ui, badge_sz - 4.0f * scale_ui, 1.0f);
+                } else {
+                    c.DrawThumbnail(thumb, bx0 + 2.0f * scale_ui, by0 + 2.0f * scale_ui, badge_sz - 4.0f * scale_ui, 0.35f);
+                    // Silver padlock badge on bottom right of badge
+                    const float lock_p = scale_ui * 1.5f;
+                    const float lock_x = bx0 + badge_sz - 5.0f * lock_p - 4.0f * scale_ui;
+                    const float lock_y = by0 + badge_sz - 5.0f * lock_p - 4.0f * scale_ui;
+                    c.DrawBitmap(kPadlock, 5, lock_x, lock_y, lock_p, Rgba(213, 219, 232));
+                }
             } else {
-                // Dimmed cup
-                c.DrawBitmap(kTrophyCup, 7, cup_x, cup_y, cup_p, 0xFF4D5363);
-                // Silver padlock badge on bottom right of badge
-                const float lock_p = scale_ui * 1.5f;
-                const float lock_x = bx0 + badge_sz - 5.0f * lock_p - 4.0f * scale_ui;
-                const float lock_y = by0 + badge_sz - 5.0f * lock_p - 4.0f * scale_ui;
-                c.DrawBitmap(kPadlock, 5, lock_x, lock_y, lock_p, 0xFFD5DBE8);
+                // Fallback to cup icon
+                const float cup_p = scale_ui * 2.3f;
+                const float cup_x = bx0 + (badge_sz - 5.0f * cup_p) * 0.5f;
+                const float cup_y = by0 + (badge_sz - 7.0f * cup_p) * 0.5f;
+                if (is_unlocked) {
+                    c.DrawBitmap(kTrophyCup, 7, cup_x, cup_y, cup_p, tier_color);
+                } else {
+                    c.DrawBitmap(kTrophyCup, 7, cup_x, cup_y, cup_p, Rgba(77, 83, 99));
+                    const float lock_p = scale_ui * 1.5f;
+                    const float lock_x = bx0 + badge_sz - 5.0f * lock_p - 4.0f * scale_ui;
+                    const float lock_y = by0 + badge_sz - 5.0f * lock_p - 4.0f * scale_ui;
+                    c.DrawBitmap(kPadlock, 5, lock_x, lock_y, lock_p, Rgba(213, 219, 232));
+                }
             }
 
             // Middle Column
             const float col_x = bx0 + badge_sz + 18.0f * scale_ui;
             const std::string trophy_name = lang::Pt() ? def.name_pt : def.name_en;
-            c.Write(trophy_name, col_x, cy0 + 12.0f * scale_ui, 2.1f * scale_ui, 0xFFFFFFFF);
+            c.Write(trophy_name, col_x, cy0 + 12.0f * scale_ui, 2.0f * scale_ui, Rgba(255, 255, 255));
 
             // Tier line: mini cup + Tier name
             const float mini_p = scale_ui * 1.5f;
             c.DrawBitmap(kTrophyCup, 7, col_x, cy0 + 36.0f * scale_ui, mini_p, tier_color);
-            c.Write(tier_label, col_x + 14.0f * scale_ui, cy0 + 35.0f * scale_ui, 1.45f * scale_ui, 0xFFA0A5B5);
+            c.Write(tier_label, col_x + 14.0f * scale_ui, cy0 + 35.0f * scale_ui, 1.45f * scale_ui, Rgba(175, 180, 195));
 
             // Rarity line: triangle + rarity text
-            c.DrawBitmap(kTriangleUp, 3, col_x, cy0 + 58.0f * scale_ui, scale_ui * 1.3f, 0xFF8E95A5);
+            c.DrawBitmap(kTriangleUp, 3, col_x, cy0 + 58.0f * scale_ui, scale_ui * 1.3f, Rgba(142, 149, 165));
             char r_buf[128];
             std::snprintf(r_buf, sizeof(r_buf), lang::Pt() ? "%s | %.1f%% dos jogadores conquistaram" : "%s | %.1f%% of players earned this",
                           rarity_tier, rarity_pct);
-            c.Write(r_buf, col_x + 12.0f * scale_ui, cy0 + 55.0f * scale_ui, 1.25f * scale_ui, 0xFF8E95A5);
+            c.Write(r_buf, col_x + 12.0f * scale_ui, cy0 + 55.0f * scale_ui, 1.25f * scale_ui, Rgba(142, 149, 165));
 
             // Right Column: Description
             const float desc_x = cx0 + card_w * 0.53f;
@@ -1736,28 +1893,28 @@ void QueueStatsOverlay() {
                 if (split_pos == std::string::npos) split_pos = 42;
                 std::string line1 = trophy_desc.substr(0, split_pos);
                 std::string line2 = trophy_desc.substr(split_pos + 1);
-                c.Write(line1, desc_x, cy0 + 22.0f * scale_ui, 1.4f * scale_ui, 0xFFAEB4C4);
-                c.Write(line2, desc_x, cy0 + 44.0f * scale_ui, 1.4f * scale_ui, 0xFFAEB4C4);
+                c.Write(line1, desc_x, cy0 + 22.0f * scale_ui, 1.4f * scale_ui, Rgba(174, 180, 196));
+                c.Write(line2, desc_x, cy0 + 44.0f * scale_ui, 1.4f * scale_ui, Rgba(174, 180, 196));
             } else {
-                c.Write(trophy_desc, desc_x, cy0 + 33.0f * scale_ui, 1.45f * scale_ui, 0xFFAEB4C4);
+                c.Write(trophy_desc, desc_x, cy0 + 33.0f * scale_ui, 1.45f * scale_ui, Rgba(174, 180, 196));
             }
         }
 
         if (filtered.empty()) {
             const std::string empty_msg = lang::Pt() ? "Nenhuma conquista encontrada nesta categoria." : "No achievements found in this category.";
-            c.Write(empty_msg, box_x0 + 40.0f * scale_ui, card_y0 + 60.0f * scale_ui, 1.8f * scale_ui, 0xFF8E95A5);
+            c.Write(empty_msg, box_x0 + 40.0f * scale_ui, card_y0 + 60.0f * scale_ui, 1.8f * scale_ui, Rgba(142, 149, 165));
         }
 
-        // Minimalist Scrollbar on right edge
-        const float sb_x0 = box_x1 - 10.0f * scale_ui;
-        const float sb_x1 = box_x1 - 6.0f * scale_ui;
+        // Minimalist Scrollbar on right edge (uses corrected vertical Pill)
+        const float sb_x0 = box_x1 - 9.0f * scale_ui;
+        const float sb_x1 = box_x1 - 5.0f * scale_ui;
         const float sb_y0 = card_y0;
         const float sb_y1 = card_y0 + kVisibleCards * (card_h + card_gap) - card_gap;
-        c.Pill(sb_x0, sb_y0, sb_x1, sb_y1, 0xFF141822);
+        c.Pill(sb_x0, sb_y0, sb_x1, sb_y1, Rgba(24, 28, 38));
         if (filtered_count > kVisibleCards) {
             const float thumb_h = std::max(28.0f * scale_ui, (sb_y1 - sb_y0) * kVisibleCards / filtered_count);
             const float thumb_y0 = sb_y0 + (sb_y1 - sb_y0 - thumb_h) * (static_cast<float>(g_achievements_scroll) / (filtered_count - kVisibleCards));
-            c.Pill(sb_x0, thumb_y0, sb_x1, thumb_y0 + thumb_h, 0xFF657088);
+            c.Pill(sb_x0, thumb_y0, sb_x1, thumb_y0 + thumb_h, Rgba(101, 112, 136));
         }
 
         // Footer at bottom
@@ -1765,7 +1922,7 @@ void QueueStatsOverlay() {
             ? "[D-PAD / ANALOGICO] NAVEGAR   [LB / RB] PAGINA   [X / TAB] FILTRAR   [B / ESC / F9] FECHAR   [RB+LB+RT] FECHAR"
             : "[D-PAD / STICK] NAVIGATE   [LB / RB] PAGE   [X / TAB] FILTER   [B / ESC / F9] CLOSE   [RB+LB+RT] CLOSE";
         const float font_foot = 1.35f * scale_ui;
-        c.Write(footer, box_x0 + (box_w - TextWidth(footer, font_foot)) * 0.5f, box_y1 - 18.0f * scale_ui, font_foot, 0xFF757D8E);
+        c.Write(footer, box_x0 + (box_w - TextWidth(footer, font_foot)) * 0.5f, box_y1 - 18.0f * scale_ui, font_foot, Rgba(117, 125, 142));
     }
 
     if (has_toast) {
@@ -1780,7 +1937,7 @@ void QueueStatsOverlay() {
 
         const float scale_ui = client.bottom >= 1400 ? 1.4f : (client.bottom >= 1000 ? 1.0f : 0.8f);
         RenderTrophyToast(c, client, scale_ui, toast.popup_style.empty() ? "ps5" : toast.popup_style,
-                          toast.type, toast.title, toast.desc, anim, false);
+                          toast.trophy_id, toast.type, toast.title, toast.desc, anim, false);
     }
 
     if (!vertices.empty()) {

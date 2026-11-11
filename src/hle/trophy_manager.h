@@ -56,6 +56,7 @@ public:
     ToastState GetActiveToast() const;
 
     const TrophyDef* FindDef(int trophy_id) const;
+    const std::filesystem::path& GetRootPath() const { return m_root_path; }
 
 private:
     TrophyManager();

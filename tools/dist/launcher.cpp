@@ -1691,6 +1691,7 @@ void SyncLegoToypadState() {
 
 HWND g_trophies_window = nullptr;
 HWND g_trophies_list = nullptr;
+HIMAGELIST g_trophies_imagelist = nullptr;
 const int kTrophiesW = 860;
 const int kTrophiesH = 580;
 const int kTrophiesClose = 501;
@@ -1712,7 +1713,7 @@ int GetUnlockedTrophiesCount() {
         uint32_t flags[4] = {};
         dat.read(reinterpret_cast<char*>(flags), sizeof(flags));
         int unlocked = 0;
-        for (int i = 0; i < 77; ++i) {
+        for (int i = 0; i < 78; ++i) {
             if (flags[i / 32] & (1u << (i % 32))) unlocked++;
         }
         if (unlocked > 0) return unlocked;
@@ -1802,6 +1803,10 @@ LRESULT CALLBACK TrophiesProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         EnableWindow(g_main, TRUE);
         SetForegroundWindow(g_main);
         g_trophies_window = nullptr;
+        if (g_trophies_imagelist) {
+            ImageList_Destroy(g_trophies_imagelist);
+            g_trophies_imagelist = nullptr;
+        }
         return 0;
     }
     return DefWindowProcW(hwnd, msg, wp, lp);
@@ -1832,7 +1837,7 @@ void OpenTrophiesDialog() {
     GetWindowRect(g_main, &owner);
     const int w = size.right - size.left, h = size.bottom - size.top;
     g_trophies_window = CreateWindowExW(WS_EX_DLGMODALFRAME, L"LegoDimensionsPcTrophies",
-                                        ui::T(L"Conquistas do LEGO Dimensions (77)", L"LEGO Dimensions Achievements (77)"),
+                                        ui::T(L"Conquistas do LEGO Dimensions (78)", L"LEGO Dimensions Achievements (78)"),
                                         style,
                                         owner.left + ((owner.right - owner.left) - w) / 2,
                                         owner.top + ((owner.bottom - owner.top) - h) / 2,
@@ -1853,7 +1858,7 @@ void OpenTrophiesDialog() {
     LVCOLUMNW col{};
     col.mask = LVCF_TEXT | LVCF_WIDTH | LVCF_SUBITEM;
 
-    col.cx = S(45);
+    col.cx = S(72);
     col.pszText = const_cast<LPWSTR>(L"#");
     SendMessageW(g_trophies_list, LVM_INSERTCOLUMNW, 0, reinterpret_cast<LPARAM>(&col));
 
@@ -1865,7 +1870,7 @@ void OpenTrophiesDialog() {
     col.pszText = const_cast<LPWSTR>(ui::T(L"Nome", L"Name"));
     SendMessageW(g_trophies_list, LVM_INSERTCOLUMNW, 2, reinterpret_cast<LPARAM>(&col));
 
-    col.cx = S(315);
+    col.cx = S(288);
     col.pszText = const_cast<LPWSTR>(ui::T(L"Descrição", L"Description"));
     SendMessageW(g_trophies_list, LVM_INSERTCOLUMNW, 3, reinterpret_cast<LPARAM>(&col));
 
@@ -1914,11 +1919,49 @@ void OpenTrophiesDialog() {
     const TrophyDef* defs = GetTrophyDefs(&count);
     const bool is_pt = (g_lang_value == L"pt" || (g_lang_value == L"auto" && PRIMARYLANGID(GetUserDefaultUILanguage()) == LANG_PORTUGUESE));
 
+    const int icon_px = S(36);
+    if (g_trophies_imagelist) {
+        ImageList_Destroy(g_trophies_imagelist);
+    }
+    g_trophies_imagelist = ImageList_Create(icon_px, icon_px, ILC_COLOR32, static_cast<int>(count), static_cast<int>(count));
+    for (size_t i = 0; i < count; ++i) {
+        const TrophyDef& d = defs[i];
+        HBITMAP hBmp = nullptr;
+        const std::wstring wicon = Utf8ToWide(d.icon);
+        const fs::path icon_candidates[] = {
+            g_root / L"assets" / L"trophy" / L"NPWR07423_00" / L"Icons" / wicon,
+            g_root / L"assets" / L"trophy" / wicon,
+            g_root / L"assets" / L"trophy" / L"Icons" / wicon
+        };
+        for (const auto& ip : icon_candidates) {
+            if (fs::exists(ip)) {
+                Gdiplus::Bitmap bmp(ip.c_str());
+                if (bmp.GetLastStatus() == Gdiplus::Ok) {
+                    Gdiplus::Bitmap thumb(icon_px, icon_px, PixelFormat32bppARGB);
+                    Gdiplus::Graphics g(&thumb);
+                    g.SetInterpolationMode(Gdiplus::InterpolationModeHighQualityBicubic);
+                    g.DrawImage(&bmp, 0, 0, icon_px, icon_px);
+                    thumb.GetHBITMAP(Gdiplus::Color(20, 22, 30), &hBmp);
+                    break;
+                }
+            }
+        }
+        if (!hBmp) {
+            HDC hdc = GetDC(nullptr);
+            hBmp = CreateCompatibleBitmap(hdc, icon_px, icon_px);
+            ReleaseDC(nullptr, hdc);
+        }
+        ImageList_Add(g_trophies_imagelist, hBmp, nullptr);
+        DeleteObject(hBmp);
+    }
+    SendMessageW(g_trophies_list, LVM_SETIMAGELIST, LVSIL_SMALL, reinterpret_cast<LPARAM>(g_trophies_imagelist));
+
     for (size_t i = 0; i < count; ++i) {
         const TrophyDef& d = defs[i];
         LVITEMW item{};
-        item.mask = LVIF_TEXT;
+        item.mask = LVIF_TEXT | LVIF_IMAGE;
         item.iItem = static_cast<int>(i);
+        item.iImage = static_cast<int>(i);
 
         std::wstring num_str = std::to_wstring(i + 1);
         item.iSubItem = 0;
@@ -1971,10 +2014,10 @@ void ResetTrophiesAction() {
         fs::remove(g_root / L"assets" / L"trophy" / L"trophies.dat", ec);
         fs::remove(g_root / L"assets" / L"trophy" / L"NPWR07423_00.xml", ec);
 
-        // Mark retro check as completed so it will not auto-unlock upon fresh game start
+        // Mark retro check as reset so it will not auto-unlock upon fresh game start
         fs::create_directories(g_root / L"assets" / L"trophy", ec);
-        std::ofstream m(g_root / L"assets" / L"trophy" / L".retro_done");
-        if (m) m << "done\n";
+        std::ofstream m(g_root / L"assets" / L"trophy" / L".retro_done", std::ios::trunc);
+        if (m) m << "reset\n";
 
         MessageBoxW(g_main,
                     ui::T(L"Conquistas reiniciadas com sucesso!", L"Achievements successfully reset!"),
@@ -2426,8 +2469,8 @@ std::vector<Row> Rows() {
                     names.empty() ? ui::T(L"Padrão", L"Default") : names, [](int) { OpenNamesDialog(); }});
     // Conquistas
     const int unlocked_cnt = GetUnlockedTrophiesCount();
-    const int pct_cnt = (unlocked_cnt * 100) / 77;
-    std::wstring progress_str = std::to_wstring(unlocked_cnt) + L" / 77 (" + std::to_wstring(pct_cnt) + L"%)";
+    const int pct_cnt = (unlocked_cnt * 100) / 78;
+    std::wstring progress_str = std::to_wstring(unlocked_cnt) + L" / 78 (" + std::to_wstring(pct_cnt) + L"%)";
     rows.push_back({kTabTrophies, RowKind::kAction, ui::T(L"Progresso geral", L"Overall progress"),
                     ui::T(L"Total de conquistas desbloqueadas no save atual. Enter: ver lista.",
                           L"Total achievements unlocked in current save. Enter: view list."),
@@ -2460,9 +2503,9 @@ std::vector<Row> Rows() {
                     }});
 
     rows.push_back({kTabTrophies, RowKind::kAction, ui::T(L"Lista de conquistas", L"Achievement list"),
-                    ui::T(L"Visualiza todas as 77 conquistas, graus e requisitos. Enter: abrir.",
-                          L"View all 77 achievements, tiers and requirements. Enter: open."),
-                    ui::T(L"Ver lista (77)...", L"View list (77)..."),
+                    ui::T(L"Visualiza todas as 78 conquistas, graus e requisitos. Enter: abrir.",
+                          L"View all 78 achievements, tiers and requirements. Enter: open."),
+                    ui::T(L"Ver lista (78)...", L"View list (78)..."),
                     [](int) { OpenTrophiesDialog(); }});
 
     rows.push_back({kTabTrophies, RowKind::kAction, ui::T(L"Reiniciar conquistas", L"Reset achievements"),

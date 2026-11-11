@@ -269,8 +269,8 @@ void TrophyManager::ResetTrophies() {
     // Ensure marker exists so retroactive scan will not re-grant reset trophies
     std::error_code ec;
     auto marker = m_root_path / "assets" / "trophy" / ".retro_done";
-    std::ofstream m(marker);
-    if (m) m << "done\n";
+    std::ofstream m(marker, std::ios::trunc);
+    if (m) m << "reset\n";
 
     SaveTrophyXml();
     log::Tagged("TROPHY", "All trophies reset to locked state.");
@@ -278,31 +278,29 @@ void TrophyManager::ResetTrophies() {
 
 void TrophyManager::LoadTrophyXml() {
     std::error_code ec;
-    if (!std::filesystem::exists(m_xml_path, ec)) {
-        return;
-    }
+    if (std::filesystem::exists(m_xml_path, ec)) {
+        std::ifstream file(m_xml_path);
+        if (file) {
+            std::string line;
+            while (std::getline(file, line)) {
+                auto pos = line.find("<trophy id=\"");
+                if (pos == std::string::npos) continue;
 
-    std::ifstream file(m_xml_path);
-    if (!file) return;
+                pos += 12;
+                int id = std::atoi(line.c_str() + pos);
+                if (id < 0 || id >= 128) continue;
 
-    std::string line;
-    while (std::getline(file, line)) {
-        auto pos = line.find("<trophy id=\"");
-        if (pos == std::string::npos) continue;
-
-        pos += 12;
-        int id = std::atoi(line.c_str() + pos);
-        if (id < 0 || id >= 128) continue;
-
-        if (line.find("unlockstate=\"true\"") != std::string::npos) {
-            m_flags[id / 32] |= (1u << (id % 32));
-            auto ts_pos = line.find("timestamp=\"");
-            if (ts_pos != std::string::npos) {
-                m_timestamps[id] = std::strtoull(line.c_str() + ts_pos + 11, nullptr, 10);
+                if (line.find("unlockstate=\"true\"") != std::string::npos) {
+                    m_flags[id / 32] |= (1u << (id % 32));
+                    auto ts_pos = line.find("timestamp=\"");
+                    if (ts_pos != std::string::npos) {
+                        m_timestamps[id] = std::strtoull(line.c_str() + ts_pos + 11, nullptr, 10);
+                    }
+                }
             }
+            log::Tagged("TROPHY", "Loaded trophy XML: %s", m_xml_path.string().c_str());
         }
     }
-    log::Tagged("TROPHY", "Loaded trophy XML: %s", m_xml_path.string().c_str());
 
     bool has_any_flag = false;
     for (int i = 0; i < 4; ++i) {
@@ -396,20 +394,12 @@ void TrophyManager::CheckRetroactiveSaves() {
     std::error_code ec;
     auto marker = m_root_path / "assets" / "trophy" / ".retro_done";
     if (std::filesystem::exists(marker, ec)) {
-        return; // Already checked or user reset
-    }
-
-    // If trophies.dat already exists, preserve it and mark retro check done
-    const std::filesystem::path dat_paths[] = {
-        m_root_path / "assets" / "trophy" / "trophies.dat",
-        m_saves_dir / "trophies.dat",
-        m_root_path / "assets" / "savedata0" / "trophies.dat"
-    };
-    for (const auto& p : dat_paths) {
-        if (std::filesystem::exists(p, ec)) {
-            std::ofstream m(marker);
-            if (m) m << "done\n";
-            return;
+        std::ifstream mf(marker);
+        std::string content;
+        if (mf && std::getline(mf, content)) {
+            if (content == "reset" || content == "v2") {
+                return; // Already checked v2 or user explicitly reset
+            }
         }
     }
 
@@ -437,16 +427,21 @@ void TrophyManager::CheckRetroactiveSaves() {
     }
 
     if (has_save) {
-        // Player has an existing save: the story prologue is completed (Follow the LEGO Brick Road)
+        // Player has an existing save with prologue completed:
+        // 1. Follow the LEGO Brick Road (prologue complete) -> Trophy 1
+        // 2. Rebuild the LEGO Gateway (happens in Vorton immediately after prologue) -> Trophy 15
+        // 3. Visit any Hub World for the First Time (Vorton is a hub world) -> Trophy 21
         int plat = -1;
         UnlockTrophy(1, &plat, false);
-        log::Tagged("TROPHY", "Retroactive save check: unlocked Trophy 1 (Follow the LEGO Brick Road).");
+        UnlockTrophy(15, &plat, false);
+        UnlockTrophy(21, &plat, false);
+        log::Tagged("TROPHY", "Retroactive save check: unlocked Trophies 1, 15, and 21.");
     }
 
     SaveTrophyXml();
 
-    std::ofstream m(marker);
-    if (m) m << "done\n";
+    std::ofstream m(marker, std::ios::trunc);
+    if (m) m << "v2\n";
 }
 
 } // namespace hle::trophy
