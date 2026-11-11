@@ -1126,6 +1126,8 @@ struct OverlayCanvas {
         }
     }
 };
+
+constexpr u8 kTrophyCup[7] = {0x1F, 0x1F, 0x0E, 0x04, 0x04, 0x0E, 0x1F};
 } // namespace
 
 void SetStatsOverlay(bool enabled) {
@@ -1484,7 +1486,7 @@ void QueueStatsOverlay() {
         }
         const char* tier_name = lang::Pt() ? tier_pt : tier_en;
 
-        static const u8 kTrophyCup[7] = {0x1F, 0x1F, 0x0E, 0x04, 0x04, 0x0E, 0x1F};
+        // (kTrophyCup defined in namespace above)
 
         if (style == "xbox") {
             // Modern Xbox One / Series style: vibrant green pill capsule
