@@ -384,7 +384,6 @@ const auto g_cap_epoch = std::chrono::steady_clock::now();
 std::filesystem::path g_root_path;
 
 int g_orig_out = -1;
-int g_orig_err = -1;
 int g_pipe_read = -1;
 std::thread g_tee_thread;
 std::thread::id g_tee_thread_id;

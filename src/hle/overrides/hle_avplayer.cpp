@@ -38,9 +38,11 @@
 //   cada um no horario (ms desde o Start).
 // - O callback de eventos (eboot+0x842010) so registra PLAY / STOP / PAUSE; o READY configura os streams.
 // Sem o .mp4 (ou sem decodificador) o jogo ve um video que comeca e termina sem quadros.
-struct AvPlayer;
-
 namespace {
+
+using namespace hle;
+
+struct AvPlayer;
 
 std::mutex g_av_diag_mutex;
 std::vector<AvPlayer*> g_av_players;
@@ -73,43 +75,6 @@ void RecordAvState(const char* state, const char* source = nullptr, const char* 
     if (source) g_av_last_source = source;
     if (pack) g_av_last_pack = pack;
 }
-
-} // namespace
-
-namespace hle::avplayer {
-
-std::string GetDiagnosticsSummary(bool pt) {
-    std::lock_guard lock(g_av_diag_mutex);
-    const u64 calls = g_av_calls.load();
-    const u64 frames = g_av_frames_decoded.load();
-    char buf[512];
-    if (pt) {
-        std::snprintf(buf, sizeof(buf),
-                      "AVPLAYER: chamadas=%llu | players=%zu | estado=%s | quadros=%llu | src=\"%s\"%s%s",
-                      static_cast<unsigned long long>(calls), g_av_players.size(), g_av_last_state.c_str(),
-                      static_cast<unsigned long long>(frames),
-                      g_av_last_source.empty() ? "-" : g_av_last_source.c_str(),
-                      g_av_last_error.empty() ? "" : " | ERRO: ",
-                      g_av_last_error.empty() ? "" : g_av_last_error.c_str());
-    } else {
-        std::snprintf(buf, sizeof(buf),
-                      "AVPLAYER: calls=%llu | players=%zu | state=%s | frames=%llu | src=\"%s\"%s%s",
-                      static_cast<unsigned long long>(calls), g_av_players.size(), g_av_last_state.c_str(),
-                      static_cast<unsigned long long>(frames),
-                      g_av_last_source.empty() ? "-" : g_av_last_source.c_str(),
-                      g_av_last_error.empty() ? "" : " | ERR: ",
-                      g_av_last_error.empty() ? "" : g_av_last_error.c_str());
-    }
-    return buf;
-}
-
-int ForceStopActive();
-
-} // namespace hle::avplayer
-
-namespace {
-
-using namespace hle;
 
 using CallbackFn = void (HLE_SYSV_ABI*)(void* user_data, int event_id, int source_id, void* event_data);
 
@@ -747,6 +712,31 @@ HLE_OVERRIDE(sceAvPlayerClose);
 } // namespace
 
 namespace hle::avplayer {
+
+std::string GetDiagnosticsSummary(bool pt) {
+    std::lock_guard lock(g_av_diag_mutex);
+    const u64 calls = g_av_calls.load();
+    const u64 frames = g_av_frames_decoded.load();
+    char buf[512];
+    if (pt) {
+        std::snprintf(buf, sizeof(buf),
+                      "AVPLAYER: chamadas=%llu | players=%zu | estado=%s | quadros=%llu | src=\"%s\"%s%s",
+                      static_cast<unsigned long long>(calls), g_av_players.size(), g_av_last_state.c_str(),
+                      static_cast<unsigned long long>(frames),
+                      g_av_last_source.empty() ? "-" : g_av_last_source.c_str(),
+                      g_av_last_error.empty() ? "" : " | ERRO: ",
+                      g_av_last_error.empty() ? "" : g_av_last_error.c_str());
+    } else {
+        std::snprintf(buf, sizeof(buf),
+                      "AVPLAYER: calls=%llu | players=%zu | state=%s | frames=%llu | src=\"%s\"%s%s",
+                      static_cast<unsigned long long>(calls), g_av_players.size(), g_av_last_state.c_str(),
+                      static_cast<unsigned long long>(frames),
+                      g_av_last_source.empty() ? "-" : g_av_last_source.c_str(),
+                      g_av_last_error.empty() ? "" : " | ERR: ",
+                      g_av_last_error.empty() ? "" : g_av_last_error.c_str());
+    }
+    return buf;
+}
 
 int ForceStopActive() {
     std::lock_guard lock(g_av_diag_mutex);
