@@ -1547,6 +1547,10 @@ int main(int argc, char** argv) {
     // saida de audio (5,33 ms por buffer) e os timeouts curtos do jogo perdem o ritmo.
     timeBeginPeriod(1);
     hle::log::Init(max_lines, verbose);
+    hle::log::SetRootPath(root);
+    if (!selftest) {
+        hle::log::StartCapture();
+    }
 
     // ---- 0. overrides: precisam estar na tabela antes das relocacoes ------
     const hle::OverrideStats ov = hle::InstallOverrides();

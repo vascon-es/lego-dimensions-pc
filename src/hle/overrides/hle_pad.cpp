@@ -722,6 +722,17 @@ HLE_IMPL(int, scePadReadState, int handle, PadData* data, u64 guest_rbp) {
         in.ry = 128;
     }
 
+    if (videoout::IsLogsMenuOpen()) {
+        videoout::HandleLogsMenuController(in.buttons);
+        in.buttons = 0;
+        in.l2 = 0;
+        in.r2 = 0;
+        in.lx = 128;
+        in.ly = 128;
+        in.rx = 128;
+        in.ry = 128;
+    }
+
     std::memset(data, 0, sizeof(*data));
     data->buttons = in.buttons;
     data->left_x = in.lx;

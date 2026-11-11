@@ -86,6 +86,9 @@ void PadMacroTick(u64 draws, u64 stable_frames); // hle_pad.cpp
 bool PadControllerPresent(int slot); // hle_pad.cpp (Fase 61)
 bool PadKeyboardInUse();             // hle_pad.cpp (2.0.2)
 }
+namespace hle::avplayer {
+std::string GetDiagnosticsSummary(bool pt);
+}
 #include "hle/overrides/hle_pad_sdl.h"
 namespace hle::gnm {
 namespace {
@@ -1259,6 +1262,27 @@ s64 NowMs() {
     return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - g_epoch).count();
 }
 
+void EmitWatchdogReport(const char* title, double since_frame, bool frame_note, const char* footer) {
+    log::FlushGameText();
+    runtime::DumpAllThreads(title);
+    if (frame_note) {
+        std::printf("---- frames: last frame submitted %.2f s ago (%s)\n", since_frame,
+                    since_frame > 2.0 ? "THE GAME STOPPED SUBMITTING FRAMES" : "the game keeps rendering the same screen");
+    } else {
+        std::printf("---- frames: last frame submitted %.2f s ago\n", since_frame);
+    }
+    PrintNgs2VoiceReport();
+    std::string detail;
+    const u64 av = log::StubCallsWithPrefix("libSceAvPlayer", &detail);
+    const u64 vd = log::StubCallsWithPrefix("libSceVideodec", &detail) + log::StubCallsWithPrefix("libSceVideoCore", &detail);
+    const std::string av_diag = hle::avplayer::GetDiagnosticsSummary(false);
+    std::printf("---- video: %s | stubs AV=%llu VD=%llu%s%s\n", av_diag.c_str(),
+                static_cast<unsigned long long>(av), static_cast<unsigned long long>(vd), detail.empty() ? "" : ": ",
+                detail.c_str());
+    std::printf("%s\n", footer);
+    std::fflush(stdout);
+}
+
 void CutsceneWatchdogThread() {
     s64 reported_since = -1; // periodo estavel ja relatado
     s64 next_report_ms = 0;
@@ -1303,24 +1327,11 @@ void CutsceneWatchdogThread() {
         next_report_ms = now + 150000; // repete a cada 150 s enquanto a tela nao mudar, ate 3 vezes
         const double stuck = (now - since) / 1000.0;
         const double since_frame = (now - g_wd_last_frame_ms.load()) / 1000.0;
-        log::FlushGameText();
-        char title[128];
+        char title[128], footer[128];
         std::snprintf(title, sizeof(title), "CUTSCENE WATCHDOG #%u: %llu draws/frame for %.0f s (t=%.0f s)", reports,
                       static_cast<unsigned long long>(draws), stuck, now / 1000.0);
-        runtime::DumpAllThreads(title);
-        std::printf("---- frames: last frame submitted %.2f s ago (%s)\n", since_frame,
-                    since_frame > 2.0 ? "THE GAME STOPPED SUBMITTING FRAMES" : "the game keeps rendering the same screen");
-        PrintNgs2VoiceReport();
-        std::string detail;
-        const u64 av = log::StubCallsWithPrefix("libSceAvPlayer", &detail);
-        const u64 vd = log::StubCallsWithPrefix("libSceVideodec", &detail) + log::StubCallsWithPrefix("libSceVideoCore", &detail);
-        std::printf("---- video: libSceAvPlayer %llu call(s), libSceVideodec/VideoCore %llu call(s)%s%s\n",
-                    static_cast<unsigned long long>(av), static_cast<unsigned long long>(vd), detail.empty() ? "" : ": ",
-                    detail.c_str());
-        std::printf("     (eboot imports libSceAvPlayer, all stubbed; does not import libSceVideodec. Zero calls = no "
-                    "FMV in progress)\n");
-        std::printf("======================== end of watchdog #%u ========================\n", reports);
-        std::fflush(stdout);
+        std::snprintf(footer, sizeof(footer), "======================== end of watchdog #%u ========================", reports);
+        EmitWatchdogReport(title, since_frame, true, footer);
     }
 }
 
@@ -7806,6 +7817,15 @@ void SetCutsceneWatchdog(u32 seconds) {
     if (seconds && !g_watchdog_started.exchange(true)) {
         std::thread(CutsceneWatchdogThread).detach();
     }
+}
+
+void CaptureWatchdogSnapshot(const char* reason) {
+    const s64 now = NowMs();
+    const double since_frame = (now - g_wd_last_frame_ms.load()) / 1000.0;
+    char title[160];
+    std::snprintf(title, sizeof(title), "%s (draws=%llu t=%.0f s)", reason ? reason : "MANUAL SNAPSHOT",
+                  static_cast<unsigned long long>(g_wd_draws.load()), now / 1000.0);
+    EmitWatchdogReport(title, since_frame, false, "======================== end of snapshot ========================");
 }
 
 // Liga o dump de telas paradas; `directory` recebe um .txt por tela e as texturas brutas.

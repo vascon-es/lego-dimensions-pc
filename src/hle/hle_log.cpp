@@ -3,14 +3,21 @@
 
 #include <algorithm>
 #include <array>
+#include <cctype>
 #include <cinttypes>
 #include <cstdarg>
 #include <cstdio>
 #include <cstdlib>
+#include <ctime>
+#include <deque>
+#include <fcntl.h>
+#include <fstream>
+#include <io.h>
 #include <map>
 #include <mutex>
 #include <string>
 #include <chrono>
+#include <thread>
 #include <vector>
 
 #include <windows.h>
@@ -338,6 +345,7 @@ void Shutdown(int exit_code) {
     std::setvbuf(stdout, nullptr, _IONBF, 0); // Fase 70b: se algo travar no resumo, o log mostra ate onde foi
     FlushGameText();
     PrintSummary();
+    StopCapture();
     std::fflush(stdout);
     TerminateProcess(GetCurrentProcess(), static_cast<UINT>(exit_code));
     std::abort();
@@ -354,6 +362,519 @@ void Fatal(const char* fmt, ...) {
     std::fflush(stdout);
     __debugbreak(); // o VEH imprime o dump e encerra
     Shutdown(5);
+}
+
+namespace {
+
+constexpr size_t kMaxAllLines = 3000;
+constexpr size_t kMaxImportantLines = 1500;
+
+std::mutex g_cap_mutex;
+std::deque<LogEntry> g_all_lines;
+std::deque<LogEntry> g_important_lines;
+u64 g_next_seq = 1;
+u64 g_cap_total = 0;
+u64 g_cap_errors = 0;
+u64 g_cap_warnings = 0;
+u64 g_cap_cutscene = 0;
+u64 g_cap_stubs = 0;
+std::atomic<bool> g_cap_paused{false};
+std::atomic<bool> g_cap_active{false};
+const auto g_cap_epoch = std::chrono::steady_clock::now();
+std::filesystem::path g_root_path;
+
+int g_orig_out = -1;
+int g_orig_err = -1;
+int g_pipe_read = -1;
+std::thread g_tee_thread;
+std::thread::id g_tee_thread_id;
+
+std::string ToUpperAscii(const std::string& s) {
+    std::string out = s;
+    for (char& ch : out) {
+        ch = static_cast<char>(std::toupper(static_cast<unsigned char>(ch)));
+    }
+    return out;
+}
+
+bool ContainsAny(const std::string& haystack, std::initializer_list<const char*> needles) {
+    for (const char* n : needles) {
+        if (haystack.find(n) != std::string::npos) return true;
+    }
+    return false;
+}
+
+void AppendCapturedLine(const std::string& raw_line) {
+    if (g_cap_paused.load(std::memory_order_relaxed)) {
+        return;
+    }
+    std::string clean;
+    clean.reserve(std::min<size_t>(raw_line.size(), 900));
+    for (size_t i = 0; i < raw_line.size() && clean.size() < 900; ++i) {
+        unsigned char c = static_cast<unsigned char>(raw_line[i]);
+        if (c == 0x1B) { // skip ANSI escape sequences
+            if (i + 1 < raw_line.size() && raw_line[i + 1] == '[') {
+                i += 2;
+                while (i < raw_line.size() && (raw_line[i] < '@' || raw_line[i] > '~')) ++i;
+            }
+            continue;
+        }
+        if (c == '\t') {
+            clean += "  ";
+        } else if (c >= 32) {
+            clean.push_back(static_cast<char>(c));
+        }
+    }
+    while (!clean.empty() && clean.back() == ' ') {
+        clean.pop_back();
+    }
+    if (clean.empty()) {
+        return;
+    }
+    if (raw_line.size() > 900) {
+        clean += "...";
+    }
+
+    const std::string upper = ToUpperAscii(clean);
+    const bool is_fs_line = upper.rfind("[FS] ", 0) == 0;
+    const bool is_zero_failure = ContainsAny(upper, {"0 FAILURES", "FAILED PIPELINES 0", "(0 RETRIES)", "0 FAILED"});
+    const bool is_stall_stack = upper.rfind("[STALL-STACKS]", 0) == 0;
+    const bool is_boot_crashdump_id = upper.find("CRASHDUMP_ID=") != std::string::npos;
+
+    LogEntry entry;
+    entry.seq = g_next_seq++;
+    entry.time_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - g_cap_epoch).count();
+    entry.is_cutscene = ContainsAny(upper, {"[AVPLAYER]", "CUTSCENE", ".MP4", "AVPLAYER", "VIDEODEC", "WATCHDOG", "LIBSCEAVPLAYER"});
+    entry.is_stub = (upper.find("] STUB ") != std::string::npos) || (upper.rfind("STUB ", 0) == 0);
+    entry.is_game = (upper.rfind("[GAME]", 0) == 0);
+
+    bool is_error = false;
+    bool is_warning = false;
+
+    if (!is_zero_failure && !is_boot_crashdump_id && !is_stall_stack) {
+        if (ContainsAny(upper, {"[FATAL", "FATAL HLE", "CRASH DUMP", "ACCESS_VIOLATION", "ILLEGAL_INSTRUCTION",
+                                "STACK_OVERFLOW", "VK_ERROR_", "I/O ERROR", "0XC00D", "MF_E_", "READSAMPLE FAILED"})) {
+            is_error = true;
+        } else if (is_fs_line) {
+            // Game probes missing optional archives often; only flag critical/cutscene/eboot/addcont misses cleanly
+            if (ContainsAny(upper, {".MP4", "CUTSCENE", ".CU3", "MOVIES", "EBOOT", "ADDCONT", "ERROR"})) {
+                is_warning = true;
+            }
+        } else if (ContainsAny(upper, {"ERROR", "ERRO:", "FALHA", "FAILED", "COULD NOT", "NAO FOI POSSIVEL",
+                                       "UNSUPPORTED TEXTURE", "NO .MP4 FOUND"})) {
+            if (upper.find("UNSUPPORTED TEXTURE") != std::string::npos || upper.find("NO .MP4 FOUND") != std::string::npos) {
+                if (upper.find("NO .MP4 FOUND") != std::string::npos) is_error = true;
+                else is_warning = true;
+            } else {
+                is_error = true;
+            }
+        }
+    }
+
+    if (!is_error) {
+        if (ContainsAny(upper, {"WARNING", "AVISO", "WARN", "CUTSCENE WATCHDOG", "WATCHDOG #", "SUPPRESSED",
+                                "SILENCED", "RELOCKING NON-RECURSIVE", "UNRESOLVED=", "NO MOUNT", "BLOCKED"}) ||
+            entry.is_stub || is_stall_stack) {
+            // Avoid flagging benign startup "unresolved=0" line as a warning
+            if (!(upper.find("UNRESOLVED=0") != std::string::npos && upper.find("RELOCATIONS:") != std::string::npos)) {
+                is_warning = true;
+            }
+        }
+    }
+
+    entry.severity = is_error ? 2 : (is_warning ? 1 : 0);
+    entry.text = std::move(clean);
+
+    std::lock_guard lock(g_cap_mutex);
+    ++g_cap_total;
+    if (entry.severity == 2) ++g_cap_errors;
+    else if (entry.severity == 1) ++g_cap_warnings;
+    if (entry.is_cutscene) ++g_cap_cutscene;
+    if (entry.is_stub) ++g_cap_stubs;
+
+    if (entry.severity > 0 || entry.is_cutscene || entry.is_stub) {
+        if (g_important_lines.size() >= kMaxImportantLines) {
+            g_important_lines.pop_front();
+        }
+        g_important_lines.push_back(entry);
+    }
+
+    if (g_all_lines.size() >= kMaxAllLines) {
+        g_all_lines.pop_front();
+    }
+    g_all_lines.push_back(std::move(entry));
+}
+
+void WriteAllFd(int fd, const char* data, int len) {
+    int off = 0;
+    while (fd >= 0 && off < len) {
+        const int w = _write(fd, data + off, static_cast<unsigned int>(len - off));
+        if (w <= 0) break;
+        off += w;
+    }
+}
+
+void CaptureTeeLoop() {
+    g_tee_thread_id = std::this_thread::get_id();
+    char buf[4096];
+    std::string pending;
+    pending.reserve(1024);
+    for (;;) {
+        const int n = _read(g_pipe_read, buf, sizeof(buf));
+        if (n <= 0) break;
+        if (g_orig_out >= 0) {
+            WriteAllFd(g_orig_out, buf, n);
+        }
+        for (int i = 0; i < n; ++i) {
+            const char c = buf[i];
+            if (c == '\n') {
+                AppendCapturedLine(pending);
+                pending.clear();
+            } else if (c != '\r') {
+                if (pending.size() < 2048) {
+                    pending.push_back(c);
+                }
+            }
+        }
+    }
+    if (!pending.empty()) {
+        AppendCapturedLine(pending);
+    }
+}
+
+void CopyUtf8ToClipboard(const std::string& utf8) {
+    if (!OpenClipboard(nullptr)) return;
+    EmptyClipboard();
+    const int wlen = MultiByteToWideChar(CP_UTF8, 0, utf8.c_str(), -1, nullptr, 0);
+    if (wlen > 0) {
+        HGLOBAL hmem = GlobalAlloc(GMEM_MOVEABLE, static_cast<size_t>(wlen) * sizeof(wchar_t));
+        if (hmem) {
+            void* ptr = GlobalLock(hmem);
+            if (ptr) {
+                MultiByteToWideChar(CP_UTF8, 0, utf8.c_str(), -1, static_cast<wchar_t*>(ptr), wlen);
+                GlobalUnlock(hmem);
+                if (!SetClipboardData(CF_UNICODETEXT, hmem)) {
+                    GlobalFree(hmem);
+                }
+            } else {
+                GlobalFree(hmem);
+            }
+        }
+    }
+    CloseClipboard();
+}
+
+} // namespace
+
+void SetRootPath(const std::filesystem::path& root) {
+    std::lock_guard lock(g_cap_mutex);
+    g_root_path = root;
+}
+
+void StartCapture() {
+    if (g_cap_active.load()) return;
+
+    std::fflush(stdout);
+    std::fflush(stderr);
+
+    int orig_out = -1;
+    int orig_err = -1;
+    if (_get_osfhandle(1) != reinterpret_cast<intptr_t>(INVALID_HANDLE_VALUE) && _get_osfhandle(1) != -2) {
+        orig_out = _dup(1);
+    }
+    if (_get_osfhandle(2) != reinterpret_cast<intptr_t>(INVALID_HANDLE_VALUE) && _get_osfhandle(2) != -2) {
+        orig_err = _dup(2);
+    }
+    if (orig_out < 0 && orig_err >= 0) {
+        orig_out = _dup(orig_err);
+    }
+    if (orig_out < 0) {
+        // Launched without console/log redirection: bind stdout/stderr to NUL first so fd 1/2 exist
+        std::freopen("NUL", "w", stdout);
+        std::freopen("NUL", "w", stderr);
+    }
+
+    int fds[2]{-1, -1};
+    if (_pipe(fds, 262144, _O_BINARY | _O_NOINHERIT) != 0) {
+        if (orig_out >= 0) _close(orig_out);
+        if (orig_err >= 0) _close(orig_err);
+        return;
+    }
+    SetHandleInformation(reinterpret_cast<HANDLE>(_get_osfhandle(fds[0])), HANDLE_FLAG_INHERIT, 0);
+    SetHandleInformation(reinterpret_cast<HANDLE>(_get_osfhandle(fds[1])), HANDLE_FLAG_INHERIT, 0);
+    if (orig_out >= 0) {
+        SetHandleInformation(reinterpret_cast<HANDLE>(_get_osfhandle(orig_out)), HANDLE_FLAG_INHERIT, 0);
+    }
+    if (orig_err >= 0) {
+        _close(orig_err); // orig_out handles both streams to console / sessao_*.log cleanly
+    }
+
+    _dup2(fds[1], 1);
+    _dup2(fds[1], 2);
+    _close(fds[1]);
+    SetHandleInformation(reinterpret_cast<HANDLE>(_get_osfhandle(1)), HANDLE_FLAG_INHERIT, 0);
+    SetHandleInformation(reinterpret_cast<HANDLE>(_get_osfhandle(2)), HANDLE_FLAG_INHERIT, 0);
+
+    g_orig_out = orig_out;
+    g_pipe_read = fds[0];
+    g_cap_active = true;
+    g_tee_thread = std::thread(CaptureTeeLoop);
+}
+
+void StopCapture() {
+    if (!g_cap_active.exchange(false)) return;
+    std::fflush(stdout);
+    std::fflush(stderr);
+    if (g_orig_out >= 0) {
+        _dup2(g_orig_out, 1);
+        _dup2(g_orig_out, 2);
+    } else {
+        _close(1);
+        _close(2);
+    }
+    if (g_tee_thread.joinable() && std::this_thread::get_id() != g_tee_thread_id) {
+        g_tee_thread.join();
+    }
+    if (g_pipe_read >= 0) {
+        _close(g_pipe_read);
+        g_pipe_read = -1;
+    }
+    if (g_orig_out >= 0) {
+        _close(g_orig_out);
+        g_orig_out = -1;
+    }
+}
+
+void FlushCapture() {
+    std::fflush(stdout);
+    std::fflush(stderr);
+}
+
+void SetCapturePaused(bool paused) {
+    g_cap_paused.store(paused);
+}
+
+bool IsCapturePaused() {
+    return g_cap_paused.load();
+}
+
+void ClearCapture() {
+    std::lock_guard lock(g_cap_mutex);
+    g_all_lines.clear();
+    g_important_lines.clear();
+    g_cap_total = 0;
+    g_cap_errors = 0;
+    g_cap_warnings = 0;
+    g_cap_cutscene = 0;
+    g_cap_stubs = 0;
+}
+
+void GetCaptureStats(LogStats* out) {
+    if (!out) return;
+    std::lock_guard lock(g_cap_mutex);
+    out->total_lines = g_cap_total;
+    out->error_count = g_cap_errors;
+    out->warning_count = g_cap_warnings;
+    out->cutscene_count = g_cap_cutscene;
+    out->stub_count = g_cap_stubs;
+    out->suppressed_lines = g_spam_total;
+    out->paused = g_cap_paused.load();
+}
+
+std::vector<LogEntry> GetCapturedLogs(LogFilter filter) {
+    std::lock_guard lock(g_cap_mutex);
+    std::vector<LogEntry> result;
+    const auto& source = (filter == LogFilter::kAll || filter == LogFilter::kGame) ? g_all_lines : g_important_lines;
+    result.reserve(source.size());
+    for (const auto& e : source) {
+        switch (filter) {
+        case LogFilter::kAll:
+            result.push_back(e);
+            break;
+        case LogFilter::kErrors:
+            if (e.severity == 2) result.push_back(e);
+            break;
+        case LogFilter::kWarnings:
+            if (e.severity >= 1) result.push_back(e);
+            break;
+        case LogFilter::kCutscene:
+            if (e.is_cutscene) result.push_back(e);
+            break;
+        case LogFilter::kStubs:
+            if (e.is_stub) result.push_back(e);
+            break;
+        case LogFilter::kGame:
+            if (e.is_game) result.push_back(e);
+            break;
+        default:
+            break;
+        }
+    }
+    return result;
+}
+
+std::string ExplainLogEntry(const LogEntry& entry, bool pt) {
+    const std::string upper = ToUpperAscii(entry.text);
+    if (upper.find("NO .MP4 FOUND") != std::string::npos) {
+        return pt
+            ? "MOTIVO: Nao ha arquivo .mp4 indexado nos pacotes (.DAT/DLC) lidos. A cutscene de video fecha sem exibir imagem."
+            : "REASON: No .mp4 found in loaded .DAT/DLC pack indexes. Video cutscene ends without picture.";
+    }
+    if (upper.find("0XC00D5212") != std::string::npos || upper.find("MF_E_TOPO_CODEC_NOT_FOUND") != std::string::npos) {
+        return pt
+            ? "MOTIVO: Codec H.264/MP4 ausente no Windows Media Foundation (instale o Media Feature Pack ou codecs)."
+            : "REASON: Missing H.264/MP4 codec in Windows Media Foundation (install Windows Media Feature Pack).";
+    }
+    if (upper.find("[AVPLAYER]") != std::string::npos &&
+        ContainsAny(upper, {"COULD NOT OPEN", "READSAMPLE FAILED", "FAILED", "0X", "ERROR"})) {
+        return pt
+            ? "MOTIVO: Erro ao abrir ou decodificar video MP4 da cutscene no Media Foundation / pacote .DAT."
+            : "REASON: Media Foundation failed opening or decoding the cutscene MP4 stream from .DAT pack.";
+    }
+    if (upper.find("[AVPLAYER]") != std::string::npos) {
+        return pt
+            ? "CUTSCENE/AV: Chamada do player de video (libSceAvPlayer). Veja se houve READY/PLAY e quadros > 0."
+            : "CUTSCENE/AV: Video player lifecycle call (libSceAvPlayer). Check for READY/PLAY and frames > 0.";
+    }
+    if (upper.find("CUTSCENE WATCHDOG") != std::string::npos || upper.find("[STALL-STACKS]") != std::string::npos) {
+        return pt
+            ? "MOTIVO: Jogo travou ou repetiu os mesmos draws por varios segundos durante cena/cutscene (veja threads logo abaixo)."
+            : "REASON: Game rendered identical draw count for seconds during scene/cutscene (check threads below).";
+    }
+    if (upper.find("] STUB ") != std::string::npos) {
+        return pt
+            ? "MOTIVO: Funcao do PS4 ainda sem implementacao HLE (stub retorna 0). Pode bloquear algo se ocorrer antes de uma cena."
+            : "REASON: Unimplemented PS4 HLE function (stub returns 0). May block features if called right before a scene.";
+    }
+    if (upper.find("[FS]") != std::string::npos && upper.find("NO MOUNT") != std::string::npos) {
+        return pt
+            ? "MOTIVO: Jogo acessou caminho nao montado (/app0, /temp0, /savedata0). Normal para /data/sce_coredumps."
+            : "REASON: Game accessed unmounted PS4 path (outside /app0, /temp0, /savedata0). Normal for /data/sce_coredumps.";
+    }
+    if (upper.find("[FS]") != std::string::npos && (upper.find("NOT FOUND") != std::string::npos || upper.find("I/O ERROR") != std::string::npos)) {
+        return pt
+            ? "MOTIVO: Arquivo nao encontrado ou falha de leitura. Normal em busca de PATCH/DLC opcional; critico se for arquivo de cena."
+            : "REASON: File missing or read error. Normal when probing optional PATCH/DLC files; critical if asset is required.";
+    }
+    if (upper.find("[VULKAN]") != std::string::npos || upper.find("VK_ERROR_") != std::string::npos) {
+        return pt
+            ? "MOTIVO: Aviso ou erro de renderizacao no driver Vulkan / traducao de shader ou textura."
+            : "REASON: Vulkan renderer / shader translation or texture format warning/error.";
+    }
+    if (upper.find("RELOCKING NON-RECURSIVE MUTEX") != std::string::npos) {
+        return pt
+            ? "MOTIVO: Thread tentou retravar o mesmo mutex; o port adaptou para evitar congelamento."
+            : "REASON: Thread tried relocking non-recursive mutex; port adapted lock to prevent deadlock.";
+    }
+    if (upper.find("[GAME]") != std::string::npos) {
+        return pt
+            ? "JOGO: Saida de texto interna do proprio executavel (eboot.bin) do LEGO Dimensions."
+            : "GAME: Internal stdout/stderr message emitted directly by LEGO Dimensions eboot.bin.";
+    }
+    if (entry.severity == 2) {
+        return pt
+            ? "ERRO: Falha detectada durante a execucao. Pressione [S] para salvar e copiar o relatorio completo."
+            : "ERROR: Runtime failure detected. Press [S] to save and copy the full diagnostic report.";
+    }
+    if (entry.severity == 1) {
+        return pt
+            ? "AVISO: Comportamento incomum registrado. Verifique o contexto ao redor ou salve o relatorio [S]."
+            : "WARNING: Notable runtime condition recorded. Check surrounding entries or press [S] to save report.";
+    }
+    return pt
+        ? "INFO: Evento normal de execucao. Use [TAB] para filtrar Erros ou Cutscene/AV, ou [D] para capturar threads."
+        : "INFO: Normal execution log. Use [TAB] to filter Errors or Cutscene/AV, or [D] to dump thread states.";
+}
+
+std::string SaveDiagnosticReport(LogFilter filter, const LogEntry* selected, bool copy_clipboard, bool pt) {
+    std::filesystem::path dir;
+    {
+        std::lock_guard lock(g_cap_mutex);
+        if (!g_root_path.empty()) {
+            dir = g_root_path / "build" / "logs";
+        } else {
+            wchar_t exe[MAX_PATH]{};
+            if (GetModuleFileNameW(nullptr, exe, MAX_PATH)) {
+                auto p = std::filesystem::path(exe).parent_path();
+                if (p.filename() == L"build") p = p.parent_path();
+                dir = p / "build" / "logs";
+            } else {
+                dir = std::filesystem::current_path() / "build" / "logs";
+            }
+        }
+    }
+
+    std::error_code ec;
+    std::filesystem::create_directories(dir, ec);
+
+    SYSTEMTIME st{};
+    GetLocalTime(&st);
+    char fname[64];
+    std::snprintf(fname, sizeof(fname), "diag_%04u%02u%02u_%02u%02u%02u.log",
+                  st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond);
+    const std::filesystem::path out_path = dir / fname;
+
+    LogStats stats{};
+    GetCaptureStats(&stats);
+    const auto entries = GetCapturedLogs(filter);
+    const auto important = GetCapturedLogs(LogFilter::kWarnings);
+
+    std::string report;
+    report.reserve(16384);
+    char hdr[512];
+    std::snprintf(hdr, sizeof(hdr),
+                  "=== LEGO DIMENSIONS PC DIAGNOSTIC REPORT (F9) ===\n"
+                  "Lines: %llu | Errors: %llu | Warnings: %llu | Cutscene/AV: %llu | Stubs: %llu\n\n",
+                  static_cast<unsigned long long>(stats.total_lines),
+                  static_cast<unsigned long long>(stats.error_count),
+                  static_cast<unsigned long long>(stats.warning_count),
+                  static_cast<unsigned long long>(stats.cutscene_count),
+                  static_cast<unsigned long long>(stats.stub_count));
+    report += hdr;
+
+    if (selected) {
+        report += "--- SELECTED LINE ---\n";
+        report += selected->text + "\n";
+        report += ExplainLogEntry(*selected, pt) + "\n\n";
+    }
+
+    report += "--- PRESERVED ERRORS / WARNINGS / CUTSCENE / STUBS ---\n";
+    for (const auto& e : important) {
+        char ts[32];
+        std::snprintf(ts, sizeof(ts), "[%.2fs] ", e.time_s);
+        report += ts + e.text + "\n";
+    }
+
+    if (filter == LogFilter::kAll || filter == LogFilter::kGame) {
+        report += "\n--- RECENT VIEW LINES ---\n";
+        for (const auto& e : entries) {
+            char ts[32];
+            std::snprintf(ts, sizeof(ts), "[%.2fs] ", e.time_s);
+            report += ts + e.text + "\n";
+        }
+    }
+
+    std::ofstream f(out_path, std::ios::binary | std::ios::trunc);
+    if (f) {
+        f.write(report.data(), static_cast<std::streamsize>(report.size()));
+    }
+
+    if (copy_clipboard) {
+        std::string clip;
+        if (selected) {
+            clip = selected->text + "\r\n" + ExplainLogEntry(*selected, pt) + "\r\n";
+        } else if (!important.empty()) {
+            const size_t start = important.size() > 12 ? important.size() - 12 : 0;
+            for (size_t i = start; i < important.size(); ++i) {
+                clip += important[i].text + "\r\n";
+            }
+        } else {
+            clip = report;
+        }
+        CopyUtf8ToClipboard(clip);
+    }
+
+    return std::string("build\\logs\\") + fname;
 }
 
 } // namespace hle::log

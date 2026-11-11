@@ -1,6 +1,9 @@
 #pragma once
 
 #include <atomic>
+#include <filesystem>
+#include <string>
+#include <vector>
 
 #include "common/types.h"
 #include "hle_stub.h"
@@ -11,13 +14,53 @@
 //   [GAME] texto                saida de texto do proprio jogo (printf, puts, fwrite...)
 // Overrides de alta frequencia usam HLE_QUIET: so contam a chamada, e so aparecem no log
 // com --verbose-hle.
-#include <string>
 
 namespace hle::log {
+
+enum class LogFilter {
+    kAll = 0,
+    kErrors,
+    kWarnings,
+    kCutscene,
+    kStubs,
+    kGame,
+    kCount
+};
+
+struct LogEntry {
+    u64 seq = 0;
+    double time_s = 0.0;
+    u8 severity = 0; // 0=Info, 1=Warning, 2=Error
+    bool is_cutscene = false;
+    bool is_stub = false;
+    bool is_game = false;
+    std::string text;
+};
+
+struct LogStats {
+    u64 total_lines = 0;
+    u64 error_count = 0;
+    u64 warning_count = 0;
+    u64 cutscene_count = 0;
+    u64 stub_count = 0;
+    u64 suppressed_lines = 0;
+    bool paused = false;
+};
 
 extern bool g_verbose;
 
 void Init(u64 max_lines, bool verbose);
+void SetRootPath(const std::filesystem::path& root);
+void StartCapture();
+void StopCapture();
+void FlushCapture();
+void SetCapturePaused(bool paused);
+bool IsCapturePaused();
+void ClearCapture();
+void GetCaptureStats(LogStats* out);
+std::vector<LogEntry> GetCapturedLogs(LogFilter filter);
+std::string ExplainLogEntry(const LogEntry& entry, bool pt);
+std::string SaveDiagnosticReport(LogFilter filter, const LogEntry* selected, bool copy_clipboard, bool pt);
 
 // Logger instalado nos stubs gerados (hle::SetStubLogger).
 void StubLogger(const StubCall& call);

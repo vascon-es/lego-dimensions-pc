@@ -41,12 +41,18 @@
 #include "hle/overrides/hle_equeue.h"
 #include "hle/overrides/hle_filesystem.h"
 #include "hle/overrides/hle_override.h"
+#include "hle/hle_log.h"
 #include "runtime/crash_handler.h"
 #include "runtime/hwmon.h"
 
 namespace hle::gnm {
 void WarmupStatus(char* text, size_t size); // hle_gnm.cpp
 void SetButtonIcons(const char* name); // hle_gnm.cpp
+void CaptureWatchdogSnapshot(const char* reason); // hle_gnm.cpp
+}
+namespace hle::avplayer {
+std::string GetDiagnosticsSummary(bool pt);
+int ForceStopActive();
 }
 namespace hle {
 bool TogglePadKeyboardPlayer(); // hle_pad.cpp (2.0.2: F2)
@@ -122,10 +128,18 @@ bool g_fullscreen = false;
 std::atomic<bool> g_stats_overlay{false};
 std::atomic<bool> g_video_menu_open{false};
 std::atomic<bool> g_achievements_overlay_open{false};
+std::atomic<bool> g_logs_overlay_open{false};
 int g_achievements_selected = 0;
 int g_achievements_scroll = 0;
 int g_achievements_filter = 0; // 0 = all, 1 = unearned, 2 = earned
 int g_achievements_visible_count = 8;
+hle::log::LogFilter g_logs_filter = hle::log::LogFilter::kAll;
+int g_logs_selected = 0;
+int g_logs_scroll = 0;
+int g_logs_visible_count = 24;
+bool g_logs_auto_follow = true;
+std::string g_logs_banner_msg;
+int g_logs_banner_timer = 0;
 int g_menu_selected = 0;
 int g_save_confirm_timer = 0;
 WINDOWPLACEMENT g_windowed_placement{sizeof(WINDOWPLACEMENT)};
@@ -411,7 +425,12 @@ static void InitMenuDefaults() {
 
 void ToggleVideoSettingsMenu() {
     InitMenuDefaults();
-    g_video_menu_open = !g_video_menu_open;
+    const bool next = !g_video_menu_open.load();
+    if (next) {
+        g_achievements_overlay_open = false;
+        g_logs_overlay_open = false;
+    }
+    g_video_menu_open = next;
     log::Tagged("VIDEO-MENU", "%s", g_video_menu_open ? "open" : "closed");
 }
 
@@ -460,12 +479,159 @@ void HandleVideoMenuController(u32 pressed) {
 }
 
 void ToggleAchievementsMenu() {
-    g_achievements_overlay_open = !g_achievements_overlay_open;
+    const bool next = !g_achievements_overlay_open.load();
+    if (next) {
+        g_video_menu_open = false;
+        g_logs_overlay_open = false;
+    }
+    g_achievements_overlay_open = next;
     log::Tagged("ACHIEVEMENTS-MENU", "%s", g_achievements_overlay_open ? "open" : "closed");
 }
 
 bool IsAchievementsMenuOpen() {
     return g_achievements_overlay_open.load();
+}
+
+namespace {
+
+void SetLogsBanner(const std::string& msg) {
+    g_logs_banner_msg = msg;
+    g_logs_banner_timer = 210;
+}
+
+void LogsSyncBounds(int count) {
+    if (count <= 0) {
+        g_logs_selected = 0;
+        g_logs_scroll = 0;
+        return;
+    }
+    if (g_logs_auto_follow) {
+        g_logs_selected = count - 1;
+        g_logs_scroll = std::max(0, count - g_logs_visible_count);
+    } else {
+        g_logs_selected = std::clamp(g_logs_selected, 0, count - 1);
+        if (g_logs_selected < g_logs_scroll) {
+            g_logs_scroll = g_logs_selected;
+        }
+        if (g_logs_selected >= g_logs_scroll + g_logs_visible_count) {
+            g_logs_scroll = std::max(0, g_logs_selected - g_logs_visible_count + 1);
+        }
+        g_logs_scroll = std::clamp(g_logs_scroll, 0, std::max(0, count - g_logs_visible_count));
+    }
+}
+
+void LogsMoveSelection(int delta) {
+    const auto entries = hle::log::GetCapturedLogs(g_logs_filter);
+    const int count = static_cast<int>(entries.size());
+    if (count <= 0) {
+        g_logs_selected = 0;
+        g_logs_scroll = 0;
+        return;
+    }
+    int cur = g_logs_auto_follow ? (count - 1) : std::clamp(g_logs_selected, 0, count - 1);
+    cur = std::clamp(cur + delta, 0, count - 1);
+    g_logs_auto_follow = (cur == count - 1 && delta > 0);
+    g_logs_selected = cur;
+    LogsSyncBounds(count);
+}
+
+void LogsSelectFilter(int step) {
+    const int n = static_cast<int>(hle::log::LogFilter::kCount);
+    const int cur = static_cast<int>(g_logs_filter);
+    g_logs_filter = static_cast<hle::log::LogFilter>((cur + step + n) % n);
+    g_logs_auto_follow = true;
+    const auto entries = hle::log::GetCapturedLogs(g_logs_filter);
+    LogsSyncBounds(static_cast<int>(entries.size()));
+}
+
+void LogsSaveReportAction() {
+    hle::log::FlushCapture();
+    const auto entries = hle::log::GetCapturedLogs(g_logs_filter);
+    const int count = static_cast<int>(entries.size());
+    const hle::log::LogEntry* sel = nullptr;
+    if (count > 0) {
+        const int idx = g_logs_auto_follow ? (count - 1) : std::clamp(g_logs_selected, 0, count - 1);
+        sel = &entries[idx];
+    }
+    const std::string saved_path = hle::log::SaveDiagnosticReport(g_logs_filter, sel, true, lang::Pt());
+    SetLogsBanner(lang::Pt() ? ("RELATORIO SALVO EM " + saved_path + " E COPIADO!") : ("SAVED TO " + saved_path + " & COPIED!"));
+}
+
+void LogsSnapshotAction() {
+    hle::gnm::CaptureWatchdogSnapshot("MANUAL SNAPSHOT (F9)");
+    hle::log::FlushCapture();
+    SetLogsBanner(lang::Pt() ? "SNAPSHOT DE THREADS, VOZES E AVPLAYER GRAVADO NO LOG!" : "THREAD, VOICE & AVPLAYER SNAPSHOT CAPTURED TO LOG!");
+}
+
+void LogsForceStopAvAction() {
+    const int n = hle::avplayer::ForceStopActive();
+    hle::log::FlushCapture();
+    if (n > 0) {
+        SetLogsBanner(lang::Pt() ? "PARADA FORCADA ENVIADA AO AVPLAYER ATIVO!" : "FORCE-STOP QUEUED FOR ACTIVE AVPLAYER!");
+    } else {
+        SetLogsBanner(lang::Pt() ? "NENHUM VIDEO AVPLAYER ATIVO NO MOMENTO." : "NO ACTIVE AVPLAYER INSTANCE RUNNING.");
+    }
+}
+
+} // namespace
+
+void ToggleLogsMenu() {
+    const bool next = !g_logs_overlay_open.load();
+    if (next) {
+        g_video_menu_open = false;
+        g_achievements_overlay_open = false;
+        hle::log::FlushCapture();
+        g_logs_auto_follow = true;
+        const auto entries = hle::log::GetCapturedLogs(g_logs_filter);
+        LogsSyncBounds(static_cast<int>(entries.size()));
+    }
+    g_logs_overlay_open = next;
+}
+
+bool IsLogsMenuOpen() {
+    return g_logs_overlay_open.load();
+}
+
+void HandleLogsMenuController(u32 pressed) {
+    if (!g_logs_overlay_open.load()) return;
+    static auto last_nav = std::chrono::steady_clock::now();
+    const auto now = std::chrono::steady_clock::now();
+    if (std::chrono::duration<float, std::milli>(now - last_nav).count() < 150.0f) {
+        return;
+    }
+    if (pressed & 0x10) { // Up
+        LogsMoveSelection(-1);
+        last_nav = now;
+    } else if (pressed & 0x40) { // Down
+        LogsMoveSelection(1);
+        last_nav = now;
+    } else if (pressed & 0x80) { // Left -> Page Up
+        LogsMoveSelection(-g_logs_visible_count);
+        last_nav = now;
+    } else if (pressed & 0x20) { // Right -> Page Down
+        LogsMoveSelection(g_logs_visible_count);
+        last_nav = now;
+    } else if (pressed & 0x400) { // LB
+        LogsSelectFilter(-1);
+        last_nav = now;
+    } else if (pressed & 0x800) { // RB
+        LogsSelectFilter(1);
+        last_nav = now;
+    } else if (pressed & 0x4000) { // Cross/A -> Save + Copy
+        LogsSaveReportAction();
+        last_nav = now;
+    } else if (pressed & 0x8000) { // Square/X -> Snapshot
+        LogsSnapshotAction();
+        last_nav = now;
+    } else if (pressed & 0x1000) { // Triangle/Y -> Pause/Resume
+        const bool next = !hle::log::IsCapturePaused();
+        hle::log::SetCapturePaused(next);
+        SetLogsBanner(next ? (lang::Pt() ? "CAPTURA PAUSADA." : "CAPTURE PAUSED.") : (lang::Pt() ? "CAPTURA RETOMADA." : "CAPTURE RESUMED."));
+        last_nav = now;
+    } else if (pressed & (0x2000 | 0x8)) { // Circle/B or Options -> Close
+        g_logs_overlay_open = false;
+        last_nav = now;
+    }
 }
 
 void HandleAchievementsMenuController(u32 pressed) {
@@ -563,8 +729,66 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
             TogglePadKeyboardPlayer();
             return 0;
         }
-        if (wparam == VK_F9 && !(lparam & (1 << 30))) {
+        if (wparam == VK_F8 && !(lparam & (1 << 30))) {
             ToggleAchievementsMenu();
+            return 0;
+        }
+        if (wparam == VK_F9 && !(lparam & (1 << 30))) {
+            ToggleLogsMenu();
+            return 0;
+        }
+        if (g_logs_overlay_open.load()) {
+            const bool fresh = !(lparam & (1 << 30));
+            if (wparam == VK_UP) {
+                LogsMoveSelection(-1);
+            } else if (wparam == VK_DOWN) {
+                LogsMoveSelection(1);
+            } else if (wparam == VK_PRIOR) {
+                LogsMoveSelection(-g_logs_visible_count);
+            } else if (wparam == VK_NEXT) {
+                LogsMoveSelection(g_logs_visible_count);
+            } else if (wparam == VK_HOME && fresh) {
+                g_logs_auto_follow = false;
+                g_logs_selected = 0;
+                g_logs_scroll = 0;
+            } else if (wparam == VK_END && fresh) {
+                g_logs_auto_follow = true;
+                LogsSyncBounds(static_cast<int>(hle::log::GetCapturedLogs(g_logs_filter).size()));
+            } else if ((wparam == VK_TAB || wparam == VK_RIGHT) && fresh) {
+                LogsSelectFilter(1);
+            } else if (wparam == VK_LEFT && fresh) {
+                LogsSelectFilter(-1);
+            } else if (wparam == 'F' && fresh) {
+                g_logs_auto_follow = !g_logs_auto_follow;
+                if (g_logs_auto_follow) {
+                    LogsSyncBounds(static_cast<int>(hle::log::GetCapturedLogs(g_logs_filter).size()));
+                }
+                SetLogsBanner(g_logs_auto_follow
+                    ? (lang::Pt() ? "AUTO-ROLAGEM (AO VIVO) LIGADA." : "AUTO-FOLLOW (LIVE) ON.")
+                    : (lang::Pt() ? "AUTO-ROLAGEM DESLIGADA." : "AUTO-FOLLOW OFF."));
+            } else if (wparam == 'P' && fresh) {
+                const bool next = !hle::log::IsCapturePaused();
+                hle::log::SetCapturePaused(next);
+                SetLogsBanner(next ? (lang::Pt() ? "CAPTURA DE LOGS PAUSADA." : "LOG CAPTURE PAUSED.") : (lang::Pt() ? "CAPTURA DE LOGS RETOMADA." : "LOG CAPTURE RESUMED."));
+            } else if (wparam == 'C' && fresh) {
+                hle::log::ClearCapture();
+                g_logs_selected = 0;
+                g_logs_scroll = 0;
+                SetLogsBanner(lang::Pt() ? "PAINEL LIMPO (ARQUIVO DE SESSAO PRESERVADO)." : "PANEL CLEARED (SESSION LOG FILE KEPT).");
+            } else if (wparam == 'V' && fresh) {
+                hle::log::g_verbose = !hle::log::g_verbose;
+                SetLogsBanner(hle::log::g_verbose
+                    ? (lang::Pt() ? "MODO VERBOSE HLE ATIVADO (MAIS DETALHES)." : "VERBOSE HLE ENABLED.")
+                    : (lang::Pt() ? "MODO VERBOSE HLE DESATIVADO." : "VERBOSE HLE DISABLED."));
+            } else if (wparam == 'D' && fresh) {
+                LogsSnapshotAction();
+            } else if (wparam == 'X' && fresh) {
+                LogsForceStopAvAction();
+            } else if ((wparam == 'S' || wparam == VK_RETURN) && fresh) {
+                LogsSaveReportAction();
+            } else if (wparam == VK_ESCAPE && fresh) {
+                g_logs_overlay_open = false;
+            }
             return 0;
         }
         if (g_achievements_overlay_open.load()) {
@@ -635,6 +859,25 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
             return 0;
         }
         return DefWindowProcA(hwnd, msg, wparam, lparam);
+    case WM_MOUSEWHEEL: {
+        const short delta = static_cast<short>(HIWORD(wparam));
+        const int steps = delta > 0 ? -3 : (delta < 0 ? 3 : 0);
+        if (steps != 0 && g_logs_overlay_open.load()) {
+            LogsMoveSelection(steps);
+            return 0;
+        }
+        if (steps != 0 && g_achievements_overlay_open.load()) {
+            const auto filtered = GetFilteredAchievements(g_achievements_filter);
+            const int total_items = static_cast<int>(filtered.size());
+            g_achievements_selected = std::clamp(g_achievements_selected + steps, 0, std::max(0, total_items - 1));
+            if (g_achievements_selected < g_achievements_scroll) g_achievements_scroll = g_achievements_selected;
+            if (g_achievements_selected >= g_achievements_scroll + g_achievements_visible_count) {
+                g_achievements_scroll = std::max(0, g_achievements_selected - g_achievements_visible_count + 1);
+            }
+            return 0;
+        }
+        return DefWindowProcA(hwnd, msg, wparam, lparam);
+    }
     case WM_SETCURSOR:
         if (g_fullscreen && LOWORD(lparam) == HTCLIENT) {
             SetCursor(nullptr);
@@ -645,6 +888,7 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
         std::printf("\nJanela fechada pelo usuario.\n");
         hle::toypad::SavePortalState();
         render::VulkanRenderer::Instance().SavePipelineCache();
+        hle::log::StopCapture();
         TerminateProcess(GetCurrentProcess(), 0);
         return 0;
     default:
@@ -1022,6 +1266,16 @@ const u8* Glyph(char c) {
     static const u8 kQuote[7] = {0x0A, 0x0A, 0x14, 0x00, 0x00, 0x00, 0x00};
     static const u8 kStar[7] = {0x00, 0x15, 0x0E, 0x1F, 0x0E, 0x15, 0x00};
     static const u8 kUnder[7] = {0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x1F};
+    static const u8 kPipe[7] = {0x04, 0x04, 0x04, 0x04, 0x04, 0x04, 0x04};
+    static const u8 kBackslash[7] = {0x10, 0x10, 0x08, 0x04, 0x02, 0x01, 0x01};
+    static const u8 kHash[7] = {0x0A, 0x1F, 0x0A, 0x0A, 0x1F, 0x0A, 0x00};
+    static const u8 kAmp[7] = {0x0C, 0x12, 0x14, 0x08, 0x15, 0x12, 0x0D};
+    static const u8 kSemi[7] = {0x00, 0x0C, 0x0C, 0x00, 0x0C, 0x04, 0x08};
+    static const u8 kTilde[7] = {0x00, 0x00, 0x08, 0x15, 0x02, 0x00, 0x00};
+    static const u8 kAt[7] = {0x0E, 0x11, 0x17, 0x15, 0x17, 0x10, 0x0E};
+    static const u8 kDollar[7] = {0x04, 0x0F, 0x14, 0x0E, 0x05, 0x1E, 0x04};
+    static const u8 kLeftBrace[7] = {0x06, 0x08, 0x08, 0x10, 0x08, 0x08, 0x06};
+    static const u8 kRightBrace[7] = {0x0C, 0x02, 0x02, 0x01, 0x02, 0x02, 0x0C};
 
     // Normalize accents
     unsigned char uc = static_cast<unsigned char>(c);
@@ -1034,10 +1288,20 @@ const u8* Glyph(char c) {
 
     switch (c) {
     case '/': return kSlash;
+    case '\\': return kBackslash;
     case '%': return kPercent;
     case ':': return kColon;
+    case ';': return kSemi;
     case '.': return kDot;
     case '-': return kDash;
+    case '|': return kPipe;
+    case '#': return kHash;
+    case '&': return kAmp;
+    case '~': return kTilde;
+    case '@': return kAt;
+    case '$': return kDollar;
+    case '{': return kLeftBrace;
+    case '}': return kRightBrace;
     case '^': return kDegree;
     case '<': return kLeftAngle;
     case '>': return kRightAngle;
@@ -1515,6 +1779,248 @@ static void RenderTrophyToast(OverlayCanvas& c, const RECT& client, float scale_
         }
     }
 }
+
+static std::vector<std::string> WrapText(const std::string& text, size_t max_chars, size_t max_lines) {
+    std::vector<std::string> lines;
+    if (text.empty() || max_chars == 0 || max_lines == 0) return lines;
+    size_t pos = 0;
+    while (pos < text.size() && lines.size() < max_lines) {
+        if (text.size() - pos <= max_chars) {
+            lines.push_back(text.substr(pos));
+            pos = text.size();
+            break;
+        }
+        if (lines.size() + 1 == max_lines) {
+            std::string tail = text.substr(pos, max_chars > 3 ? max_chars - 3 : max_chars);
+            if (max_chars > 3) tail += "...";
+            lines.push_back(std::move(tail));
+            break;
+        }
+        size_t cut = text.rfind(' ', pos + max_chars);
+        if (cut == std::string::npos || cut <= pos + max_chars / 2) {
+            cut = pos + max_chars;
+            lines.push_back(text.substr(pos, cut - pos));
+            pos = cut;
+        } else {
+            lines.push_back(text.substr(pos, cut - pos));
+            pos = cut + 1;
+        }
+    }
+    return lines;
+}
+
+static void RenderLogsOverlay(OverlayCanvas& c, const RECT& client) {
+    const float scale_ui = client.bottom >= 1400 ? 1.35f : (client.bottom >= 1000 ? 1.0f : 0.75f);
+    const bool pt = lang::Pt();
+
+    const float pad_x = client.right * 0.03f;
+    const float pad_y = client.bottom * 0.035f;
+    const float box_x0 = pad_x;
+    const float box_x1 = client.right - pad_x;
+    const float box_y0 = pad_y;
+    const float box_y1 = client.bottom - pad_y;
+    const float box_w = box_x1 - box_x0;
+
+    // Backdrop & outer frame
+    c.Rect(0, 0, client.right, client.bottom, Rgba(6, 9, 14, 240));
+    c.Rect(box_x0 - 2.0f, box_y0 - 2.0f, box_x1 + 2.0f, box_y1 + 2.0f, Rgba(56, 130, 210, 220));
+    c.Rect(box_x0, box_y0, box_x1, box_y1, Rgba(13, 16, 23, 248));
+
+    hle::log::LogStats stats{};
+    hle::log::GetCaptureStats(&stats);
+    const auto entries = hle::log::GetCapturedLogs(g_logs_filter);
+    const int count = static_cast<int>(entries.size());
+
+    // Header strip
+    const float hdr_y = box_y0 + 12.0f * scale_ui;
+    const std::string title = pt ? "PAINEL DE LOGS E DIAGNOSTICO [F9]" : "LOGS & DIAGNOSTICS PANEL [F9]";
+    c.Write(title, box_x0 + 16.0f * scale_ui, hdr_y, 2.0f * scale_ui, Rgba(92, 198, 255));
+
+    // Live counters & status pills on header right
+    char cnt_buf[180];
+    std::snprintf(cnt_buf, sizeof(cnt_buf),
+                  pt ? "ERROS: %llu  |  AVISOS: %llu  |  CUTSCENE/AV: %llu  |  STUBS: %llu  |  LINHAS: %llu"
+                     : "ERRORS: %llu  |  WARNINGS: %llu  |  CUTSCENE/AV: %llu  |  STUBS: %llu  |  LINES: %llu",
+                  static_cast<unsigned long long>(stats.error_count),
+                  static_cast<unsigned long long>(stats.warning_count),
+                  static_cast<unsigned long long>(stats.cutscene_count),
+                  static_cast<unsigned long long>(stats.stub_count),
+                  static_cast<unsigned long long>(stats.total_lines));
+    const float cnt_font = 1.35f * scale_ui;
+    c.Write(cnt_buf, box_x0 + 16.0f * scale_ui, hdr_y + 20.0f * scale_ui, cnt_font,
+            stats.error_count > 0 ? Rgba(255, 118, 118) : Rgba(180, 190, 210));
+
+    // Badges top right: [PAUSADO / AO VIVO] [VERBOSE]
+    std::string state_badge = stats.paused ? (pt ? "[PAUSADO]" : "[PAUSED]") : (g_logs_auto_follow ? (pt ? "[AO VIVO]" : "[LIVE]") : (pt ? "[INSPECIONANDO]" : "[INSPECTING]"));
+    std::string verb_badge = hle::log::g_verbose ? "[VERBOSE: ON]" : "[VERBOSE: OFF]";
+    const float b_font = 1.35f * scale_ui;
+    const float vw = TextWidth(verb_badge, b_font);
+    const float sw = TextWidth(state_badge, b_font);
+    c.Write(verb_badge, box_x1 - vw - 16.0f * scale_ui, hdr_y + 2.0f * scale_ui, b_font,
+            hle::log::g_verbose ? Rgba(255, 210, 75) : Rgba(130, 140, 160));
+    c.Write(state_badge, box_x1 - vw - sw - 34.0f * scale_ui, hdr_y + 2.0f * scale_ui, b_font,
+            stats.paused ? Rgba(255, 175, 65) : Rgba(95, 235, 145));
+
+    // Cutscene / AVPlayer live diagnostics bar
+    const float av_y0 = hdr_y + 38.0f * scale_ui;
+    const float av_h = 26.0f * scale_ui;
+    c.Rect(box_x0 + 14.0f * scale_ui, av_y0, box_x1 - 14.0f * scale_ui, av_y0 + av_h, Rgba(20, 26, 38, 235));
+    const std::string av_diag = hle::avplayer::GetDiagnosticsSummary(pt);
+    const float av_font = 1.3f * scale_ui;
+    const size_t av_max_chars = static_cast<size_t>(std::max(30.0f, (box_w - 44.0f * scale_ui) / (6.0f * av_font)));
+    std::string av_shown = av_diag.size() > av_max_chars ? (av_diag.substr(0, av_max_chars - 3) + "...") : av_diag;
+    const bool av_has_err = (av_diag.find("ERRO:") != std::string::npos || av_diag.find("ERR:") != std::string::npos);
+    c.Write(av_shown, box_x0 + 22.0f * scale_ui, av_y0 + 8.0f * scale_ui, av_font,
+            av_has_err ? Rgba(255, 110, 110) : Rgba(125, 220, 255));
+
+    // Filter tabs row
+    const float tab_y0 = av_y0 + av_h + 8.0f * scale_ui;
+    const float tab_h = 24.0f * scale_ui;
+    const float tab_font = 1.3f * scale_ui;
+    struct TabDef {
+        hle::log::LogFilter id;
+        std::string label;
+        u32 accent;
+    };
+    const TabDef tabs[] = {
+        {hle::log::LogFilter::kAll,      pt ? "TODAS"       : "ALL",         Rgba(110, 185, 255)},
+        {hle::log::LogFilter::kErrors,   (pt ? "ERROS ("     : "ERRORS (")    + std::to_string(stats.error_count) + ")", Rgba(255, 95, 95)},
+        {hle::log::LogFilter::kWarnings, (pt ? "AVISOS ("    : "WARNINGS (")  + std::to_string(stats.warning_count) + ")", Rgba(255, 195, 70)},
+        {hle::log::LogFilter::kCutscene, (pt ? "CUTSCENE/AV (" : "CUTSCENE/AV (") + std::to_string(stats.cutscene_count) + ")", Rgba(80, 225, 255)},
+        {hle::log::LogFilter::kStubs,    "STUBS (" + std::to_string(stats.stub_count) + ")", Rgba(215, 170, 255)},
+        {hle::log::LogFilter::kGame,     pt ? "JOGO [GAME]" : "GAME [GAME]", Rgba(130, 235, 155)},
+    };
+    float tab_x = box_x0 + 16.0f * scale_ui;
+    for (const auto& t : tabs) {
+        const bool active = (t.id == g_logs_filter);
+        const float tw = TextWidth(t.label, tab_font) + 18.0f * scale_ui;
+        c.Pill(tab_x, tab_y0, tab_x + tw, tab_y0 + tab_h, active ? Rgba(42, 68, 108, 255) : Rgba(24, 29, 40, 220));
+        if (active) {
+            c.Rect(tab_x + 8.0f * scale_ui, tab_y0 + tab_h - 3.0f * scale_ui, tab_x + tw - 8.0f * scale_ui, tab_y0 + tab_h, t.accent);
+        }
+        c.Write(t.label, tab_x + 9.0f * scale_ui, tab_y0 + 7.0f * scale_ui, tab_font, active ? Rgba(255, 255, 255) : Rgba(155, 165, 185));
+        tab_x += tw + 8.0f * scale_ui;
+    }
+
+    // Geometry for list vs bottom Inspector Box
+    const float footer_y = box_y1 - 22.0f * scale_ui;
+    const float insp_h = 114.0f * scale_ui;
+    const float insp_y1 = footer_y - 8.0f * scale_ui;
+    const float insp_y0 = insp_y1 - insp_h;
+    const float list_y0 = tab_y0 + tab_h + 10.0f * scale_ui;
+    const float list_y1 = insp_y0 - 8.0f * scale_ui;
+    const float list_h = std::max(60.0f * scale_ui, list_y1 - list_y0);
+
+    c.Rect(box_x0 + 14.0f * scale_ui, list_y0, box_x1 - 14.0f * scale_ui, list_y1, Rgba(10, 12, 18, 230));
+
+    const float row_h = 20.0f * scale_ui;
+    const float row_font = 1.35f * scale_ui;
+    g_logs_visible_count = std::clamp(static_cast<int>(list_h / row_h), 6, 36);
+    LogsSyncBounds(count);
+
+    const float text_left = box_x0 + 22.0f * scale_ui;
+    const float text_right = box_x1 - 24.0f * scale_ui;
+    const size_t row_max_chars = static_cast<size_t>(std::max(30.0f, (text_right - text_left) / (6.0f * row_font)));
+
+    for (int r = 0; r < g_logs_visible_count; ++r) {
+        const int idx = g_logs_scroll + r;
+        if (idx >= count) break;
+
+        const auto& e = entries[idx];
+        const bool is_sel = (idx == g_logs_selected);
+        const float ry0 = list_y0 + 4.0f * scale_ui + r * row_h;
+        const float ry1 = ry0 + row_h - 1.0f;
+
+        if (is_sel) {
+            c.Rect(box_x0 + 15.0f * scale_ui, ry0, box_x1 - 20.0f * scale_ui, ry1, Rgba(44, 62, 94, 240));
+            c.Rect(box_x0 + 15.0f * scale_ui, ry0, box_x0 + 18.0f * scale_ui, ry1, Rgba(92, 198, 255));
+        } else if (e.severity == 2) {
+            c.Rect(box_x0 + 15.0f * scale_ui, ry0, box_x1 - 20.0f * scale_ui, ry1, Rgba(64, 18, 22, 130));
+        } else if (e.severity == 1 && (r % 2 == 0)) {
+            c.Rect(box_x0 + 15.0f * scale_ui, ry0, box_x1 - 20.0f * scale_ui, ry1, Rgba(52, 40, 14, 90));
+        }
+
+        const char* tag = e.severity == 2 ? "[ERR]" : (e.severity == 1 ? "[WRN]" : (e.is_cutscene ? "[CUT]" : "[INF]"));
+        u32 col = Rgba(210, 216, 228);
+        if (e.severity == 2) col = Rgba(255, 115, 115);
+        else if (e.severity == 1) col = Rgba(255, 208, 90);
+        else if (e.is_cutscene) col = Rgba(105, 225, 255);
+        else if (e.is_game) col = Rgba(145, 232, 165);
+        else if (is_sel) col = Rgba(255, 255, 255);
+
+        char prefix[32];
+        std::snprintf(prefix, sizeof(prefix), "%6.1fs %s ", e.time_s, tag);
+        std::string line_str = std::string(prefix) + e.text;
+        if (line_str.size() > row_max_chars) {
+            line_str.resize(row_max_chars > 3 ? row_max_chars - 3 : row_max_chars);
+            if (row_max_chars > 3) line_str += "...";
+        }
+        c.Write(line_str, text_left, ry0 + 5.0f * scale_ui, row_font, col);
+    }
+
+    if (count == 0) {
+        const std::string empty_msg = pt ? "Nenhum log nesta categoria ainda." : "No log entries in this category yet.";
+        c.Write(empty_msg, text_left + 12.0f * scale_ui, list_y0 + 28.0f * scale_ui, 1.6f * scale_ui, Rgba(140, 148, 168));
+    }
+
+    // Scrollbar on list right edge
+    const float sb_x0 = box_x1 - 12.0f * scale_ui;
+    const float sb_x1 = box_x1 - 7.0f * scale_ui;
+    c.Pill(sb_x0, list_y0 + 4.0f * scale_ui, sb_x1, list_y1 - 4.0f * scale_ui, Rgba(24, 28, 38));
+    if (count > g_logs_visible_count) {
+        const float track_h = (list_y1 - 4.0f * scale_ui) - (list_y0 + 4.0f * scale_ui);
+        const float thumb_h = std::max(24.0f * scale_ui, track_h * g_logs_visible_count / count);
+        const float thumb_y0 = (list_y0 + 4.0f * scale_ui) +
+                               (track_h - thumb_h) * (static_cast<float>(g_logs_scroll) / (count - g_logs_visible_count));
+        c.Pill(sb_x0, thumb_y0, sb_x1, thumb_y0 + thumb_h, Rgba(92, 138, 198));
+    }
+
+    // Bottom Inspector Box: full unwrapped line + human-readable Reason / Diagnosis
+    c.Rect(box_x0 + 14.0f * scale_ui, insp_y0, box_x1 - 14.0f * scale_ui, insp_y1, Rgba(18, 22, 32, 245));
+    c.Rect(box_x0 + 14.0f * scale_ui, insp_y0, box_x1 - 14.0f * scale_ui, insp_y0 + 2.0f * scale_ui, Rgba(56, 130, 210));
+
+    const float insp_font = 1.3f * scale_ui;
+    const size_t insp_max_chars = static_cast<size_t>(std::max(35.0f, (box_w - 46.0f * scale_ui) / (6.0f * insp_font)));
+    if (count > 0) {
+        const auto& sel = entries[std::clamp(g_logs_selected, 0, count - 1)];
+        const auto wrapped_raw = WrapText(sel.text, insp_max_chars, 2);
+        float iy = insp_y0 + 10.0f * scale_ui;
+        for (const auto& wl : wrapped_raw) {
+            c.Write(wl, text_left, iy, insp_font, Rgba(240, 244, 252));
+            iy += 16.0f * scale_ui;
+        }
+        const std::string reason = hle::log::ExplainLogEntry(sel, pt);
+        const auto wrapped_reason = WrapText(reason, insp_max_chars, 2);
+        float ry = insp_y0 + 50.0f * scale_ui;
+        for (const auto& rl : wrapped_reason) {
+            c.Write(rl, text_left, ry, insp_font, Rgba(255, 212, 92));
+            ry += 16.0f * scale_ui;
+        }
+    } else {
+        c.Write(pt ? "DICA: Use [D] para capturar threads/cutscene ou [V] para ligar Verbose HLE."
+                   : "TIP: Press [D] to dump thread/cutscene snapshot or [V] for Verbose HLE.",
+                text_left, insp_y0 + 16.0f * scale_ui, insp_font, Rgba(165, 175, 195));
+    }
+
+    if (g_logs_banner_timer > 0) {
+        --g_logs_banner_timer;
+        const float bw = TextWidth(g_logs_banner_msg, insp_font) + 20.0f * scale_ui;
+        const float bx = std::max(text_left, box_x1 - 18.0f * scale_ui - bw);
+        const float by = insp_y1 - 24.0f * scale_ui;
+        c.Pill(bx, by, bx + bw, by + 20.0f * scale_ui, Rgba(22, 82, 44, 240));
+        c.Write(g_logs_banner_msg, bx + 10.0f * scale_ui, by + 5.0f * scale_ui, insp_font, Rgba(150, 255, 175));
+    }
+
+    // Footer shortcuts
+    const std::string footer = pt
+        ? "[CIMA/BAIXO] ROLAR  [TAB/ESQ/DIR] FILTRO  [F] AO VIVO  [P] PAUSAR  [C] LIMPAR  [V] VERBOSE  [D] DUMP  [X] PARAR AV  [S/ENTER] SALVAR+COPIAR  [F9/ESC] FECHAR"
+        : "[UP/DOWN] SCROLL  [TAB/L/R] FILTER  [F] LIVE  [P] PAUSE  [C] CLEAR  [V] VERBOSE  [D] SNAPSHOT  [X] STOP AV  [S/ENTER] SAVE+COPY  [F9/ESC] CLOSE";
+    const float font_foot = 1.2f * scale_ui;
+    const float foot_w = TextWidth(footer, font_foot);
+    const float eff_foot = (foot_w > box_w - 24.0f * scale_ui) ? (font_foot * (box_w - 24.0f * scale_ui) / foot_w) : font_foot;
+    c.Write(footer, box_x0 + (box_w - TextWidth(footer, eff_foot)) * 0.5f, footer_y, eff_foot, Rgba(130, 142, 165));
+}
+
 } // namespace
 
 void SetStatsOverlay(bool enabled) {
@@ -1550,7 +2056,15 @@ void QueueStatsOverlay() {
     }
     const bool has_toast = hle::trophy::TrophyManager::Instance().HasActiveToast();
     hle::trophy::TrophyManager::Instance().Update(ms * 0.001f);
-    if (!g_stats_overlay.load() && !g_video_menu_open.load() && !g_achievements_overlay_open.load() && !has_toast) {
+    if (g_logs_overlay_open.load()) {
+        static int s_log_flush_div = 0;
+        if (++s_log_flush_div >= 15) {
+            s_log_flush_div = 0;
+            hle::log::FlushCapture();
+        }
+    }
+    if (!g_stats_overlay.load() && !g_video_menu_open.load() && !g_achievements_overlay_open.load() &&
+        !g_logs_overlay_open.load() && !has_toast) {
         return;
     }
     static std::vector<LoadingVertex> vertices;
@@ -1928,10 +2442,14 @@ void QueueStatsOverlay() {
 
         // Footer at bottom
         const std::string footer = lang::Pt()
-            ? "[D-PAD / ANALOGICO] NAVEGAR   [LB / RB] PAGINA   [X / TAB] FILTRAR   [B / ESC / F9] FECHAR   [RB+LB+RT] FECHAR"
-            : "[D-PAD / STICK] NAVIGATE   [LB / RB] PAGE   [X / TAB] FILTER   [B / ESC / F9] CLOSE   [RB+LB+RT] CLOSE";
+            ? "[D-PAD / ANALOGICO] NAVEGAR   [LB / RB] PAGINA   [X / TAB] FILTRAR   [B / ESC / F8] FECHAR   [RB+LB+RT] FECHAR"
+            : "[D-PAD / STICK] NAVIGATE   [LB / RB] PAGE   [X / TAB] FILTER   [B / ESC / F8] CLOSE   [RB+LB+RT] CLOSE";
         const float font_foot = 1.35f * scale_ui;
         c.Write(footer, box_x0 + (box_w - TextWidth(footer, font_foot)) * 0.5f, box_y1 - 18.0f * scale_ui, font_foot, Rgba(117, 125, 142));
+    }
+
+    if (g_logs_overlay_open.load()) {
+        RenderLogsOverlay(c, client);
     }
 
     if (has_toast) {

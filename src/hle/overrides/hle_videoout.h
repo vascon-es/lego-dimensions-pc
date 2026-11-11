@@ -77,10 +77,15 @@ void ToggleVideoSettingsMenu();
 bool IsVideoSettingsMenuOpen();
 void HandleVideoMenuController(u32 pressed_buttons);
 
-// Menu de conquistas dentro do jogo (F9 ou RB+LB+RT)
+// Menu de conquistas dentro do jogo (F8 ou RB+LB+RT)
 void ToggleAchievementsMenu();
 bool IsAchievementsMenuOpen();
 void HandleAchievementsMenuController(u32 pressed_buttons);
+
+// Painel de logs e diagnostico dentro do jogo (F9)
+void ToggleLogsMenu();
+bool IsLogsMenuOpen();
+void HandleLogsMenuController(u32 pressed_buttons);
 
 // true se a janela do jogo existe e esta em primeiro plano (o teclado so vale nesse caso).
 bool WindowHasFocus();

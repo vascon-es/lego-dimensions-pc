@@ -38,6 +38,75 @@
 //   cada um no horario (ms desde o Start).
 // - O callback de eventos (eboot+0x842010) so registra PLAY / STOP / PAUSE; o READY configura os streams.
 // Sem o .mp4 (ou sem decodificador) o jogo ve um video que comeca e termina sem quadros.
+struct AvPlayer;
+
+namespace {
+
+std::mutex g_av_diag_mutex;
+std::vector<AvPlayer*> g_av_players;
+std::atomic<u64> g_av_calls{0};
+std::atomic<u64> g_av_frames_decoded{0};
+std::string g_av_last_source;
+std::string g_av_last_pack;
+std::string g_av_last_state = "IDLE";
+std::string g_av_last_error;
+
+const char* DescribeMfError(HRESULT hr) {
+    switch (static_cast<u32>(hr)) {
+    case 0xC00D5212u: return "MF_E_TOPO_CODEC_NOT_FOUND (missing H.264/MP4 codec or Windows Media Feature Pack)";
+    case 0xC00D36C4u: return "MF_E_UNSUPPORTED_BYTESTREAM_TYPE (invalid or unsupported MP4 container)";
+    case 0x80070002u: return "ERROR_FILE_NOT_FOUND";
+    case 0x80070005u: return "ERROR_ACCESS_DENIED";
+    default: return "Media Foundation error";
+    }
+}
+
+void RecordAvError(const std::string& err) {
+    std::lock_guard lock(g_av_diag_mutex);
+    g_av_last_error = err;
+    g_av_last_state = "ERROR";
+}
+
+void RecordAvState(const char* state, const char* source = nullptr, const char* pack = nullptr) {
+    std::lock_guard lock(g_av_diag_mutex);
+    g_av_last_state = state ? state : "IDLE";
+    if (source) g_av_last_source = source;
+    if (pack) g_av_last_pack = pack;
+}
+
+} // namespace
+
+namespace hle::avplayer {
+
+std::string GetDiagnosticsSummary(bool pt) {
+    std::lock_guard lock(g_av_diag_mutex);
+    const u64 calls = g_av_calls.load();
+    const u64 frames = g_av_frames_decoded.load();
+    char buf[512];
+    if (pt) {
+        std::snprintf(buf, sizeof(buf),
+                      "AVPLAYER: chamadas=%llu | players=%zu | estado=%s | quadros=%llu | src=\"%s\"%s%s",
+                      static_cast<unsigned long long>(calls), g_av_players.size(), g_av_last_state.c_str(),
+                      static_cast<unsigned long long>(frames),
+                      g_av_last_source.empty() ? "-" : g_av_last_source.c_str(),
+                      g_av_last_error.empty() ? "" : " | ERRO: ",
+                      g_av_last_error.empty() ? "" : g_av_last_error.c_str());
+    } else {
+        std::snprintf(buf, sizeof(buf),
+                      "AVPLAYER: calls=%llu | players=%zu | state=%s | frames=%llu | src=\"%s\"%s%s",
+                      static_cast<unsigned long long>(calls), g_av_players.size(), g_av_last_state.c_str(),
+                      static_cast<unsigned long long>(frames),
+                      g_av_last_source.empty() ? "-" : g_av_last_source.c_str(),
+                      g_av_last_error.empty() ? "" : " | ERR: ",
+                      g_av_last_error.empty() ? "" : g_av_last_error.c_str());
+    }
+    return buf;
+}
+
+int ForceStopActive();
+
+} // namespace hle::avplayer
+
 namespace {
 
 using namespace hle;
@@ -218,8 +287,12 @@ private:
             DWORD stream = 0, flags = 0;
             LONGLONG ts = 0;
             IMFSample* sample = nullptr;
-            if (FAILED(reader->ReadSample(MF_SOURCE_READER_FIRST_VIDEO_STREAM, 0, &stream, &flags, &ts, &sample))) {
-                log::Tagged("AVPLAYER", "Media Foundation: ReadSample failed, video stops here");
+            const HRESULT sr = reader->ReadSample(MF_SOURCE_READER_FIRST_VIDEO_STREAM, 0, &stream, &flags, &ts, &sample);
+            if (FAILED(sr)) {
+                char err_buf[256];
+                std::snprintf(err_buf, sizeof(err_buf), "ReadSample failed (0x%08lX: %s)", static_cast<unsigned long>(sr), DescribeMfError(sr));
+                log::Tagged("AVPLAYER", "ERROR: Media Foundation %s, video stops here", err_buf);
+                RecordAvError(err_buf);
                 break;
             }
             if (flags & MF_SOURCE_READERF_CURRENTMEDIATYPECHANGED) {
@@ -232,6 +305,7 @@ private:
                     std::lock_guard lock(mutex_);
                     queue_.push_back(std::move(frame));
                     ++frames;
+                    g_av_frames_decoded.fetch_add(1, std::memory_order_relaxed);
                 }
                 sample->Release();
             }
@@ -252,7 +326,9 @@ private:
         const HANDLE file = CreateFileW(pack.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING,
                                         FILE_ATTRIBUTE_NORMAL, nullptr);
         if (file == INVALID_HANDLE_VALUE) {
-            log::Tagged("AVPLAYER", "could not open %s", pack.string().c_str());
+            const DWORD err = GetLastError();
+            log::Tagged("AVPLAYER", "ERROR: could not open %s (win32=%lu)", pack.string().c_str(), err);
+            RecordAvError("CreateFile failed for " + pack.string() + " (win32=" + std::to_string(err) + ")");
             return nullptr;
         }
         auto* stream = new RangeStream(file, offset, size);
@@ -293,7 +369,11 @@ private:
         SafeRelease(bytes_attrs);
         SafeRelease(bytes);
         if (FAILED(hr)) {
-            log::Tagged("AVPLAYER", "Media Foundation could not open the video (0x%08lX)", static_cast<unsigned long>(hr));
+            char err_buf[256];
+            const char* desc = DescribeMfError(hr);
+            std::snprintf(err_buf, sizeof(err_buf), "Media Foundation 0x%08lX: %s", static_cast<unsigned long>(hr), desc);
+            log::Tagged("AVPLAYER", "ERROR: %s", err_buf);
+            RecordAvError(err_buf);
             SafeRelease(reader);
         }
         return reader;
@@ -371,6 +451,7 @@ struct AvPlayer {
     bool looping = false;
     std::atomic<bool> active{false};    // sem decodificador: Start ja foi chamado e o IsActive ainda nao respondeu 1
     std::atomic<bool> stop_sent{false}; // STATE_STOP do fim do video ja enviado
+    std::atomic<bool> force_stop_requested{false}; // F9 log panel manual stop request
     std::unique_ptr<Decoder> decoder;
     Frame current; // o ultimo quadro entregue (o jogo copia na hora)
     std::chrono::steady_clock::time_point start;
@@ -396,21 +477,38 @@ u64 NowMs(AvPlayer* player) {
 std::unique_ptr<Decoder> OpenVideo() {
     radar::StoredFile file;
     if (!radar::FindStoredFile(".mp4", &file)) {
-        log::Tagged("AVPLAYER", "no .mp4 found in the indexes of the packs read so far: the video will have no picture");
+        log::Tagged("AVPLAYER", "ERROR: no .mp4 found in the indexes of the packs read so far: the video will have no picture");
+        RecordAvError("no .mp4 found in DAT/DLC indexes");
         return nullptr;
     }
     const fs::Resolved resolved = fs::Resolve(file.guest_pack.c_str());
-    auto decoder = std::make_unique<Decoder>();
-    if (resolved.host.empty() || !decoder->Open(resolved.host, file.offset, file.size)) {
+    if (resolved.host.empty()) {
+        log::Tagged("AVPLAYER", "ERROR: pack \"%s\" containing \"%s\" could not be resolved on disk",
+                    file.guest_pack.c_str(), file.name.c_str());
+        RecordAvError("unresolved pack " + file.guest_pack);
         return nullptr;
     }
+    auto decoder = std::make_unique<Decoder>();
+    if (!decoder->Open(resolved.host, file.offset, file.size)) {
+        log::Tagged("AVPLAYER", "ERROR: failed to open MP4 video \"%s\" from \"%s\"",
+                    file.name.c_str(), file.guest_pack.c_str());
+        return nullptr;
+    }
+    RecordAvState("READY", nullptr, file.guest_pack.c_str());
     log::Tagged("AVPLAYER", "video %s (%s, %.0f MB): %ux%u, %.1f s, decoded by Media Foundation", file.name.c_str(),
                 file.guest_pack.c_str(), file.size / 1048576.0, decoder->width, decoder->height, decoder->duration_ms / 1000.0);
     return decoder;
 }
 
 HLE_IMPL(u64, sceAvPlayerInit, const void* init_data) {
+    g_av_calls.fetch_add(1, std::memory_order_relaxed);
     auto* player = new AvPlayer();
+    {
+        std::lock_guard lock(g_av_diag_mutex);
+        g_av_players.push_back(player);
+        g_av_last_error.clear();
+        g_av_last_state = "INIT";
+    }
     if (init_data) {
         // Layout de SceAvPlayerInitData no PS4/eboot:
         // [init_data + 0x50] = pUserData, [init_data + 0x58] = eventCallback
@@ -424,13 +522,16 @@ HLE_IMPL(u64, sceAvPlayerInit, const void* init_data) {
 HLE_OVERRIDE(sceAvPlayerInit);
 
 HLE_IMPL(int, sceAvPlayerPostInit, AvPlayer* player, const void* reserved) {
+    g_av_calls.fetch_add(1, std::memory_order_relaxed);
     log::Tagged("AVPLAYER", "sceAvPlayerPostInit(%p)", player);
     return err::OK;
 }
 HLE_OVERRIDE(sceAvPlayerPostInit);
 
 HLE_IMPL(int, sceAvPlayerAddSource, AvPlayer* player, const char* filename) {
+    g_av_calls.fetch_add(1, std::memory_order_relaxed);
     log::Tagged("AVPLAYER", "sceAvPlayerAddSource(%p, \"%s\")", player, filename ? filename : "");
+    RecordAvState("ADD_SOURCE", filename ? filename : "");
     if (player) {
         if (filename) {
             player->source = filename;
@@ -512,10 +613,13 @@ HLE_IMPL(int, sceAvPlayerSetLooping, AvPlayer* player, u32 loop) {
 HLE_OVERRIDE(sceAvPlayerSetLooping);
 
 HLE_IMPL(int, sceAvPlayerStart, AvPlayer* player) {
+    g_av_calls.fetch_add(1, std::memory_order_relaxed);
     log::Tagged("AVPLAYER", "sceAvPlayerStart(%p)", player);
+    RecordAvState("PLAYING");
     if (player) {
         player->active = true;
         player->stop_sent = false;
+        player->force_stop_requested = false;
         player->started = true;
         player->paused = false;
         player->start = std::chrono::steady_clock::now();
@@ -530,7 +634,18 @@ HLE_IMPL(int, sceAvPlayerStart, AvPlayer* player) {
 HLE_OVERRIDE(sceAvPlayerStart);
 
 HLE_IMPL(int, sceAvPlayerIsActive, AvPlayer* player) {
+    g_av_calls.fetch_add(1, std::memory_order_relaxed);
     if (!player) {
+        return 0;
+    }
+    if (player->force_stop_requested.exchange(false)) {
+        player->active = false;
+        player->decoder.reset();
+        RecordAvState("FORCE_STOPPED");
+        if (!player->stop_sent.exchange(true)) {
+            log::Tagged("AVPLAYER", "sceAvPlayerIsActive(%p): forced stop requested from F9 panel -> STATE_STOP", player);
+            Event(player, kStateStop);
+        }
         return 0;
     }
     if (player->decoder) {
@@ -541,6 +656,7 @@ HLE_IMPL(int, sceAvPlayerIsActive, AvPlayer* player) {
         return 1; // sem decodificador: 1 uma vez (o jogo sai da espera do Start) e depois o fim
     }
     if (!player->stop_sent.exchange(true)) {
+        RecordAvState("STOPPED");
         log::Tagged("AVPLAYER", "sceAvPlayerIsActive(%p): video ended (%llu frames decoded) -> STATE_STOP", player,
                     static_cast<unsigned long long>(player->decoder ? player->decoder->frames : 0));
         Event(player, kStateStop);
@@ -579,7 +695,9 @@ HLE_IMPL(u64, sceAvPlayerCurrentTime, AvPlayer* player) {
 HLE_OVERRIDE(sceAvPlayerCurrentTime);
 
 HLE_IMPL(int, sceAvPlayerStop, AvPlayer* player) {
+    g_av_calls.fetch_add(1, std::memory_order_relaxed);
     log::Tagged("AVPLAYER", "sceAvPlayerStop(%p)", player);
+    RecordAvState("STOPPED");
     if (player) {
         player->active = false;
         player->stop_sent = true;
@@ -610,8 +728,16 @@ HLE_IMPL(int, sceAvPlayerResume, AvPlayer* player) {
 HLE_OVERRIDE(sceAvPlayerResume);
 
 HLE_IMPL(int, sceAvPlayerClose, AvPlayer* player) {
+    g_av_calls.fetch_add(1, std::memory_order_relaxed);
     log::Tagged("AVPLAYER", "sceAvPlayerClose(%p)", player);
     if (player) {
+        {
+            std::lock_guard lock(g_av_diag_mutex);
+            g_av_players.erase(std::remove(g_av_players.begin(), g_av_players.end(), player), g_av_players.end());
+            if (g_av_players.empty()) {
+                g_av_last_state = "IDLE";
+            }
+        }
         delete player;
     }
     return err::OK;
@@ -619,3 +745,24 @@ HLE_IMPL(int, sceAvPlayerClose, AvPlayer* player) {
 HLE_OVERRIDE(sceAvPlayerClose);
 
 } // namespace
+
+namespace hle::avplayer {
+
+int ForceStopActive() {
+    std::lock_guard lock(g_av_diag_mutex);
+    int stopped = 0;
+    for (AvPlayer* p : g_av_players) {
+        if (p && !p->stop_sent.load()) {
+            p->force_stop_requested = true;
+            ++stopped;
+        }
+    }
+    if (stopped > 0) {
+        log::Tagged("AVPLAYER", "Manual force-stop queued from F9 panel for %d active player(s)", stopped);
+    } else {
+        log::Tagged("AVPLAYER", "Manual stop requested from F9 panel: no active AVPlayer instance running");
+    }
+    return stopped;
+}
+
+} // namespace hle::avplayer

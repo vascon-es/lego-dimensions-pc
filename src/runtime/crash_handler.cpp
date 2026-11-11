@@ -209,6 +209,7 @@ LONG CALLBACK VectoredHandler(EXCEPTION_POINTERS* info) {
     std::printf("============================================================\n");
     std::fflush(stdout);
     hle::log::PrintSummary();
+    hle::log::StopCapture();
     std::fflush(stdout);
     TerminateProcess(GetCurrentProcess(), 2);
     return EXCEPTION_CONTINUE_SEARCH;
