@@ -91,14 +91,6 @@ int g_flip_rate = 0; // 0 = 60 Hz, 1 = 30 Hz, 2 = 20 Hz
 std::atomic<bool> g_force_60hz{true}; // padrao 60 FPS no PC
 std::atomic<bool> g_unlocked_fps{false}; // FPS desbloqueado
 std::atomic<int> g_blank_frequency{900}; // Padrao 900 Hz
-
-void SetBlankFrequency(int hz) {
-    g_blank_frequency.store(hz > 0 ? hz : 900);
-}
-
-int GetBlankFrequency() {
-    return g_blank_frequency.load();
-}
 std::condition_variable g_flip_cv;
 u32 g_width = 1920, g_height = 1080;
 std::vector<void*> g_buffers;
@@ -835,6 +827,14 @@ void SetUnlockedFps(bool enabled) {
 
 bool IsUnlockedFps() {
     return g_unlocked_fps.load(std::memory_order_relaxed);
+}
+
+void SetBlankFrequency(int hz) {
+    g_blank_frequency.store(hz > 0 ? hz : 900);
+}
+
+int GetBlankFrequency() {
+    return g_blank_frequency.load();
 }
 
 void InitVideoDefaults() {
