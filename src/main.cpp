@@ -847,7 +847,7 @@ int SelfTest() {
         check("Toy Pad: second copy of same tag gets new UID and remains same character", dup_ok && again && second_id == ids[0]);
 
         // Test portal state persistence (save and restore)
-        const std::filesystem::path test_portal = root / "build" / "test_portal.json";
+        const std::filesystem::path test_portal = std::filesystem::temp_directory_path() / "test_portal.json";
         tp::Uid test_uid{4, 10, 20, 30, 40, 50, 60};
         tp::LoadTag(1, 0, tp::BuildTag(test_uid, 42), std::string());
         tp::SavePortalState(test_portal);
