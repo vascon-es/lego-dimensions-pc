@@ -40,6 +40,8 @@ bool IsSrgbDisplayBuffer(u64 address);
 void SetForce60Hz(bool enabled);
 void SetUnlockedFps(bool enabled);
 bool IsUnlockedFps();
+void SetBlankFrequency(int hz);
+int GetBlankFrequency();
 void InitVideoDefaults();
 // Fase 38: confere na abertura todos os .spv soltos de shaders_spv (diagnostico; segura o backend por segundos).
 void SetCheckModules(bool enabled);
@@ -74,6 +76,11 @@ void SetWindowResolution(u32 width, u32 height);
 void ToggleVideoSettingsMenu();
 bool IsVideoSettingsMenuOpen();
 void HandleVideoMenuController(u32 pressed_buttons);
+
+// Menu de conquistas dentro do jogo (F9 ou RB+LB+RT)
+void ToggleAchievementsMenu();
+bool IsAchievementsMenuOpen();
+void HandleAchievementsMenuController(u32 pressed_buttons);
 
 // true se a janela do jogo existe e esta em primeiro plano (o teclado so vale nesse caso).
 bool WindowHasFocus();

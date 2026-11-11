@@ -45,6 +45,12 @@ u32 SessionNumber();
 std::optional<Packet> PlaceFigure(int pad, const Uid& uid, u32 character_id);
 std::optional<Packet> RemoveFigure(int pad);
 
+// Persistencia do estado do portal (portal.json)
+void SetPortalFilePath(const std::filesystem::path& path);
+std::filesystem::path GetPortalFilePath();
+void SavePortalState(const std::filesystem::path& path = {});
+void LoadPortalState(const std::filesystem::path& path = {});
+
 // Fase 27 (app LegoToypad): figuras por INDICE (0..6), cada uma numa zona, com a tag inteira vinda
 // de fora (dump de 180 bytes). `path` nao vazio = arquivo que recebe as escritas do jogo.
 std::optional<Packet> LoadTag(int pad, int index, const TagData& tag, const std::string& path, u32* character_id = nullptr);

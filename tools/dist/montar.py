@@ -172,7 +172,7 @@ def stage():
                 if text.encode('latin-1') != data:
                     with open(full, 'wb') as fh:
                         fh.write(text.encode('latin-1'))
-            assert not low.endswith(('.dat', '.dat2', '.hdr', '.hdr2', '.elf', '.prx', '.sprx', '.self', '.pak', '.spv')), f
+            assert low == 'trophies.dat' or not low.endswith(('.dat', '.dat2', '.hdr', '.hdr2', '.elf', '.prx', '.sprx', '.self', '.pak', '.spv')), f
             assert low != 'eboot.bin', f
 
 

@@ -42,6 +42,78 @@ u32 g_session_number = 0; // Fase 60: conta as sessoes abertas (cada desafio dep
 // Indice da figura no protocolo = posicao neste vetor (0..6). As figuras do portal.json usam o
 // indice igual a zona (1..3), como desde a Fase 8; o app LegoToypad escolhe o indice.
 Figure g_figures[kSlotCount];
+std::filesystem::path g_portal_file_path;
+
+void SavePortalStateLocked(const std::filesystem::path& path = {}) {
+    const std::filesystem::path target = !path.empty() ? path : g_portal_file_path;
+    if (target.empty()) {
+        return;
+    }
+    std::error_code ec;
+    std::filesystem::create_directories(target.parent_path(), ec);
+    std::ofstream out(target, std::ios::trunc);
+    if (!out) {
+        return;
+    }
+
+    const Figure* pad_figs[kPadCount + 1] = {nullptr, nullptr, nullptr, nullptr};
+    for (int i = 0; i < kSlotCount; ++i) {
+        if (g_figures[i].present && g_figures[i].pad >= 1 && g_figures[i].pad <= kPadCount) {
+            if (!pad_figs[g_figures[i].pad]) {
+                pad_figs[g_figures[i].pad] = &g_figures[i];
+            }
+        }
+    }
+
+    out << "{\n";
+    for (int p = 1; p <= kPadCount; ++p) {
+        out << "  \"pad" << p << "\": ";
+        if (pad_figs[p]) {
+            const auto& f = *pad_figs[p];
+            out << "{\"uid\": ["
+                << static_cast<int>(f.uid[0]) << ","
+                << static_cast<int>(f.uid[1]) << ","
+                << static_cast<int>(f.uid[2]) << ","
+                << static_cast<int>(f.uid[3]) << ","
+                << static_cast<int>(f.uid[4]) << ","
+                << static_cast<int>(f.uid[5]) << ","
+                << static_cast<int>(f.uid[6]) << "], \"id\": " << f.id << "}";
+        } else {
+            out << "null";
+        }
+        out << ",\n";
+    }
+
+    out << "  \"slots\": [\n";
+    bool first_slot = true;
+    for (int i = 0; i < kSlotCount; ++i) {
+        if (g_figures[i].present) {
+            if (!first_slot) out << ",\n";
+            first_slot = false;
+            const auto& f = g_figures[i];
+            out << "    {\"index\": " << i << ", \"pad\": " << f.pad << ", \"id\": " << f.id
+                << ", \"uid\": ["
+                << static_cast<int>(f.uid[0]) << ","
+                << static_cast<int>(f.uid[1]) << ","
+                << static_cast<int>(f.uid[2]) << ","
+                << static_cast<int>(f.uid[3]) << ","
+                << static_cast<int>(f.uid[4]) << ","
+                << static_cast<int>(f.uid[5]) << ","
+                << static_cast<int>(f.uid[6]) << "]";
+            if (!f.path.empty()) {
+                std::string esc;
+                for (char c : f.path) {
+                    if (c == '\\') esc += "\\\\";
+                    else esc += c;
+                }
+                out << ", \"path\": \"" << esc << "\"";
+            }
+            out << "}";
+        }
+    }
+    out << "\n  ]\n";
+    out << "}\n";
+}
 // Fase 60: estado dos LEDs de cada zona (0 = centro, 1 = esquerda, 2 = direita), como no listener do Cemu
 // "Remote Toypad" que o app LegoToypad le: o app anima piscadas e fades sozinho a partir deste estado.
 // Tempos em "ticks" do portal (~40 ms cada), como chegam do jogo.
@@ -357,6 +429,7 @@ std::optional<Packet> PlaceFigure(int pad, const Uid& uid, u32 character_id) {
     figure.data = BuildTag(uid, character_id);
     figure.path.clear();
     ++g_stats.figures_placed;
+    SavePortalStateLocked();
     return FigureEvent(pad, pad, false, uid);
 }
 
@@ -419,6 +492,7 @@ std::optional<Packet> LoadTag(int pad, int index, const TagData& tag, const std:
         *character_id = figure.id;
     }
     ++g_stats.figures_placed;
+    SavePortalStateLocked();
     return FigureEvent(pad, index, false, figure.uid);
 }
 
@@ -430,6 +504,7 @@ std::optional<Packet> RemoveIndex(int index) {
     Figure& figure = g_figures[index];
     figure.present = false;
     ++g_stats.figures_removed;
+    SavePortalStateLocked();
     return FigureEvent(figure.pad, index, true, figure.uid);
 }
 
@@ -449,6 +524,7 @@ std::vector<Packet> MoveIndex(int new_pad, int new_index, int old_index) {
     moved.pad = new_pad;
     g_figures[new_index] = moved;
     events.push_back(FigureEvent(new_pad, new_index, false, moved.uid));
+    SavePortalStateLocked();
     return events;
 }
 
@@ -496,6 +572,7 @@ std::optional<Packet> RemoveFigure(int pad) {
     Figure& figure = g_figures[pad];
     figure.present = false;
     ++g_stats.figures_removed;
+    SavePortalStateLocked();
     return FigureEvent(figure.pad, pad, true, figure.uid);
 }
 
@@ -625,6 +702,169 @@ std::optional<Packet> HandleCommand(const u8* command, u32 length) {
 Stats GetStats() {
     std::lock_guard lock(g_mutex);
     return g_stats;
+}
+
+void SetPortalFilePath(const std::filesystem::path& path) {
+    std::lock_guard lock(g_mutex);
+    g_portal_file_path = path;
+}
+
+std::filesystem::path GetPortalFilePath() {
+    std::lock_guard lock(g_mutex);
+    return g_portal_file_path;
+}
+
+void SavePortalState(const std::filesystem::path& path) {
+    std::lock_guard lock(g_mutex);
+    SavePortalStateLocked(path);
+}
+
+void LoadPortalState(const std::filesystem::path& path) {
+    std::lock_guard lock(g_mutex);
+    const std::filesystem::path target = !path.empty() ? path : g_portal_file_path;
+    if (target.empty()) return;
+
+    std::error_code ec;
+    if (!std::filesystem::exists(target, ec)) return;
+
+    std::ifstream in(target, std::ios::binary);
+    if (!in) return;
+    const std::string json((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+
+    for (int i = 0; i < kSlotCount; ++i) {
+        g_figures[i] = {};
+    }
+
+    size_t slots_pos = json.find("\"slots\"");
+    if (slots_pos != std::string::npos) {
+        size_t arr_open = json.find('[', slots_pos);
+        size_t arr_close = json.find(']', arr_open);
+        if (arr_open != std::string::npos && arr_close != std::string::npos) {
+            size_t pos = arr_open + 1;
+            while (pos < arr_close) {
+                size_t obj_open = json.find('{', pos);
+                if (obj_open == std::string::npos || obj_open >= arr_close) break;
+                size_t obj_close = json.find('}', obj_open);
+                if (obj_close == std::string::npos || obj_close > arr_close) break;
+
+                std::string obj = json.substr(obj_open, obj_close - obj_open + 1);
+                auto get_num = [&](const std::string& key) -> int {
+                    size_t kp = obj.find(key);
+                    if (kp == std::string::npos) return -1;
+                    size_t col = obj.find(':', kp);
+                    if (col == std::string::npos) return -1;
+                    return std::atoi(obj.c_str() + col + 1);
+                };
+                int idx = get_num("\"index\"");
+                int pad = get_num("\"pad\"");
+                int id = get_num("\"id\"");
+
+                Uid uid{};
+                size_t uid_pos = obj.find("\"uid\"");
+                if (uid_pos != std::string::npos) {
+                    size_t u_open = obj.find('[', uid_pos);
+                    size_t u_close = obj.find(']', u_open);
+                    if (u_open != std::string::npos && u_close != std::string::npos) {
+                        size_t cur = u_open + 1;
+                        for (int k = 0; k < 7; ++k) {
+                            cur = obj.find_first_of("0123456789", cur);
+                            if (cur == std::string::npos || cur > u_close) break;
+                            uid[k] = static_cast<u8>(std::strtoul(obj.c_str() + cur, nullptr, 10));
+                            cur = obj.find_first_not_of("0123456789", cur);
+                        }
+                    }
+                }
+
+                std::string fpath;
+                size_t p_pos = obj.find("\"path\"");
+                if (p_pos != std::string::npos) {
+                    size_t str_open = obj.find('\"', obj.find(':', p_pos) + 1);
+                    if (str_open != std::string::npos) {
+                        size_t str_close = obj.find('\"', str_open + 1);
+                        while (str_close != std::string::npos && obj[str_close - 1] == '\\') {
+                            str_close = obj.find('\"', str_close + 1);
+                        }
+                        if (str_close != std::string::npos) {
+                            fpath = obj.substr(str_open + 1, str_close - str_open - 1);
+                            std::string unesc;
+                            for (size_t c = 0; c < fpath.size(); ++c) {
+                                if (fpath[c] == '\\' && c + 1 < fpath.size() && fpath[c + 1] == '\\') {
+                                    unesc += '\\';
+                                    ++c;
+                                } else {
+                                    unesc += fpath[c];
+                                }
+                            }
+                            fpath = unesc;
+                        }
+                    }
+                }
+
+                if (idx >= 0 && idx < kSlotCount && pad >= 1 && pad <= kPadCount) {
+                    Figure& f = g_figures[idx];
+                    f.present = true;
+                    f.pad = pad;
+                    f.id = static_cast<u32>(id);
+                    f.uid = uid;
+                    f.path = fpath;
+                    bool loaded_from_file = false;
+                    if (!fpath.empty()) {
+                        std::ifstream fin(std::filesystem::u8path(fpath), std::ios::binary);
+                        if (fin && fin.read(reinterpret_cast<char*>(f.data.data()), f.data.size())) {
+                            loaded_from_file = true;
+                        }
+                    }
+                    if (!loaded_from_file) {
+                        f.data = BuildTag(uid, static_cast<u32>(id));
+                    }
+                    log::Tagged("PORTAL", "Restored figure in slot %d pad %d (id %u)", idx, pad, f.id);
+                }
+                pos = obj_close + 1;
+            }
+            return;
+        }
+    }
+
+    // Fallback: legacy format without slots
+    for (int pad = 1; pad <= kPadCount; ++pad) {
+        const std::string key = "\"pad" + std::to_string(pad) + "\"";
+        size_t pos = json.find(key);
+        if (pos == std::string::npos) continue;
+        pos = json.find(':', pos + key.size());
+        if (pos == std::string::npos) continue;
+        pos = json.find_first_not_of(" \t\r\n", pos + 1);
+        if (pos == std::string::npos || json[pos] != '{') continue;
+        size_t end = json.find('}', pos);
+        if (end == std::string::npos) continue;
+        std::string obj = json.substr(pos, end - pos);
+        size_t uid_pos = obj.find("\"uid\"");
+        size_t id_pos = obj.find("\"id\"");
+        if (uid_pos == std::string::npos || id_pos == std::string::npos) continue;
+        size_t u_open = obj.find('[', uid_pos);
+        size_t u_close = obj.find(']', u_open);
+        if (u_open == std::string::npos || u_close == std::string::npos) continue;
+
+        Uid uid{};
+        size_t cur = u_open + 1;
+        for (int k = 0; k < 7; ++k) {
+            cur = obj.find_first_of("0123456789", cur);
+            if (cur == std::string::npos || cur > u_close) break;
+            uid[k] = static_cast<u8>(std::strtoul(obj.c_str() + cur, nullptr, 10));
+            cur = obj.find_first_not_of("0123456789", cur);
+        }
+        size_t id_digits = obj.find_first_of("0123456789", obj.find(':', id_pos));
+        if (id_digits == std::string::npos) continue;
+        u32 id = static_cast<u32>(std::strtoul(obj.c_str() + id_digits, nullptr, 10));
+
+        Figure& f = g_figures[pad];
+        f.present = true;
+        f.pad = pad;
+        f.uid = uid;
+        f.id = id;
+        f.data = BuildTag(uid, id);
+        f.path.clear();
+        log::Tagged("PORTAL", "Restored legacy figure in pad %d (id %u)", pad, id);
+    }
 }
 
 } // namespace hle::toypad

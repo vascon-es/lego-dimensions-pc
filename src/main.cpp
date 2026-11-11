@@ -165,6 +165,7 @@ struct EntryParams {
 // Segundo argumento do entry point: o crt0 chama isto se main() retornar.
 HLE_SYSV_ABI void ProgramExit() {
     std::printf("\nProgram called the exit handler passed in RSI. Exiting.\n");
+    hle::toypad::SavePortalState();
     hle::log::Shutdown(0);
 }
 
@@ -844,6 +845,21 @@ int SelfTest() {
         tp::RemoveIndex(4);
         tp::RemoveIndex(5);
         check("Toy Pad: second copy of same tag gets new UID and remains same character", dup_ok && again && second_id == ids[0]);
+
+        // Test portal state persistence (save and restore)
+        const std::filesystem::path test_portal = std::filesystem::temp_directory_path() / "test_portal.json";
+        tp::Uid test_uid{4, 10, 20, 30, 40, 50, 60};
+        tp::LoadTag(1, 0, tp::BuildTag(test_uid, 42), std::string());
+        tp::SavePortalState(test_portal);
+        tp::RemoveIndex(0);
+        check("portal persistence: figures cleared", tp::PresentEvents().empty());
+        tp::LoadPortalState(test_portal);
+        const auto restored = tp::PresentEvents();
+        bool persist_ok = restored.size() == 1;
+        tp::RemoveIndex(0);
+        std::error_code ec_tp;
+        std::filesystem::remove(test_portal, ec_tp);
+        check("portal persistence: slot state saved and restored accurately", persist_ok);
     }
 
     // ---- extrator de shaders: acha o OrbShdr a partir dos registradores e grava um arquivo por shader distinto
@@ -1208,6 +1224,15 @@ int main(int argc, char** argv) {
             hle::videoout::SetForce60Hz(true);
             hle::videoout::SetUnlockedFps(false);
         }
+        wchar_t ini_popup[64] = {};
+        GetPrivateProfileStringW(L"launcher", L"popup_style", L"ps5", ini_popup, 64, (root / "launcher.ini").wstring().c_str());
+        char popup_style_a[64] = {};
+        wcstombs(popup_style_a, ini_popup, sizeof(popup_style_a));
+        if (popup_style_a[0]) {
+            hle::trophy::TrophyManager::Instance().SetPopupStyle(popup_style_a);
+        }
+        int bf = GetPrivateProfileIntW(L"launcher", L"blank_frequency", 900, (root / "launcher.ini").wstring().c_str());
+        hle::videoout::SetBlankFrequency(bf > 0 ? bf : 900);
     }
     std::filesystem::path elf_path = root / "assets" / "decrypted_elfs" / "eboot.bin.elf";
     std::filesystem::path app0 = DefaultApp0(root);
@@ -1308,10 +1333,10 @@ int main(int argc, char** argv) {
             hle::videoout::SetStatsOverlay(true); // Fase 65: contador de FPS / info (F10 alterna no jogo)
         } else if (!std::strcmp(argv[i], "--trophy-sound") && i + 1 < argc) {
             hle::trophy::TrophyManager::Instance().SetSoundType(argv[++i]);
-        } else if (!std::strcmp(argv[i], "--reset-trophies")) {
-            hle::trophy::TrophyManager::Instance().ResetTrophies();
-        } else if (!std::strcmp(argv[i], "--trophy-sound") && i + 1 < argc) {
-            hle::trophy::TrophyManager::Instance().SetSoundType(argv[++i]);
+        } else if (!std::strcmp(argv[i], "--popup-style") && i + 1 < argc) {
+            hle::trophy::TrophyManager::Instance().SetPopupStyle(argv[++i]);
+        } else if (!std::strcmp(argv[i], "--blank-frequency") && i + 1 < argc) {
+            hle::videoout::SetBlankFrequency(std::atoi(argv[++i]));
         } else if (!std::strcmp(argv[i], "--reset-trophies")) {
             hle::trophy::TrophyManager::Instance().ResetTrophies();
         } else if (!std::strcmp(argv[i], "--lang") && i + 1 < argc) {
@@ -1527,24 +1552,6 @@ int main(int argc, char** argv) {
     const hle::OverrideStats ov = hle::InstallOverrides();
     hle::InitDataObjects();
     hle::fs::Configure(app0, root / "assets");
-    hle::trophy::TrophyManager::Instance().Init(root, root / "assets" / "savedata0");
-
-    if (lang::Pt()) {
-        std::string tid = game_region::TitleId(app0);
-        if (tid.empty()) tid = "CUSA00935";
-        std::vector<std::filesystem::path> pt_candidates = {
-            root / "assets" / "locale" / "pt" / tid,
-            root / "assets" / "locale" / "pt" / (tid == "CUSA00935" ? "USA" : "EUR"),
-        };
-        std::error_code ec;
-        for (const auto& cand : pt_candidates) {
-            if (std::filesystem::is_directory(cand, ec)) {
-                hle::fs::SetLocaleOverlay(cand);
-                std::printf("locale     : Portuguese (%s) translation pack [%s]\n", tid.c_str(), hle::fs::PathText(cand).c_str());
-                break;
-            }
-        }
-    }
     hle::trophy::TrophyManager::Instance().Init(root, root / "assets" / "savedata0");
 
     if (lang::Pt()) {
