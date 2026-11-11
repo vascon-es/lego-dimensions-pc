@@ -33,6 +33,7 @@ import sys
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(HERE, '..', 'nu2_shader_extractor'))
 import nu2toc  # noqa: E402
+import nu2dat  # noqa: E402  (2.0.2: text.csv comprimido)
 
 GAME_PACK = re.compile(r'^(PATCHSTREAM|DLCSTREAM|STREAM|PATCH|GAME)\d*$', re.IGNORECASE)
 LANG = 'en'
@@ -1039,6 +1040,49 @@ def merge_text(base, extras):
     return merged, len(added)
 
 
+# 2.0.2: textos do port. Rotulo trocado -> (rotulo, plataforma) de onde vem o texto novo, nas linguas do PROPRIO text.csv do
+# jogador (o jogo ja traz as frases da versao de PC traduzidas): a entrada do jogador 2 passa a falar do F2 (o teclado vira o
+# jogador 2) e a tela de titulo passa a dizer botao / tecla.
+PORT_TEXTS = {
+    'PRESS_START_SHORT': ('PRESS_START_P2', 'ALL'),     # "Press F2 or any button to start"
+    'PRESS_START_TITLES': ('PRESS_ANY_BUTTON', 'ALL'),  # "Press any button/key"
+}
+
+
+def port_texts(base):
+    """text.csv com as linhas de PORT_TEXTS trocadas, coluna por coluna (idioma por idioma); None se nada mudou."""
+    import csv
+    import io
+    try:
+        text, encoding = base.decode('utf-8'), 'utf-8'
+    except UnicodeDecodeError:
+        text, encoding = base.decode('cp1252', errors='replace'), 'cp1252'
+    newline = '\r\n' if '\r\n' in text else '\n'
+    lines = text.split(newline)
+    wanted = {src for src in PORT_TEXTS.values()}
+    sources = {}
+    for line in lines:
+        if line.startswith('"PRESS_'):
+            row = csv_row(line)
+            if len(row) > 3 and (row[0].upper(), row[1].upper()) in wanted:
+                sources[(row[0].upper(), row[1].upper())] = row
+    changed = 0
+    for i, line in enumerate(lines):
+        if not line.startswith('"PRESS_START_'):
+            continue
+        row = csv_row(line)
+        src = sources.get(PORT_TEXTS.get(row[0].upper() if row else ''))
+        if not src or len(row) <= 3:
+            continue
+        new = row[:3] + [src[k] if k < len(src) and src[k] else row[k] for k in range(3, len(row))]
+        if new != row:
+            out = io.StringIO()
+            csv.writer(out, quoting=csv.QUOTE_ALL, lineterminator='').writerow(new)
+            lines[i] = out.getvalue()
+            changed += 1
+    return newline.join(lines).encode(encoding, errors='replace') if changed else None
+
+
 def merge_lines(base, versions):
     """Junta as mudancas de cada versao (ordem = prioridade) sobre o texto base, linha a linha. Devolve (linhas,
     conflitos): trechos que duas versoes mudam de jeitos diferentes ficam com a de maior prioridade."""
@@ -1294,6 +1338,23 @@ def prepare(root, app0, patch, mods_dir, cache, addcont, loader='anomaly'):
             wanted[('PATCH', text_name.upper())] = ((-1, 0), T('textos dos mods', 'mod texts'), text_name, merged, len(merged), False)
             say('TEXTOS ' + T('%d linha(s) nova(s) dos mods no text.csv (%s)' % (count, ', '.join(l for l, _ in texts)),
                               '%d new line(s) from the mods in text.csv (%s)' % (count, ', '.join(l for l, _ in texts))))
+    # 2.0.2: textos do port (F2 = jogador 2 no teclado), sempre, com ou sem mods
+    if 'PATCH' in tocs and text_name.upper() in tocs['PATCH'][1]:
+        current = wanted.get(('PATCH', text_name.upper()))
+        base = current[3] if current else None
+        if base is None:
+            stored = game_file(tocs, packs, text_name.upper(), raw=True)
+            if stored:
+                data, usize, packed = stored
+                try:
+                    base = nu2dat.unpack(data, usize) if packed else data
+                except Exception:
+                    base = None
+        changed = port_texts(base) if base else None
+        if changed:
+            label = current[1] if current else T('textos do port', 'port texts')
+            wanted[('PATCH', text_name.upper())] = ((-1, 0), label, text_name, changed, len(changed), False)
+            say(T('textos do port: entrada do jogador 2 com F2 e tela de titulo com tecla', 'port texts: player 2 join with F2 and title screen with key'))
     enabled_figures = set()
     if loader == 'anomaly' and os.path.isfile(FIGURES_FILE):
         # Fase 67: figura desligada no jogo (ex. Lord Vortech) cuja gravacao .bin esta na pasta de mods

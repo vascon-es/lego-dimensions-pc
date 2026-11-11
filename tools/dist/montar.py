@@ -100,6 +100,7 @@ def stage():
     copy(R('tools', 'setup', 'preparar.py'), S('tools', 'setup', 'preparar.py'))
     copy(R('tools', 'setup', 'atualizar.py'), S('tools', 'setup', 'atualizar.py'))  # Fase 61: botao Atualizar do launcher
     copy(R('tools', 'setup', 'botoes.py'), S('tools', 'setup', 'botoes.py'))  # Fase 62: icones dos botoes de outras plataformas
+    copy(R('tools', 'setup', 'teclado.py'), S('tools', 'setup', 'teclado.py'))  # 2.0.2: icones de teclado (fonte do jogo)
     copy(R('tools', 'setup', 'ld_transfer.py'), S('tools', 'setup', 'ld_transfer.py'))  # Fase 63: LD PC Transfer
     copy(R('tools', 'setup', 'mods.py'), S('tools', 'setup', 'mods.py'))  # Fase 64: carregador de mods
     copy(R('tools', 'setup', 'launcher_art.py'), S('tools', 'setup', 'launcher_art.py'))  # 1.8.7: a fonte do jogo para o launcher
@@ -142,7 +143,21 @@ def stage():
     copy(levels, S('assets', 'shaders_spv', 'pipeline_levels_base.txt'))
     copy(R('assets', 'shaders_spv', 'pair_warm.tsv'), S('assets', 'shaders_spv', 'pair_warm.tsv'))
     if os.path.isdir(R('assets', 'trophy')):
-        copy_tree(R('assets', 'trophy'), S('assets', 'trophy'))
+        # 3.0: sem o progresso de quem monta (trophies.dat e os desbloqueios que o trophy_manager grava no XML)
+        import re
+        copy_tree(R('assets', 'trophy'), S('assets', 'trophy'), skip_files=('trophies.dat',))
+        if os.path.isfile(S('assets', 'trophy', 'trophies.dat')):
+            os.remove(S('assets', 'trophy', 'trophies.dat'))
+        for root, _dirs, files in os.walk(S('assets', 'trophy')):
+            for name in files:
+                if name.lower().endswith('.xml'):
+                    path = os.path.join(root, name)
+                    with open(path, 'rb') as f:
+                        xml = f.read()
+                    clean = re.sub(rb'\s+(?:unlockstate|timestamp)="[^"]*"', b'', xml)
+                    if clean != xml:
+                        with open(path, 'wb') as f:
+                            f.write(clean)
     for d in ('shaders_aot', 'decrypted_elfs', 'dumped_shaders', 'savedata0', 'temp0', 'download0', os.path.join('shaders_spv', 'pairs')):
         keep(S('assets', d))
     keep(S('build', 'logs'))

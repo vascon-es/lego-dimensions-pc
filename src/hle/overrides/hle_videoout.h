@@ -71,7 +71,7 @@ void SetStatsOverlay(bool enabled);
 // Chamado uma vez por quadro do jogo, antes do DrawFrame: mede o tempo do quadro e, ligado, enfileira o desenho.
 void QueueStatsOverlay();
 
-// Menu de configuracoes de video dentro do jogo (F2 ou L3+R3)
+// Menu de configuracoes de video dentro do jogo (F1 ou L3+R3; 2.0.2: era F2)
 void SetWindowResolution(u32 width, u32 height);
 void ToggleVideoSettingsMenu();
 bool IsVideoSettingsMenuOpen();

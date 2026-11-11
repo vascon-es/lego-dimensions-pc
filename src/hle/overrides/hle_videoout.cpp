@@ -48,6 +48,9 @@ namespace hle::gnm {
 void WarmupStatus(char* text, size_t size); // hle_gnm.cpp
 void SetButtonIcons(const char* name); // hle_gnm.cpp
 }
+namespace hle {
+bool TogglePadKeyboardPlayer(); // hle_pad.cpp (2.0.2: F2)
+}
 
 namespace hle::videoout {
 
@@ -147,14 +150,14 @@ struct MenuItem {
     int selected = 0;
 };
 
-// F2 menu (2.0: in English, with the options the port really has; they match the launcher's)
+// F1 menu (2.0.2; was F2) (2.0: in English, with the options the port really has; they match the launcher's)
 static std::vector<MenuItem> g_menu_items = {
     {"RESOLUTION (RESTART)", {"1280X720", "1600X900", "1920X1080", "2560X1080", "2560X1440", "3440X1440", "3840X2160"}, 2},
     {"DISPLAY MODE", {"FULLSCREEN", "WINDOWED"}, 0},
     {"ANTI-ALIASING", {"OFF", "TAA X16", "FSR 3 AA", "FSR 4 AA"}, 0},
     {"FRAME RATE (RESTART)", {"30 FPS", "60 FPS", "UNLOCKED", "UNLOCKED NO VSYNC"}, 1},
     {"FPS COUNTER (F10)", {"OFF", "ON"}, 0},
-    {"CONTROLLER ICONS", {"AUTO", "PS4", "XBOX", "SWITCH"}, 0},
+    {"CONTROLLER ICONS", {"AUTO", "PS4", "XBOX", "SWITCH", "KEYBOARD"}, 0},
     {"TROPHY SOUND", {"PLAYSTATION", "XBOX", "STEAM", "OFF"}, 0},
     {"RESET TROPHIES", {"< PRESS ENTER >", "TROPHIES RESET!"}, 0},
     {"POPUP STYLE", {"PS5 (QUALIFIED)", "PS4", "XBOX", "XBOX 360", "STEAM"}, 0},
@@ -272,10 +275,10 @@ static void ApplyAndSaveVideoSettings() {
     SetStatsOverlay(g_menu_items[4].selected == 1);
 
     // Controller icons
-    static const char* const kIconsAnsi[] = {"auto", "ps4", "xboxone", "wiiu"};
-    static const wchar_t* const kIconsStr[] = {L"auto", L"ps4", L"xboxone", L"wiiu"};
+    static const char* const kIconsAnsi[] = {"auto", "ps4", "xboxone", "wiiu", "keyboard"};
+    static const wchar_t* const kIconsStr[] = {L"auto", L"ps4", L"xboxone", L"wiiu", L"keyboard"};
     const int ic = g_menu_items[5].selected;
-    if (ic >= 0 && ic < 4) {
+    if (ic >= 0 && ic < 5) {
         WriteLauncherIni(L"icones", kIconsStr[ic]);
         gnm::SetButtonIcons(kIconsAnsi[ic]);
     }
@@ -340,6 +343,7 @@ static void InitMenuDefaults() {
         g_menu_items[4].label = "CONTADOR FPS (F10)";
         g_menu_items[4].options = {"DESLIGADO", "LIGADO"};
         g_menu_items[5].label = "ICONES DE CONTROLE";
+        g_menu_items[5].options = {"AUTO", "PS4", "XBOX", "SWITCH", "TECLADO"};
         g_menu_items[6].label = "SOM DE CONQUISTA";
         g_menu_items[6].options = {"PLAYSTATION", "XBOX", "STEAM", "DESLIGADO"};
         g_menu_items[7].label = "REINICIAR CONQUISTAS";
@@ -369,6 +373,7 @@ static void InitMenuDefaults() {
         if (wcsstr(buf, L"ps4") || wcsstr(buf, L"ps3")) g_menu_items[5].selected = 1;
         else if (wcsstr(buf, L"xbox")) g_menu_items[5].selected = 2;
         else if (wcsstr(buf, L"wiiu") || wcsstr(buf, L"switch")) g_menu_items[5].selected = 3;
+        else if (wcsstr(buf, L"keyboard")) g_menu_items[5].selected = 4;
         else g_menu_items[5].selected = 0;
 
         GetPrivateProfileStringW(L"launcher", L"trophy_sound", L"playstation", buf, 64, ini.wstring().c_str());
@@ -550,8 +555,12 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
         return 0;
     }
     case WM_KEYDOWN:
-        if (wparam == VK_F2 && !(lparam & (1 << 30))) {
+        if (wparam == VK_F1 && !(lparam & (1 << 30))) { // 2.0.2: era F2 (agora o F2 e o do jogador 2, como nos jogos LEGO de PC)
             ToggleVideoSettingsMenu();
+            return 0;
+        }
+        if (wparam == VK_F2 && !(lparam & (1 << 30)) && !g_video_menu_open.load()) {
+            TogglePadKeyboardPlayer();
             return 0;
         }
         if (wparam == VK_F9 && !(lparam & (1 << 30))) {
@@ -1653,7 +1662,7 @@ void QueueStatsOverlay() {
             const std::string saved_msg = lang::Pt() ? "CONFIGURACOES SALVAS!" : "SETTINGS SAVED!";
             c.Write(saved_msg, box_x0 + (box_w - TextWidth(saved_msg, font_item)) / 2.0f, box_y1 - 42.0f * scale_ui, font_item, kBorder);
         } else {
-            const std::string footer = lang::Pt() ? "[CIMA/BAIXO] NAVEGAR  [ESQ/DIR] ALTERAR  [ENTER] SALVAR  [F2/ESC] SAIR" : "[UP/DOWN] SELECT  [LEFT/RIGHT] CHANGE  [ENTER] SAVE  [F2/ESC] CLOSE";
+            const std::string footer = lang::Pt() ? "[CIMA/BAIXO] NAVEGAR  [ESQ/DIR] ALTERAR  [ENTER] SALVAR  [F1/ESC] SAIR" : "[UP/DOWN] SELECT  [LEFT/RIGHT] CHANGE  [ENTER] SAVE  [F1/ESC] CLOSE";
             float font_foot = 1.7f * scale_ui;
             c.Write(footer, box_x0 + (box_w - TextWidth(footer, font_foot)) / 2.0f, box_y1 - 40.0f * scale_ui, font_foot, kGray);
         }

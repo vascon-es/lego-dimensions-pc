@@ -124,6 +124,7 @@ struct IconChoice {
 const IconChoice kIconChoices[] = {
     {L"auto", L"Autom\u00e1tico", L"Automatic"}, {L"ps4", L"PS4", L"PS4"}, {L"ps3", L"PS3", L"PS3"},
     {L"360", L"Xbox 360", L"Xbox 360"},             {L"xboxone", L"Xbox One", L"Xbox One"}, {L"wiiu", L"Wii U", L"Wii U"},
+    {L"keyboard", L"Teclado", L"Keyboard"}, // 2.0.2
 };
 std::wstring g_icons_value = L"auto";
 // Fase 74: bibliotecas de pipeline do Vulkan (GPL). Automatico = o port decide pelo fabricante (NVIDIA / Intel sim, AMD nao).
@@ -1298,7 +1299,8 @@ void RunGame() {
         std::ofstream(g_root / L"assets" / L"preparado.txt", std::ios::app) << "aviso_pacote=" << kPackVersion << "\n";
     }
     std::error_code icons_ec;
-    if (!fs::is_regular_file(g_root / L"assets" / L"buttons" / L"ps4_dxt5.hash", icons_ec)) {
+    if (!fs::is_regular_file(g_root / L"assets" / L"buttons" / L"ps4_dxt5.hash", icons_ec) ||
+        !fs::is_regular_file(g_root / L"assets" / L"buttons" / L"keyboard.rgba", icons_ec)) { // 2.0.2: teclas
         // Fase 62: folhas de icones dos botoes (feitas do dump; o Preparar ja faz, mas quem atualizou pelo launcher nao)
         fs::path python = g_root / L"tools" / L"python" / L"python.exe";
         std::wstring make = (fs::is_regular_file(python, icons_ec) ? Quote(python.wstring()) : L"python") + L" -I " +
@@ -2450,7 +2452,8 @@ std::vector<Row> Rows() {
                         SaveSettings();
                     }});
     rows.push_back({kTabGame, RowKind::kChoice, ui::T(L"Ícones dos botões", L"Button icons"),
-                    ui::T(L"Automático: pelo controle ligado.", L"Automatic: from the connected controller."), ui::T(CurrentIcons().pt, CurrentIcons().en),
+                    ui::T(L"Automático: pelo controle ligado ou pelo teclado, o que você usou por último.",
+                          L"Automatic: from the controller or the keyboard, whichever you used last."), ui::T(CurrentIcons().pt, CurrentIcons().en),
                     [](int step) {
                         g_icons_value = Step(kIconChoices, g_icons_value, step, [](const IconChoice& c) { return std::wstring(c.code); });
                         SaveSettings();
