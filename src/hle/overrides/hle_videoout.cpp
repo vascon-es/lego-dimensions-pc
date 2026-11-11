@@ -281,6 +281,23 @@ static void InitMenuDefaults() {
     static bool s_init = false;
     if (s_init) return;
     s_init = true;
+
+    if (lang::Pt()) {
+        g_menu_items[0].label = "RESOLUCAO (REINICIAR)";
+        g_menu_items[1].label = "MODO DE TELA";
+        g_menu_items[1].options = {"TELA CHEIA", "JANELA"};
+        g_menu_items[2].label = "ANTI-ALIASING";
+        g_menu_items[2].options = {"DESLIGADO", "TAA X16", "FSR 3 AA", "FSR 4 AA"};
+        g_menu_items[3].label = "TAXA DE QUADROS";
+        g_menu_items[3].options = {"30 FPS", "60 FPS", "ILIMITADO", "ILIMITADO SEM VSYNC"};
+        g_menu_items[4].label = "CONTADOR FPS (F10)";
+        g_menu_items[4].options = {"DESLIGADO", "LIGADO"};
+        g_menu_items[5].label = "ICONES DE CONTROLE";
+        g_menu_items[6].label = "SOM DE CONQUISTA";
+        g_menu_items[6].options = {"PLAYSTATION", "XBOX", "STEAM", "DESLIGADO"};
+        g_menu_items[7].label = "REINICIAR CONQUISTAS";
+        g_menu_items[7].options = {"< APERTE ENTER >", "CONQUISTAS REINICIADAS!"};
+    }
     wchar_t exe[MAX_PATH];
     if (GetModuleFileNameW(nullptr, exe, MAX_PATH)) {
         std::filesystem::path root = std::filesystem::path(exe).parent_path();
@@ -1072,7 +1089,7 @@ void QueueStatsOverlay() {
         
         float scale_ui = client.bottom >= 1400 ? 1.5f : (client.bottom >= 1000 ? 1.0f : 0.75f);
         float box_w = 700.0f * scale_ui;
-        float box_h = 420.0f * scale_ui;
+        float box_h = 480.0f * scale_ui;
         float box_x0 = (client.right - box_w) / 2.0f;
         float box_y0 = (client.bottom - box_h) / 2.0f;
         float box_x1 = box_x0 + box_w;
@@ -1081,7 +1098,7 @@ void QueueStatsOverlay() {
         c.Rect(box_x0 - 4.0f, box_y0 - 4.0f, box_x1 + 4.0f, box_y1 + 4.0f, kBorder);
         c.Rect(box_x0, box_y0, box_x1, box_y1, kBg);
         
-        const std::string title = "VIDEO SETTINGS";
+        const std::string title = lang::Pt() ? "CONFIGURACOES DE VIDEO" : "VIDEO SETTINGS";
         float font_title = 3.5f * scale_ui;
         c.Write(title, box_x0 + (box_w - TextWidth(title, font_title)) / 2.0f, box_y0 + 20.0f * scale_ui, font_title, kTitleYellow);
         
@@ -1107,10 +1124,10 @@ void QueueStatsOverlay() {
         c.Rect(box_x0 + 20.0f * scale_ui, box_y1 - 60.0f * scale_ui, box_x1 - 20.0f * scale_ui, box_y1 - 58.0f * scale_ui, kGray);
         if (g_save_confirm_timer > 0) {
             --g_save_confirm_timer;
-            const std::string saved_msg = "SETTINGS SAVED!";
+            const std::string saved_msg = lang::Pt() ? "CONFIGURACOES SALVAS!" : "SETTINGS SAVED!";
             c.Write(saved_msg, box_x0 + (box_w - TextWidth(saved_msg, font_item)) / 2.0f, box_y1 - 42.0f * scale_ui, font_item, kBorder);
         } else {
-            const std::string footer = "[UP/DOWN] SELECT  [LEFT/RIGHT] CHANGE  [ENTER] SAVE  [F2/ESC] CLOSE";
+            const std::string footer = lang::Pt() ? "[CIMA/BAIXO] NAVEGAR  [ESQ/DIR] ALTERAR  [ENTER] SALVAR  [F2/ESC] SAIR" : "[UP/DOWN] SELECT  [LEFT/RIGHT] CHANGE  [ENTER] SAVE  [F2/ESC] CLOSE";
             float font_foot = 1.7f * scale_ui;
             c.Write(footer, box_x0 + (box_w - TextWidth(footer, font_foot)) / 2.0f, box_y1 - 40.0f * scale_ui, font_foot, kGray);
         }

@@ -1310,10 +1310,6 @@ int main(int argc, char** argv) {
             hle::trophy::TrophyManager::Instance().SetSoundType(argv[++i]);
         } else if (!std::strcmp(argv[i], "--reset-trophies")) {
             hle::trophy::TrophyManager::Instance().ResetTrophies();
-        } else if (!std::strcmp(argv[i], "--trophy-sound") && i + 1 < argc) {
-            hle::trophy::TrophyManager::Instance().SetSoundType(argv[++i]);
-        } else if (!std::strcmp(argv[i], "--reset-trophies")) {
-            hle::trophy::TrophyManager::Instance().ResetTrophies();
         } else if (!std::strcmp(argv[i], "--lang") && i + 1 < argc) {
             // Fase 60/61: idioma dos textos do port e do jogo (pt / en / es / fr / de / it / nl / da); sem a opcao, o do Windows
             lang::SetFromCode(argv[++i]);
@@ -1527,24 +1523,6 @@ int main(int argc, char** argv) {
     const hle::OverrideStats ov = hle::InstallOverrides();
     hle::InitDataObjects();
     hle::fs::Configure(app0, root / "assets");
-    hle::trophy::TrophyManager::Instance().Init(root, root / "assets" / "savedata0");
-
-    if (lang::Pt()) {
-        std::string tid = game_region::TitleId(app0);
-        if (tid.empty()) tid = "CUSA00935";
-        std::vector<std::filesystem::path> pt_candidates = {
-            root / "assets" / "locale" / "pt" / tid,
-            root / "assets" / "locale" / "pt" / (tid == "CUSA00935" ? "USA" : "EUR"),
-        };
-        std::error_code ec;
-        for (const auto& cand : pt_candidates) {
-            if (std::filesystem::is_directory(cand, ec)) {
-                hle::fs::SetLocaleOverlay(cand);
-                std::printf("locale     : Portuguese (%s) translation pack [%s]\n", tid.c_str(), hle::fs::PathText(cand).c_str());
-                break;
-            }
-        }
-    }
     hle::trophy::TrophyManager::Instance().Init(root, root / "assets" / "savedata0");
 
     if (lang::Pt()) {

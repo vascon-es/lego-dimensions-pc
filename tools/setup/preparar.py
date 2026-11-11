@@ -124,7 +124,14 @@ def convert_eboot(app0, patch=''):
     import check_binaries
     out_dir = os.path.join(ROOT, 'assets', 'decrypted_elfs')
     os.makedirs(out_dir, exist_ok=True)
-    data = open(game_file(app0, patch, 'eboot.bin'), 'rb').read()  # so leitura (Fase 58: o da atualizacao, se separada)
+    target_elf = os.path.join(out_dir, 'eboot.bin.elf')
+    src_file = game_file(app0, patch, 'eboot.bin')
+    if not os.path.isfile(src_file):
+        fail(T('eboot.bin nao encontrado em %s' % src_file, 'eboot.bin not found at %s' % src_file))
+    try:
+        data = open(src_file, 'rb').read()
+    except Exception as err:
+        fail(T('nao foi possivel ler %s: %s' % (src_file, err), 'could not read %s: %s' % (src_file, err)))
     if data[:4] == b'\x7fELF':
         elf = data
     else:
@@ -132,8 +139,12 @@ def convert_eboot(app0, patch=''):
         if elf is None:
             fail(T('eboot.bin criptografado (SELF de varejo): use um dump descriptografado do jogo. ',
                    'encrypted eboot.bin (retail SELF): use a decrypted dump of the game. ') + '; '.join(info.notes))
-    with open(os.path.join(out_dir, 'eboot.bin.elf'), 'wb') as f:
-        f.write(elf)
+    try:
+        with open(target_elf, 'wb') as f:
+            f.write(elf)
+    except Exception as err:
+        fail(T('nao foi possivel gravar %s (feche o jogo se estiver aberto): %s' % (target_elf, err),
+               'could not write %s (close the game if running): %s' % (target_elf, err)))
     print('eboot.bin.elf: %d bytes' % len(elf), flush=True)
 
 
@@ -283,4 +294,9 @@ def main():
 
 
 if __name__ == '__main__':
-    main()
+    try:
+        main()
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        fail(f'{type(e).__name__}: {e}')

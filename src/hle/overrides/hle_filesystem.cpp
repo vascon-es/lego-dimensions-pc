@@ -59,6 +59,9 @@ std::filesystem::path FindApp0File(const std::filesystem::path& rel) {
         if (const auto p = (g_locale_overlay / rel).lexically_normal(); std::filesystem::exists(p, ec)) {
             return p;
         }
+        if (const auto p_flat = (g_locale_overlay / rel.filename()).lexically_normal(); std::filesystem::exists(p_flat, ec)) {
+            return p_flat;
+        }
     }
     for (const auto& dir : g_overlays) {
         if (const auto p = (dir / rel).lexically_normal(); std::filesystem::exists(p, ec)) {

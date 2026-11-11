@@ -27,7 +27,7 @@ public:
     void Init(const std::filesystem::path& root_path, const std::filesystem::path& saves_dir);
 
     // Called from sceNpTrophyUnlockTrophy
-    bool UnlockTrophy(int trophy_id, int* platinum_id);
+    bool UnlockTrophy(int trophy_id, int* platinum_id, bool notify = true);
 
     // Called from sceNpTrophyGetTrophyUnlockState
     void GetUnlockState(uint32_t* flags, uint32_t* count);
@@ -58,7 +58,7 @@ private:
     void SaveTrophyXml();
     void PlayTrophySound();
 
-    mutable std::mutex m_mutex;
+    mutable std::recursive_mutex m_mutex;
     std::filesystem::path m_root_path;
     std::filesystem::path m_saves_dir;
     std::filesystem::path m_xml_path;

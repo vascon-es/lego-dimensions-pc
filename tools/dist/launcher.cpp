@@ -712,12 +712,11 @@ void OnLine(const std::wstring& line) {
         MessageBoxW(g_main, line.substr(5).c_str(), L"LEGO Dimensions PC", MB_ICONERROR);
         return;
     }
-    if (line.find(L"EXTRAIDO") != std::wstring::npos || line.find(L"COMPILADO") != std::wstring::npos || line.find(L"PLANO") != std::wstring::npos ||
-        line.find(L"EXTRACTED") != std::wstring::npos || line.find(L"COMPILED") != std::wstring::npos || line.find(L"PLAN:") == 0 ||
-        line.find(L"jogo:") == 0 || line.find(L"game:") == 0 || line.find(L"DLC") != std::wstring::npos || line.find(L"AVISO") == 0 ||
-        line.find(L"WARNING") == 0 || line.find(L"eboot") == 0) {
-        AppendLog(line);
+    // Discard raw batch-by-batch progress lines so log does not flood with 176 batch entries
+    if (line.find(L"lote ") != std::wstring::npos || line.find(L"batch ") != std::wstring::npos) {
+        return;
     }
+    AppendLog(line);
 }
 
 // ---- mods (Fase 64) ----
@@ -1352,9 +1351,6 @@ void RunGame() {
                        : (L"Starting at " + g_res_value + (g_opt_fullscreen ? L" (Fullscreen)..." : L" (Windowed)...")));
     if (g_lang_value != L"auto") {
         command += L" --lang " + g_lang_value; // Fase 61: idioma do jogo (e do port)
-    }
-    if (!g_trophy_sound_value.empty()) {
-        command += L" --trophy-sound " + g_trophy_sound_value;
     }
     if (!g_trophy_sound_value.empty()) {
         command += L" --trophy-sound " + g_trophy_sound_value;
