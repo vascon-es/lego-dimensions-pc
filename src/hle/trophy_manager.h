@@ -34,6 +34,8 @@ public:
     void GetUnlockState(uint32_t* flags, uint32_t* count);
 
     bool IsUnlocked(int trophy_id) const;
+    uint64_t GetTimestamp(int trophy_id) const;
+    void GetProgress(int* unlocked, int* total, int* plat, int* gold, int* silver, int* bronze) const;
 
     void SetSoundType(const std::string& sound_name);
     std::string GetSoundType() const;

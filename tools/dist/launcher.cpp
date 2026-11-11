@@ -1580,6 +1580,19 @@ int GetUnlockedTrophiesCount() {
         for (int i = 0; i < 77; ++i) {
             if (flags[i / 32] & (1u << (i % 32))) unlocked++;
         }
+        if (unlocked > 0) return unlocked;
+    }
+    // Fallback: parse XML
+    const auto xml_path = g_root / L"assets" / L"trophy" / L"NPWR07423_00.xml";
+    std::ifstream xml(xml_path);
+    if (xml) {
+        std::string line;
+        int unlocked = 0;
+        while (std::getline(xml, line)) {
+            if (line.find("<trophy id=\"") != std::string::npos && line.find("unlockstate=\"true\"") != std::string::npos) {
+                unlocked++;
+            }
+        }
         return unlocked;
     }
     return 0;
@@ -1741,6 +1754,24 @@ void OpenTrophiesDialog() {
             dat.read(reinterpret_cast<char*>(&c), 4);
             dat.read(reinterpret_cast<char*>(flags), 16);
             break;
+        }
+    }
+    if (flags[0] == 0 && flags[1] == 0 && flags[2] == 0 && flags[3] == 0) {
+        // Fallback: parse XML
+        const auto xml_path = g_root / L"assets" / L"trophy" / L"NPWR07423_00.xml";
+        std::ifstream xml(xml_path);
+        if (xml) {
+            std::string line;
+            while (std::getline(xml, line)) {
+                auto pos = line.find("<trophy id=\"");
+                if (pos != std::string::npos && line.find("unlockstate=\"true\"") != std::string::npos) {
+                    pos += 12;
+                    int id = std::atoi(line.c_str() + pos);
+                    if (id >= 0 && id < 128) {
+                        flags[id / 32] |= (1u << (id % 32));
+                    }
+                }
+            }
         }
     }
 

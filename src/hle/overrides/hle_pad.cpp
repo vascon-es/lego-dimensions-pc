@@ -676,6 +676,23 @@ HLE_IMPL(int, scePadReadState, int handle, PadData* data, u64 guest_rbp) {
         in.ry = 128;
     }
 
+    // Menu de Conquistas (RB + LB + RT no controle: kR1 | kL1 | kR2)
+    static bool s_achievements_combo_held = false;
+    const bool achievements_combo_now = ((in.buttons & (kL1 | kR1 | kR2)) == (kL1 | kR1 | kR2));
+    if (achievements_combo_now && !s_achievements_combo_held) {
+        videoout::ToggleAchievementsMenu();
+    }
+    s_achievements_combo_held = achievements_combo_now;
+
+    if (videoout::IsAchievementsMenuOpen()) {
+        videoout::HandleAchievementsMenuController(in.buttons);
+        in.buttons = 0;
+        in.lx = 128;
+        in.ly = 128;
+        in.rx = 128;
+        in.ry = 128;
+    }
+
     std::memset(data, 0, sizeof(*data));
     data->buttons = in.buttons;
     data->left_x = in.lx;

@@ -165,6 +165,7 @@ struct EntryParams {
 // Segundo argumento do entry point: o crt0 chama isto se main() retornar.
 HLE_SYSV_ABI void ProgramExit() {
     std::printf("\nProgram called the exit handler passed in RSI. Exiting.\n");
+    hle::toypad::SavePortalState();
     hle::log::Shutdown(0);
 }
 
@@ -844,6 +845,21 @@ int SelfTest() {
         tp::RemoveIndex(4);
         tp::RemoveIndex(5);
         check("Toy Pad: second copy of same tag gets new UID and remains same character", dup_ok && again && second_id == ids[0]);
+
+        // Test portal state persistence (save and restore)
+        const std::filesystem::path test_portal = root / "build" / "test_portal.json";
+        tp::Uid test_uid{4, 10, 20, 30, 40, 50, 60};
+        tp::LoadTag(1, 0, tp::BuildTag(test_uid, 42), std::string());
+        tp::SavePortalState(test_portal);
+        tp::RemoveIndex(0);
+        check("portal persistence: figures cleared", tp::PresentEvents().empty());
+        tp::LoadPortalState(test_portal);
+        const auto restored = tp::PresentEvents();
+        bool persist_ok = restored.size() == 1;
+        tp::RemoveIndex(0);
+        std::error_code ec_tp;
+        std::filesystem::remove(test_portal, ec_tp);
+        check("portal persistence: slot state saved and restored accurately", persist_ok);
     }
 
     // ---- extrator de shaders: acha o OrbShdr a partir dos registradores e grava um arquivo por shader distinto

@@ -465,28 +465,14 @@ void PortalWatcher() {
             g_seen_session = session;
             g_was_ready = false;
         }
-        if (g_external_control) {
-            if (!g_external_applied) { // (as figuras do portal.json ja sairam em TakeToypadExternalControl)
-                g_external_applied = true;
-                for (int pad = 1; pad <= toypad::kPadCount; ++pad) {
-                    g_applied[pad - 1] = {};
-                }
-            }
-            if (!g_was_ready) { // sessao nova: reanuncia as figuras que o app deixou no portal
-                g_was_ready = true;
-                for (const toypad::Packet& event : toypad::PresentEvents()) {
-                    InjectPacket(event);
-                }
-            }
-            continue;
-        }
         if (!g_was_ready) {
-            // Sessao nova (primeira, ou depois de um WAKE): o jogo nao sabe de figura nenhuma.
             g_was_ready = true;
-            for (int pad = 1; pad <= toypad::kPadCount; ++pad) {
-                toypad::RemoveFigure(pad);
-                g_applied[pad - 1] = {};
+            for (const toypad::Packet& event : toypad::PresentEvents()) {
+                InjectPacket(event);
             }
+        }
+        if (g_external_control) {
+            continue;
         }
         std::ifstream in(g_portal_file, std::ios::binary);
         if (!in) {
@@ -526,15 +512,7 @@ void InjectToypadPacket(const toypad::Packet& packet) {
 
 void TakeToypadExternalControl() {
     if (!g_external_control.exchange(true)) {
-        log::Tagged("PORTAL", "LegoToypad app took over portal: portal.json no longer applies to this run");
-        // As figuras do portal.json saem JA, antes de o pedido do app ser atendido: elas usam os
-        // indices 1..3, os mesmos que o app pode escolher.
-        const bool ready = toypad::SessionReady();
-        for (int pad = 1; pad <= toypad::kPadCount; ++pad) {
-            if (const auto event = toypad::RemoveFigure(pad); event && ready) {
-                InjectPacket(*event);
-            }
-        }
+        log::Tagged("PORTAL", "LegoToypad app active on portal");
     }
 }
 
@@ -576,11 +554,18 @@ bool ParsePortalJson(const std::string& json, int pad, std::array<u8, 7>* uid, u
 // Liga a vigia de `portal_file` (criado com as tres zonas vazias se nao existir).
 void StartPortalWatcher(const std::filesystem::path& portal_file) {
     g_portal_file = portal_file;
+    toypad::SetPortalFilePath(portal_file);
     std::error_code ec;
     if (!std::filesystem::exists(portal_file, ec)) {
         std::ofstream out(portal_file);
         // Trio inicial do jogo: Batman no centro, Gandalf a esquerda, Megaestilo a direita.
         out << "{\"pad1\": {\"uid\": [4,163,55,18,34,55,66], \"id\": 1},\n"
+               " \"pad2\": {\"uid\": [4,81,112,26,91,64,129], \"id\": 2},\n"
+               " \"pad3\": {\"uid\": [4,202,17,74,153,54,128], \"id\": 3}}\n";
+    }
+    toypad::LoadPortalState(portal_file);
+    std::thread(PortalWatcher).detach();
+},\n"
                " \"pad2\": {\"uid\": [4,81,112,26,91,64,129], \"id\": 2},\n"
                " \"pad3\": {\"uid\": [4,202,17,74,153,54,128], \"id\": 3}}\n";
     }

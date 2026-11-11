@@ -56,6 +56,34 @@ bool TrophyManager::IsUnlocked(int trophy_id) const {
     return (m_flags[word] & (1u << bit)) != 0;
 }
 
+uint64_t TrophyManager::GetTimestamp(int trophy_id) const {
+    std::lock_guard lock(m_mutex);
+    if (trophy_id < 0 || trophy_id >= 128) return 0;
+    return m_timestamps[trophy_id];
+}
+
+void TrophyManager::GetProgress(int* unlocked, int* total, int* plat, int* gold, int* silver, int* bronze) const {
+    std::lock_guard lock(m_mutex);
+    size_t count = 0;
+    const TrophyDef* defs = GetTrophyDefs(&count);
+    int u = 0, p = 0, g = 0, s = 0, b = 0;
+    for (size_t i = 0; i < count; ++i) {
+        if (IsUnlocked(defs[i].id)) {
+            ++u;
+            if (defs[i].type == 'P') ++p;
+            else if (defs[i].type == 'G') ++g;
+            else if (defs[i].type == 'S') ++s;
+            else if (defs[i].type == 'B') ++b;
+        }
+    }
+    if (unlocked) *unlocked = u;
+    if (total) *total = static_cast<int>(count);
+    if (plat) *plat = p;
+    if (gold) *gold = g;
+    if (silver) *silver = s;
+    if (bronze) *bronze = b;
+}
+
 void TrophyManager::GetUnlockState(uint32_t* flags, uint32_t* count) {
     std::lock_guard lock(m_mutex);
     if (!flags || !count) return;
@@ -274,6 +302,32 @@ void TrophyManager::LoadTrophyXml() {
         }
     }
     log::Tagged("TROPHY", "Loaded trophy XML: %s", m_xml_path.string().c_str());
+
+    bool has_any_flag = false;
+    for (int i = 0; i < 4; ++i) {
+        if (m_flags[i]) has_any_flag = true;
+    }
+    if (!has_any_flag) {
+        const std::filesystem::path dat_paths[] = {
+            m_root_path / "assets" / "trophy" / "trophies.dat",
+            m_saves_dir / "trophies.dat",
+            m_root_path / "assets" / "savedata0" / "trophies.dat"
+        };
+        for (const auto& p : dat_paths) {
+            std::ifstream dat(p, std::ios::binary);
+            if (!dat) continue;
+            char magic[4] = {};
+            dat.read(magic, 4);
+            if (std::memcmp(magic, "LDT1", 4) == 0) {
+                uint32_t c = 0;
+                dat.read(reinterpret_cast<char*>(&c), 4);
+                dat.read(reinterpret_cast<char*>(m_flags), sizeof(m_flags));
+                dat.read(reinterpret_cast<char*>(m_timestamps), sizeof(m_timestamps));
+                log::Tagged("TROPHY", "Loaded trophies.dat from %s (%u unlocked)", p.string().c_str(), c);
+                break;
+            }
+        }
+    }
 }
 
 void TrophyManager::SaveTrophyXml() {
@@ -307,24 +361,61 @@ void TrophyManager::SaveTrophyXml() {
         out << " />\n";
     }
     out << "</trophyconf>\n";
+
+    // Write binary trophies.dat
+    uint32_t total_unlocked = 0;
+    for (int i = 0; i < 4; ++i) {
+        uint32_t w = m_flags[i];
+        while (w) {
+            total_unlocked += (w & 1);
+            w >>= 1;
+        }
+    }
+
+    const std::filesystem::path dat_paths[] = {
+        m_root_path / "assets" / "trophy" / "trophies.dat",
+        m_saves_dir / "trophies.dat",
+        m_root_path / "assets" / "savedata0" / "trophies.dat"
+    };
+
+    for (const auto& p : dat_paths) {
+        std::error_code ec;
+        std::filesystem::create_directories(p.parent_path(), ec);
+        std::ofstream dat(p, std::ios::binary | std::ios::trunc);
+        if (dat) {
+            dat.write("LDT1", 4);
+            dat.write(reinterpret_cast<const char*>(&total_unlocked), 4);
+            dat.write(reinterpret_cast<const char*>(m_flags), sizeof(m_flags));
+            dat.write(reinterpret_cast<const char*>(m_timestamps), sizeof(m_timestamps));
+        }
+    }
 }
 
 void TrophyManager::CheckRetroactiveSaves() {
-    auto marker = m_root_path / "assets" / "trophy" / ".retro_done";
+    log::Tagged("TROPHY", "Scanning save files for retroactive milestone progress...");
+
     std::error_code ec;
-    if (std::filesystem::exists(marker, ec)) {
-        return; // Already checked previously
-    }
-
-    log::Tagged("TROPHY", "Running first-time retroactive save milestone check...");
-
-    // Determine save path
     std::vector<std::filesystem::path> check_dirs = {
         m_saves_dir / "Slot00",
         m_root_path / "assets" / "savedata0" / "Slot00",
         m_saves_dir / "Slot01",
+        m_root_path / "assets" / "savedata0" / "Slot01",
         m_saves_dir / "Slot02",
+        m_root_path / "assets" / "savedata0" / "Slot02",
+        m_saves_dir / "Slot03",
+        m_root_path / "assets" / "savedata0" / "Slot03",
     };
+
+    // Dynamically discover all slot folders
+    for (const auto& base : {m_saves_dir, m_root_path / "assets" / "savedata0"}) {
+        if (std::filesystem::exists(base, ec)) {
+            for (const auto& entry : std::filesystem::directory_iterator(base, ec)) {
+                if (entry.is_directory(ec)) {
+                    check_dirs.push_back(entry.path());
+                }
+            }
+        }
+    }
 
     bool has_save = false;
     int unlocked_count = 0;
@@ -358,7 +449,6 @@ void TrophyManager::CheckRetroactiveSaves() {
                                 uint32_t val = 0;
                                 std::memcpy(&val, data.data() + pos + 8 + k * 4, 4);
                                 if (val >= 1 && val <= 77) {
-                                    // Milestone matches trophy ID
                                     int plat = -1;
                                     if (UnlockTrophy(static_cast<int>(val), &plat, false)) {
                                         ++unlocked_count;
@@ -377,22 +467,23 @@ void TrophyManager::CheckRetroactiveSaves() {
     }
 
     if (has_save) {
-        // Level 1, LEGO Gateway, Hub world are guaranteed completed with any valid save
+        // Base milestones guaranteed by any saved game progress
         int plat = -1;
         if (UnlockTrophy(1, &plat, false)) ++unlocked_count;
         if (UnlockTrophy(15, &plat, false)) ++unlocked_count;
         if (UnlockTrophy(21, &plat, false)) ++unlocked_count;
     }
 
+    // Always ensure trophies.dat and XML are up to date with found achievements
+    SaveTrophyXml();
+
+    // Clean up any stale marker so future checks won't be suppressed
+    auto marker = m_root_path / "assets" / "trophy" / ".retro_done";
+    std::filesystem::remove(marker, ec);
+
     if (unlocked_count > 0) {
-        SaveTrophyXml();
         log::Tagged("TROPHY", "Retroactive save check unlocked %d trophies.", unlocked_count);
     }
-
-    // Write marker so we don't repeat the retroactive check on every single launch
-    std::ofstream mark_file(marker);
-    mark_file << "1";
-    m_retroactive_done = true;
 }
 
 } // namespace hle::trophy
