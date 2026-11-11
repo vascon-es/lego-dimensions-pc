@@ -35,6 +35,7 @@
 #include "patcher/fs_tls_patcher.h"
 #include "runtime/lang.h"
 #include "hle/trophy_manager.h"
+#include "hle/trophy_popup.h"
 #include "runtime/crash_handler.h"
 #include "runtime/orbis_tls.h"
 
@@ -1236,6 +1237,7 @@ int main(int argc, char** argv) {
     }
     std::filesystem::path elf_path = root / "assets" / "decrypted_elfs" / "eboot.bin.elf";
     std::filesystem::path app0 = DefaultApp0(root);
+    std::filesystem::path popup_test; // 3.0: --popup-test
     std::filesystem::path app0_patch; // Fase 58
     std::filesystem::path mods_cache = root / "assets" / "mods_cache"; // Fase 64: mods preparados pelo mods.py ("-" = --no-mods)
     bool live_compiler = true;
@@ -1335,6 +1337,8 @@ int main(int argc, char** argv) {
             hle::trophy::TrophyManager::Instance().SetSoundType(argv[++i]);
         } else if (!std::strcmp(argv[i], "--popup-style") && i + 1 < argc) {
             hle::trophy::TrophyManager::Instance().SetPopupStyle(argv[++i]);
+        } else if (!std::strcmp(argv[i], "--popup-test") && i + 1 < argc) {
+            popup_test = WideArg(i + 1, argv[i + 1]), ++i; // 3.0: desenha os pop-ups de conquista em arquivos e sai
         } else if (!std::strcmp(argv[i], "--blank-frequency") && i + 1 < argc) {
             hle::videoout::SetBlankFrequency(std::atoi(argv[++i]));
         } else if (!std::strcmp(argv[i], "--reset-trophies")) {
@@ -1557,6 +1561,38 @@ int main(int argc, char** argv) {
     hle::InitDataObjects();
     hle::fs::Configure(app0, root / "assets");
     hle::trophy::TrophyManager::Instance().Init(root, root / "assets" / "savedata0");
+    if (!popup_test.empty()) { // 3.0: cada estilo em <pasta>\<estilo>.rgba ("w h" + RGBA) e as posicoes da animacao em .txt
+        std::filesystem::create_directories(popup_test);
+        for (const char* style : hle::trophy_popup::kStyleKeys) {
+            for (const int scale10 : {10, 20}) {
+                hle::trophy_popup::Image image;
+                const hle::trophy_popup::Request request{style, 16, 'G', "Simply Walked Into... Metropolis", "Complete 'Painting the Town Black'",
+                                                         lang::Pt(), scale10 / 10.0f};
+                if (!hle::trophy_popup::Render(request, &image)) {
+                    std::printf("popup-test: %s failed\n", style);
+                    continue;
+                }
+                const std::string name = std::string(style) + (scale10 == 20 ? "_4k" : "");
+                std::ofstream raw(popup_test / (name + ".rgba"), std::ios::binary);
+                raw << image.w << ' ' << image.h << '\n';
+                raw.write(reinterpret_cast<const char*>(image.rgba.data()), static_cast<std::streamsize>(image.rgba.size() * 4));
+                std::ofstream layout(popup_test / (name + ".txt"));
+                const float cw = scale10 == 20 ? 3840.0f : 1920.0f, ch = scale10 == 20 ? 2160.0f : 1080.0f;
+                for (const float t : {0.05f, 0.12f, 0.2f, 0.3f, 0.45f, 1.0f, 5.2f, 5.42f}) {
+                    std::vector<hle::trophy_popup::Quad> quads;
+                    hle::trophy_popup::Layout(style, image, cw, ch, scale10 / 10.0f, t, 5.5f - t, &quads);
+                    layout << "t " << t << '\n';
+                    for (const auto& q : quads) {
+                        layout << q.x0 << ' ' << q.y0 << ' ' << q.x1 << ' ' << q.y1 << ' ' << q.u0 << ' ' << q.v0 << ' ' << q.u1 << ' '
+                               << q.v1 << ' ' << q.alpha << '\n';
+                    }
+                }
+            }
+        }
+        std::printf("popup-test: written to %s\n", popup_test.string().c_str());
+        std::fflush(stdout);
+        ExitProcess(0); // sem destrutores estaticos (GDI+, threads do HLE)
+    }
 
     if (lang::Pt()) {
         std::string tid = game_region::TitleId(app0);

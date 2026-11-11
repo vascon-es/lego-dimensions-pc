@@ -87,6 +87,7 @@ add_executable(lego_dimensions
     src/hle/overrides/hle_savedata.cpp
     src/hle/overrides/hle_offline.cpp
     src/hle/trophy_manager.cpp
+    src/hle/trophy_popup.cpp
     src/hle/overrides/hle_avplayer.cpp
     src/render/vulkan_backend.cpp
     ${HLE_GENERATED_SOURCES}

@@ -1,5 +1,7 @@
 #include "trophy_manager.h"
 #include "trophy_sounds.h"
+#include "trophy_trp.h"
+#include "hle/overrides/hle_filesystem.h"
 #include "runtime/lang.h"
 #include "hle_log.h"
 
@@ -10,6 +12,9 @@
 #include <chrono>
 #include <cstring>
 #include <algorithm>
+#include <cmath>
+#include <thread>
+#include <atomic>
 
 namespace hle::trophy {
 
@@ -34,6 +39,13 @@ void TrophyManager::Init(const std::filesystem::path& root_path, const std::file
 
         m_initialized = true;
         LoadTrophyXml();
+        // 3.0: os icones vem do trophy00.trp do jogo do jogador (atualizacao primeiro: traz os das DLCs)
+        const auto icons = dir / "NPWR07423_00" / "Icons";
+        if (trophy_trp::EnsureIcons(icons, {hle::fs::App0Patch(), hle::fs::App0()})) {
+            log::Tagged("TROPHY", "trophy icons ready in %s", icons.string().c_str());
+        } else {
+            log::Tagged("TROPHY", "trophy icons not found (no sce_sys\\trophy\\trophy00.trp in the game folder)");
+        }
     }
     CheckRetroactiveSaves();
 }
@@ -160,27 +172,99 @@ void TrophyManager::QueueToast(int trophy_id) {
     m_toast_queue.push_back(trophy_id);
 }
 
+namespace {
+
+// 3.0: sino curto feito aqui mesmo (nao e o som de console nenhum), para os estilos sem som embutido (Wii U, Switch).
+// notas: (frequencia, inicio em s); cada uma decai sozinha.
+std::vector<unsigned char> Chime(std::initializer_list<std::pair<float, float>> notes, float seconds, float decay) {
+    constexpr int kRate = 44100;
+    const int frames = static_cast<int>(seconds * kRate);
+    std::vector<float> mix(frames, 0.0f);
+    for (const auto& [freq, start] : notes) {
+        for (int i = static_cast<int>(start * kRate); i < frames; ++i) {
+            const float t = static_cast<float>(i) / kRate - start;
+            const float env = std::exp(-t * decay) * std::min(1.0f, t * 400.0f);
+            mix[i] += env * (std::sin(6.2831853f * freq * t) + 0.25f * std::sin(6.2831853f * 2.0f * freq * t));
+        }
+    }
+    std::vector<unsigned char> wav(44 + frames * 2);
+    auto put32 = [&](size_t at, uint32_t v) { std::memcpy(&wav[at], &v, 4); };
+    auto put16 = [&](size_t at, uint16_t v) { std::memcpy(&wav[at], &v, 2); };
+    std::memcpy(&wav[0], "RIFF", 4), put32(4, static_cast<uint32_t>(36 + frames * 2)), std::memcpy(&wav[8], "WAVEfmt ", 8);
+    put32(16, 16), put16(20, 1), put16(22, 1), put32(24, kRate), put32(28, kRate * 2), put16(32, 2), put16(34, 16);
+    std::memcpy(&wav[36], "data", 4), put32(40, static_cast<uint32_t>(frames * 2));
+    for (int i = 0; i < frames; ++i) {
+        const float v = std::clamp(mix[i] * 0.28f, -1.0f, 1.0f);
+        put16(44 + i * 2, static_cast<uint16_t>(static_cast<int16_t>(v * 32767.0f)));
+    }
+    return wav;
+}
+
+// mp3 (ou wav) por MCI numa thread propria: abre, toca ate o fim e fecha
+void PlayMci(const std::filesystem::path& path) {
+    static std::atomic<int> s_counter{0};
+    const std::wstring alias = L"ld_trophy_" + std::to_wstring(++s_counter);
+    std::thread([path, alias] {
+        const std::wstring open = L"open \"" + path.wstring() + L"\" type mpegvideo alias " + alias;
+        if (mciSendStringW(open.c_str(), nullptr, 0, nullptr) == 0) {
+            mciSendStringW((L"play " + alias + L" wait").c_str(), nullptr, 0, nullptr);
+            mciSendStringW((L"close " + alias).c_str(), nullptr, 0, nullptr);
+        }
+    }).detach();
+}
+
+} // namespace
+
+void TrophyManager::PlayPreviewSound() {
+    PlayTrophySound();
+}
+
 void TrophyManager::PlayTrophySound() {
-    if (m_sound_type == "off" || m_sound_type == "desligado" || m_sound_type == "none") {
+    std::string choice, style;
+    {
+        std::lock_guard lock(m_mutex);
+        choice = m_sound_type, style = m_popup_style;
+    }
+    if (choice == "off" || choice == "desligado" || choice == "none") {
         return;
     }
+    // 3.0: "auto" = o som do console do pop-up; PlayStation / Xbox / Steam forcam a familia
+    std::string key = style;
+    if (choice == "playstation" && style.rfind("ps", 0) != 0) key = "ps5";
+    if (choice == "xbox" && style.rfind("xbox", 0) != 0) key = "xbox";
+    if (choice == "steam") key = "steam";
+    const std::string file = key == "xbox" ? "xboxone" : key;
 
-    // Check custom sound file first
-    auto custom_wav = m_root_path / "assets" / "custom_trophy" / "trophy.wav";
+    // 1) o som que o jogador colocou: assets\trophy\sounds\<estilo>.wav / .mp3
     std::error_code ec;
-    if (std::filesystem::exists(custom_wav, ec)) {
-        PlaySoundW(custom_wav.c_str(), nullptr, SND_FILENAME | SND_ASYNC | SND_NODEFAULT);
+    const auto sounds = m_root_path / "assets" / "trophy" / "sounds";
+    if (const auto wav = sounds / (file + ".wav"); std::filesystem::exists(wav, ec)) {
+        PlaySoundW(wav.c_str(), nullptr, SND_FILENAME | SND_ASYNC | SND_NODEFAULT);
         return;
     }
-
-    if (m_sound_type == "xbox") {
-        PlaySoundW(reinterpret_cast<LPCWSTR>(kTrophySoundXbox), nullptr, SND_MEMORY | SND_ASYNC | SND_NODEFAULT);
-    } else if (m_sound_type == "steam") {
-        PlaySoundW(reinterpret_cast<LPCWSTR>(kTrophySoundSteam), nullptr, SND_MEMORY | SND_ASYNC | SND_NODEFAULT);
-    } else {
-        // Default: PlayStation
-        PlaySoundW(reinterpret_cast<LPCWSTR>(kTrophySoundPlaystation), nullptr, SND_MEMORY | SND_ASYNC | SND_NODEFAULT);
+    if (const auto mp3 = sounds / (file + ".mp3"); std::filesystem::exists(mp3, ec)) {
+        PlayMci(mp3);
+        return;
     }
+    // 2) o som personalizado antigo (um para todos)
+    if (const auto custom = m_root_path / "assets" / "custom_trophy" / "trophy.wav"; std::filesystem::exists(custom, ec)) {
+        PlaySoundW(custom.c_str(), nullptr, SND_FILENAME | SND_ASYNC | SND_NODEFAULT);
+        return;
+    }
+    // 3) os sons que ja vem no port
+    const void* sound = kTrophySoundPlaystation;
+    if (key.rfind("xbox", 0) == 0) {
+        sound = kTrophySoundXbox;
+    } else if (key == "steam") {
+        sound = kTrophySoundSteam;
+    } else if (key == "wiiu") {
+        static const auto s_wiiu = Chime({{1046.5f, 0.0f}, {1318.5f, 0.09f}, {1568.0f, 0.18f}, {2093.0f, 0.27f}}, 1.1f, 5.0f);
+        sound = s_wiiu.data();
+    } else if (key == "switch") {
+        static const auto s_switch = Chime({{1318.5f, 0.0f}, {1975.5f, 0.075f}}, 0.55f, 9.0f);
+        sound = s_switch.data();
+    }
+    PlaySoundW(reinterpret_cast<LPCWSTR>(sound), nullptr, SND_MEMORY | SND_ASYNC | SND_NODEFAULT);
 }
 
 void TrophyManager::SetSoundType(const std::string& sound_name) {
@@ -195,10 +279,11 @@ std::string TrophyManager::GetSoundType() const {
 
 void TrophyManager::CycleSoundType() {
     std::lock_guard lock(m_mutex);
-    if (m_sound_type == "playstation") m_sound_type = "xbox";
+    if (m_sound_type == "auto") m_sound_type = "playstation";
+    else if (m_sound_type == "playstation") m_sound_type = "xbox";
     else if (m_sound_type == "xbox") m_sound_type = "steam";
     else if (m_sound_type == "steam") m_sound_type = "off";
-    else m_sound_type = "playstation";
+    else m_sound_type = "auto";
 }
 
 void TrophyManager::SetPopupStyle(const std::string& style) {
@@ -213,11 +298,10 @@ std::string TrophyManager::GetPopupStyle() const {
 
 void TrophyManager::CyclePopupStyle() {
     std::lock_guard lock(m_mutex);
-    if (m_popup_style == "ps5") m_popup_style = "ps4";
-    else if (m_popup_style == "ps4") m_popup_style = "xbox";
-    else if (m_popup_style == "xbox") m_popup_style = "xbox360";
-    else if (m_popup_style == "xbox360") m_popup_style = "steam";
-    else m_popup_style = "ps5";
+    static const char* const kOrder[] = {"ps5", "ps4", "ps3", "xbox", "xbox360", "wiiu", "steam", "switch"}; // trophy_popup
+    size_t i = 0;
+    while (i < 8 && m_popup_style != kOrder[i]) ++i;
+    m_popup_style = kOrder[(i + 1) % 8];
 }
 
 void TrophyManager::Update(float delta_sec) {

@@ -13,6 +13,7 @@
 #include "ui.h"
 #include "../../src/common/game_region.h"
 #include "../../src/hle/trophy_defs.h"
+#include "../../src/hle/trophy_trp.h" // 3.0: icones das conquistas do jogo do jogador
 
 #include <shellapi.h>
 #include <uxtheme.h>
@@ -1814,7 +1815,14 @@ LRESULT CALLBACK TrophiesProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     return DefWindowProcW(hwnd, msg, wp, lp);
 }
 
+// 3.0: os icones das conquistas saem do trophy00.trp do jogo do jogador (nao vem no download)
+void EnsureTrophyIcons() {
+    trophy_trp::EnsureIcons(g_root / L"assets" / L"trophy" / L"NPWR07423_00" / L"Icons",
+                            {fs::path(g_patch_dir), fs::path(g_game_dir)});
+}
+
 void OpenTrophiesDialog() {
+    EnsureTrophyIcons();
     if (g_trophies_window) {
         SetForegroundWindow(g_trophies_window);
         return;
@@ -2479,27 +2487,33 @@ std::vector<Row> Rows() {
                           L"Total achievements unlocked in current save. Enter: view list."),
                     progress_str, [](int) { OpenTrophiesDialog(); }});
 
-    static const wchar_t* const kPopupStyles[] = {L"ps5", L"ps4", L"xbox", L"xbox360", L"steam"};
+    // 3.0: os mesmos estilos de hle/trophy_popup (kStyleKeys)
+    static const wchar_t* const kPopupStyles[] = {L"ps5", L"ps4", L"ps3", L"xbox", L"xbox360", L"wiiu", L"steam", L"switch"};
     rows.push_back({kTabTrophies, RowKind::kChoice, ui::T(L"Estilo do pop-up", L"Pop-up style"),
-                    ui::T(L"Visual do alerta (PS5 qualificado por grau, PS4, Xbox Series, Xbox 360, Steam).",
-                          L"Alert style (PS5 qualified by tier, PS4, Xbox Series, Xbox 360, Steam)."),
+                    ui::T(L"O aviso de conquista no visual de cada console (o menu F1 do jogo mostra uma prévia).",
+                          L"The achievement alert in the look of each console (the in-game F1 menu shows a preview)."),
                     g_popup_style_value == L"ps4"     ? std::wstring(L"PlayStation 4") :
-                    g_popup_style_value == L"xbox"    ? std::wstring(L"Xbox One / Series") :
+                    g_popup_style_value == L"ps3"     ? std::wstring(L"PlayStation 3") :
+                    g_popup_style_value == L"xbox"    ? std::wstring(L"Xbox One") :
                     g_popup_style_value == L"xbox360" ? std::wstring(L"Xbox 360") :
+                    g_popup_style_value == L"wiiu"    ? std::wstring(L"Wii U") :
                     g_popup_style_value == L"steam"   ? std::wstring(L"Steam") :
-                    ui::T(L"PlayStation 5 (Qualificado)", L"PlayStation 5 (Qualified)"),
+                    g_popup_style_value == L"switch"  ? std::wstring(L"Nintendo Switch") :
+                    std::wstring(L"PlayStation 5"),
                     [](int step) {
                         g_popup_style_value = Step(kPopupStyles, g_popup_style_value, step, [](const wchar_t* s) { return std::wstring(s); });
                         SaveSettings();
                     }});
 
-    static const wchar_t* const kTrophySounds[] = {L"playstation", L"xbox", L"steam", L"desligado"};
+    static const wchar_t* const kTrophySounds[] = {L"auto", L"playstation", L"xbox", L"steam", L"desligado"};
     rows.push_back({kTabTrophies, RowKind::kChoice, ui::T(L"Som de conquista", L"Trophy sound"),
-                    ui::T(L"Efeito sonoro ao desbloquear conquistas (PlayStation, Xbox, Steam).",
-                          L"Sound effect when unlocking achievements (PlayStation, Xbox, Steam)."),
+                    ui::T(L"Automático: o som do console do pop-up. Sons próprios: assets\\trophy\\sounds (veja o LEIA-ME de lá).",
+                          L"Automatic: the sound of the pop-up's console. Your own sounds: assets\\trophy\\sounds (see the README there)."),
+                    g_trophy_sound_value == L"playstation" ? std::wstring(L"PlayStation") :
                     g_trophy_sound_value == L"xbox" ? std::wstring(L"Xbox") :
                     g_trophy_sound_value == L"steam" ? std::wstring(L"Steam") :
-                    (g_trophy_sound_value == L"desligado" || g_trophy_sound_value == L"off") ? ui::T(L"Desligado", L"Off") : std::wstring(L"PlayStation"),
+                    (g_trophy_sound_value == L"desligado" || g_trophy_sound_value == L"off") ? ui::T(L"Desligado", L"Off") :
+                    ui::T(L"Automático", L"Automatic"),
                     [](int step) {
                         g_trophy_sound_value = Step(kTrophySounds, g_trophy_sound_value, step, [](const wchar_t* s) { return std::wstring(s); });
                         SaveSettings();
@@ -3190,7 +3204,12 @@ void LoadSettings() {
     g_opt_overlay = ReadIni(L"contador", L"0") == L"1"; // Fase 65
     g_opt_toypad = ReadIni(L"toypad_auto", L"0") == L"1";
     g_saves_value = ReadIni(L"saves", L"savedata0");
-    g_trophy_sound_value = ReadIni(L"trophy_sound", L"playstation");
+    g_trophy_sound_value = ReadIni(L"trophy_sound", L"auto");
+    if (ReadIni(L"som_v3", L"").empty()) { // 3.0: o "playstation" gravado antes era so o padrao; passa a seguir o estilo
+        if (g_trophy_sound_value == L"playstation") g_trophy_sound_value = L"auto";
+        WriteIni(L"som_v3", L"1");
+        WriteIni(L"trophy_sound", g_trophy_sound_value);
+    }
     g_popup_style_value = ReadIni(L"popup_style", L"ps5");
     g_blank_frequency_value = ReadIni(L"blank_frequency", L"900");
     if (const auto folders = SaveFolders(); std::find(folders.begin(), folders.end(), g_saves_value) == folders.end()) {
@@ -3644,6 +3663,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show) {
         const int result=Screenshots(screenshots);DestroyWindow(g_main);CoUninitialize();return result;
     }
     LoadSettings();
+    EnsureTrophyIcons(); // 3.0
     ShowWindow(g_main, show);
     if (const std::wstring custom_repo = ReadIni(L"repo", L""); !custom_repo.empty()) {
         SetEnvironmentVariableW(L"LD_REPO", custom_repo.c_str());

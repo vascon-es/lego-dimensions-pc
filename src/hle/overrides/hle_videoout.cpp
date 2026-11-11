@@ -15,12 +15,14 @@
 #include "render/vulkan_backend.h"
 #include "runtime/lang.h"
 #include "hle/trophy_manager.h"
+#include "hle/trophy_popup.h"
 #include "hle/overrides/hle_toypad.h"
 
 #include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cinttypes>
+#include <cmath>
 #include <condition_variable>
 #include <cstdio>
 #include <cstring>
@@ -29,6 +31,7 @@
 #include <filesystem>
 #include <string>
 #include <mutex>
+#include <optional>
 #include <thread>
 #include <vector>
 
@@ -172,9 +175,9 @@ static std::vector<MenuItem> g_menu_items = {
     {"FRAME RATE (RESTART)", {"30 FPS", "60 FPS", "UNLOCKED", "UNLOCKED NO VSYNC"}, 1},
     {"FPS COUNTER (F10)", {"OFF", "ON"}, 0},
     {"CONTROLLER ICONS", {"AUTO", "PS4", "XBOX", "SWITCH", "KEYBOARD"}, 0},
-    {"TROPHY SOUND", {"PLAYSTATION", "XBOX", "STEAM", "OFF"}, 0},
+    {"TROPHY SOUND", {"AUTO (POPUP STYLE)", "PLAYSTATION", "XBOX", "STEAM", "OFF"}, 0}, // 3.0: auto = o som do console do pop-up
     {"RESET TROPHIES", {"< PRESS ENTER >", "TROPHIES RESET!"}, 0},
-    {"POPUP STYLE", {"PS5 (QUALIFIED)", "PS4", "XBOX", "XBOX 360", "STEAM"}, 0},
+    {"POPUP STYLE", {"PS5", "PS4", "PS3", "XBOX ONE", "XBOX 360", "WII U", "STEAM", "SWITCH"}, 0}, // 3.0: trophy_popup::kStyleKeys
     {"BLANK FREQUENCY", {"900 HZ", "600 HZ", "300 HZ", "120 HZ", "60 HZ"}, 0}
 };
 
@@ -299,10 +302,10 @@ static void ApplyAndSaveVideoSettings() {
 
     // Trophy sound
     if (g_menu_items.size() > 6) {
-        static const wchar_t* const kSoundStr[] = {L"playstation", L"xbox", L"steam", L"off"};
-        static const char* const kSoundAnsi[] = {"playstation", "xbox", "steam", "off"};
+        static const wchar_t* const kSoundStr[] = {L"auto", L"playstation", L"xbox", L"steam", L"off"};
+        static const char* const kSoundAnsi[] = {"auto", "playstation", "xbox", "steam", "off"};
         const int ts = g_menu_items[6].selected;
-        if (ts >= 0 && ts < 4) {
+        if (ts >= 0 && ts < 5) {
             WriteLauncherIni(L"trophy_sound", kSoundStr[ts]);
             hle::trophy::TrophyManager::Instance().SetSoundType(kSoundAnsi[ts]);
         }
@@ -316,12 +319,11 @@ static void ApplyAndSaveVideoSettings() {
 
     // Popup style
     if (g_menu_items.size() > 8) {
-        static const wchar_t* const kPopupStr[] = {L"ps5", L"ps4", L"xbox", L"xbox360", L"steam"};
-        static const char* const kPopupAnsi[] = {"ps5", "ps4", "xbox", "xbox360", "steam"};
         const int ps = g_menu_items[8].selected;
-        if (ps >= 0 && ps < 5) {
-            WriteLauncherIni(L"popup_style", kPopupStr[ps]);
-            hle::trophy::TrophyManager::Instance().SetPopupStyle(kPopupAnsi[ps]);
+        if (ps >= 0 && ps < hle::trophy_popup::kStyleCount) {
+            const std::string key = hle::trophy_popup::kStyleKeys[ps];
+            WriteLauncherIni(L"popup_style", std::wstring(key.begin(), key.end()).c_str());
+            hle::trophy::TrophyManager::Instance().SetPopupStyle(key);
         }
     }
 
@@ -359,11 +361,10 @@ static void InitMenuDefaults() {
         g_menu_items[5].label = "ICONES DE CONTROLE";
         g_menu_items[5].options = {"AUTO", "PS4", "XBOX", "SWITCH", "TECLADO"};
         g_menu_items[6].label = "SOM DE CONQUISTA";
-        g_menu_items[6].options = {"PLAYSTATION", "XBOX", "STEAM", "DESLIGADO"};
+        g_menu_items[6].options = {"AUTO (DO ESTILO)", "PLAYSTATION", "XBOX", "STEAM", "DESLIGADO"};
         g_menu_items[7].label = "REINICIAR CONQUISTAS";
         g_menu_items[7].options = {"< APERTE ENTER >", "CONQUISTAS REINICIADAS!"};
         g_menu_items[8].label = "ESTILO DO POP-UP";
-        g_menu_items[8].options = {"PS5 (QUALIFICADO)", "PS4", "XBOX", "XBOX 360", "STEAM"};
         g_menu_items[9].label = "FREQUENCIA BLANK";
         g_menu_items[9].options = {"900 HZ (FLUIDO)", "600 HZ", "300 HZ", "120 HZ", "60 HZ"};
     }
@@ -390,18 +391,17 @@ static void InitMenuDefaults() {
         else if (wcsstr(buf, L"keyboard")) g_menu_items[5].selected = 4;
         else g_menu_items[5].selected = 0;
 
-        GetPrivateProfileStringW(L"launcher", L"trophy_sound", L"playstation", buf, 64, ini.wstring().c_str());
-        if (!_wcsicmp(buf, L"xbox")) g_menu_items[6].selected = 1;
-        else if (!_wcsicmp(buf, L"steam")) g_menu_items[6].selected = 2;
-        else if (!_wcsicmp(buf, L"off") || !_wcsicmp(buf, L"desligado")) g_menu_items[6].selected = 3;
+        GetPrivateProfileStringW(L"launcher", L"trophy_sound", L"auto", buf, 64, ini.wstring().c_str());
+        if (!_wcsicmp(buf, L"playstation")) g_menu_items[6].selected = 1;
+        else if (!_wcsicmp(buf, L"xbox")) g_menu_items[6].selected = 2;
+        else if (!_wcsicmp(buf, L"steam")) g_menu_items[6].selected = 3;
+        else if (!_wcsicmp(buf, L"off") || !_wcsicmp(buf, L"desligado")) g_menu_items[6].selected = 4;
         else g_menu_items[6].selected = 0;
 
         GetPrivateProfileStringW(L"launcher", L"popup_style", L"ps5", buf, 64, ini.wstring().c_str());
-        if (!_wcsicmp(buf, L"ps4")) g_menu_items[8].selected = 1;
-        else if (!_wcsicmp(buf, L"xbox")) g_menu_items[8].selected = 2;
-        else if (!_wcsicmp(buf, L"xbox360")) g_menu_items[8].selected = 3;
-        else if (!_wcsicmp(buf, L"steam")) g_menu_items[8].selected = 4;
-        else g_menu_items[8].selected = 0;
+        char style[64]{};
+        WideCharToMultiByte(CP_ACP, 0, buf, -1, style, sizeof(style), nullptr, nullptr);
+        g_menu_items[8].selected = std::max(0, hle::trophy_popup::StyleIndex(style));
 
         int bf = GetPrivateProfileIntW(L"launcher", L"blank_frequency", 900, ini.wstring().c_str());
         if (bf == 600) g_menu_items[9].selected = 1;
@@ -457,16 +457,16 @@ void HandleVideoMenuController(u32 pressed) {
         auto& item = g_menu_items[g_menu_selected];
         item.selected = (item.selected - 1 + static_cast<int>(item.options.size())) % item.options.size();
         if (g_menu_selected == 8) {
-            static const char* const kPopupAnsi[] = {"ps5", "ps4", "xbox", "xbox360", "steam"};
-            hle::trophy::TrophyManager::Instance().SetPopupStyle(kPopupAnsi[item.selected]);
+            hle::trophy::TrophyManager::Instance().SetPopupStyle(hle::trophy_popup::kStyleKeys[item.selected]);
+            hle::trophy::TrophyManager::Instance().PlayPreviewSound(); // 3.0
         }
         last_nav = now;
     } else if (pressed & 0x20) { // Right
         auto& item = g_menu_items[g_menu_selected];
         item.selected = (item.selected + 1) % item.options.size();
         if (g_menu_selected == 8) {
-            static const char* const kPopupAnsi[] = {"ps5", "ps4", "xbox", "xbox360", "steam"};
-            hle::trophy::TrophyManager::Instance().SetPopupStyle(kPopupAnsi[item.selected]);
+            hle::trophy::TrophyManager::Instance().SetPopupStyle(hle::trophy_popup::kStyleKeys[item.selected]);
+            hle::trophy::TrophyManager::Instance().PlayPreviewSound(); // 3.0
         }
         last_nav = now;
     } else if (pressed & 0x4000) { // Cross (Enter / Apply)
@@ -826,8 +826,8 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
                 auto& item = g_menu_items[g_menu_selected];
                 item.selected = (item.selected - 1 + static_cast<int>(item.options.size())) % item.options.size();
                 if (g_menu_selected == 8) {
-                    static const char* const kPopupAnsi[] = {"ps5", "ps4", "xbox", "xbox360", "steam"};
-                    hle::trophy::TrophyManager::Instance().SetPopupStyle(kPopupAnsi[item.selected]);
+                    hle::trophy::TrophyManager::Instance().SetPopupStyle(hle::trophy_popup::kStyleKeys[item.selected]);
+                    hle::trophy::TrophyManager::Instance().PlayPreviewSound(); // 3.0
                 }
                 return 0;
             }
@@ -835,8 +835,8 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
                 auto& item = g_menu_items[g_menu_selected];
                 item.selected = (item.selected + 1) % item.options.size();
                 if (g_menu_selected == 8) {
-                    static const char* const kPopupAnsi[] = {"ps5", "ps4", "xbox", "xbox360", "steam"};
-                    hle::trophy::TrophyManager::Instance().SetPopupStyle(kPopupAnsi[item.selected]);
+                    hle::trophy::TrophyManager::Instance().SetPopupStyle(hle::trophy_popup::kStyleKeys[item.selected]);
+                    hle::trophy::TrophyManager::Instance().PlayPreviewSound(); // 3.0
                 }
                 return 0;
             }
@@ -1780,6 +1780,97 @@ static void RenderTrophyToast(OverlayCanvas& c, const RECT& client, float scale_
     }
 }
 
+// ---- 3.0: pop-up de conquista em alta resolucao, no visual de cada console (hle/trophy_popup) ----
+// A imagem do pop-up vai para uma textura fixa (atlas) e o overlay desenha os retangulos da animacao por cima de tudo.
+struct PopupVertex {
+    float x, y, z;
+    u32 rgba;
+    float u, v;
+};
+constexpr u32 kPopupAtlasW = 2048, kPopupAtlasH = 512;
+constexpr u64 kPopupAtlasKey = 0x7E0F'A11C'0000'0001ull;
+static hle::trophy_popup::Image g_popup_image;
+
+// Desenha a imagem do pop-up (so quando o conteudo, o estilo ou o tamanho da janela mudam) e a envia como textura.
+static bool PreparePopup(float ch, const std::string& style, int trophy_id, char type, const std::string& title,
+                         const std::string& desc) {
+    static std::string s_key;
+    static bool s_ok = false, s_uploaded = false;
+    static std::vector<u32> s_atlas;
+    const float scale = std::clamp(ch / 1080.0f, 0.6f, 2.2f);
+    char scale_text[16];
+    std::snprintf(scale_text, sizeof(scale_text), "%.3f", scale);
+    const std::string key = style + '\x1f' + std::to_string(trophy_id) + type + '\x1f' + title + '\x1f' + desc + '\x1f' +
+                            (lang::Pt() ? "pt" : "en") + scale_text;
+    if (key == s_key) {
+        return s_ok;
+    }
+    s_key = key;
+    const hle::trophy_popup::Request request{style, trophy_id, type, title, desc, lang::Pt(), scale};
+    s_ok = hle::trophy_popup::Render(request, &g_popup_image) && g_popup_image.w <= int(kPopupAtlasW) &&
+           g_popup_image.h <= int(kPopupAtlasH);
+    if (!s_ok) {
+        log::Tagged("TROPHY", "popup image failed (%s)", style.c_str());
+        return false;
+    }
+    s_atlas.assign(size_t(kPopupAtlasW) * kPopupAtlasH, 0);
+    for (int y = 0; y < g_popup_image.h; ++y) {
+        std::memcpy(&s_atlas[size_t(y) * kPopupAtlasW], &g_popup_image.rgba[size_t(y) * g_popup_image.w], size_t(g_popup_image.w) * 4);
+    }
+    render::TextureData texture;
+    texture.format = render::TextureData::kRgba8;
+    texture.width = kPopupAtlasW;
+    texture.height = kPopupAtlasH;
+    texture.data = s_atlas.data();
+    texture.bytes = s_atlas.size() * 4;
+    auto& renderer = render::VulkanRenderer::Instance();
+    s_ok = s_uploaded && renderer.HasTexture(kPopupAtlasKey) ? renderer.UpdateTexture(kPopupAtlasKey, texture)
+                                                              : renderer.UploadTexture(kPopupAtlasKey, texture);
+    s_uploaded = s_ok;
+    if (!s_ok) {
+        log::Tagged("TROPHY", "popup texture upload failed");
+    }
+    return s_ok;
+}
+
+static void QueuePopup(float cw, float ch, const std::string& style, float elapsed, float remaining) {
+    static std::vector<hle::trophy_popup::Quad> quads;
+    static std::vector<PopupVertex> vertices;
+    quads.clear();
+    vertices.clear();
+    hle::trophy_popup::Layout(style, g_popup_image, cw, ch, std::clamp(ch / 1080.0f, 0.6f, 2.2f), elapsed, remaining, &quads);
+    for (const auto& q : quads) {
+        const u32 color = Rgba(255, 255, 255, static_cast<u8>(std::clamp(q.alpha, 0.0f, 1.0f) * 255.0f + 0.5f));
+        auto v = [&](float x, float y, float tu, float tv) {
+            vertices.push_back({x / (cw * 0.5f) - 1.0f, 1.0f - y / (ch * 0.5f), 0.0f, color, tu / kPopupAtlasW, tv / kPopupAtlasH});
+        };
+        v(q.x0, q.y0, q.u0, q.v0), v(q.x1, q.y0, q.u1, q.v0), v(q.x1, q.y1, q.u1, q.v1);
+        v(q.x0, q.y0, q.u0, q.v0), v(q.x1, q.y1, q.u1, q.v1), v(q.x0, q.y1, q.u0, q.v1);
+    }
+    if (vertices.empty()) {
+        return;
+    }
+    render::DrawCall draw;
+    draw.vertex_data = vertices.data();
+    draw.vertex_count = static_cast<u32>(vertices.size());
+    draw.stride = sizeof(PopupVertex);
+    draw.position_offset = 0;
+    draw.position_format = render::DrawCall::kFloat3;
+    draw.has_color = true;
+    draw.color_offset = 12;
+    draw.primitive = render::DrawCall::kTriangleList;
+    draw.blend = true;
+    draw.uv_format = render::DrawCall::kUvFloat2;
+    draw.uv_offset = 16;
+    draw.texture_key = kPopupAtlasKey;
+    static const float kIdentity[16] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};
+    std::memcpy(draw.mvp, kIdentity, sizeof(kIdentity));
+    draw.viewport[0] = draw.viewport[1] = 0.0f;
+    draw.viewport[2] = draw.target_size[0] = cw;
+    draw.viewport[3] = draw.target_size[1] = ch;
+    render::VulkanRenderer::Instance().QueueDraw(draw);
+}
+
 static std::vector<std::string> WrapText(const std::string& text, size_t max_chars, size_t max_lines) {
     std::vector<std::string> lines;
     if (text.empty() || max_chars == 0 || max_lines == 0) return lines;
@@ -2182,15 +2273,26 @@ void QueueStatsOverlay() {
         }
     }
 
+    // 3.0: o pop-up (de verdade ou a previa do menu, que repete a animacao) vai por cima de tudo, depois do overlay
+    struct PendingPopup {
+        std::string style;
+        float elapsed, remaining;
+    };
+    std::optional<PendingPopup> popup;
     if (g_video_menu_open.load() && g_menu_selected == 8) {
-        static const char* const kStyles[] = {"ps5", "ps4", "xbox", "xbox360", "steam"};
-        int sel = g_menu_items[8].selected;
-        if (sel >= 0 && sel < 5) {
-            float scale_toast = client.bottom >= 1400 ? 1.4f : (client.bottom >= 1000 ? 1.0f : 0.8f);
-            RenderTrophyToast(c, client, scale_toast, kStyles[sel], 16, 'G',
-                              lang::Pt() ? "Exemplo de Conquista" : "Sample Achievement",
-                              lang::Pt() ? "Pre-visualizacao do estilo selecionado" : "Selected popup style preview",
-                              1.0f, true);
+        const int sel = g_menu_items[8].selected;
+        if (sel >= 0 && sel < hle::trophy_popup::kStyleCount) {
+            const std::string style = hle::trophy_popup::kStyleKeys[sel];
+            const char* title = lang::Pt() ? "Exemplo de Conquista" : "Sample Achievement";
+            const char* desc = lang::Pt() ? "Pré-visualização do estilo selecionado" : "Selected popup style preview";
+            constexpr float kLoop = 5.0f;
+            const float t = std::fmod(static_cast<float>(std::chrono::duration<double>(now.time_since_epoch()).count()), kLoop);
+            if (PreparePopup(c.h, style, 16, 'G', title, desc)) {
+                popup = PendingPopup{style, t, kLoop - t};
+            } else {
+                float scale_toast = client.bottom >= 1400 ? 1.4f : (client.bottom >= 1000 ? 1.0f : 0.8f);
+                RenderTrophyToast(c, client, scale_toast, style, 16, 'G', title, desc, 1.0f, true);
+            }
         }
     }
 
@@ -2462,9 +2564,13 @@ void QueueStatsOverlay() {
             anim = toast.time_remaining / 0.35f;
         }
 
-        const float scale_ui = client.bottom >= 1400 ? 1.4f : (client.bottom >= 1000 ? 1.0f : 0.8f);
-        RenderTrophyToast(c, client, scale_ui, toast.popup_style.empty() ? "ps5" : toast.popup_style,
-                          toast.trophy_id, toast.type, toast.title, toast.desc, anim, false);
+        const std::string style = toast.popup_style.empty() ? "ps5" : toast.popup_style;
+        if (PreparePopup(c.h, style, toast.trophy_id, toast.type, toast.title, toast.desc)) {
+            popup = PendingPopup{style, time_in, toast.time_remaining};
+        } else {
+            const float scale_ui = client.bottom >= 1400 ? 1.4f : (client.bottom >= 1000 ? 1.0f : 0.8f);
+            RenderTrophyToast(c, client, scale_ui, style, toast.trophy_id, toast.type, toast.title, toast.desc, anim, false);
+        }
     }
 
     if (!vertices.empty()) {
@@ -2485,6 +2591,9 @@ void QueueStatsOverlay() {
         draw.viewport[2] = draw.target_size[0] = c.w;
         draw.viewport[3] = draw.target_size[1] = c.h;
         render::VulkanRenderer::Instance().QueueDraw(draw);
+    }
+    if (popup) {
+        QueuePopup(c.w, c.h, popup->style, popup->elapsed, popup->remaining);
     }
 }
 
