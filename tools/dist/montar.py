@@ -100,6 +100,7 @@ def stage():
     copy(R('tools', 'setup', 'preparar.py'), S('tools', 'setup', 'preparar.py'))
     copy(R('tools', 'setup', 'atualizar.py'), S('tools', 'setup', 'atualizar.py'))  # Fase 61: botao Atualizar do launcher
     copy(R('tools', 'setup', 'botoes.py'), S('tools', 'setup', 'botoes.py'))  # Fase 62: icones dos botoes de outras plataformas
+    copy(R('tools', 'setup', 'teclado.py'), S('tools', 'setup', 'teclado.py'))  # 2.0.2: icones de teclado (fonte do jogo)
     copy(R('tools', 'setup', 'ld_transfer.py'), S('tools', 'setup', 'ld_transfer.py'))  # Fase 63: LD PC Transfer
     copy(R('tools', 'setup', 'mods.py'), S('tools', 'setup', 'mods.py'))  # Fase 64: carregador de mods
     copy(R('tools', 'setup', 'launcher_art.py'), S('tools', 'setup', 'launcher_art.py'))  # 1.8.7: a fonte do jogo para o launcher

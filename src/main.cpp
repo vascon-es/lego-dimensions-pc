@@ -1396,7 +1396,7 @@ int main(int argc, char** argv) {
         } else if (!std::strcmp(argv[i], "--check-modules")) {
             hle::videoout::SetCheckModules(true); // confere todos os .spv soltos na abertura (diagnostico lento)
         } else if (!std::strcmp(argv[i], "--button-icons") && i + 1 < argc) {
-            hle::gnm::SetButtonIcons(argv[++i]); // Fase 62: auto (pelo controle) | ps4 | ps3 | 360 | xboxone | wiiu
+            hle::gnm::SetButtonIcons(argv[++i]); // Fase 62: auto (pelo controle) | ps4 | ps3 | 360 | xboxone | wiiu | keyboard (2.0.2)
         } else if (!std::strcmp(argv[i], "--geometry-budget") && i + 1 < argc) {
             hle::gnm::SetGeometryBudget(std::atof(argv[++i])); // Fase 61: ms por frame para promover / conferir geometria (0 = sem limite)
         } else if (!std::strcmp(argv[i], "--pair-budget") && i + 1 < argc) {

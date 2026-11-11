@@ -10,6 +10,7 @@ destas na hora de enviar para a GPU, conforme o controle ligado (ou a opcao do l
 
 Saida em assets\\buttons\\: <plataforma>.rgba (608x608 RGBA8, sem cabecalho) para ps4 ps3 360 xboxone wiiu, e
 ps4_dxt5.hash (hash FNV-1a 64 dos blocos DXT5 da folha do PS4, para o port reconhecer a textura).
+2.0.2: tambem keyboard.rgba, as teclas do port (teclado.py) escritas com a fonte do proprio jogo (\\gui\\font\\font_nxg.ft2).
 
 uso: botoes.py --app0 <pasta do jogo> [--patch <pasta da atualizacao>] [--png]   (--png: copias para conferir)
 """
@@ -22,7 +23,9 @@ import zlib
 
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..'))
 sys.path.insert(0, os.path.join(ROOT, 'tools', 'nu2_shader_extractor'))
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))  # python -I nao poe a pasta do script no caminho
 import nu2dat  # noqa: E402
+import teclado  # noqa: E402
 
 OUT = os.path.join(ROOT, 'assets', 'buttons')
 PLATFORMS = ('ps4', 'ps3', '360', 'xboxone', 'wiiu')
@@ -170,6 +173,15 @@ def main():
     found = {}   # plataforma -> (pacote, dados); o da atualizacao (PATCH*) vence
     names = {}
     errors = collections.Counter()
+    font = None  # 2.0.2: fonte do jogo para as teclas (a da atualizacao, de resolucao maior, vence)
+    for _pack, name, data in nu2dat.iter_files(args.app0, suffix='font_nxg.ft2', errors=errors, patch=args.patch):
+        if name.lower() == '\\gui\\font\\font_nxg.ft2':
+            try:
+                candidate = teclado.parse_ft2(data, decode_dxt)
+            except (ValueError, struct.error):
+                continue
+            if font is None or candidate['width'] > font['width']:
+                font = candidate
     for suffix in ('buttonicons_dx11.tsh', 'buttonicons_dx11_contents.txt'):
         for pack, name, data in nu2dat.iter_files(args.app0, suffix=suffix, errors=errors, patch=args.patch):
             parts = name.lower().split('\\')
@@ -207,6 +219,15 @@ def main():
         if args.png:
             write_png(os.path.join(OUT, platform + '.png'), image, w4, h4)
         print('icons %s ready' % platform, flush=True)
+    if font is None:
+        print('WARNING game font not found: no keyboard icons', flush=True)
+    else:
+        image = teclado.compose_keyboard(ps4, font)
+        with open(os.path.join(OUT, 'keyboard.rgba'), 'wb') as f:
+            f.write(b''.join(bytes(row) for row in image))
+        if args.png:
+            write_png(os.path.join(OUT, 'keyboard.png'), image, w4, h4)
+        print('icons keyboard ready', flush=True)
     return 0
 
 

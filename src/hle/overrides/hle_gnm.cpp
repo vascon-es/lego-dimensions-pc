@@ -84,6 +84,7 @@ namespace hle {
 void PrintNgs2VoiceReport(); // hle_audio.cpp
 void PadMacroTick(u64 draws, u64 stable_frames); // hle_pad.cpp
 bool PadControllerPresent(int slot); // hle_pad.cpp (Fase 61)
+bool PadKeyboardInUse();             // hle_pad.cpp (2.0.2)
 }
 #include "hle/overrides/hle_pad_sdl.h"
 namespace hle::gnm {
@@ -1604,8 +1605,10 @@ using PixelVector = std::vector<u8, NoInitAllocator<u8>>;
 // (tools/setup/botoes.py) monta, a partir do dump do jogador, folhas no MESMO layout com os desenhos do PS3, Xbox 360,
 // Xbox One e Wii U (assets/buttons/<plataforma>.rgba) e o hash dos blocos da folha do PS4. Quando o jogo envia essa
 // textura, ela vai para a GPU como a folha da plataforma escolhida; se o controle mudar, a textura e reescrita.
-const char* const kIconPlatforms[] = {"ps4", "ps3", "360", "xboxone", "wiiu"};
-constexpr int kIconPlatformCount = 5;
+// 2.0.2: "keyboard" = as teclas do port escritas com a fonte do jogo (tools/setup/teclado.py)
+const char* const kIconPlatforms[] = {"ps4", "ps3", "360", "xboxone", "wiiu", "keyboard"};
+constexpr int kIconPlatformCount = 6;
+constexpr int kKeyboardIcons = 5;
 std::atomic<int> g_icons_forced{-1}; // --button-icons: -1 = pelo controle
 struct IconSheets {
     std::once_flag once;
@@ -1655,10 +1658,14 @@ bool LoadIconSheets() {
 }
 
 // Plataforma pedida agora: a opcao do launcher, ou a do controle do jogador 1 (so XInput: Xbox; sem controle: PS4).
+// 2.0.2: no automatico, a ultima entrada do teclado troca para as teclas (e o controle traz de volta os botoes dele).
 int WantedIconPlatform() {
     const int forced = g_icons_forced.load();
     if (forced >= 0) {
         return forced;
+    }
+    if (hle::PadKeyboardInUse() && !g_icons.rgba[kKeyboardIcons].empty()) {
+        return kKeyboardIcons;
     }
     const int from_pad = IconIndex(padsdl::IconPlatform(0));
     if (from_pad >= 0) {

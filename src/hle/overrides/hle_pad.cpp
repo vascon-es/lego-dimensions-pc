@@ -115,6 +115,10 @@ std::atomic<u64> g_reads{0};
 double Seconds();
 bool g_keyboard_enabled = true;
 u64 g_last_timestamp = 0;
+// 2.0.2: de onde veio a ultima entrada do jogador 1 (os icones dos botoes seguem): -1 = nada ainda, 0 = controle, 1 = teclado
+std::atomic<int> g_last_device{-1};
+// 2.0.2: de qual jogador e o teclado (0 = jogador 1; 1 = jogador 2, ligado pelo F2 com o jogador 1 num controle, como no PC)
+std::atomic<int> g_keyboard_player{0};
 
 // ---- sonda: o que o JOGO enxerga -------------------------------------------------------------
 // O unico ponto que chama scePadReadState e eboot+0x4b9004, dentro de eboot+0x4b8ce0, chamada
@@ -318,7 +322,7 @@ bool FreshKey(int vk) {
     return down;
 }
 
-void ReadKeyboard(Input& in) {
+void ReadKeyboard(Input& in, bool player1 = true) {
     if (!g_keyboard_enabled || !videoout::WindowHasFocus()) {
         g_had_focus = false;
         return;
@@ -337,9 +341,11 @@ void ReadKeyboard(Input& in) {
         {VK_UP, kUp},          {VK_RIGHT, kRight}, {VK_DOWN, kDown},     {VK_LEFT, kLeft},
         {'Q', kL1},            {'E', kR1},         {'1', kL2},           {'3', kR2},     {VK_TAB, kTouchPad},
     };
+    bool any = false;
     for (const auto& m : map) {
         if (FreshKey(m.vk)) {
             in.buttons |= m.orbis;
+            any = true;
         }
     }
     if (in.buttons & kL2) {
@@ -357,6 +363,18 @@ void ReadKeyboard(Input& in) {
     if (FreshKey('L')) in.rx = 0xFF;
     if (FreshKey('I')) in.ry = 0x00;
     if (FreshKey('K')) in.ry = 0xFF;
+    for (const int vk : {'A', 'D', 'W', 'S', 'J', 'L', 'I', 'K'}) {
+        any = any || (!g_blocked[vk] && Key(vk));
+    }
+    if (any && player1 && g_last_device.exchange(1) != 1) {
+        log::Tagged("PAD", "t=%.1fs keyboard in use", Seconds());
+    }
+}
+
+// 2.0.2: o controle mexeu (botao, gatilho ou analogico fora da zona morta)?
+bool PadMoved(const Input& in) {
+    auto off = [](u8 v) { return v < 128 - 48 || v > 128 + 48; };
+    return in.buttons || in.l2 > 40 || in.r2 > 40 || off(in.lx) || off(in.ly) || off(in.rx) || off(in.ry);
 }
 
 std::mutex g_script_mutex; // o macro acrescenta passos de outra thread
@@ -522,6 +540,9 @@ bool SlotPresent(int slot) {
     if (slot == 1 && std::getenv("LD_PAD_LIVE2")) {
         return true; // controle virtual do jogador 2 (testes)
     }
+    if (slot == 1 && g_keyboard_player.load() == 1) {
+        return true; // 2.0.2: o teclado e o jogador 2
+    }
     padsdl::State sdl;
     if (padsdl::Read(&sdl, slot)) {
         return true;
@@ -563,6 +584,9 @@ bool ReadOtherPlayer(int slot, Input& in) {
         ReadXInput(in, static_cast<DWORD>(slot));
     }
     if (slot == 1) {
+        if (g_keyboard_player.load() == 1) {
+            ReadKeyboard(in, false); // 2.0.2
+        }
         ReadScript(in, 1);
     }
     return true;
@@ -656,7 +680,12 @@ HLE_IMPL(int, scePadReadState, int handle, PadData* data, u64 guest_rbp) {
         ReadXInput(in);
     }
     in.buttons &= ~PadHeldSinceFocus(in.buttons);
-    ReadKeyboard(in);
+    if (PadMoved(in) && g_last_device.exchange(0) != 0) {
+        log::Tagged("PAD", "t=%.1fs controller in use", Seconds());
+    }
+    if (g_keyboard_player.load() == 0) {
+        ReadKeyboard(in);
+    }
     ReadScript(in);
 
     // Menu de Configuracoes de Video (L3 + R3 no controle)
@@ -772,6 +801,32 @@ void SetPadStickLog(bool enabled) {
 
 bool PadControllerPresent(int slot) { // Fase 61: usado pelo UserService (login / logout dos jogadores 2 a 4)
     return SlotPresent(slot);
+}
+
+// 2.0.2: F2 = o teclado vira o jogador 2 (o jogo ve um segundo usuario entrar e mostra "aperte F2 ou qualquer botao"), e F2
+// de novo devolve o teclado ao jogador 1. So com um controle no jogador 1: sem ele o jogador 1 ficaria sem comandos.
+bool TogglePadKeyboardPlayer() {
+    if (g_keyboard_player.load() == 1) {
+        g_keyboard_player = 0;
+        log::Tagged("PAD", "keyboard back to player 1");
+        return true;
+    }
+    if (!g_keyboard_enabled || !SlotPresent(0)) {
+        log::Tagged("PAD", "F2: no controller for player 1, the keyboard stays with player 1");
+        return false;
+    }
+    g_keyboard_player = 1;
+    g_last_device = 0; // os icones seguem o controle do jogador 1
+    log::Tagged("PAD", "keyboard is now player 2");
+    return true;
+}
+
+bool PadKeyboardInUse() { // 2.0.2: o jogador 1 esta no teclado (ultima entrada; antes de qualquer uma: sem controle ligado)
+    if (g_keyboard_player.load() == 1) {
+        return false;
+    }
+    const int last = g_last_device.load();
+    return last >= 0 ? last == 1 : (g_keyboard_enabled && !SlotPresent(0));
 }
 
 void SetPadBackgroundInput(bool enabled) {
