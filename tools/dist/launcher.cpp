@@ -1872,7 +1872,7 @@ void OpenTrophiesDialog() {
     col.pszText = const_cast<LPWSTR>(ui::T(L"Nome", L"Name"));
     SendMessageW(g_trophies_list, LVM_INSERTCOLUMNW, 2, reinterpret_cast<LPARAM>(&col));
 
-    col.cx = S(288);
+    col.cx = S(270);
     col.pszText = const_cast<LPWSTR>(ui::T(L"Descrição", L"Description"));
     SendMessageW(g_trophies_list, LVM_INSERTCOLUMNW, 3, reinterpret_cast<LPARAM>(&col));
 

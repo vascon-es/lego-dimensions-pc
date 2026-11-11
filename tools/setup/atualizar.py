@@ -204,16 +204,6 @@ def apply(zip_path, root):
                 kept += 1
                 continue
             data = z.read(info)
-            if exists and rel.startswith('tools/python/') and os.path.isfile(os.path.join(root, 'tools', 'python', 'python.exe')):
-                # Heal broken mixed Python stdlib (e.g. 3.11 glob.py paired with 3.14 pathlib)
-                if rel == 'tools/python/Lib/glob.py' and b'_StringGlobber' in data:
-                    with open(path, 'rb') as fg:
-                        if b'_StringGlobber' in fg.read():
-                            kept += 1
-                            continue
-                else:
-                    kept += 1
-                    continue
             if exists and rel in MERGE_LINES:
                 merged += merge_lines(path, data)
                 continue
@@ -223,6 +213,14 @@ def apply(zip_path, root):
                         continue
             write_file(path, data)
             changed += 1
+        # Remove stale Python 3.11 single-file pathlib.py if package tools/python/Lib/pathlib/ is present
+        if 'tools/python/Lib/pathlib/__init__.py' in names:
+            stale_pathlib = os.path.join(root, 'tools', 'python', 'Lib', 'pathlib.py')
+            if os.path.isfile(stale_pathlib):
+                try:
+                    os.remove(stale_pathlib)
+                except OSError:
+                    pass
     print(T('arquivos trocados: %d; mantidos: %d; aprendidos com linhas novas: %d' % (changed, kept, merged),
             'files replaced: %d; kept: %d; learned files with new lines: %d' % (changed, kept, merged)), flush=True)
 

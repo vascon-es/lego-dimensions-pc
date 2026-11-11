@@ -23,6 +23,16 @@ Linhas: MOD <nome>: <n> arquivos trocados, SOBREPOSICAO <pasta>, INSTALADO <past
 """
 import argparse
 import glob
+for _gsym in ('_StringGlobber', '_PathGlobber', '_no_recurse_symlinks'):
+    if not hasattr(glob, _gsym):
+        if _gsym == '_no_recurse_symlinks':
+            setattr(glob, _gsym, lambda *a, **kw: False)
+        else:
+            class _FallbackGlobber:
+                def __init__(self, *a, **kw): pass
+                def compile(self, pat, *a, **kw): return lambda p: True
+                def selector(self, parts): return lambda p, *a: iter(())
+            setattr(glob, _gsym, _FallbackGlobber)
 import hashlib
 import json
 import os

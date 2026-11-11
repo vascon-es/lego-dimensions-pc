@@ -145,7 +145,7 @@ def stage():
     if os.path.isdir(R('assets', 'trophy')):
         # 3.0: sem o progresso de quem monta (trophies.dat e os desbloqueios que o trophy_manager grava no XML)
         import re
-        copy_tree(R('assets', 'trophy'), S('assets', 'trophy'), skip_files=('trophies.dat',))
+        copy_tree(R('assets', 'trophy'), S('assets', 'trophy'), skip_files=('trophies.dat', '.retro_done'))
         if os.path.isfile(S('assets', 'trophy', 'trophies.dat')):
             os.remove(S('assets', 'trophy', 'trophies.dat'))
         for root, _dirs, files in os.walk(S('assets', 'trophy')):

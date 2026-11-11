@@ -37,16 +37,16 @@
 	<trophy id="018" hidden="no" ttype="G" pid="000" />
 	<trophy id="019" hidden="no" ttype="S" pid="000" />
 	<trophy id="020" hidden="no" ttype="G" pid="000" />
-	<trophy id="021" hidden="no" ttype="B" pid="000" unlockstate="true" timestamp="1790117507" />
-	<trophy id="022" hidden="no" ttype="B" pid="000" unlockstate="true" timestamp="1790117507" />
+	<trophy id="021" hidden="no" ttype="B" pid="000" />
+	<trophy id="022" hidden="no" ttype="B" pid="000" />
 	<trophy id="023" hidden="no" ttype="B" pid="000" />
 	<trophy id="024" hidden="no" ttype="S" pid="000" />
-	<trophy id="025" hidden="no" ttype="B" pid="000" unlockstate="true" timestamp="1790123129" />
-	<trophy id="026" hidden="no" ttype="S" pid="000" unlockstate="true" timestamp="1790123129" />
+	<trophy id="025" hidden="no" ttype="B" pid="000" />
+	<trophy id="026" hidden="no" ttype="S" pid="000" />
 	<trophy id="027" hidden="no" ttype="B" pid="000" />
 	<trophy id="028" hidden="no" ttype="B" pid="000" />
 	<trophy id="029" hidden="no" ttype="S" pid="000" />
-	<trophy id="030" hidden="no" ttype="S" pid="000" unlockstate="true" timestamp="1790117490" />
+	<trophy id="030" hidden="no" ttype="S" pid="000" />
 	<trophy id="031" hidden="no" ttype="S" pid="000" />
 	<trophy id="032" hidden="no" ttype="S" pid="000" />
 	<trophy id="033" hidden="no" ttype="S" pid="000" />
