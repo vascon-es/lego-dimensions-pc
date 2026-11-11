@@ -565,11 +565,6 @@ void StartPortalWatcher(const std::filesystem::path& portal_file) {
     }
     toypad::LoadPortalState(portal_file);
     std::thread(PortalWatcher).detach();
-},\n"
-               " \"pad2\": {\"uid\": [4,81,112,26,91,64,129], \"id\": 2},\n"
-               " \"pad3\": {\"uid\": [4,202,17,74,153,54,128], \"id\": 3}}\n";
-    }
-    std::thread(PortalWatcher).detach();
 }
 
 } // namespace hle

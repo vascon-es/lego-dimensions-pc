@@ -119,52 +119,6 @@ std::atomic<bool> g_video_menu_open{false};
 std::atomic<bool> g_achievements_overlay_open{false};
 int g_achievements_selected = 0;
 int g_achievements_scroll = 0;
-
-void ToggleAchievementsMenu() {
-    g_achievements_overlay_open = !g_achievements_overlay_open;
-    log::Tagged("ACHIEVEMENTS-MENU", "%s", g_achievements_overlay_open ? "open" : "closed");
-}
-
-bool IsAchievementsMenuOpen() {
-    return g_achievements_overlay_open.load();
-}
-
-void HandleAchievementsMenuController(u32 pressed) {
-    if (!g_achievements_overlay_open) return;
-    static auto last_nav = std::chrono::steady_clock::now();
-    const auto now = std::chrono::steady_clock::now();
-    if (std::chrono::duration<float, std::milli>(now - last_nav).count() < 160.0f) {
-        return;
-    }
-
-    const int total_trophies = 77;
-    // kUp = 0x10, kRight = 0x20, kDown = 0x40, kLeft = 0x80
-    // kL1 = 0x400 (LB), kR1 = 0x800 (RB)
-    // kCircle = 0x2000 (B), kCross = 0x4000 (A), kOptions = 0x8
-    if (pressed & 0x10) { // Up
-        if (g_achievements_selected > 0) --g_achievements_selected;
-        last_nav = now;
-    } else if (pressed & 0x40) { // Down
-        if (g_achievements_selected + 1 < total_trophies) ++g_achievements_selected;
-        last_nav = now;
-    } else if (pressed & 0x400) { // LB: Page Up
-        g_achievements_selected = std::max(0, g_achievements_selected - 6);
-        last_nav = now;
-    } else if (pressed & 0x800) { // RB: Page Down
-        g_achievements_selected = std::min(total_trophies - 1, g_achievements_selected + 6);
-        last_nav = now;
-    } else if (pressed & (0x2000 | 0x8)) { // Circle / B or Options: Close
-        g_achievements_overlay_open = false;
-        last_nav = now;
-    }
-
-    if (g_achievements_selected < g_achievements_scroll) {
-        g_achievements_scroll = g_achievements_selected;
-    }
-    if (g_achievements_selected >= g_achievements_scroll + 6) {
-        g_achievements_scroll = g_achievements_selected - 5;
-    }
-}
 int g_menu_selected = 0;
 int g_save_confirm_timer = 0;
 WINDOWPLACEMENT g_windowed_placement{sizeof(WINDOWPLACEMENT)};
@@ -471,6 +425,52 @@ void HandleVideoMenuController(u32 pressed) {
     } else if (pressed & 0x2000) { // Circle (Back / Close)
         g_video_menu_open = false;
         last_nav = now;
+    }
+}
+
+void ToggleAchievementsMenu() {
+    g_achievements_overlay_open = !g_achievements_overlay_open;
+    log::Tagged("ACHIEVEMENTS-MENU", "%s", g_achievements_overlay_open ? "open" : "closed");
+}
+
+bool IsAchievementsMenuOpen() {
+    return g_achievements_overlay_open.load();
+}
+
+void HandleAchievementsMenuController(u32 pressed) {
+    if (!g_achievements_overlay_open) return;
+    static auto last_nav = std::chrono::steady_clock::now();
+    const auto now = std::chrono::steady_clock::now();
+    if (std::chrono::duration<float, std::milli>(now - last_nav).count() < 160.0f) {
+        return;
+    }
+
+    const int total_trophies = 77;
+    // kUp = 0x10, kRight = 0x20, kDown = 0x40, kLeft = 0x80
+    // kL1 = 0x400 (LB), kR1 = 0x800 (RB)
+    // kCircle = 0x2000 (B), kCross = 0x4000 (A), kOptions = 0x8
+    if (pressed & 0x10) { // Up
+        if (g_achievements_selected > 0) --g_achievements_selected;
+        last_nav = now;
+    } else if (pressed & 0x40) { // Down
+        if (g_achievements_selected + 1 < total_trophies) ++g_achievements_selected;
+        last_nav = now;
+    } else if (pressed & 0x400) { // LB: Page Up
+        g_achievements_selected = std::max(0, g_achievements_selected - 6);
+        last_nav = now;
+    } else if (pressed & 0x800) { // RB: Page Down
+        g_achievements_selected = std::min(total_trophies - 1, g_achievements_selected + 6);
+        last_nav = now;
+    } else if (pressed & (0x2000 | 0x8)) { // Circle / B or Options: Close
+        g_achievements_overlay_open = false;
+        last_nav = now;
+    }
+
+    if (g_achievements_selected < g_achievements_scroll) {
+        g_achievements_scroll = g_achievements_selected;
+    }
+    if (g_achievements_selected >= g_achievements_scroll + 6) {
+        g_achievements_scroll = g_achievements_selected - 5;
     }
 }
 
