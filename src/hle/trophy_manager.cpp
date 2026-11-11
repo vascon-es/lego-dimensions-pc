@@ -173,6 +173,25 @@ void TrophyManager::CycleSoundType() {
     else m_sound_type = "playstation";
 }
 
+void TrophyManager::SetPopupStyle(const std::string& style) {
+    std::lock_guard lock(m_mutex);
+    m_popup_style = style;
+}
+
+std::string TrophyManager::GetPopupStyle() const {
+    std::lock_guard lock(m_mutex);
+    return m_popup_style;
+}
+
+void TrophyManager::CyclePopupStyle() {
+    std::lock_guard lock(m_mutex);
+    if (m_popup_style == "ps5") m_popup_style = "ps4";
+    else if (m_popup_style == "ps4") m_popup_style = "xbox";
+    else if (m_popup_style == "xbox") m_popup_style = "xbox360";
+    else if (m_popup_style == "xbox360") m_popup_style = "steam";
+    else m_popup_style = "ps5";
+}
+
 void TrophyManager::Update(float delta_sec) {
     std::lock_guard lock(m_mutex);
 
@@ -194,6 +213,7 @@ void TrophyManager::Update(float delta_sec) {
             m_active_toast.type = def->type;
             m_active_toast.title = lang::Pt() ? def->name_pt : def->name_en;
             m_active_toast.desc = lang::Pt() ? def->desc_pt : def->desc_en;
+            m_active_toast.popup_style = m_popup_style;
             m_active_toast.total_duration = 5.5f;
             m_active_toast.time_remaining = 5.5f;
             m_active_toast.active = true;

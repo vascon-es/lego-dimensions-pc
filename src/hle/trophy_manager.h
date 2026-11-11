@@ -15,6 +15,7 @@ struct ToastState {
     char type = 'B';
     std::string title;
     std::string desc;
+    std::string popup_style = "ps5"; // ps5, ps4, xbox, xbox360, steam
     float time_remaining = 0.0f;
     float total_duration = 5.5f;
     bool active = false;
@@ -37,6 +38,10 @@ public:
     void SetSoundType(const std::string& sound_name);
     std::string GetSoundType() const;
     void CycleSoundType();
+
+    void SetPopupStyle(const std::string& style);
+    std::string GetPopupStyle() const;
+    void CyclePopupStyle();
 
     void ResetTrophies();
 
@@ -66,6 +71,7 @@ private:
     uint32_t m_flags[4] = {}; // 128-bit bitmask
     uint64_t m_timestamps[128] = {};
     std::string m_sound_type = "playstation"; // playstation, xbox, steam, off, custom
+    std::string m_popup_style = "ps5";        // ps5, ps4, xbox, xbox360, steam
 
     std::deque<int> m_toast_queue;
     ToastState m_active_toast;

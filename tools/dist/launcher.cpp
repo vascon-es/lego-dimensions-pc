@@ -12,6 +12,7 @@
 #define _UNICODE
 #include "ui.h"
 #include "../../src/common/game_region.h"
+#include "../../src/hle/trophy_defs.h"
 
 #include <shellapi.h>
 #include <uxtheme.h>
@@ -166,6 +167,8 @@ bool g_opt_fps = true, g_opt_console = false, g_opt_fullscreen = false, g_opt_sk
 std::wstring g_lang_at_start; // o idioma do launcher mudou nas Configuracoes: ele reabre ao voltar
 std::wstring g_saves_value = L"savedata0"; // pasta dos saves dentro de assets (--saves-dir); savedata0 = os do jogador
 std::wstring g_trophy_sound_value = L"playstation"; // som ao desbloquear conquista: playstation, xbox, steam, desligado
+std::wstring g_popup_style_value = L"ps5"; // estilo da notificacao: ps5, ps4, xbox, xbox360, steam
+std::wstring g_blank_frequency_value = L"900"; // frequencia de vblank: 900, 600, 300, 120, 60
 std::deque<std::wstring> g_log_lines; // o que a preparacao / os mods / o jogo disseram (as ultimas linhas)
 
 fs::path Ini() { return g_root / L"launcher.ini"; }
@@ -415,6 +418,8 @@ void SaveSettings() {
     WriteIni(L"toypad_auto", g_opt_toypad ? L"1" : L"0");
     WriteIni(L"saves", g_saves_value);
     WriteIni(L"trophy_sound", g_trophy_sound_value);
+    WriteIni(L"popup_style", g_popup_style_value);
+    WriteIni(L"blank_frequency", g_blank_frequency_value);
 }
 
 const Language& CurrentLanguage() {
@@ -1355,6 +1360,12 @@ void RunGame() {
     if (!g_trophy_sound_value.empty()) {
         command += L" --trophy-sound " + g_trophy_sound_value;
     }
+    if (!g_popup_style_value.empty()) {
+        command += L" --popup-style " + g_popup_style_value;
+    }
+    if (!g_blank_frequency_value.empty()) {
+        command += L" --blank-frequency " + g_blank_frequency_value;
+    }
     if (g_opt_skip) {
         command += L" --skip-cutscenes"; // Fase 61: qualquer cutscene pode ser pulada, mesmo sem 100%
     }
@@ -1542,19 +1553,267 @@ void LaunchLegoToypad(bool notify_if_running) {
     }
 }
 
+
+HWND g_trophies_window = nullptr;
+HWND g_trophies_list = nullptr;
+const int kTrophiesW = 860;
+const int kTrophiesH = 580;
+const int kTrophiesClose = 501;
+
+int GetUnlockedTrophiesCount() {
+    const fs::path paths[] = {
+        g_root / L"assets" / g_saves_value / L"trophies.dat",
+        g_root / L"assets" / L"savedata0" / L"trophies.dat",
+        g_root / L"assets" / L"trophy" / L"trophies.dat"
+    };
+    for (const auto& dat_path : paths) {
+        std::ifstream dat(dat_path, std::ios::binary);
+        if (!dat) continue;
+        char magic[4] = {};
+        dat.read(magic, 4);
+        if (std::memcmp(magic, "LDT1", 4) != 0) continue;
+        uint32_t count = 0;
+        dat.read(reinterpret_cast<char*>(&count), sizeof(count));
+        uint32_t flags[4] = {};
+        dat.read(reinterpret_cast<char*>(flags), sizeof(flags));
+        int unlocked = 0;
+        for (int i = 0; i < 77; ++i) {
+            if (flags[i / 32] & (1u << (i % 32))) unlocked++;
+        }
+        return unlocked;
+    }
+    return 0;
+}
+
+LRESULT CALLBACK TrophiesProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
+    switch (msg) {
+    case WM_ERASEBKGND:
+        return 1;
+    case WM_PAINT: {
+        PAINTSTRUCT ps;
+        HDC dc = BeginPaint(hwnd, &ps);
+        RECT r;
+        GetClientRect(hwnd, &r);
+        FillRect(dc, &r, g_bg_brush);
+        EndPaint(hwnd, &ps);
+        return 0;
+    }
+    case WM_DRAWITEM:
+        ui::DrawButton(reinterpret_cast<const DRAWITEMSTRUCT*>(lp));
+        return TRUE;
+    case WM_NOTIFY: {
+        NMHDR* nm = reinterpret_cast<NMHDR*>(lp);
+        if (nm->idFrom == 1001 && nm->code == NM_CUSTOMDRAW) {
+            LPNMLVCUSTOMDRAW lplvcd = reinterpret_cast<LPNMLVCUSTOMDRAW>(lp);
+            switch (lplvcd->nmcd.dwDrawStage) {
+            case CDDS_PREPAINT:
+                return CDRF_NOTIFYITEMDRAW;
+            case CDDS_ITEMPREPAINT:
+                return CDRF_NOTIFYSUBITEMDRAW;
+            case CDDS_ITEMPREPAINT | CDDS_SUBITEM: {
+                const int item = static_cast<int>(lplvcd->nmcd.dwItemSpec);
+                const int sub = lplvcd->iSubItem;
+                if (sub == 1) {
+                    size_t count = 0;
+                    const TrophyDef* defs = GetTrophyDefs(&count);
+                    if (item >= 0 && item < static_cast<int>(count)) {
+                        const char t = defs[item].type;
+                        if (t == 'P') lplvcd->clrText = RGB(0, 220, 255);
+                        else if (t == 'G') lplvcd->clrText = RGB(255, 215, 0);
+                        else if (t == 'S') lplvcd->clrText = RGB(200, 210, 225);
+                        else lplvcd->clrText = RGB(205, 127, 50);
+                    }
+                } else if (sub == 4) {
+                    wchar_t buf[64] = {};
+                    LVITEMW it{};
+                    it.iSubItem = 4;
+                    it.pszText = buf;
+                    it.cchTextMax = 64;
+                    SendMessageW(g_trophies_list, LVM_GETITEMTEXTW, item, reinterpret_cast<LPARAM>(&it));
+                    if (wcsstr(buf, L"DESBLOQUEADO") || wcsstr(buf, L"UNLOCKED")) {
+                        lplvcd->clrText = RGB(70, 220, 90);
+                    } else {
+                        lplvcd->clrText = RGB(140, 140, 140);
+                    }
+                }
+                return CDRF_DODEFAULT;
+            }
+            }
+        }
+        break;
+    }
+    case WM_COMMAND:
+        if (LOWORD(wp) == kTrophiesClose) {
+            DestroyWindow(hwnd);
+        }
+        return 0;
+    case WM_CLOSE:
+        DestroyWindow(hwnd);
+        return 0;
+    case WM_DESTROY:
+        EnableWindow(g_main, TRUE);
+        SetForegroundWindow(g_main);
+        g_trophies_window = nullptr;
+        return 0;
+    }
+    return DefWindowProcW(hwnd, msg, wp, lp);
+}
+
+void OpenTrophiesDialog() {
+    if (g_trophies_window) {
+        SetForegroundWindow(g_trophies_window);
+        return;
+    }
+    static bool registered = false;
+    if (!registered) {
+        WNDCLASSEXW wc{sizeof(wc)};
+        wc.lpfnWndProc = TrophiesProc;
+        wc.hInstance = GetModuleHandleW(nullptr);
+        wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+        wc.hbrBackground = g_bg_brush;
+        wc.hIcon = LoadIconW(wc.hInstance, MAKEINTRESOURCEW(1));
+        wc.lpszClassName = L"LegoDimensionsPcTrophies";
+        RegisterClassExW(&wc);
+        registered = true;
+    }
+
+    const DWORD style = WS_POPUP | WS_CAPTION | WS_SYSMENU | WS_CLIPCHILDREN;
+    RECT size{0, 0, S(kTrophiesW), S(kTrophiesH)};
+    AdjustWindowRect(&size, style, FALSE);
+    RECT owner;
+    GetWindowRect(g_main, &owner);
+    const int w = size.right - size.left, h = size.bottom - size.top;
+    g_trophies_window = CreateWindowExW(WS_EX_DLGMODALFRAME, L"LegoDimensionsPcTrophies",
+                                        ui::T(L"Conquistas do LEGO Dimensions (77)", L"LEGO Dimensions Achievements (77)"),
+                                        style,
+                                        owner.left + ((owner.right - owner.left) - w) / 2,
+                                        owner.top + ((owner.bottom - owner.top) - h) / 2,
+                                        w, h, g_main, nullptr, GetModuleHandleW(nullptr), nullptr);
+    ui::DarkTitle(g_trophies_window);
+
+    INITCOMMONCONTROLSEX icex{sizeof(icex), ICC_LISTVIEW_CLASSES};
+    InitCommonControlsEx(&icex);
+
+    g_trophies_list = CreateWindowExW(0, WC_LISTVIEWW, L"",
+                                      WS_CHILD | WS_VISIBLE | WS_VSCROLL | WS_BORDER | LVS_REPORT | LVS_SINGLESEL | LVS_NOSORTHEADER,
+                                      S(24), S(20), S(kTrophiesW - 48), S(kTrophiesH - 90),
+                                      g_trophies_window, reinterpret_cast<HMENU>(1001), GetModuleHandleW(nullptr), nullptr);
+    SendMessageW(g_trophies_list, LVM_SETEXTENDEDLISTVIEWSTYLE, 0, LVS_EX_FULLROWSELECT | LVS_EX_GRIDLINES | LVS_EX_DOUBLEBUFFER);
+    SetWindowTheme(g_trophies_list, L"Explorer", nullptr);
+    SendMessageW(g_trophies_list, WM_SETFONT, reinterpret_cast<WPARAM>(g_font), TRUE);
+
+    LVCOLUMNW col{};
+    col.mask = LVCF_TEXT | LVCF_WIDTH | LVCF_SUBITEM;
+
+    col.cx = S(45);
+    col.pszText = const_cast<LPWSTR>(L"#");
+    SendMessageW(g_trophies_list, LVM_INSERTCOLUMNW, 0, reinterpret_cast<LPARAM>(&col));
+
+    col.cx = S(95);
+    col.pszText = const_cast<LPWSTR>(ui::T(L"Grau", L"Tier"));
+    SendMessageW(g_trophies_list, LVM_INSERTCOLUMNW, 1, reinterpret_cast<LPARAM>(&col));
+
+    col.cx = S(240);
+    col.pszText = const_cast<LPWSTR>(ui::T(L"Nome", L"Name"));
+    SendMessageW(g_trophies_list, LVM_INSERTCOLUMNW, 2, reinterpret_cast<LPARAM>(&col));
+
+    col.cx = S(315);
+    col.pszText = const_cast<LPWSTR>(ui::T(L"Descrição", L"Description"));
+    SendMessageW(g_trophies_list, LVM_INSERTCOLUMNW, 3, reinterpret_cast<LPARAM>(&col));
+
+    col.cx = S(115);
+    col.pszText = const_cast<LPWSTR>(ui::T(L"Status", L"Status"));
+    SendMessageW(g_trophies_list, LVM_INSERTCOLUMNW, 4, reinterpret_cast<LPARAM>(&col));
+
+    uint32_t flags[4] = {};
+    const fs::path dat_paths[] = {
+        g_root / L"assets" / g_saves_value / L"trophies.dat",
+        g_root / L"assets" / L"savedata0" / L"trophies.dat",
+        g_root / L"assets" / L"trophy" / L"trophies.dat"
+    };
+    for (const auto& dat_path : dat_paths) {
+        std::ifstream dat(dat_path, std::ios::binary);
+        if (!dat) continue;
+        char magic[4] = {};
+        dat.read(magic, 4);
+        if (std::memcmp(magic, "LDT1", 4) == 0) {
+            uint32_t c = 0;
+            dat.read(reinterpret_cast<char*>(&c), 4);
+            dat.read(reinterpret_cast<char*>(flags), 16);
+            break;
+        }
+    }
+
+    size_t count = 0;
+    const TrophyDef* defs = GetTrophyDefs(&count);
+    const bool is_pt = (g_lang_value == L"pt" || (g_lang_value == L"auto" && PRIMARYLANGID(GetUserDefaultUILanguage()) == LANG_PORTUGUESE));
+
+    for (size_t i = 0; i < count; ++i) {
+        const TrophyDef& d = defs[i];
+        LVITEMW item{};
+        item.mask = LVIF_TEXT;
+        item.iItem = static_cast<int>(i);
+
+        std::wstring num_str = std::to_wstring(i + 1);
+        item.iSubItem = 0;
+        item.pszText = num_str.data();
+        SendMessageW(g_trophies_list, LVM_INSERTITEMW, 0, reinterpret_cast<LPARAM>(&item));
+
+        std::wstring tier_str;
+        switch (d.type) {
+        case 'P': tier_str = is_pt ? L"★ Platina" : L"★ Platinum"; break;
+        case 'G': tier_str = is_pt ? L"◆ Ouro" : L"◆ Gold"; break;
+        case 'S': tier_str = is_pt ? L"▲ Prata" : L"▲ Silver"; break;
+        default:  tier_str = is_pt ? L"● Bronze" : L"● Bronze"; break;
+        }
+        item.iSubItem = 1;
+        item.pszText = tier_str.data();
+        SendMessageW(g_trophies_list, LVM_SETITEMTEXTW, i, reinterpret_cast<LPARAM>(&item));
+
+        std::wstring name_str = Utf8ToWide(is_pt ? d.name_pt : d.name_en);
+        item.iSubItem = 2;
+        item.pszText = name_str.data();
+        SendMessageW(g_trophies_list, LVM_SETITEMTEXTW, i, reinterpret_cast<LPARAM>(&item));
+
+        std::wstring desc_str = Utf8ToWide(is_pt ? d.desc_pt : d.desc_en);
+        item.iSubItem = 3;
+        item.pszText = desc_str.data();
+        SendMessageW(g_trophies_list, LVM_SETITEMTEXTW, i, reinterpret_cast<LPARAM>(&item));
+
+        const bool unlocked = (flags[d.id / 32] & (1u << (d.id % 32))) != 0;
+        std::wstring status_str = unlocked ? (is_pt ? L"✔ DESBLOQUEADO" : L"✔ UNLOCKED") : (is_pt ? L"Bloqueado" : L"Locked");
+        item.iSubItem = 4;
+        item.pszText = status_str.data();
+        SendMessageW(g_trophies_list, LVM_SETITEMTEXTW, i, reinterpret_cast<LPARAM>(&item));
+    }
+
+    ui::Button(g_trophies_window, ui::T(L"Fechar", L"Close"), ui::Style::kSecondary,
+               S((kTrophiesW - 140) / 2), S(kTrophiesH - 58), S(140), S(40), kTrophiesClose, g_button);
+
+    EnableWindow(g_main, FALSE);
+    ShowWindow(g_trophies_window, SW_SHOW);
+}
+
 void ResetTrophiesAction() {
     if (MessageBoxW(g_main,
                     ui::T(L"Tem certeza que deseja reiniciar todas as conquistas do LEGO Dimensions PC?\n\nIsso apagará o arquivo de progresso dos troféus e permitirá conquistá-los novamente.",
-                          L"Are you sure you want to reset all achievements for LEGO Dimensions PC?\n\nThis will clear the trophy progress file."),
+                          L"Are you sure you want to reset all achievements for LEGO Dimensions PC?\n\nThis will clear the trophy progress file and allow earning them again."),
                     L"LEGO Dimensions PC", MB_YESNO | MB_ICONWARNING) == IDYES) {
         std::error_code ec;
+        fs::remove(g_root / L"assets" / g_saves_value / L"trophies.dat", ec);
+        fs::remove(g_root / L"assets" / g_saves_value / L".retro_done", ec);
+        fs::remove(g_root / L"assets" / L"savedata0" / L"trophies.dat", ec);
+        fs::remove(g_root / L"assets" / L"savedata0" / L".retro_done", ec);
+        fs::remove(g_root / L"assets" / L"trophy" / L"trophies.dat", ec);
         fs::remove(g_root / L"assets" / L"trophy" / L"NPWR07423_00.xml", ec);
         fs::remove(g_root / L"assets" / L"trophy" / L".retro_done", ec);
         MessageBoxW(g_main,
                     ui::T(L"Conquistas reiniciadas com sucesso!", L"Achievements successfully reset!"),
                     L"LEGO Dimensions PC", MB_OK | MB_ICONINFORMATION);
+        Redraw();
     }
 }
+
 
 void OpenTransfer() {
     wchar_t self[MAX_PATH * 4];
@@ -1951,6 +2210,19 @@ std::vector<Row> Rows() {
                         g_fps_value = Step(kFpsModes, g_fps_value, step, [](const wchar_t* r) { return std::wstring(r); });
                         SaveSettings();
                     }});
+    static const wchar_t* const kBlankFreqs[] = {L"900", L"600", L"300", L"120", L"60"};
+    rows.push_back({kTabDisplay, RowKind::kChoice, ui::T(L"Frequência de blank (vblank)", L"Blank frequency (vblank)"),
+                    ui::T(L"900 Hz: máxima fluidez e menor latência de quadros (padrão recomendado).",
+                          L"900 Hz: maximum smoothness and lowest frame latency (recommended default)."),
+                    g_blank_frequency_value == L"600" ? std::wstring(L"600 Hz") :
+                    g_blank_frequency_value == L"300" ? std::wstring(L"300 Hz") :
+                    g_blank_frequency_value == L"120" ? std::wstring(L"120 Hz") :
+                    g_blank_frequency_value == L"60"  ? std::wstring(L"60 Hz") :
+                    ui::T(L"900 Hz (Recomendado)", L"900 Hz (Recommended)"),
+                    [](int step) {
+                        g_blank_frequency_value = Step(kBlankFreqs, g_blank_frequency_value, step, [](const wchar_t* s) { return std::wstring(s); });
+                        SaveSettings();
+                    }});
     rows.push_back({kTabDisplay, RowKind::kChoice, ui::T(L"Bibliotecas de pipeline (GPL)", L"Pipeline libraries (GPL)"),
                     ui::T(L"Automático: ligado na NVIDIA / Intel, desligado na AMD (pode deixar a tela preta).",
                           L"Automatic: on for NVIDIA / Intel, off for AMD (may give a black screen)."),
@@ -1984,6 +2256,28 @@ std::vector<Row> Rows() {
                     ui::T(L"O nome no lugar de Player1, Player2... Enter: editar.", L"The name shown instead of Player1, Player2... Enter: edit."),
                     names.empty() ? ui::T(L"Padrão", L"Default") : names, [](int) { OpenNamesDialog(); }});
     // Conquistas
+    const int unlocked_cnt = GetUnlockedTrophiesCount();
+    const int pct_cnt = (unlocked_cnt * 100) / 77;
+    std::wstring progress_str = std::to_wstring(unlocked_cnt) + L" / 77 (" + std::to_wstring(pct_cnt) + L"%)";
+    rows.push_back({kTabTrophies, RowKind::kAction, ui::T(L"Progresso geral", L"Overall progress"),
+                    ui::T(L"Total de conquistas desbloqueadas no save atual. Enter: ver lista.",
+                          L"Total achievements unlocked in current save. Enter: view list."),
+                    progress_str, [](int) { OpenTrophiesDialog(); }});
+
+    static const wchar_t* const kPopupStyles[] = {L"ps5", L"ps4", L"xbox", L"xbox360", L"steam"};
+    rows.push_back({kTabTrophies, RowKind::kChoice, ui::T(L"Estilo do pop-up", L"Pop-up style"),
+                    ui::T(L"Visual do alerta (PS5 qualificado por grau, PS4, Xbox Series, Xbox 360, Steam).",
+                          L"Alert style (PS5 qualified by tier, PS4, Xbox Series, Xbox 360, Steam)."),
+                    g_popup_style_value == L"ps4"     ? std::wstring(L"PlayStation 4") :
+                    g_popup_style_value == L"xbox"    ? std::wstring(L"Xbox One / Series") :
+                    g_popup_style_value == L"xbox360" ? std::wstring(L"Xbox 360") :
+                    g_popup_style_value == L"steam"   ? std::wstring(L"Steam") :
+                    ui::T(L"PlayStation 5 (Qualificado)", L"PlayStation 5 (Qualified)"),
+                    [](int step) {
+                        g_popup_style_value = Step(kPopupStyles, g_popup_style_value, step, [](const wchar_t* s) { return std::wstring(s); });
+                        SaveSettings();
+                    }});
+
     static const wchar_t* const kTrophySounds[] = {L"playstation", L"xbox", L"steam", L"desligado"};
     rows.push_back({kTabTrophies, RowKind::kChoice, ui::T(L"Som de conquista", L"Trophy sound"),
                     ui::T(L"Efeito sonoro ao desbloquear conquistas (PlayStation, Xbox, Steam).",
@@ -1995,6 +2289,13 @@ std::vector<Row> Rows() {
                         g_trophy_sound_value = Step(kTrophySounds, g_trophy_sound_value, step, [](const wchar_t* s) { return std::wstring(s); });
                         SaveSettings();
                     }});
+
+    rows.push_back({kTabTrophies, RowKind::kAction, ui::T(L"Lista de conquistas", L"Achievement list"),
+                    ui::T(L"Visualiza todas as 77 conquistas, graus e requisitos. Enter: abrir.",
+                          L"View all 77 achievements, tiers and requirements. Enter: open."),
+                    ui::T(L"Ver lista (77)...", L"View list (77)..."),
+                    [](int) { OpenTrophiesDialog(); }});
+
     rows.push_back({kTabTrophies, RowKind::kAction, ui::T(L"Reiniciar conquistas", L"Reset achievements"),
                     ui::T(L"Limpa todas as conquistas para recomeçar do zero. Enter: reiniciar.",
                           L"Reset all achievements back to locked. Enter: reset."),
@@ -2674,6 +2975,8 @@ void LoadSettings() {
     g_opt_toypad = ReadIni(L"toypad_auto", L"0") == L"1";
     g_saves_value = ReadIni(L"saves", L"savedata0");
     g_trophy_sound_value = ReadIni(L"trophy_sound", L"playstation");
+    g_popup_style_value = ReadIni(L"popup_style", L"ps5");
+    g_blank_frequency_value = ReadIni(L"blank_frequency", L"900");
     if (const auto folders = SaveFolders(); std::find(folders.begin(), folders.end(), g_saves_value) == folders.end()) {
         g_saves_value = L"savedata0";
     }

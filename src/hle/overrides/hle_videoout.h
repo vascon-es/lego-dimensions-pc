@@ -40,6 +40,8 @@ bool IsSrgbDisplayBuffer(u64 address);
 void SetForce60Hz(bool enabled);
 void SetUnlockedFps(bool enabled);
 bool IsUnlockedFps();
+void SetBlankFrequency(int hz);
+int GetBlankFrequency();
 void InitVideoDefaults();
 // Fase 38: confere na abertura todos os .spv soltos de shaders_spv (diagnostico; segura o backend por segundos).
 void SetCheckModules(bool enabled);

@@ -90,6 +90,15 @@ std::atomic<bool> g_window_started{false}; // Fase 42: aberta antes do jogo pela
 int g_flip_rate = 0; // 0 = 60 Hz, 1 = 30 Hz, 2 = 20 Hz
 std::atomic<bool> g_force_60hz{true}; // padrao 60 FPS no PC
 std::atomic<bool> g_unlocked_fps{false}; // FPS desbloqueado
+std::atomic<int> g_blank_frequency{900}; // Padrao 900 Hz
+
+void SetBlankFrequency(int hz) {
+    g_blank_frequency.store(hz > 0 ? hz : 900);
+}
+
+int GetBlankFrequency() {
+    return g_blank_frequency.load();
+}
 std::condition_variable g_flip_cv;
 u32 g_width = 1920, g_height = 1080;
 std::vector<void*> g_buffers;
@@ -133,7 +142,9 @@ static std::vector<MenuItem> g_menu_items = {
     {"FPS COUNTER (F10)", {"OFF", "ON"}, 0},
     {"CONTROLLER ICONS", {"AUTO", "PS4", "XBOX", "SWITCH"}, 0},
     {"TROPHY SOUND", {"PLAYSTATION", "XBOX", "STEAM", "OFF"}, 0},
-    {"RESET TROPHIES", {"< PRESS ENTER >", "TROPHIES RESET!"}, 0}
+    {"RESET TROPHIES", {"< PRESS ENTER >", "TROPHIES RESET!"}, 0},
+    {"POPUP STYLE", {"PS5 (QUALIFIED)", "PS4", "XBOX", "XBOX 360", "STEAM"}, 0},
+    {"BLANK FREQUENCY", {"900 HZ", "600 HZ", "300 HZ", "120 HZ", "60 HZ"}, 0}
 };
 
 static void WriteLauncherIni(const wchar_t* key, const wchar_t* val) {
@@ -272,6 +283,28 @@ static void ApplyAndSaveVideoSettings() {
         g_menu_items[7].selected = 1;
     }
 
+    // Popup style
+    if (g_menu_items.size() > 8) {
+        static const wchar_t* const kPopupStr[] = {L"ps5", L"ps4", L"xbox", L"xbox360", L"steam"};
+        static const char* const kPopupAnsi[] = {"ps5", "ps4", "xbox", "xbox360", "steam"};
+        const int ps = g_menu_items[8].selected;
+        if (ps >= 0 && ps < 5) {
+            WriteLauncherIni(L"popup_style", kPopupStr[ps]);
+            hle::trophy::TrophyManager::Instance().SetPopupStyle(kPopupAnsi[ps]);
+        }
+    }
+
+    // Blank frequency
+    if (g_menu_items.size() > 9) {
+        static const int kBlankHz[] = {900, 600, 300, 120, 60};
+        static const wchar_t* const kBlankStr[] = {L"900", L"600", L"300", L"120", L"60"};
+        const int bf = g_menu_items[9].selected;
+        if (bf >= 0 && bf < 5) {
+            WriteLauncherIni(L"blank_frequency", kBlankStr[bf]);
+            SetBlankFrequency(kBlankHz[bf]);
+        }
+    }
+
     g_save_confirm_timer = 90;
 }
 
@@ -297,6 +330,10 @@ static void InitMenuDefaults() {
         g_menu_items[6].options = {"PLAYSTATION", "XBOX", "STEAM", "DESLIGADO"};
         g_menu_items[7].label = "REINICIAR CONQUISTAS";
         g_menu_items[7].options = {"< APERTE ENTER >", "CONQUISTAS REINICIADAS!"};
+        g_menu_items[8].label = "ESTILO DO POP-UP";
+        g_menu_items[8].options = {"PS5 (QUALIFICADO)", "PS4", "XBOX", "XBOX 360", "STEAM"};
+        g_menu_items[9].label = "FREQUENCIA BLANK";
+        g_menu_items[9].options = {"900 HZ (FLUIDO)", "600 HZ", "300 HZ", "120 HZ", "60 HZ"};
     }
     wchar_t exe[MAX_PATH];
     if (GetModuleFileNameW(nullptr, exe, MAX_PATH)) {
@@ -325,6 +362,21 @@ static void InitMenuDefaults() {
         else if (!_wcsicmp(buf, L"steam")) g_menu_items[6].selected = 2;
         else if (!_wcsicmp(buf, L"off") || !_wcsicmp(buf, L"desligado")) g_menu_items[6].selected = 3;
         else g_menu_items[6].selected = 0;
+
+        GetPrivateProfileStringW(L"launcher", L"popup_style", L"ps5", buf, 64, ini.wstring().c_str());
+        if (!_wcsicmp(buf, L"ps4")) g_menu_items[8].selected = 1;
+        else if (!_wcsicmp(buf, L"xbox")) g_menu_items[8].selected = 2;
+        else if (!_wcsicmp(buf, L"xbox360")) g_menu_items[8].selected = 3;
+        else if (!_wcsicmp(buf, L"steam")) g_menu_items[8].selected = 4;
+        else g_menu_items[8].selected = 0;
+
+        int bf = GetPrivateProfileIntW(L"launcher", L"blank_frequency", 900, ini.wstring().c_str());
+        if (bf == 600) g_menu_items[9].selected = 1;
+        else if (bf == 300) g_menu_items[9].selected = 2;
+        else if (bf == 120) g_menu_items[9].selected = 3;
+        else if (bf == 60) g_menu_items[9].selected = 4;
+        else g_menu_items[9].selected = 0;
+        SetBlankFrequency(bf);
     }
     g_menu_items[1].selected = g_start_fullscreen.load() || g_fullscreen ? 0 : 1;
     int major = 0;
@@ -606,7 +658,10 @@ void VsyncThread() {
         if (next < now) {
             next = now;
         }
-        next += std::chrono::microseconds(16667) * (rate + 1);
+        const int hz = g_blank_frequency.load(std::memory_order_relaxed);
+        const int effective_hz = hz > 0 ? hz : 900;
+        const int period_us = std::max(500, 1000000 / effective_hz);
+        next += std::chrono::microseconds(period_us) * (rate + 1);
         std::this_thread::sleep_until(next);
 
         std::vector<FlipListener> listeners;
@@ -943,6 +998,25 @@ struct OverlayCanvas {
         v(x0, y0), v(x1, y0), v(x1, y1);
         v(x0, y0), v(x1, y1), v(x0, y1);
     }
+    void Circle(float cx, float cy, float r, u32 rgba) {
+        const int steps = static_cast<int>(r);
+        for (int dy = -steps; dy <= steps; ++dy) {
+            float fdy = static_cast<float>(dy);
+            float dx = std::sqrt(std::max(0.0f, r * r - fdy * fdy));
+            Rect(cx - dx, cy + fdy, cx + dx, cy + fdy + 1.0f, rgba);
+        }
+    }
+    void Pill(float x0, float y0, float x1, float y1, u32 rgba) {
+        float r = (y1 - y0) * 0.5f;
+        Rect(x0 + r, y0, x1 - r, y1, rgba);
+        const int steps = static_cast<int>(r);
+        for (int dy = -steps; dy <= steps; ++dy) {
+            float fdy = static_cast<float>(dy);
+            float dx = std::sqrt(std::max(0.0f, r * r - fdy * fdy));
+            Rect(x0 + r - dx, y0 + r + fdy, x0 + r, y0 + r + fdy + 1.0f, rgba);
+            Rect(x1 - r, y0 + r + fdy, x1 - r + dx, y0 + r + fdy + 1.0f, rgba);
+        }
+    }
     // pixels acesos seguidos na mesma linha viram um retangulo so
     void Glyphs(const std::string& text, float x, float y, float pixel, u32 rgba) {
         for (const char c : text) {
@@ -1089,7 +1163,7 @@ void QueueStatsOverlay() {
         
         float scale_ui = client.bottom >= 1400 ? 1.5f : (client.bottom >= 1000 ? 1.0f : 0.75f);
         float box_w = 700.0f * scale_ui;
-        float box_h = 480.0f * scale_ui;
+        float box_h = 560.0f * scale_ui;
         float box_x0 = (client.right - box_w) / 2.0f;
         float box_y0 = (client.bottom - box_h) / 2.0f;
         float box_x1 = box_x0 + box_w;
@@ -1144,12 +1218,7 @@ void QueueStatsOverlay() {
         }
 
         const float scale_ui = client.bottom >= 1400 ? 1.4f : (client.bottom >= 1000 ? 1.0f : 0.8f);
-        const float box_w = 460.0f * scale_ui;
-        const float box_h = 74.0f * scale_ui;
-        const float target_x = client.right - box_w - 24.0f * scale_ui;
-        const float target_y = 24.0f * scale_ui;
-        const float cur_y = target_y - (1.0f - anim) * (box_h + 35.0f * scale_ui);
-        const float cur_x = target_x;
+        const std::string style = toast.popup_style.empty() ? "ps5" : toast.popup_style;
 
         u32 tier_col = 0xFFCD7F32; // Bronze
         const char* tier_en = "BRONZE";
@@ -1167,42 +1236,170 @@ void QueueStatsOverlay() {
             tier_en = "SILVER";
             tier_pt = "PRATA";
         }
+        const char* tier_name = lang::Pt() ? tier_pt : tier_en;
 
-        // Outer border and dark slate background
-        c.Rect(cur_x - 3.0f * scale_ui, cur_y - 3.0f * scale_ui, cur_x + box_w + 3.0f * scale_ui, cur_y + box_h + 3.0f * scale_ui, tier_col);
-        c.Rect(cur_x, cur_y, cur_x + box_w, cur_y + box_h, 0xEE14141A);
-
-        // Badge area on left
-        const float badge_sz = box_h - 12.0f * scale_ui;
-        const float badge_x = cur_x + 6.0f * scale_ui;
-        const float badge_y = cur_y + 6.0f * scale_ui;
-        c.Rect(badge_x, badge_y, badge_x + badge_sz, badge_y + badge_sz, 0x44000000);
-        c.Rect(badge_x + 1.0f, badge_y + 1.0f, badge_x + badge_sz - 1.0f, badge_y + badge_sz - 1.0f, 0x33FFFFFF);
-
-        // Trophy cup icon
-        const float cup_p = scale_ui * 2.5f;
-        const float cup_x = badge_x + (badge_sz - 5.0f * cup_p) * 0.5f;
-        const float cup_y = badge_y + (badge_sz - 7.0f * cup_p) * 0.5f;
         static const u8 kTrophyCup[7] = {0x1F, 0x1F, 0x0E, 0x04, 0x04, 0x0E, 0x1F};
-        for (int r = 0; r < 7; ++r) {
-            for (int col = 0; col < 5; ++col) {
-                if (kTrophyCup[r] & (0x10 >> col)) {
-                    c.Rect(cup_x + col * cup_p, cup_y + r * cup_p, cup_x + (col + 1) * cup_p, cup_y + (r + 1) * cup_p, tier_col);
+
+        if (style == "xbox") {
+            // Modern Xbox One / Series style: vibrant green pill capsule
+            const float box_w = 480.0f * scale_ui;
+            const float box_h = 66.0f * scale_ui;
+            const float cur_x = (client.right - box_w) * 0.5f;
+            const float cur_y = 24.0f * scale_ui - (1.0f - anim) * (box_h + 35.0f * scale_ui);
+
+            c.Pill(cur_x, cur_y + 3.0f * scale_ui, cur_x + box_w, cur_y + box_h + 3.0f * scale_ui, 0x66000000);
+            c.Pill(cur_x, cur_y, cur_x + box_w, cur_y + box_h, 0xFF107C10);
+
+            const float cr = (box_h - 16.0f * scale_ui) * 0.5f;
+            const float cx = cur_x + 14.0f * scale_ui + cr;
+            const float cy = cur_y + box_h * 0.5f;
+            c.Circle(cx, cy, cr, 0xFF0C620C);
+
+            const float cup_p = scale_ui * 2.0f;
+            const float cup_x = cx - 2.5f * cup_p;
+            const float cup_y = cy - 3.5f * cup_p;
+            for (int r = 0; r < 7; ++r) {
+                for (int col = 0; col < 5; ++col) {
+                    if (kTrophyCup[r] & (0x10 >> col)) {
+                        c.Rect(cup_x + col * cup_p, cup_y + r * cup_p, cup_x + (col + 1) * cup_p, cup_y + (r + 1) * cup_p, 0xFFFFFFFF);
+                    }
                 }
             }
+
+            const float text_x = cx + cr + 14.0f * scale_ui;
+            std::string hdr = lang::Pt() ? "Conquista desbloqueada" : "Achievement unlocked";
+            c.Write(hdr, text_x, cur_y + 11.0f * scale_ui, 1.8f * scale_ui, 0xFFFFFFFF);
+            c.Write(toast.title, text_x, cur_y + 35.0f * scale_ui, 1.6f * scale_ui, 0xFFD8FFD8);
+
+        } else if (style == "xbox360") {
+            // Classic Xbox 360 style: dark charcoal pill with green guide orb
+            const float box_w = 460.0f * scale_ui;
+            const float box_h = 64.0f * scale_ui;
+            const float cur_x = (client.right - box_w) * 0.5f;
+            const float cur_y = 24.0f * scale_ui - (1.0f - anim) * (box_h + 35.0f * scale_ui);
+
+            c.Pill(cur_x - 1.5f * scale_ui, cur_y - 1.5f * scale_ui, cur_x + box_w + 1.5f * scale_ui, cur_y + box_h + 1.5f * scale_ui, 0xFF505054);
+            c.Pill(cur_x, cur_y, cur_x + box_w, cur_y + box_h, 0xF21C1C1F);
+
+            const float cr = (box_h - 16.0f * scale_ui) * 0.5f;
+            const float cx = cur_x + 14.0f * scale_ui + cr;
+            const float cy = cur_y + box_h * 0.5f;
+            c.Circle(cx, cy, cr, 0xFF353538);
+            c.Circle(cx, cy, cr - 3.0f * scale_ui, 0xFF7D7D85);
+
+            // Guide quarter arc (upper left green)
+            for (float dy = -cr + 1.0f; dy <= 0.0f; dy += 1.0f) {
+                float dx = std::sqrt(std::max(0.0f, (cr - 1.0f) * (cr - 1.0f) - dy * dy));
+                c.Rect(cx - dx, cy + dy, cx, cy + dy + 1.0f, 0xFF52B022);
+            }
+
+            const float text_x = cx + cr + 14.0f * scale_ui;
+            std::string hdr = lang::Pt() ? "Conquista desbloqueada" : "Achievement unlocked";
+            c.Write(hdr, text_x, cur_y + 11.0f * scale_ui, 1.8f * scale_ui, 0xFFE0E0E0);
+            c.Write(toast.title, text_x, cur_y + 34.0f * scale_ui, 1.6f * scale_ui, 0xFFFFFFFF);
+
+        } else if (style == "ps4") {
+            // PlayStation 4 style: clean dark slate notification banner at top-right
+            const float box_w = 460.0f * scale_ui;
+            const float box_h = 72.0f * scale_ui;
+            const float cur_x = client.right - box_w - 24.0f * scale_ui;
+            const float cur_y = 24.0f * scale_ui - (1.0f - anim) * (box_h + 35.0f * scale_ui);
+
+            c.Rect(cur_x - 2.0f * scale_ui, cur_y - 2.0f * scale_ui, cur_x + box_w + 2.0f * scale_ui, cur_y + box_h + 2.0f * scale_ui, 0xFF363842);
+            c.Rect(cur_x, cur_y, cur_x + box_w, cur_y + box_h, 0xEE16181E);
+
+            const float badge_sz = box_h - 16.0f * scale_ui;
+            const float badge_x = cur_x + 8.0f * scale_ui;
+            const float badge_y = cur_y + 8.0f * scale_ui;
+            c.Rect(badge_x, badge_y, badge_x + badge_sz, badge_y + badge_sz, 0xFF242630);
+
+            const float cup_p = scale_ui * 2.2f;
+            const float cup_x = badge_x + (badge_sz - 5.0f * cup_p) * 0.5f;
+            const float cup_y = badge_y + (badge_sz - 7.0f * cup_p) * 0.5f;
+            for (int r = 0; r < 7; ++r) {
+                for (int col = 0; col < 5; ++col) {
+                    if (kTrophyCup[r] & (0x10 >> col)) {
+                        c.Rect(cup_x + col * cup_p, cup_y + r * cup_p, cup_x + (col + 1) * cup_p, cup_y + (r + 1) * cup_p, tier_col);
+                    }
+                }
+            }
+
+            const float text_x = badge_x + badge_sz + 12.0f * scale_ui;
+            c.Write(toast.title, text_x, cur_y + 14.0f * scale_ui, 2.0f * scale_ui, 0xFFFFFFFF);
+            std::string sub = lang::Pt() ? "Trofeu conquistado!" : "Trophy earned!";
+            c.Write(sub, text_x, cur_y + 40.0f * scale_ui, 1.4f * scale_ui, 0xFFA0A0B2);
+
+        } else if (style == "steam") {
+            // Steam style: navy rectangular banner at bottom-right
+            const float box_w = 420.0f * scale_ui;
+            const float box_h = 72.0f * scale_ui;
+            const float cur_x = client.right - box_w - 24.0f * scale_ui;
+            const float cur_y = client.bottom - box_h - 24.0f * scale_ui + (1.0f - anim) * (box_h + 35.0f * scale_ui);
+
+            c.Rect(cur_x - 2.0f * scale_ui, cur_y - 2.0f * scale_ui, cur_x + box_w + 2.0f * scale_ui, cur_y + box_h + 2.0f * scale_ui, 0xFF2B475D);
+            c.Rect(cur_x, cur_y, cur_x + box_w, cur_y + box_h, 0xFA171A21);
+
+            const float badge_sz = box_h - 16.0f * scale_ui;
+            const float badge_x = cur_x + 8.0f * scale_ui;
+            const float badge_y = cur_y + 8.0f * scale_ui;
+            c.Rect(badge_x, badge_y, badge_x + badge_sz, badge_y + badge_sz, 0xFF0E141B);
+
+            const float cup_p = scale_ui * 2.2f;
+            const float cup_x = badge_x + (badge_sz - 5.0f * cup_p) * 0.5f;
+            const float cup_y = badge_y + (badge_sz - 7.0f * cup_p) * 0.5f;
+            for (int r = 0; r < 7; ++r) {
+                for (int col = 0; col < 5; ++col) {
+                    if (kTrophyCup[r] & (0x10 >> col)) {
+                        c.Rect(cup_x + col * cup_p, cup_y + r * cup_p, cup_x + (col + 1) * cup_p, cup_y + (r + 1) * cup_p, 0xFF66C0F4);
+                    }
+                }
+            }
+
+            const float text_x = badge_x + badge_sz + 12.0f * scale_ui;
+            std::string hdr = lang::Pt() ? "Steam - Conquista Desbloqueada" : "Steam - Achievement Unlocked";
+            c.Write(hdr, text_x, cur_y + 9.0f * scale_ui, 1.4f * scale_ui, 0xFF66C0F4);
+            c.Write(toast.title, text_x, cur_y + 26.0f * scale_ui, 1.8f * scale_ui, 0xFFFFFFFF);
+            c.Write(toast.desc, text_x, cur_y + 48.0f * scale_ui, 1.2f * scale_ui, 0xFF8F98A0);
+
+        } else {
+            // Default / PS5: PlayStation 5 style with full Trophy Tier Qualification
+            const float box_w = 500.0f * scale_ui;
+            const float box_h = 78.0f * scale_ui;
+            const float cur_x = (client.right - box_w) * 0.5f;
+            const float cur_y = 24.0f * scale_ui - (1.0f - anim) * (box_h + 35.0f * scale_ui);
+
+            // Outer glowing pill outline in tier color
+            c.Pill(cur_x - 3.0f * scale_ui, cur_y - 3.0f * scale_ui, cur_x + box_w + 3.0f * scale_ui, cur_y + box_h + 3.0f * scale_ui, tier_col);
+            // Sleek dark frosted glass body
+            c.Pill(cur_x, cur_y, cur_x + box_w, cur_y + box_h, 0xF20F1218);
+
+            // Side tier indicator bar
+            c.Pill(cur_x + 8.0f * scale_ui, cur_y + 12.0f * scale_ui, cur_x + 14.0f * scale_ui, cur_y + box_h - 12.0f * scale_ui, tier_col);
+
+            // Left circular trophy badge
+            const float cr = (box_h - 18.0f * scale_ui) * 0.5f;
+            const float cx = cur_x + 22.0f * scale_ui + cr;
+            const float cy = cur_y + box_h * 0.5f;
+            c.Circle(cx, cy, cr, 0x44000000);
+
+            const float cup_p = scale_ui * 2.4f;
+            const float cup_x = cx - 2.5f * cup_p;
+            const float cup_y = cy - 3.5f * cup_p;
+            for (int r = 0; r < 7; ++r) {
+                for (int col = 0; col < 5; ++col) {
+                    if (kTrophyCup[r] & (0x10 >> col)) {
+                        c.Rect(cup_x + col * cup_p, cup_y + r * cup_p, cup_x + (col + 1) * cup_p, cup_y + (r + 1) * cup_p, tier_col);
+                    }
+                }
+            }
+
+            const float text_x = cx + cr + 14.0f * scale_ui;
+            // Tier qualification header
+            std::string hdr = std::string(lang::Pt() ? "* TROFEU DE " : "* ") + tier_name + (lang::Pt() ? " CONQUISTADO!" : " TROPHY EARNED!");
+            c.Write(hdr, text_x, cur_y + 10.0f * scale_ui, 1.55f * scale_ui, tier_col);
+            c.Write(toast.title, text_x, cur_y + 28.0f * scale_ui, 2.1f * scale_ui, 0xFFFFFFFF);
+            c.Write(toast.desc, text_x, cur_y + 52.0f * scale_ui, 1.35f * scale_ui, 0xFFAAAAAA);
         }
-
-        // Text lines on right
-        const float text_x = badge_x + badge_sz + 12.0f * scale_ui;
-        const float font_hdr = 1.5f * scale_ui;
-        const float font_title = 2.0f * scale_ui;
-        const float font_desc = 1.35f * scale_ui;
-
-        std::string hdr = std::string(lang::Pt() ? "* CONQUISTA DESBLOQUEADA! [" : "* TROPHY UNLOCKED! [") +
-                          (lang::Pt() ? tier_pt : tier_en) + "]";
-        c.Write(hdr, text_x, cur_y + 9.0f * scale_ui, font_hdr, tier_col);
-        c.Write(toast.title, text_x, cur_y + 25.0f * scale_ui, font_title, 0xFFFFFFFF);
-        c.Write(toast.desc, text_x, cur_y + 48.0f * scale_ui, font_desc, 0xFFAAAAAA);
     }
 
     if (!vertices.empty()) {

@@ -1208,6 +1208,15 @@ int main(int argc, char** argv) {
             hle::videoout::SetForce60Hz(true);
             hle::videoout::SetUnlockedFps(false);
         }
+        wchar_t ini_popup[64] = {};
+        GetPrivateProfileStringW(L"launcher", L"popup_style", L"ps5", ini_popup, 64, (root / "launcher.ini").wstring().c_str());
+        char popup_style_a[64] = {};
+        wcstombs(popup_style_a, ini_popup, sizeof(popup_style_a));
+        if (popup_style_a[0]) {
+            hle::trophy::TrophyManager::Instance().SetPopupStyle(popup_style_a);
+        }
+        int bf = GetPrivateProfileIntW(L"launcher", L"blank_frequency", 900, (root / "launcher.ini").wstring().c_str());
+        hle::videoout::SetBlankFrequency(bf > 0 ? bf : 900);
     }
     std::filesystem::path elf_path = root / "assets" / "decrypted_elfs" / "eboot.bin.elf";
     std::filesystem::path app0 = DefaultApp0(root);
@@ -1308,6 +1317,10 @@ int main(int argc, char** argv) {
             hle::videoout::SetStatsOverlay(true); // Fase 65: contador de FPS / info (F10 alterna no jogo)
         } else if (!std::strcmp(argv[i], "--trophy-sound") && i + 1 < argc) {
             hle::trophy::TrophyManager::Instance().SetSoundType(argv[++i]);
+        } else if (!std::strcmp(argv[i], "--popup-style") && i + 1 < argc) {
+            hle::trophy::TrophyManager::Instance().SetPopupStyle(argv[++i]);
+        } else if (!std::strcmp(argv[i], "--blank-frequency") && i + 1 < argc) {
+            hle::videoout::SetBlankFrequency(std::atoi(argv[++i]));
         } else if (!std::strcmp(argv[i], "--reset-trophies")) {
             hle::trophy::TrophyManager::Instance().ResetTrophies();
         } else if (!std::strcmp(argv[i], "--lang") && i + 1 < argc) {
