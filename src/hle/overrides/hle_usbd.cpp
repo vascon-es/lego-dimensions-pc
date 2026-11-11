@@ -564,6 +564,15 @@ void StartPortalWatcher(const std::filesystem::path& portal_file) {
                " \"pad3\": {\"uid\": [4,202,17,74,153,54,128], \"id\": 3}}\n";
     }
     toypad::LoadPortalState(portal_file);
+    {
+        std::ifstream in(portal_file, std::ios::binary);
+        if (in) {
+            const std::string json((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+            for (int pad = 1; pad <= toypad::kPadCount; ++pad) {
+                g_applied[pad - 1] = ParsePad(json, pad);
+            }
+        }
+    }
     std::thread(PortalWatcher).detach();
 }
 
