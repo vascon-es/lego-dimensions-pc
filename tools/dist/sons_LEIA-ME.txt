@@ -5,7 +5,7 @@ SONS DE CONQUISTA / ACHIEVEMENT SOUNDS
 
     ps5      ps4      ps3      xboxone      xbox360      wiiu      steam      switch
 
-Exemplo: ps3.wav, xbox360.mp3. Com "Som de conquista" em "Automatico" (launcher ou menu F1 do jogo),
+Exemplo: ps3.wav, xbox360.mp3. Um som so para um grau: <estilo>_platinum / _gold / _silver / _bronze (ex.: ps5_platinum.wav). Com "Som de conquista" em "Automatico" (launcher ou menu F1 do jogo),
 o jogo toca o arquivo do estilo escolhido. Sem arquivo, toca o som que ja vem no port.
 Os sons nao vem no download: use os seus.
 
@@ -13,6 +13,6 @@ Os sons nao vem no download: use os seus.
 
     ps5      ps4      ps3      xboxone      xbox360      wiiu      steam      switch
 
-Example: ps3.wav, xbox360.mp3. With "Trophy sound" set to "Automatic" (launcher or the in-game F1 menu),
+Example: ps3.wav, xbox360.mp3. A sound for one tier only: <style>_platinum / _gold / _silver / _bronze (e.g. ps5_platinum.wav). With "Trophy sound" set to "Automatic" (launcher or the in-game F1 menu),
 the game plays the file of the chosen style. Without a file, it plays the sound that comes with the port.
 The sounds are not included in the download: use your own.
