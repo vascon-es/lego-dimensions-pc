@@ -65,7 +65,7 @@ private:
 
     void LoadTrophyXml();
     void SaveTrophyXml();
-    void PlayTrophySound();
+    void PlayTrophySound(char type); // 3.0: tocado quando o pop-up aparece (o som do grau, se houver)
 
     mutable std::recursive_mutex m_mutex;
     std::filesystem::path m_root_path;

@@ -1787,7 +1787,7 @@ struct PopupVertex {
     u32 rgba;
     float u, v;
 };
-constexpr u32 kPopupAtlasW = 2048, kPopupAtlasH = 512;
+constexpr u32 kPopupAtlasW = 2048, kPopupAtlasH = 1024;
 constexpr u64 kPopupAtlasKey = 0x7E0F'A11C'0000'0001ull;
 static hle::trophy_popup::Image g_popup_image;
 
@@ -1833,15 +1833,20 @@ static bool PreparePopup(float ch, const std::string& style, int trophy_id, char
     return s_ok;
 }
 
-static void QueuePopup(float cw, float ch, const std::string& style, float elapsed, float remaining) {
+static void QueuePopup(float cw, float ch, float elapsed, float remaining) {
     static std::vector<hle::trophy_popup::Quad> quads;
     static std::vector<PopupVertex> vertices;
     quads.clear();
     vertices.clear();
-    hle::trophy_popup::Layout(style, g_popup_image, cw, ch, std::clamp(ch / 1080.0f, 0.6f, 2.2f), elapsed, remaining, &quads);
+    hle::trophy_popup::Layout(g_popup_image, cw, ch, elapsed, remaining, &quads);
     for (const auto& q : quads) {
-        const u32 color = Rgba(255, 255, 255, static_cast<u8>(std::clamp(q.alpha, 0.0f, 1.0f) * 255.0f + 0.5f));
+        const u32 color = (q.tint & 0xFFFFFFu) | (static_cast<u32>(std::clamp(q.alpha, 0.0f, 1.0f) * 255.0f + 0.5f) << 24);
+        const float mx = (q.x0 + q.x1) * 0.5f, my = (q.y0 + q.y1) * 0.5f, cs = std::cos(q.angle), sn = std::sin(q.angle);
         auto v = [&](float x, float y, float tu, float tv) {
+            if (q.angle != 0.0f) { // rotacao em volta do centro (o logo do Xbox One rolando)
+                const float dx = x - mx, dy = y - my;
+                x = mx + dx * cs - dy * sn, y = my + dx * sn + dy * cs;
+            }
             vertices.push_back({x / (cw * 0.5f) - 1.0f, 1.0f - y / (ch * 0.5f), 0.0f, color, tu / kPopupAtlasW, tv / kPopupAtlasH});
         };
         v(q.x0, q.y0, q.u0, q.v0), v(q.x1, q.y0, q.u1, q.v0), v(q.x1, q.y1, q.u1, q.v1);
@@ -2285,10 +2290,10 @@ void QueueStatsOverlay() {
             const std::string style = hle::trophy_popup::kStyleKeys[sel];
             const char* title = lang::Pt() ? "Exemplo de Conquista" : "Sample Achievement";
             const char* desc = lang::Pt() ? "Pré-visualização do estilo selecionado" : "Selected popup style preview";
-            constexpr float kLoop = 5.0f;
-            const float t = std::fmod(static_cast<float>(std::chrono::duration<double>(now.time_since_epoch()).count()), kLoop);
+            const float show = hle::trophy_popup::Duration(style, 'G'), loop = show + 0.8f; // repete a animacao com uma pausa
+            const float t = std::fmod(static_cast<float>(std::chrono::duration<double>(now.time_since_epoch()).count()), loop);
             if (PreparePopup(c.h, style, 16, 'G', title, desc)) {
-                popup = PendingPopup{style, t, kLoop - t};
+                popup = PendingPopup{style, t, t < show ? show - t : -1.0f};
             } else {
                 float scale_toast = client.bottom >= 1400 ? 1.4f : (client.bottom >= 1000 ? 1.0f : 0.8f);
                 RenderTrophyToast(c, client, scale_toast, style, 16, 'G', title, desc, 1.0f, true);
@@ -2592,8 +2597,8 @@ void QueueStatsOverlay() {
         draw.viewport[3] = draw.target_size[1] = c.h;
         render::VulkanRenderer::Instance().QueueDraw(draw);
     }
-    if (popup) {
-        QueuePopup(c.w, c.h, popup->style, popup->elapsed, popup->remaining);
+    if (popup && popup->remaining >= 0.0f) {
+        QueuePopup(c.w, c.h, popup->elapsed, popup->remaining);
     }
 }
 

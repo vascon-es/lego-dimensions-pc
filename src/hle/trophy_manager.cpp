@@ -1,6 +1,7 @@
 #include "trophy_manager.h"
 #include "trophy_sounds.h"
 #include "trophy_trp.h"
+#include "trophy_popup.h"
 #include "hle/overrides/hle_filesystem.h"
 #include "runtime/lang.h"
 #include "hle_log.h"
@@ -146,8 +147,7 @@ bool TrophyManager::UnlockTrophy(int trophy_id, int* platinum_id, bool notify) {
     }
 
     if (notify) {
-        QueueToast(trophy_id);
-        PlayTrophySound();
+        QueueToast(trophy_id); // 3.0: o som toca quando o pop-up aparece (Update), junto com a animacao
     }
 
     if (all_base && !(m_flags[0] & 1u)) {
@@ -216,10 +216,10 @@ void PlayMci(const std::filesystem::path& path) {
 } // namespace
 
 void TrophyManager::PlayPreviewSound() {
-    PlayTrophySound();
+    PlayTrophySound('G');
 }
 
-void TrophyManager::PlayTrophySound() {
+void TrophyManager::PlayTrophySound(char type) {
     std::string choice, style;
     {
         std::lock_guard lock(m_mutex);
@@ -235,16 +235,19 @@ void TrophyManager::PlayTrophySound() {
     if (choice == "steam") key = "steam";
     const std::string file = key == "xbox" ? "xboxone" : key;
 
-    // 1) o som que o jogador colocou: assets\trophy\sounds\<estilo>.wav / .mp3
+    // 1) o som que o jogador colocou: assets\trophy\sounds\<estilo>_<grau>.wav / .mp3 (ex.: ps5_platinum), depois <estilo>
     std::error_code ec;
     const auto sounds = m_root_path / "assets" / "trophy" / "sounds";
-    if (const auto wav = sounds / (file + ".wav"); std::filesystem::exists(wav, ec)) {
-        PlaySoundW(wav.c_str(), nullptr, SND_FILENAME | SND_ASYNC | SND_NODEFAULT);
-        return;
-    }
-    if (const auto mp3 = sounds / (file + ".mp3"); std::filesystem::exists(mp3, ec)) {
-        PlayMci(mp3);
-        return;
+    const char* tier = type == 'P' ? "_platinum" : type == 'G' ? "_gold" : type == 'S' ? "_silver" : "_bronze";
+    for (const std::string& name : {file + tier, file}) {
+        if (const auto wav = sounds / (name + ".wav"); std::filesystem::exists(wav, ec)) {
+            PlaySoundW(wav.c_str(), nullptr, SND_FILENAME | SND_ASYNC | SND_NODEFAULT);
+            return;
+        }
+        if (const auto mp3 = sounds / (name + ".mp3"); std::filesystem::exists(mp3, ec)) {
+            PlayMci(mp3);
+            return;
+        }
     }
     // 2) o som personalizado antigo (um para todos)
     if (const auto custom = m_root_path / "assets" / "custom_trophy" / "trophy.wav"; std::filesystem::exists(custom, ec)) {
@@ -326,9 +329,10 @@ void TrophyManager::Update(float delta_sec) {
             m_active_toast.title = lang::Pt() ? def->name_pt : def->name_en;
             m_active_toast.desc = lang::Pt() ? def->desc_pt : def->desc_en;
             m_active_toast.popup_style = m_popup_style;
-            m_active_toast.total_duration = 5.5f;
-            m_active_toast.time_remaining = 5.5f;
+            m_active_toast.total_duration = hle::trophy_popup::Duration(m_popup_style, def->type); // 3.0: o tempo de cada console
+            m_active_toast.time_remaining = m_active_toast.total_duration;
             m_active_toast.active = true;
+            PlayTrophySound(def->type);
         }
     }
 }

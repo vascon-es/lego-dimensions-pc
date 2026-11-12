@@ -1564,27 +1564,27 @@ int main(int argc, char** argv) {
     if (!popup_test.empty()) { // 3.0: cada estilo em <pasta>\<estilo>.rgba ("w h" + RGBA) e as posicoes da animacao em .txt
         std::filesystem::create_directories(popup_test);
         for (const char* style : hle::trophy_popup::kStyleKeys) {
-            for (const int scale10 : {10, 20}) {
+            for (const char type : {'G', 'P'}) {
                 hle::trophy_popup::Image image;
-                const hle::trophy_popup::Request request{style, 16, 'G', "Simply Walked Into... Metropolis", "Complete 'Painting the Town Black'",
-                                                         lang::Pt(), scale10 / 10.0f};
+                const hle::trophy_popup::Request request{style, 16, type, "Simply Walked Into... Metropolis", "Complete 'Painting the Town Black'",
+                                                         lang::Pt(), 1.0f};
                 if (!hle::trophy_popup::Render(request, &image)) {
                     std::printf("popup-test: %s failed\n", style);
                     continue;
                 }
-                const std::string name = std::string(style) + (scale10 == 20 ? "_4k" : "");
+                const std::string name = std::string(style) + "_" + type;
                 std::ofstream raw(popup_test / (name + ".rgba"), std::ios::binary);
                 raw << image.w << ' ' << image.h << '\n';
                 raw.write(reinterpret_cast<const char*>(image.rgba.data()), static_cast<std::streamsize>(image.rgba.size() * 4));
                 std::ofstream layout(popup_test / (name + ".txt"));
-                const float cw = scale10 == 20 ? 3840.0f : 1920.0f, ch = scale10 == 20 ? 2160.0f : 1080.0f;
-                for (const float t : {0.05f, 0.12f, 0.2f, 0.3f, 0.45f, 1.0f, 5.2f, 5.42f}) {
+                const float total = hle::trophy_popup::Duration(style, type);
+                for (float t = 0.0f; t < total; t += 1.0f / 15.0f) {
                     std::vector<hle::trophy_popup::Quad> quads;
-                    hle::trophy_popup::Layout(style, image, cw, ch, scale10 / 10.0f, t, 5.5f - t, &quads);
+                    hle::trophy_popup::Layout(image, 1920.0f, 1080.0f, t, total - t, &quads);
                     layout << "t " << t << '\n';
                     for (const auto& q : quads) {
                         layout << q.x0 << ' ' << q.y0 << ' ' << q.x1 << ' ' << q.y1 << ' ' << q.u0 << ' ' << q.v0 << ' ' << q.u1 << ' '
-                               << q.v1 << ' ' << q.alpha << '\n';
+                               << q.v1 << ' ' << q.alpha << ' ' << q.tint << ' ' << q.angle << '\n';
                     }
                 }
             }
