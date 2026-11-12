@@ -3,7 +3,7 @@
 
 Saida em dist/:
   LEGO Dimensions PC/               pasta montada (a mesma do .zip)
-  LEGO_Dimensions_PC_portatil.zip   versao portatil (descompactar e abrir LegoDimensionsLauncher.exe)
+  LEGO_Dimensions_PC_Portable.zip   versao portatil (descompactar e abrir LegoDimensionsLauncher.exe)
   LEGO_Dimensions_PC_Setup.exe      instalador (o mesmo conteudo colado no fim do instalador)
 
 Vai junto: o port, o compilador de shaders ao vivo, o launcher, o runtime do Visual C++ (redistribuivel),
@@ -212,7 +212,7 @@ def main():
     files = sum(len(f) for _, _, f in os.walk(STAGE))
     size = sum(os.path.getsize(os.path.join(b, f)) for b, _, fs in os.walk(STAGE) for f in fs)
     print('montado: %d arquivos, %.0f MB em %s' % (files, size / 2 ** 20, STAGE))
-    portable = os.path.join(DIST, 'LEGO_Dimensions_PC_portatil.zip')
+    portable = os.path.join(DIST, 'LEGO_Dimensions_PC_Portable.zip')  # 4.0: nomes em ingles
     print('zip portatil: %.0f MB' % (write_zip(portable, NAME) / 2 ** 20))
     payload = os.path.join(DIST, 'payload.zip')
     write_zip(payload, '')

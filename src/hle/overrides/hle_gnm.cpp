@@ -46,6 +46,7 @@
 #include "hle/overrides/hle_equeue.h"
 #include "hle/overrides/hle_override.h"
 #include "hle/overrides/hle_videoout.h"
+#include "runtime/multiplayer.h"
 #include "render/vulkan_backend.h"
 #include "runtime/crash_handler.h"
 #include "runtime/lang.h"
@@ -2957,6 +2958,21 @@ void RememberProjection(float p00, float p11) {
 
 // TAA (1.9.1): depois da proporcao, o deslocamento do quadro (jx, jy em NDC) entra na projecao: x / y do recorte += j * w.
 // `camera`: e o buffer de camera do VS de um desenho com profundidade - a matriz (sem o deslocamento) vai para o TAA.
+// 4.0: so acha a matriz da camera (mesmo teste do PatchProjection) e anota, sem mudar nada (multiplayer: nomes).
+void NoteCameraOnly(const u8* data, u32 bytes, u64 depth) {
+    const float* f = reinterpret_cast<const float*>(data);
+    for (u32 i = 0; i + 16 <= bytes / 4; i += 4) {
+        const float* m = f + i;
+        const float l3 = m[3] * m[3] + m[7] * m[7] + m[11] * m[11];
+        if (!(l3 > 0.98f && l3 < 1.02f)) continue;
+        const float l0 = std::sqrt(m[0] * m[0] + m[4] * m[4] + m[8] * m[8]);
+        const float l1 = std::sqrt(m[1] * m[1] + m[5] * m[5] + m[9] * m[9]);
+        if (!(l1 > 0.2f && l1 < 50.0f) || std::fabs(l0 / l1 - 0.5625f) > 0.004f) continue;
+        render::NoteSceneCamera(m, depth);
+        return;
+    }
+}
+
 void PatchProjection(u8* data, u32 bytes, float sx, float sy, float jx, float jy, bool camera, u64 depth) {
     const u32 count = bytes / 4;
     float* f = reinterpret_cast<float*>(data);
@@ -4959,6 +4975,9 @@ void SubmitDrawToVulkan(u32 opcode, const u32* body, u32 body_dwords) {
     const bool projection_patch = (aspect_sx != 1.0f || aspect_sy != 1.0f || jitter_x != 0.0f || jitter_y != 0.0f) &&
                                   render::IsScreenTarget(draw.color_count ? draw.colors[0].width : draw.depth.width,
                                                          draw.color_count ? draw.colors[0].height : draw.depth.height);
+    const bool camera_only = !projection_patch && draw.depth.address && runtime::multiplayer::Enabled() && // 4.0
+                             render::IsScreenTarget(draw.color_count ? draw.colors[0].width : draw.depth.width,
+                                                    draw.color_count ? draw.colors[0].height : draw.depth.height);
     for (const auto& r : info->resources) {
         const u32* ud = stage_ud[r.stage];
         const u32 dwords = r.kind == render::GamePairLayout::kImage ? 8 : 4;
@@ -5003,6 +5022,8 @@ void SubmitDrawToVulkan(u32 opcode, const u32* body, u32 body_dwords) {
                     PatchProjection(arena.data() + used - ((bytes + 15) & ~15ull), static_cast<u32>(bytes), aspect_sx, aspect_sy, jitter_x,
                                     jitter_y, &r - info->resources.data() == info->camera_resource && draw.depth.address != 0,
                                     draw.depth.address);
+                } else if (camera_only && &r - info->resources.data() == info->camera_resource) {
+                    NoteCameraOnly(arena.data() + used - ((bytes + 15) & ~15ull), static_cast<u32>(bytes), draw.depth.address);
                 }
                 if (g_dbg_cb_record) { // DIAGNOSTICO Fase 60 (LD_DBG_CB=1): o jogo muda as constantes depois da copia?
                     DbgCbRecord(address, static_cast<u32>(bytes), arena.data() + used - ((bytes + 15) & ~15ull), info->vs_hash, info->ps_hash,

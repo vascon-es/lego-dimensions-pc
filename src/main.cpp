@@ -37,6 +37,8 @@
 #include "hle/trophy_manager.h"
 #include "hle/trophy_popup.h"
 #include "runtime/crash_handler.h"
+#include "runtime/multiplayer.h"
+#include "runtime/mp_net.h"
 #include "runtime/orbis_tls.h"
 
 namespace hle {
@@ -109,6 +111,7 @@ namespace {
 // ser pulada: depois das checagens de estado, vale o "allowcutskip" do nivel ou o bit 0 de [obj+0xe8] (cena
 // ja vista / jogo completo). Troca essa ultima leitura por "mov al, 1", mantendo as checagens de antes.
 bool g_skip_cutscenes = false;
+runtime::multiplayer::Config g_mp_config; // Fase 79: --mp-server/--mp-room/--mp-name (caixa do launcher)
 bool g_keep_16x9 = false; // 1.9.1: --keep-16x9 = tela de outra proporcao com barras (sem corrigir a camera)
 
 bool PatchCutsceneSkip(const loader::ElfPieLoader& elf) {
@@ -1358,6 +1361,14 @@ int main(int argc, char** argv) {
             render::VulkanRenderer::Instance().SetNoVsync(true); // 1.9.1: IMMEDIATE (mais FPS, com tearing)
         } else if (!std::strcmp(argv[i], "--keep-16x9")) {
             g_keep_16x9 = true;
+        } else if (!std::strcmp(argv[i], "--mp-server") && i + 1 < argc) {
+            g_mp_config.server = argv[++i]; // Fase 79: multiplayer online
+        } else if (!std::strcmp(argv[i], "--mp-room") && i + 1 < argc) {
+            g_mp_config.room = argv[++i];
+        } else if (!std::strcmp(argv[i], "--mp-name") && i + 1 < argc) {
+            g_mp_config.name = argv[++i];
+        } else if (!std::strcmp(argv[i], "--mp-pass") && i + 1 < argc) {
+            g_mp_config.password = argv[++i]; // testes; o launcher passa a senha em LD_MP_PASS (nao aparece nos logs)
         } else if (!std::strcmp(argv[i], "--skip-cutscenes")) {
             g_skip_cutscenes = true; // Fase 61: toda cutscene pode ser pulada, mesmo sem 100%
         } else if (!std::strcmp(argv[i], "--resolution") && i + 1 < argc) {
@@ -1739,6 +1750,9 @@ int main(int argc, char** argv) {
     }
     if (!selftest) {
         hle::anomaly::Install(elf.base()); // Fase 67: carregador de mods Anomaly (connorh315), se houver pacotes de mod
+        if (const char* pass = std::getenv("LD_MP_PASS"); pass && g_mp_config.password.empty()) g_mp_config.password = pass;
+        runtime::multiplayer::Configure(g_mp_config); // Fase 79: sem --mp-server/--mp-room nao faz nada
+        runtime::multiplayer::Install(elf.base());
     }
     if (!elf.Protect()) {
         std::printf("ERROR: %s\n", elf.error().c_str());
@@ -1781,6 +1795,7 @@ int main(int argc, char** argv) {
                         static_cast<unsigned long long>(memory.PeakWorkingSetSize >> 20));
         }
         renderer.SaveDiskPipelineCache();
+        runtime::mp_net::Stop(); // 4.0: avisa o servidor do multiplayer que saiu
         std::fflush(stdout);
         // Como o fechamento do jogo (hle_videoout): sem destrutores globais. Voltar do main com as threads de
         // pipeline vivas terminava em abort (0xC0000409). O driver ja guardou cada pipeline ao cria-lo.

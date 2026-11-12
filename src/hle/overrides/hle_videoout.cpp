@@ -12,6 +12,8 @@
 // Nada e desenhado: a janela mostra o estado e o titulo traz os contadores. Os flips sao
 // concluidos por uma thread de VSync, que e quem dita o ritmo do jogo.
 #include "hle/overrides/hle_videoout.h"
+#include "runtime/multiplayer.h"
+#include "runtime/mp_net.h"
 #include "render/vulkan_backend.h"
 #include "runtime/lang.h"
 #include "hle/trophy_manager.h"
@@ -132,6 +134,10 @@ std::atomic<bool> g_stats_overlay{false};
 std::atomic<bool> g_video_menu_open{false};
 std::atomic<bool> g_achievements_overlay_open{false};
 std::atomic<bool> g_logs_overlay_open{false};
+std::atomic<bool> g_mp_panel_open{false}; // 4.0: sala do multiplayer (F3, ou pelo menu F1)
+int g_mp_selected = 0;
+int g_mp_kick_id = 0; // primeiro Enter num jogador so pede a confirmacao
+std::chrono::steady_clock::time_point g_mp_kick_time;
 int g_achievements_selected = 0;
 int g_achievements_scroll = 0;
 int g_achievements_filter = 0; // 0 = all, 1 = unearned, 2 = earned
@@ -234,6 +240,11 @@ void SetWindowResolution(u32 width, u32 height) {
 namespace {
 
 static void ApplyAndSaveVideoSettings() {
+    if (g_menu_items.size() > 10 && g_menu_selected == 10) { // 4.0: "SALA DO MULTIPLAYER"
+        g_video_menu_open = false;
+        ToggleMpRoomMenu();
+        return;
+    }
     HWND hwnd = static_cast<HWND>(WindowHandle());
 
     // Resolution: the window changes now; the game is drawn at the new resolution from the next start
@@ -368,6 +379,10 @@ static void InitMenuDefaults() {
         g_menu_items[9].label = "FREQUENCIA BLANK";
         g_menu_items[9].options = {"900 HZ (FLUIDO)", "600 HZ", "300 HZ", "120 HZ", "60 HZ"};
     }
+    if (runtime::multiplayer::Enabled()) {
+        g_menu_items.push_back({lang::Pt() ? "SALA DO MULTIPLAYER (F3)" : "MULTIPLAYER ROOM (F3)",
+                                {lang::Pt() ? "< APERTE ENTER >" : "< PRESS ENTER >"}, 0});
+    }
     wchar_t exe[MAX_PATH];
     if (GetModuleFileNameW(nullptr, exe, MAX_PATH)) {
         std::filesystem::path root = std::filesystem::path(exe).parent_path();
@@ -423,12 +438,124 @@ static void InitMenuDefaults() {
 
 } // namespace
 
+// ---- 4.0: sala do multiplayer (quem esta, trancar, expulsar) ----
+namespace {
+
+struct MpRow {
+    int id = 0; // 0 = a linha "trancar sala" (so para o dono)
+    std::string name;
+    bool self = false;
+};
+
+std::vector<MpRow> MpRows() {
+    std::vector<MpRow> rows;
+    const int self = runtime::mp_net::SelfId();
+    if (self && runtime::mp_net::OwnerId() == self) rows.push_back({0, "", false});
+    if (self) rows.push_back({self, runtime::mp_net::SelfName(), true});
+    for (const auto& p : runtime::mp_net::Peers()) {
+        if (p.id != self && !p.name.empty()) rows.push_back({p.id, p.name, false});
+    }
+    return rows;
+}
+
+bool MpIsOwner() {
+    const int self = runtime::mp_net::SelfId();
+    return self && runtime::mp_net::OwnerId() == self;
+}
+
+void MpMove(int delta) {
+    const int n = static_cast<int>(MpRows().size());
+    if (n > 0) g_mp_selected = (g_mp_selected + delta + n) % n;
+    g_mp_kick_id = 0;
+}
+
+void MpActivate() {
+    if (!MpIsOwner()) return;
+    const std::vector<MpRow> rows = MpRows();
+    if (g_mp_selected < 0 || g_mp_selected >= static_cast<int>(rows.size())) return;
+    const MpRow& row = rows[g_mp_selected];
+    if (row.id == 0) {
+        runtime::mp_net::SetRoomLocked(!runtime::mp_net::RoomLocked());
+        return;
+    }
+    if (row.self) return;
+    const auto now = std::chrono::steady_clock::now();
+    if (g_mp_kick_id == row.id && now - g_mp_kick_time < std::chrono::seconds(4)) {
+        runtime::mp_net::Kick(row.id);
+        log::Tagged("MP", "kicked %s from the room", row.name.c_str());
+        g_mp_kick_id = 0;
+        g_mp_selected = 0;
+    } else {
+        g_mp_kick_id = row.id; // Enter de novo em ate 4 s confirma
+        g_mp_kick_time = now;
+    }
+}
+
+std::string MpUpper(const std::string& text) {
+    std::string out;
+    for (char ch : text) out += static_cast<char>(std::toupper(static_cast<unsigned char>(ch)));
+    return out;
+}
+
+// Recusa definitiva do servidor, em texto para a tela (vazio = nenhuma)
+std::string MpRefusedText() {
+    const std::string code = runtime::mp_net::RefusedCode();
+    const bool pt = lang::Pt();
+    if (code == "senha") return pt ? "MULTIPLAYER: SENHA ERRADA (CONFIRA NO LAUNCHER)" : "MULTIPLAYER: WRONG ROOM PASSWORD (CHECK THE LAUNCHER)";
+    if (code == "trancada") return pt ? "MULTIPLAYER: A SALA ESTA TRANCADA" : "MULTIPLAYER: THE ROOM IS LOCKED";
+    if (code == "expulso") return pt ? "MULTIPLAYER: VOCE FOI EXPULSO DA SALA" : "MULTIPLAYER: YOU WERE KICKED FROM THE ROOM";
+    if (code == "cheia") return pt ? "MULTIPLAYER: A SALA ESTA CHEIA (16)" : "MULTIPLAYER: THE ROOM IS FULL (16)";
+    if (code == "versao") return pt ? "MULTIPLAYER: O SERVIDOR E DE OUTRA VERSAO" : "MULTIPLAYER: THE SERVER IS A DIFFERENT VERSION";
+    return {};
+}
+
+} // namespace
+
+void ToggleMpRoomMenu() {
+    if (!runtime::multiplayer::Enabled()) return;
+    const bool next = !g_mp_panel_open.load();
+    if (next) {
+        g_video_menu_open = false;
+        g_achievements_overlay_open = false;
+        g_logs_overlay_open = false;
+        g_mp_selected = 0;
+        g_mp_kick_id = 0;
+    }
+    g_mp_panel_open = next;
+    log::Tagged("MP-MENU", "%s", next ? "open" : "closed");
+}
+
+bool IsMpRoomMenuOpen() {
+    return g_mp_panel_open.load();
+}
+
+void HandleMpRoomMenuController(u32 pressed) {
+    if (!g_mp_panel_open) return;
+    static auto last_nav = std::chrono::steady_clock::now();
+    const auto now = std::chrono::steady_clock::now();
+    if (std::chrono::duration<float, std::milli>(now - last_nav).count() < 160.0f) return;
+    if (pressed & 0x10) { // cima
+        MpMove(-1);
+        last_nav = now;
+    } else if (pressed & 0x40) { // baixo
+        MpMove(1);
+        last_nav = now;
+    } else if (pressed & 0x4000) { // X: trancar / expulsar
+        MpActivate();
+        last_nav = now;
+    } else if (pressed & 0x2000) { // bola: fecha
+        g_mp_panel_open = false;
+        last_nav = now;
+    }
+}
+
 void ToggleVideoSettingsMenu() {
     InitMenuDefaults();
     const bool next = !g_video_menu_open.load();
     if (next) {
         g_achievements_overlay_open = false;
         g_logs_overlay_open = false;
+        g_mp_panel_open = false;
     }
     g_video_menu_open = next;
     log::Tagged("VIDEO-MENU", "%s", g_video_menu_open ? "open" : "closed");
@@ -733,6 +860,23 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
             ToggleAchievementsMenu();
             return 0;
         }
+        if (wparam == VK_F3 && !(lparam & (1 << 30)) && runtime::multiplayer::Enabled()) { // 4.0: sala do multiplayer
+            ToggleMpRoomMenu();
+            return 0;
+        }
+        if (g_mp_panel_open.load()) {
+            const bool fresh = !(lparam & (1 << 30));
+            if (wparam == VK_UP) {
+                MpMove(-1);
+            } else if (wparam == VK_DOWN) {
+                MpMove(1);
+            } else if (wparam == VK_RETURN && fresh) {
+                MpActivate();
+            } else if (wparam == VK_ESCAPE && fresh) {
+                g_mp_panel_open = false;
+            }
+            return 0;
+        }
         if (wparam == VK_F9 && !(lparam & (1 << 30))) {
             ToggleLogsMenu();
             return 0;
@@ -889,6 +1033,7 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
         hle::toypad::SavePortalState();
         render::VulkanRenderer::Instance().SavePipelineCache();
         hle::log::StopCapture();
+        runtime::mp_net::Stop(); // 4.0: avisa o servidor que saiu (o TerminateProcess pula o atexit)
         TerminateProcess(GetCurrentProcess(), 0);
         return 0;
     default:
@@ -2159,14 +2304,58 @@ void QueueStatsOverlay() {
             hle::log::FlushCapture();
         }
     }
+    const std::vector<runtime::multiplayer::NameTag> tags = runtime::multiplayer::NameTags(); // 4.0
+    // 4.0: a sala do multiplayer e o aviso de recusa (senha errada, expulso...), que fica 15 s na tela
+    const std::string mp_refused = runtime::multiplayer::Enabled() ? MpRefusedText() : std::string();
+    static std::chrono::steady_clock::time_point s_refused_since{};
+    static std::string s_refused_seen;
+    static bool s_refused_shown = false; // so comeca a contar com o jogador no mundo (a recusa chega antes do 1o quadro)
+    if (mp_refused != s_refused_seen) {
+        s_refused_seen = mp_refused;
+        s_refused_shown = false;
+    }
+    if (!mp_refused.empty() && !s_refused_shown && runtime::multiplayer::InWorld()) {
+        s_refused_shown = true;
+        s_refused_since = now;
+    }
+    const bool show_refused = s_refused_shown && !mp_refused.empty() && now - s_refused_since < std::chrono::seconds(15);
     if (!g_stats_overlay.load() && !g_video_menu_open.load() && !g_achievements_overlay_open.load() &&
-        !g_logs_overlay_open.load() && !has_toast) {
+        !g_logs_overlay_open.load() && !has_toast && tags.empty() && !g_mp_panel_open.load() && !show_refused) {
         return;
     }
     static std::vector<LoadingVertex> vertices;
     vertices.clear();
     OverlayCanvas c{vertices, static_cast<float>(client.right), static_cast<float>(client.bottom)};
     const float p = client.bottom >= 1400 ? 3.0f : 2.0f; // tamanho do pixel da fonte
+
+    // 4.0: o nome de cada jogador do multiplayer em cima do personagem dele
+    float view[16], rect[4], extent[2];
+    if (!tags.empty() && render::SceneViewProjection(view, rect, extent)) {
+        const float kx = client.right / extent[0], ky = client.bottom / extent[1];
+        static const bool tag_debug = std::getenv("LD_MP_DEBUG") != nullptr;
+        static int tag_frames = 0;
+        if (tag_debug && ++tag_frames % 180 == 0) {
+            std::printf("[MP] camera: %.3f %.3f %.3f %.3f | %.3f %.3f %.3f %.3f | %.3f %.3f %.3f %.3f | %.3f %.3f %.3f %.3f rect %.0f %.0f %.0f %.0f\n",
+                        view[0], view[1], view[2], view[3], view[4], view[5], view[6], view[7], view[8], view[9], view[10], view[11],
+                        view[12], view[13], view[14], view[15], rect[0], rect[1], rect[2], rect[3]);
+        }
+        for (const auto& tag : tags) {
+            const float cx = tag.x * view[0] + tag.y * view[4] + tag.z * view[8] + view[12];
+            const float cy = tag.x * view[1] + tag.y * view[5] + tag.z * view[9] + view[13];
+            const float cw = tag.x * view[3] + tag.y * view[7] + tag.z * view[11] + view[15];
+            if (cw < 0.05f) continue; // atras da camera
+            const float nx = cx / cw, ny = cy / cw;
+            if (nx < -1.2f || nx > 1.2f || ny < -1.2f || ny > 1.2f) continue;
+            const float sx = (rect[0] + (nx * 0.5f + 0.5f) * rect[2]) * kx;
+            const float sy = (rect[1] + (0.5f - ny * 0.5f) * rect[3]) * ky;
+            const float tp = std::clamp(p * 4.0f / std::max(cw, 1.0f), p * 0.75f, p * 1.5f); // menor de longe
+            std::string name;
+            for (char ch : tag.name) name += static_cast<char>(std::toupper(static_cast<unsigned char>(ch)));
+            const float w = TextWidth(name, tp);
+            c.Pill(sx - w * 0.5f - 4 * tp, sy - 10 * tp, sx + w * 0.5f + 4 * tp, sy - 1 * tp, 0x99000000);
+            c.Write(name, sx - w * 0.5f, sy - 8.5f * tp, tp, 0xFFFFFFFF);
+        }
+    }
 
     if (g_stats_overlay.load()) {
         const runtime::hwmon::Snapshot s = runtime::hwmon::Get();
@@ -2276,6 +2465,77 @@ void QueueStatsOverlay() {
             float font_foot = 1.7f * scale_ui;
             c.Write(footer, box_x0 + (box_w - TextWidth(footer, font_foot)) / 2.0f, box_y1 - 40.0f * scale_ui, font_foot, kGray);
         }
+    }
+
+    if (show_refused) {
+        const float tp = p * 1.2f;
+        const float w = TextWidth(mp_refused, tp);
+        const float x = (client.right - w) * 0.5f, y = 40.0f * p;
+        c.Pill(x - 6 * tp, y - 3 * tp, x + w + 6 * tp, y + 10 * tp, 0xCC000060);
+        c.Write(mp_refused, x, y, tp, 0xFFFFFFFF);
+    }
+
+    if (g_mp_panel_open.load()) {
+        constexpr u32 kBg = 0xEE121216, kBorder = 0xFF00D000, kTitleYellow = 0xFF00E0FF, kHiBg = 0xAA303038;
+        constexpr u32 kWhite = 0xFFFFFFFF, kGray = 0xFFA0A0A0, kCyan = 0xFFE0C040, kRed = 0xFF4040FF;
+        const bool pt = lang::Pt();
+        const std::vector<MpRow> rows = MpRows();
+        if (g_mp_selected >= static_cast<int>(rows.size())) g_mp_selected = 0;
+        const bool owner = MpIsOwner();
+        const int owner_id = runtime::mp_net::OwnerId();
+        const float s = client.bottom >= 1400 ? 1.5f : (client.bottom >= 1000 ? 1.0f : 0.75f);
+        const float box_w = 760.0f * s;
+        const float box_h = (175.0f + 38.0f * std::max<size_t>(rows.size(), 1) + 70.0f) * s;
+        const float x0 = (client.right - box_w) / 2.0f, y0 = std::max(10.0f, (client.bottom - box_h) / 2.0f);
+        const float x1 = x0 + box_w, y1 = y0 + box_h;
+        c.Rect(x0 - 4.0f, y0 - 4.0f, x1 + 4.0f, y1 + 4.0f, kBorder);
+        c.Rect(x0, y0, x1, y1, kBg);
+        const std::string title = pt ? "SALA DO MULTIPLAYER" : "MULTIPLAYER ROOM";
+        const float ft = 3.5f * s, fi = 2.4f * s, fs = 1.9f * s;
+        c.Write(title, x0 + (box_w - TextWidth(title, ft)) / 2.0f, y0 + 20.0f * s, ft, kTitleYellow);
+        c.Rect(x0 + 20.0f * s, y0 + 55.0f * s, x1 - 20.0f * s, y0 + 57.0f * s, kGray);
+        char info[160];
+        const int rtt = runtime::mp_net::RttMs();
+        std::snprintf(info, sizeof(info), pt ? "CODIGO %s - %s - PING %d MS" : "CODE %s - %s - PING %d MS",
+                      MpUpper(runtime::mp_net::RoomCode()).c_str(),
+                      runtime::mp_net::RoomLocked() ? (pt ? "TRANCADA" : "LOCKED") : (pt ? "ABERTA" : "OPEN"), rtt);
+        c.Write(info, x0 + 24.0f * s, y0 + 72.0f * s, fs, kWhite);
+        std::string sub;
+        if (!mp_refused.empty()) sub = mp_refused;
+        else if (!runtime::mp_net::SelfId()) sub = pt ? "CONECTANDO AO SERVIDOR..." : "CONNECTING TO THE SERVER...";
+        else sub = owner ? (pt ? "VOCE E O DONO DA SALA" : "YOU OWN THIS ROOM")
+                         : (pt ? "SO O DONO DA SALA TRANCA OU EXPULSA" : "ONLY THE ROOM OWNER CAN LOCK OR KICK");
+        c.Write(sub, x0 + 24.0f * s, y0 + 100.0f * s, fs, mp_refused.empty() ? kGray : kRed);
+        float row_y = y0 + 140.0f * s;
+        for (size_t i = 0; i < rows.size(); ++i) {
+            const MpRow& r = rows[i];
+            const bool sel = static_cast<int>(i) == g_mp_selected;
+            if (sel) c.Rect(x0 + 16.0f * s, row_y - 4.0f * s, x1 - 16.0f * s, row_y + 26.0f * s, kHiBg);
+            std::string label, value;
+            u32 value_color = sel ? kCyan : kGray;
+            if (r.id == 0) {
+                label = pt ? "TRANCAR A SALA" : "LOCK THE ROOM";
+                value = runtime::mp_net::RoomLocked() ? (pt ? "< SIM >" : "< ON >") : (pt ? "< NAO >" : "< OFF >");
+            } else {
+                label = MpUpper(r.name);
+                if (r.self) label += pt ? " (VOCE)" : " (YOU)";
+                if (r.id == owner_id) label += pt ? " - DONO" : " - OWNER";
+                if (owner && !r.self && sel) {
+                    const bool confirm = g_mp_kick_id == r.id && now - g_mp_kick_time < std::chrono::seconds(4);
+                    value = confirm ? (pt ? "ENTER DE NOVO: EXPULSAR" : "ENTER AGAIN: KICK") : (pt ? "ENTER: EXPULSAR" : "ENTER: KICK");
+                    if (confirm) value_color = kRed;
+                }
+            }
+            c.Write(sel ? "> " + label : "  " + label, x0 + 24.0f * s, row_y, fi, sel ? kTitleYellow : kWhite);
+            if (!value.empty()) c.Write(value, x1 - TextWidth(value, fi) - 32.0f * s, row_y, fi, value_color);
+            row_y += 38.0f * s;
+        }
+        c.Rect(x0 + 20.0f * s, y1 - 60.0f * s, x1 - 20.0f * s, y1 - 58.0f * s, kGray);
+        const std::string footer = owner ? (pt ? "[CIMA/BAIXO] ESCOLHER  [ENTER] TRANCAR / EXPULSAR  [F3/ESC] SAIR"
+                                               : "[UP/DOWN] SELECT  [ENTER] LOCK / KICK  [F3/ESC] CLOSE")
+                                         : (pt ? "[F3/ESC] SAIR" : "[F3/ESC] CLOSE");
+        const float ff = 1.7f * s;
+        c.Write(footer, x0 + (box_w - TextWidth(footer, ff)) / 2.0f, y1 - 40.0f * s, ff, kGray);
     }
 
     // 3.0: o pop-up (de verdade ou a previa do menu, que repete a animacao) vai por cima de tudo, depois do overlay

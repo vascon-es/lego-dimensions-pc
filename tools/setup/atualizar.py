@@ -37,7 +37,7 @@ import zipfile
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..'))
 REPO = os.environ.get('LD_REPO', 'vascon-es/lego-dimensions-pc')
 API = 'https://api.github.com/repos/%s/releases/latest' % REPO
-ASSET_SUFFIX = '_portatil.zip'
+ASSET_SUFFIX = '_Portable.zip'  # 4.0: nome em ingles (ate a 3.1: _portatil.zip, ainda aceito abaixo)
 KEEP_IF_PRESENT = {'assets/portal.json'}
 MERGE_LINES = {'assets/shaders_spv/pipeline_states.txt', 'assets/shaders_spv/pair_warm.tsv'}
 REQUIRED = {'LegoDimensionsLauncher.exe', 'build/lego_dimensions.exe'}
@@ -93,7 +93,7 @@ def latest_release():
                'could not reach GitHub (%s). Check the internet connection and try again.' % e))
     asset = next((a for a in release.get('assets', []) if a.get('name', '').endswith(ASSET_SUFFIX)), None)
     if not asset:
-        asset = next((a for a in release.get('assets', []) if a.get('name', '').endswith('.zip') and 'portatil' in a.get('name', '').lower()), None)
+        asset = next((a for a in release.get('assets', []) if a.get('name', '').lower().endswith('.zip') and ('portatil' in a.get('name', '').lower() or 'portable' in a.get('name', '').lower())), None)
     if not asset:
         fail(T('a ultima release (%s) nao tem o zip portatil.' % release.get('tag_name'),
                'the latest release (%s) has no portable zip.' % release.get('tag_name')))

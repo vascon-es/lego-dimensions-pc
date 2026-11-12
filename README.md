@@ -49,6 +49,29 @@ loading user settings or starting external tools. `LD_UI_WORKAREA=1280x680`
 can exercise the small-screen layout. Visual appearance and gameplay remain
 separate manual checks.
 
+## Online multiplayer (alpha)
+
+From 4.0 (alpha), friends can play together online, like the Marvel's Spider-Man multiplayer mod: everyone plays their own
+game, and the other players in the same area show up as characters that run, jump and attack in your world. Up to 16
+players per room.
+
+1. In the launcher, **Settings > Game > Online multiplayer**: On (it is Off by default; Off changes nothing in the game).
+2. **Multiplayer room**: a room code (**New room** makes one; share it with your friends), your name and, if you
+   want, a password. The server comes filled in with the public one (`wss://lego-dimensions-mp-server.onrender.com`).
+3. Everyone with the same server and room code (and password) is in the same room.
+
+Rooms are private: they are never listed, the codes from **New room** have 8 characters, and the password is set
+by whoever creates the room. The first player in is the room owner: in the game, **F3** (or **Multiplayer room** in
+the F1 menu) shows who is in the room, and the owner can lock it and kick players.
+
+The public server is free and sleeps after 15 minutes without players. The launcher wakes it up as soon as it opens
+(with multiplayer on), so it is usually awake by the time the game reaches the menu; otherwise the first connection
+can take up to a minute (the game keeps retrying on its own). You can also run your own: it is a small relay in
+[tools/mp_server](tools/mp_server/README.md) (Node.js, no dependencies) for your PC or a free Render service.
+In this first version the other players copy moving, running, jumping and attacking. All figures work, DLC included.
+When a room has more different characters than free character slots, the players farthest away show up only as
+their name until a slot frees up.
+
 ## Language
 
 New launcher settings and setup command output default to English. Choose the

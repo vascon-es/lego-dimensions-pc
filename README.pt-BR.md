@@ -33,6 +33,29 @@ Baixe o instalador (`LEGO_Dimensions_PC_Setup.exe`) ou o zip portátil na págin
 
 Detalhes e dicas no [LEIA-ME](tools/dist/LEIA-ME.txt).
 
+## Multiplayer online (alfa)
+
+A partir da 4.0 (alfa) dá para jogar com amigos pela internet, como no mod de multiplayer do Marvel's Spider-Man: cada um
+joga o seu jogo, e os outros jogadores da mesma área aparecem como personagens que correm, pulam e atacam no seu
+mundo. Até 16 jogadores por sala.
+
+1. No launcher, **Configurações > Jogo > Multiplayer online**: Ligado (vem Desligado; desligado não muda nada no jogo).
+2. **Sala do multiplayer**: um código de sala (**Nova sala** cria um; passe para os amigos), o seu nome e, se
+   quiser, uma senha. O servidor já vem preenchido com o público (`wss://lego-dimensions-mp-server.onrender.com`).
+3. Quem usar o mesmo servidor e o mesmo código (e a senha) fica na mesma sala.
+
+As salas são privadas: ninguém lista as salas, os códigos do **Nova sala** têm 8 caracteres e a senha é definida por
+quem cria a sala. O primeiro a entrar é o dono: no jogo, **F3** (ou **Sala do multiplayer** no menu F1) mostra quem
+está na sala, e o dono pode trancar a sala e expulsar jogadores.
+
+O servidor público é gratuito e dorme depois de 15 minutos sem jogadores. O launcher acorda o servidor assim que
+abre (com o multiplayer ligado), então ele costuma estar acordado quando o jogo chega no menu; se não, a primeira
+conexão pode levar até um minuto (o jogo tenta de novo sozinho). Dá também para rodar o seu: é um repassador pequeno em
+[tools/mp_server](tools/mp_server/README.md) (Node.js, sem dependências), no seu PC ou num serviço grátis do Render.
+Nesta primeira versão os outros jogadores copiam andar, correr, pular e atacar. Todas as figuras funcionam, DLC
+incluída. Quando a sala tem mais personagens diferentes do que os espaços livres de personagem, os jogadores mais
+longe aparecem só com o nome até um espaço liberar.
+
 ## Estado
 
 - Dá para jogar a história, Vorton e as fases com DLCs, a 60 fps (opção "60 FPS" no launcher).

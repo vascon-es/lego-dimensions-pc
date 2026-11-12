@@ -58,6 +58,8 @@ add_executable(lego_dimensions
     src/patcher/fs_tls_patcher.cpp
     src/runtime/orbis_tls.cpp
     src/runtime/crash_handler.cpp
+    src/runtime/multiplayer.cpp
+    src/runtime/mp_net.cpp
     src/runtime/hwmon.cpp
     src/hle/hle_log.cpp
     src/hle/hle_perf.cpp
@@ -113,7 +115,7 @@ target_link_libraries(lego_dimensions PRIVATE ${CMAKE_SOURCE_DIR}/externals/sdl3
 # o tradutor de shaders. O port usa os headers incluidos quando nao ha SDK.
 include(cmake/VulkanHeaders.cmake)
 target_link_libraries(lego_dimensions PRIVATE Vulkan::Headers)
-target_link_libraries(lego_dimensions PRIVATE Zydis winmm user32 gdi32 gdiplus xinput dbghelp mfplat mfreadwrite mfuuid ole32)
+target_link_libraries(lego_dimensions PRIVATE Zydis winhttp winmm user32 gdi32 gdiplus xinput dbghelp mfplat mfreadwrite mfuuid ole32)
 target_compile_definitions(lego_dimensions PRIVATE
     NOMINMAX WIN32_LEAN_AND_MEAN _CRT_SECURE_NO_WARNINGS
     LD_PROJECT_ROOT="${CMAKE_CURRENT_SOURCE_DIR}")

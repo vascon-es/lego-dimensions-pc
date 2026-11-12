@@ -34,6 +34,7 @@
 
 #include <xinput.h>
 
+#include "runtime/multiplayer.h"
 #include "hle/overrides/hle_override.h"
 #include "hle/overrides/hle_pad_sdl.h"
 #include "hle/overrides/hle_videoout.h"
@@ -627,6 +628,9 @@ HLE_IMPL(int, scePadReadState, int handle, PadData* data, u64 guest_rbp) {
     if (!data) {
         return kPadErrorInvalidArg;
     }
+    if (handle == kPadHandle) {
+        runtime::multiplayer::Tick(); // Fase 79: multiplayer online (nada se estiver desligado)
+    }
     if (handle != kPadHandle) { // Fase 61: jogadores 2 a 4
         const int slot = handle - kPadHandle;
         Input other;
@@ -716,6 +720,17 @@ HLE_IMPL(int, scePadReadState, int handle, PadData* data, u64 guest_rbp) {
     if (videoout::IsAchievementsMenuOpen()) {
         videoout::HandleAchievementsMenuController(in.buttons);
         in.buttons = 0;
+        in.lx = 128;
+        in.ly = 128;
+        in.rx = 128;
+        in.ry = 128;
+    }
+
+    if (videoout::IsMpRoomMenuOpen()) { // 4.0
+        videoout::HandleMpRoomMenuController(in.buttons);
+        in.buttons = 0;
+        in.l2 = 0;
+        in.r2 = 0;
         in.lx = 128;
         in.ly = 128;
         in.rx = 128;

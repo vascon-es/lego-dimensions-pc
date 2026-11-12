@@ -423,6 +423,9 @@ void CameraAspectScale(float* x, float* y);
 // 1.9.1: TAA. A camera da cena de um desenho (matriz sem o deslocamento, alvo de profundidade), o deslocamento deste
 // quadro em NDC (0 com o TAA desligado) e o modo (0 = nenhum, 1 = TAA).
 void NoteSceneCamera(const float matrix[16], u64 depth_address);
+// 4.0: a camera da cena do ultimo quadro (vetor-linha: recorte = [x y z 1] * m) e a area da imagem do jogo na janela
+// (x, y, largura, altura em pixels do swapchain, que tem extent[0] x extent[1]). false se ainda nao ha camera.
+bool SceneViewProjection(float m[16], float rect[4], float extent[2]);
 void TemporalJitter(float* x, float* y);
 void SetAntiAliasing(int mode);
 int GetAntiAliasing();

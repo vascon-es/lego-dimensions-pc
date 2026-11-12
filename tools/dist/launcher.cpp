@@ -26,6 +26,7 @@
 #include <hidsdi.h>
 #include <setupapi.h>
 #include <winhttp.h>
+#include <bcrypt.h>
 
 #include <algorithm>
 #include <atomic>
@@ -48,6 +49,7 @@
 #pragma comment(lib, "hid.lib")
 #pragma comment(lib, "setupapi.lib")
 #pragma comment(lib, "winhttp.lib")
+#pragma comment(lib, "bcrypt.lib")
 #pragma comment(linker, "\"/manifestdependency:type='win32' name='Microsoft.Windows.Common-Controls' version='6.0.0.0' "      \
                         "processorArchitecture='amd64' publicKeyToken='6595b64144ccf1df' language='*'\"")
 
@@ -168,6 +170,11 @@ struct Status {
 // As pastas e as opcoes (launcher.ini)
 std::wstring g_game_dir, g_patch_dir, g_dlc_dir;
 bool g_opt_fps = true, g_opt_console = false, g_opt_fullscreen = false, g_opt_skip = false, g_opt_overlay = false, g_opt_toypad = false;
+// 4.0 (Fase 79): multiplayer online. Desligado por padrao: sem isso o jogo nao recebe nenhuma opcao --mp-*.
+bool g_opt_mp = false;
+void WakeMpServer(); // 4.0 (abaixo)
+std::wstring g_mp_server, g_mp_room, g_mp_name, g_mp_pass; // 4.0 (senha: so a sala que voce cria a usa)
+const wchar_t kDefaultMpServer[] = L"wss://lego-dimensions-mp-server.onrender.com"; // servidor publico (Render, gratis)
 std::wstring g_lang_at_start; // o idioma do launcher mudou nas Configuracoes: ele reabre ao voltar
 std::wstring g_saves_value = L"savedata0"; // pasta dos saves dentro de assets (--saves-dir); savedata0 = os do jogador
 std::wstring g_trophy_sound_value = L"playstation"; // som ao desbloquear conquista: playstation, xbox, steam, desligado
@@ -420,6 +427,11 @@ void SaveSettings() {
     WriteIni(L"pularcenas", g_opt_skip ? L"1" : L"0");
     WriteIni(L"contador", g_opt_overlay ? L"1" : L"0"); // Fase 65
     WriteIni(L"toypad_auto", g_opt_toypad ? L"1" : L"0");
+    WriteIni(L"multiplayer", g_opt_mp ? L"1" : L"0"); // 4.0
+    WriteIni(L"mp_servidor", g_mp_server);
+    WriteIni(L"mp_sala", g_mp_room);
+    WriteIni(L"mp_nome", g_mp_name);
+    WriteIni(L"mp_senha", g_mp_pass);
     WriteIni(L"saves", g_saves_value);
     WriteIni(L"trophy_sound", g_trophy_sound_value);
     WriteIni(L"popup_style", g_popup_style_value);
@@ -1221,6 +1233,188 @@ LRESULT CALLBACK NamesProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     return DefWindowProcW(hwnd, msg, wp, lp);
 }
 
+// ---- 4.0: janela da sala do multiplayer ----
+// O nome vai pela linha de comando: so letras sem acento, numeros, espaco, - e _.
+std::wstring MpName() {
+    std::wstring name = g_mp_name.empty() ? ReadPlayerNames()[0] : g_mp_name;
+    std::wstring out;
+    for (wchar_t c : name) {
+        static const std::wstring from = L"áàâãäéèêëíìîïóòôõöúùûüçñÁÀÂÃÄÉÈÊËÍÌÎÏÓÒÔÕÖÚÙÛÜÇÑ";
+        static const std::wstring to = L"aaaaaeeeeiiiiooooouuuucnAAAAAEEEEIIIIOOOOOUUUUCN";
+        if (const size_t k = from.find(c); k != std::wstring::npos) c = to[k];
+        if ((c >= L'a' && c <= L'z') || (c >= L'A' && c <= L'Z') || (c >= L'0' && c <= L'9') || c == L' ' || c == L'-' || c == L'_') out += c;
+    }
+    if (out.size() > 16) out.resize(16);
+    return out.empty() ? std::wstring(L"Jogador") : out;
+}
+
+std::wstring CleanRoom(std::wstring room) {
+    std::wstring out;
+    for (wchar_t c : room) {
+        if (c >= L'a' && c <= L'z') c = static_cast<wchar_t>(c - 32);
+        if ((c >= L'A' && c <= L'Z') || (c >= L'0' && c <= L'9')) out += c;
+    }
+    if (out.size() > 12) out.resize(12);
+    return out;
+}
+
+HWND g_mp_window = nullptr;
+HWND g_mp_edits[4] = {}; // servidor, sala, nome, senha
+HWND g_mp_focus = nullptr;
+constexpr int kMpW = 460, kMpH = 520;
+enum MpId { kMpSave = 1, kMpCancel = 2, kMpNewRoom = 3, kMpEdit = 400 };
+
+LRESULT CALLBACK MpProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
+    switch (msg) {
+    case WM_PAINT: {
+        PAINTSTRUCT ps;
+        HDC target = BeginPaint(hwnd, &ps);
+        RECT client;
+        GetClientRect(hwnd, &client);
+        {
+            ui::Buffered buffer(target, client);
+            HBRUSH bg = CreateSolidBrush(ui::kBg);
+            FillRect(buffer.dc, &client, bg);
+            DeleteObject(bg);
+            Gdiplus::Graphics g(buffer.dc);
+            g.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
+            for (HWND edit : g_mp_edits) {
+                ui::FieldBox(g, hwnd, edit, g_mp_focus == edit);
+            }
+            g.Flush();
+            RECT title{S(28), S(18), S(kMpW - 28), S(46)};
+            ui::Text(buffer.dc, ui::T(L"Sala do multiplayer", L"Multiplayer room"), title, g_button, ui::kText);
+            RECT hint{S(28), S(48), S(kMpW - 28), S(92)};
+            ui::Text(buffer.dc, ui::T(L"Quem usar o mesmo código e o mesmo servidor joga junto (até 16). Cada um joga no seu jogo; os outros aparecem como personagens.",
+                                      L"Everyone with the same code and server plays together (up to 16). Each one plays their own game; the others show up as characters."),
+                     hint, g_small, ui::kMuted, DT_LEFT | DT_TOP | DT_WORDBREAK);
+            const wchar_t* labels[4] = {ui::T(L"SERVIDOR", L"SERVER"), ui::T(L"CÓDIGO DA SALA", L"ROOM CODE"), ui::T(L"SEU NOME", L"YOUR NAME"),
+                                        ui::T(L"SENHA DA SALA (OPCIONAL)", L"ROOM PASSWORD (OPTIONAL)")};
+            for (int i = 0; i < 4; ++i) {
+                RECT label{S(28), S(104.0f + i * 70), S(kMpW - 28), S(122.0f + i * 70)};
+                ui::Text(buffer.dc, labels[i], label, g_label, ui::kMuted);
+            }
+        }
+        EndPaint(hwnd, &ps);
+        return 0;
+    }
+    case WM_ERASEBKGND:
+        return 1;
+    case WM_DRAWITEM:
+        ui::DrawButton(reinterpret_cast<const DRAWITEMSTRUCT*>(lp));
+        return TRUE;
+    case WM_CTLCOLOREDIT: {
+        HDC dc = reinterpret_cast<HDC>(wp);
+        SetBkColor(dc, ui::kField);
+        SetTextColor(dc, ui::kText);
+        return reinterpret_cast<LRESULT>(g_field_brush);
+    }
+    case WM_COMMAND:
+        if (LOWORD(wp) >= kMpEdit && LOWORD(wp) < kMpEdit + 4 && (HIWORD(wp) == EN_SETFOCUS || HIWORD(wp) == EN_KILLFOCUS)) {
+            g_mp_focus = HIWORD(wp) == EN_SETFOCUS ? reinterpret_cast<HWND>(lp) : nullptr;
+            InvalidateRect(hwnd, nullptr, FALSE);
+        } else if (LOWORD(wp) == kMpNewRoom) {
+            static const wchar_t kChars[] = L"ABCDEFGHJKLMNPQRSTUVWXYZ23456789"; // sem 0/O e 1/I (faceis de confundir)
+            std::wstring code;
+            unsigned char random[8] = {};
+            if (BCryptGenRandom(nullptr, random, sizeof(random), BCRYPT_USE_SYSTEM_PREFERRED_RNG) != 0) { // nao deve falhar
+                LARGE_INTEGER t;
+                QueryPerformanceCounter(&t);
+                unsigned long long x = static_cast<unsigned long long>(t.QuadPart) ^ (GetTickCount64() << 21) ^ GetCurrentProcessId();
+                for (unsigned char& r : random) {
+                    x ^= x << 13;
+                    x ^= x >> 7;
+                    x ^= x << 17;
+                    r = static_cast<unsigned char>(x);
+                }
+            }
+            for (unsigned char r : random) code += kChars[r % 32]; // 8 de 32 simbolos: ~1 trilhao de codigos
+            SetWindowTextW(g_mp_edits[1], code.c_str());
+        } else if (LOWORD(wp) == kMpSave) {
+            std::wstring server = GetText(g_mp_edits[0]);
+            std::erase(server, L'"');
+            std::erase(server, L' ');
+            g_mp_server = server.empty() ? kDefaultMpServer : server; // vazio = o servidor publico
+            g_mp_room = CleanRoom(GetText(g_mp_edits[1]));
+            std::wstring name = GetText(g_mp_edits[2]);
+            std::erase(name, L'"');
+            g_mp_name = name;
+            std::wstring pass = GetText(g_mp_edits[3]);
+            std::erase(pass, L'"');
+            std::erase(pass, L'|');
+            g_mp_pass = pass;
+            SaveSettings();
+            WakeMpServer();
+            if (!g_mp_room.empty() && g_mp_room.size() < 6 && g_mp_pass.empty()) {
+                AppendLog(ui::T(L"Multiplayer: código curto e sem senha - qualquer um pode adivinhar. Use \"Nova sala\" ou ponha uma senha.",
+                                L"Multiplayer: short code and no password - anyone can guess it. Use \"New room\" or set a password."));
+            }
+            AppendLog(ui::T(L"Multiplayer: sala ", L"Multiplayer: room ") + (g_mp_room.empty() ? std::wstring(L"-") : g_mp_room) +
+                      ui::T(L", nome ", L", name ") + MpName());
+            DestroyWindow(hwnd);
+        } else if (LOWORD(wp) == kMpCancel) {
+            DestroyWindow(hwnd);
+        }
+        return 0;
+    case WM_CLOSE:
+        DestroyWindow(hwnd);
+        return 0;
+    case WM_DESTROY:
+        EnableWindow(g_main, TRUE);
+        SetForegroundWindow(g_main);
+        g_mp_window = nullptr;
+        Redraw();
+        return 0;
+    }
+    return DefWindowProcW(hwnd, msg, wp, lp);
+}
+
+void OpenMpDialog() {
+    if (g_mp_window) {
+        SetForegroundWindow(g_mp_window);
+        return;
+    }
+    static bool registered = false;
+    if (!registered) {
+        WNDCLASSEXW wc{sizeof(wc)};
+        wc.lpfnWndProc = MpProc;
+        wc.hInstance = GetModuleHandleW(nullptr);
+        wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+        wc.hbrBackground = g_bg_brush;
+        wc.hIcon = LoadIconW(wc.hInstance, MAKEINTRESOURCEW(1));
+        wc.lpszClassName = L"LegoDimensionsPcMultiplayer";
+        RegisterClassExW(&wc);
+        registered = true;
+    }
+    const DWORD style = WS_POPUP | WS_CAPTION | WS_SYSMENU | WS_CLIPCHILDREN;
+    RECT size{0, 0, S(kMpW), S(kMpH)};
+    AdjustWindowRect(&size, style, FALSE);
+    RECT owner;
+    GetWindowRect(g_main, &owner);
+    const int w = size.right - size.left, h = size.bottom - size.top;
+    g_mp_window = CreateWindowExW(WS_EX_DLGMODALFRAME, L"LegoDimensionsPcMultiplayer", ui::T(L"Multiplayer", L"Multiplayer"), style,
+                                  owner.left + ((owner.right - owner.left) - w) / 2, owner.top + ((owner.bottom - owner.top) - h) / 2, w, h, g_main,
+                                  nullptr, GetModuleHandleW(nullptr), nullptr);
+    ui::DarkTitle(g_mp_window);
+    const std::wstring values[4] = {g_mp_server, g_mp_room, g_mp_name, g_mp_pass};
+    const wchar_t* cues[4] = {L"wss://seu-servidor.onrender.com", ui::T(L"ex.: K7MQ2XPA", L"e.g. K7MQ2XPA"), ui::T(L"o apelido do Jogador 1", L"Player 1 nickname"),
+                              ui::T(L"vazia = sem senha (vale para quem cria a sala)", L"empty = no password (set by whoever creates the room)")};
+    for (int i = 0; i < 4; ++i) {
+        const int width = i == 1 ? kMpW - 76 - 150 : kMpW - 76;
+        g_mp_edits[i] = ui::Edit(g_mp_window, S(38), S(132.0f + i * 70), S(width), S(24), kMpEdit + i, g_font);
+        SendMessageW(g_mp_edits[i], EM_LIMITTEXT, i == 0 ? 200 : (i == 1 ? 12 : (i == 3 ? 32 : 16)), 0);
+        if (i == 3) SendMessageW(g_mp_edits[i], EM_SETPASSWORDCHAR, L'\x25CF', 0); // bolinhas
+        SetWindowTextW(g_mp_edits[i], values[i].c_str());
+        SendMessageW(g_mp_edits[i], EM_SETCUEBANNER, TRUE, reinterpret_cast<LPARAM>(cues[i]));
+    }
+    ui::Button(g_mp_window, ui::T(L"Nova sala", L"New room"), ui::Style::kSecondary, S(kMpW - 168), S(124.0f + 70), S(140), S(40), kMpNewRoom, g_button);
+    ui::Button(g_mp_window, ui::T(L"Cancelar", L"Cancel"), ui::Style::kSecondary, S(kMpW - 316), S(kMpH - 62), S(130), S(44), kMpCancel, g_button);
+    ui::Button(g_mp_window, ui::T(L"Salvar", L"Save"), ui::Style::kPrimary, S(kMpW - 176), S(kMpH - 62), S(148), S(44), kMpSave, g_button);
+    EnableWindow(g_main, FALSE);
+    ShowWindow(g_mp_window, SW_SHOW);
+    SetFocus(g_mp_edits[g_mp_server.empty() ? 0 : 1]);
+}
+
 // Janelinha com os 4 apelidos; o launcher fica travado enquanto ela esta aberta.
 void OpenNamesDialog() {
     if (g_names_window) {
@@ -1376,6 +1570,17 @@ void RunGame() {
     }
     if (g_opt_overlay) {
         command += L" --stats-overlay"; // Fase 65: contador de FPS / info
+    }
+    if (g_opt_mp) { // 4.0: multiplayer online (so com a caixa ligada)
+        if (g_mp_server.empty() || g_mp_room.empty()) {
+            AppendLog(ui::T(L"Multiplayer: falta o código da sala ou o servidor (Configurações > Jogo > Sala do multiplayer). Abrindo sem multiplayer.",
+                            L"Multiplayer: room code or server missing (Settings > Game > Multiplayer room). Starting without multiplayer."));
+        } else {
+            command += L" --mp-server " + Quote(g_mp_server) + L" --mp-room " + Quote(g_mp_room) + L" --mp-name " + Quote(MpName());
+            SetEnvironmentVariableW(L"LD_MP_PASS", g_mp_pass.empty() ? nullptr : g_mp_pass.c_str()); // o jogo herda
+            WakeMpServer();
+            AppendLog(ui::T(L"Multiplayer online: sala ", L"Online multiplayer: room ") + g_mp_room);
+        }
     }
     const std::vector<std::wstring> names = ReadPlayerNames(); // Fase 65: apelidos (vazio = PlayerN)
     for (size_t i = 0; i < names.size(); ++i) {
@@ -1556,6 +1761,48 @@ void LaunchLegoToypad(bool notify_if_running) {
         CloseHandle(pi.hProcess);
         AppendLog(ui::T(L"LegoToypad v1.9 iniciado em segundo plano.", L"LegoToypad started in background."));
     }
+}
+
+// 4.0: o servidor gratis do Render dorme depois de 15 min sem jogadores e leva ate ~1 min para acordar. Com o
+// multiplayer ligado, o launcher acessa a pagina do servidor ao abrir (e ao ligar a caixa, salvar a sala ou abrir o
+// jogo): quando o jogo chega no menu, ele ja acordou. Em segundo plano; no maximo uma vez a cada 5 min.
+void WakeMpServer() {
+    if (!g_opt_mp || g_mp_server.empty()) return;
+    static std::atomic<ULONGLONG> last{0};
+    const ULONGLONG now = GetTickCount64();
+    if (last && now - last < 5 * 60 * 1000) return;
+    last = now;
+    std::wstring url = g_mp_server;
+    if (url.rfind(L"wss://", 0) == 0) url = L"https://" + url.substr(6);
+    else if (url.rfind(L"ws://", 0) == 0) url = L"http://" + url.substr(5);
+    else if (url.find(L"://") == std::wstring::npos) url = L"https://" + url;
+    std::thread([url] {
+        URL_COMPONENTS parts{sizeof(parts)};
+        wchar_t host[256] = {}, path[1024] = {};
+        parts.lpszHostName = host;
+        parts.dwHostNameLength = 256;
+        parts.lpszUrlPath = path;
+        parts.dwUrlPathLength = 1024;
+        if (!WinHttpCrackUrl(url.c_str(), 0, 0, &parts)) return;
+        HINTERNET session = WinHttpOpen(L"LegoDimensionsLauncher/1.0", WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY, WINHTTP_NO_PROXY_NAME,
+                                        WINHTTP_NO_PROXY_BYPASS, 0);
+        if (!session) session = WinHttpOpen(L"LegoDimensionsLauncher/1.0", WINHTTP_ACCESS_TYPE_DEFAULT_PROXY, WINHTTP_NO_PROXY_NAME,
+                                            WINHTTP_NO_PROXY_BYPASS, 0);
+        if (!session) return;
+        WinHttpSetTimeouts(session, 15000, 15000, 15000, 90000); // acordar pode levar ~1 min
+        if (HINTERNET connect = WinHttpConnect(session, host, parts.nPort, 0)) {
+            const bool secure = parts.nScheme == INTERNET_SCHEME_HTTPS;
+            if (HINTERNET request = WinHttpOpenRequest(connect, L"GET", path[0] ? path : L"/", nullptr, WINHTTP_NO_REFERER,
+                                                       WINHTTP_DEFAULT_ACCEPT_TYPES, secure ? WINHTTP_FLAG_SECURE : 0)) {
+                if (WinHttpSendRequest(request, WINHTTP_NO_ADDITIONAL_HEADERS, 0, WINHTTP_NO_REQUEST_DATA, 0, 0, 0)) {
+                    WinHttpReceiveResponse(request, nullptr); // so acordar: a resposta nao importa
+                }
+                WinHttpCloseHandle(request);
+            }
+            WinHttpCloseHandle(connect);
+        }
+        WinHttpCloseHandle(session);
+    }).detach();
 }
 
 // ---- Persistencia de estado do LegoToypad (Harrysof) ----
@@ -2318,6 +2565,7 @@ struct Row {
 
 std::wstring OnOff(bool on) { return on ? ui::T(L"Ligado", L"On") : ui::T(L"Desligado", L"Off"); }
 void OpenNamesDialog();
+void OpenMpDialog(); // 4.0
 std::vector<std::wstring> ReadPlayerNames();
 
 // As pastas de saves: assets\savedata0 (a do jogador, sempre) e as outras assets\savedata* com um Slot00 dentro
@@ -2471,6 +2719,17 @@ std::vector<Row> Rows() {
                     toggle(g_opt_skip)});
     rows.push_back({kTabGame, RowKind::kChoice, ui::T(L"Abrir o LegoToypad com o jogo", L"Start LegoToypad with the game"),
                     ui::T(L"O portal na tela (tools\\LegoToypad.exe).", L"The on-screen portal (tools\\LegoToypad.exe)."), OnOff(g_opt_toypad), toggle(g_opt_toypad)});
+    rows.push_back({kTabGame, RowKind::kChoice, ui::T(L"Multiplayer online (alfa)", L"Online multiplayer (alpha)"),
+                    ui::T(L"Amigos da mesma sala aparecem no seu jogo. Desligado: nada muda.",
+                          L"Friends in the same room show up in your game. Off: nothing changes."),
+                    OnOff(g_opt_mp), [](int) {
+                        g_opt_mp = !g_opt_mp;
+                        SaveSettings();
+                        WakeMpServer();
+                    }});
+    rows.push_back({kTabGame, RowKind::kAction, ui::T(L"Sala do multiplayer", L"Multiplayer room"),
+                    ui::T(L"Código da sala, seu nome e o servidor. Enter: editar.", L"Room code, your name and the server. Enter: edit."),
+                    g_mp_room.empty() ? ui::T(L"Nenhuma", L"None") : g_mp_room, [](int) { OpenMpDialog(); }});
     std::wstring names;
     for (const std::wstring& name : ReadPlayerNames()) {
         if (!name.empty()) names += (names.empty() ? L"" : L", ") + name;
@@ -3203,6 +3462,12 @@ void LoadSettings() {
     g_opt_skip = ReadIni(L"pularcenas", L"0") == L"1";
     g_opt_overlay = ReadIni(L"contador", L"0") == L"1"; // Fase 65
     g_opt_toypad = ReadIni(L"toypad_auto", L"0") == L"1";
+    g_opt_mp = ReadIni(L"multiplayer", L"0") == L"1"; // 4.0
+    g_mp_server = ReadIni(L"mp_servidor", kDefaultMpServer);
+    if (g_mp_server.empty()) g_mp_server = kDefaultMpServer;
+    g_mp_room = ReadIni(L"mp_sala", L"");
+    g_mp_name = ReadIni(L"mp_nome", L"");
+    g_mp_pass = ReadIni(L"mp_senha", L"");
     g_saves_value = ReadIni(L"saves", L"savedata0");
     g_trophy_sound_value = ReadIni(L"trophy_sound", L"auto");
     if (ReadIni(L"som_v3", L"").empty()) { // 3.0: o "playstation" gravado antes era so o padrao; passa a seguir o estilo
@@ -3663,8 +3928,10 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show) {
         const int result=Screenshots(screenshots);DestroyWindow(g_main);CoUninitialize();return result;
     }
     LoadSettings();
+    WakeMpServer(); // 4.0: com o multiplayer ligado, acorda o servidor enquanto voce navega no launcher
     EnsureTrophyIcons(); // 3.0
     ShowWindow(g_main, show);
+    if (GetEnvironmentVariableW(L"LD_LAUNCHER_ABRIR_MP", nullptr, 0)) OpenMpDialog(); // teste da janela da sala
     if (const std::wstring custom_repo = ReadIni(L"repo", L""); !custom_repo.empty()) {
         SetEnvironmentVariableW(L"LD_REPO", custom_repo.c_str());
     }
@@ -3674,7 +3941,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show) {
     SetTimer(g_main, kToypadSyncTimer, 1000, nullptr);  // sincroniza persistencia do toypad (harrysof)
     MSG msg;
     while (GetMessageW(&msg, nullptr, 0, 0)) {
-        if (!g_names_window || !IsDialogMessageW(g_names_window, &msg)) {
+        if ((!g_names_window || !IsDialogMessageW(g_names_window, &msg)) && (!g_mp_window || !IsDialogMessageW(g_mp_window, &msg))) {
             TranslateMessage(&msg);
             DispatchMessageW(&msg);
         }
