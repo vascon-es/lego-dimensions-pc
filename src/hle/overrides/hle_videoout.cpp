@@ -808,7 +808,7 @@ void OpenMpRoomDialog() {
         WNDCLASSEXW wc{sizeof(wc)};
         wc.lpfnWndProc = InGameMpProc;
         wc.hInstance = GetModuleHandleW(nullptr);
-        wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+        wc.hCursor = LoadCursorW(nullptr, MAKEINTRESOURCEW(32512));
         s_mp_bg_brush = CreateSolidBrush(RGB(20, 24, 32));
         s_mp_field_brush = CreateSolidBrush(RGB(34, 40, 52));
         wc.hbrBackground = s_mp_bg_brush;
