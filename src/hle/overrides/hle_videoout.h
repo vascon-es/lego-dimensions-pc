@@ -89,10 +89,12 @@ void ToggleAchievementsMenu();
 bool IsAchievementsMenuOpen();
 void HandleAchievementsMenuController(u32 pressed_buttons);
 
-// 4.0: sala do multiplayer dentro do jogo (F3, ou pelo menu F1): quem esta, trancar a sala e expulsar (so o dono)
+// 4.0/4.1: sala do multiplayer dentro do jogo: overlay de participantes (F4) e configuracao/entrar na sala (F3)
 void ToggleMpRoomMenu();
 bool IsMpRoomMenuOpen();
 void HandleMpRoomMenuController(u32 pressed_buttons);
+void OpenMpRoomDialog();
+bool IsMpDialogOpen();
 
 // Painel de logs e diagnostico dentro do jogo (F9)
 void ToggleLogsMenu();

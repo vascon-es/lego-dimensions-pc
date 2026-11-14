@@ -36,13 +36,13 @@ namespace {
 // ---- enderecos do eboot (deslocamentos a partir da base) --------------------------------------------------------
 constexpr u64 kPlayerTable = 0x3163788;    // instancia do jogador 1 (+8 = jogador 2)
 constexpr u64 kControlFn = 0xd70730;       // atualizacao de controle de cada personagem (rdi = inst, xmm0 = dt)
-constexpr u64 kSpawnFn = 0x158c2c0;        // AttemptToSpawnObject_Internal(spawner, pedido, 1)
-constexpr u64 kRequestDtorFn = 0x15857b0;  // destrutor do pedido (desfaz o personagem)
-constexpr u64 kRequestDeleteFn = 0x1585d40; // destrutor com delete (vtable[2] do pedido)
+constexpr u64 kSpawnFn = 0x158c2d0;        // AttemptToSpawnObject_Internal(spawner, pedido, 1) (eboot+0x158c2d0)
+constexpr u64 kRequestDtorFn = 0x15857c0;  // destrutor do pedido (desfaz o personagem) (eboot+0x15857c0)
+constexpr u64 kRequestDeleteFn = 0x1585d50; // destrutor com delete (vtable[2] do pedido) (eboot+0x1585d50)
 constexpr u64 kDescFn = 0x937c20;          // descritor do personagem (desc, nome, 0x73db, 0)
-constexpr u64 kSlotLoadFn = 0x157f1f0;     // carrega o personagem num slot livre do portal
+constexpr u64 kSlotLoadFn = 0x157f200;     // carrega o personagem num slot livre do portal (eboot+0x157f200)
 constexpr u64 kAllocatorA = 0x4adb10, kAllocatorB = 0x4adb90, kAllocFn = 0x4a83d0, kFreeFn = 0x4a94a0;
-constexpr u64 kListPushFn = 0x22c0d90;     // lista do spawner (+0x1d0): {cabeca, cauda, contagem}, no {prox, ant, valor}
+constexpr u64 kListPushFn = 0x22c0da0;     // lista do spawner (+0x1d0): {cabeca, cauda, contagem}, no {prox, ant, valor}
 constexpr u64 kSpawnerVtable = 0x2cfada0, kRequestVtable = 0x2cfaca0;
 // Listas de slots: vetor {dados, tamanho, capacidade | 0x40000000 (memoria que o jogo nao libera)}.
 // Portal ("MechPortal Load Slot N", 7 na memoria do eboot) e jogador ("MechPortal Player Load Slot 0..3").
@@ -51,8 +51,8 @@ constexpr u64 kPortalSlots = 0x315ddd0, kPlayerSlots = 0x315f200, kSlotStep = 0x
 constexpr int kMaxSlotsSeen = 64;
 int g_nslots = 7, g_nall = 11; // atualizados a cada Tick (a lista do portal cresce no preparo da fase)
 constexpr int kKeepFreeSlots = 1; // nunca ocupar o ultimo slot livre do portal: o jogador pode por uma figura nova
-constexpr u64 kSlotStateFn = 0x157cdd0; // (slot, estado, 0): 0 = cancela pedido / esvazia, 3 = descarrega (o jogo leva a 0)
-constexpr u64 kLevelSetupFn = 0x1577ba0; // prepara a memoria dos slots ao carregar a fase (rdi = config, +0x233)
+constexpr u64 kSlotStateFn = 0x157cde0; // (slot, estado, 0): 0 = cancela pedido / esvazia, 3 = descarrega (o jogo leva a 0)
+constexpr u64 kLevelSetupFn = 0x1577bb0; // prepara a memoria dos slots ao carregar a fase (rdi = config, +0x233)
 
 constexpr u32 kCross = 0x40004000, kSquare = 0x10008000; // mascara de botoes do jogo
 constexpr u32 kSentButtons = kCross | kSquare;           // pulo e ataque
@@ -959,17 +959,24 @@ std::vector<NameTag> NameTags() {
 }
 
 void Install(std::uint8_t* eboot_base) {
-    if (!g_enabled) return;
     g_base = eboot_base;
-    g_control = reinterpret_cast<ControlFn>(Hook(kControlFn, reinterpret_cast<const void*>(&ControlHook)));
-    g_spawn = reinterpret_cast<SpawnFn>(Hook(kSpawnFn, reinterpret_cast<const void*>(&SpawnHook)));
-    g_dtor = reinterpret_cast<DtorFn>(Hook(kRequestDtorFn, reinterpret_cast<const void*>(&RequestDtorHook)));
-    if (const char* env = std::getenv("LD_MP_SLOTS")) g_extra_slots = std::clamp(std::atoi(env) - 7, 0, 1);
-    g_setup = reinterpret_cast<SetupFn>(Hook(kLevelSetupFn, reinterpret_cast<const void*>(&LevelSetupHook))); // sem ele: so o portal
-    g_slot_load = reinterpret_cast<SetupFn>(Hook(kSlotLoadFn, reinterpret_cast<const void*>(&SlotLoadHook)));
+    static bool s_hooks_installed = false;
+    if (!s_hooks_installed) {
+        g_control = reinterpret_cast<ControlFn>(Hook(kControlFn, reinterpret_cast<const void*>(&ControlHook)));
+        g_spawn = reinterpret_cast<SpawnFn>(Hook(kSpawnFn, reinterpret_cast<const void*>(&SpawnHook)));
+        g_dtor = reinterpret_cast<DtorFn>(Hook(kRequestDtorFn, reinterpret_cast<const void*>(&RequestDtorHook)));
+        if (const char* env = std::getenv("LD_MP_SLOTS")) g_extra_slots = std::clamp(std::atoi(env) - 7, 0, 1);
+        g_setup = reinterpret_cast<SetupFn>(Hook(kLevelSetupFn, reinterpret_cast<const void*>(&LevelSetupHook))); // sem ele: so o portal
+        g_slot_load = reinterpret_cast<SetupFn>(Hook(kSlotLoadFn, reinterpret_cast<const void*>(&SlotLoadHook)));
+        s_hooks_installed = true;
+    }
     if (!g_control || !g_spawn || !g_dtor) {
         std::printf("[MP] eboot diferente: multiplayer desligado\n");
         g_enabled = false; // os ganchos que entraram so repassam (sem fantasmas nada muda)
+        return;
+    }
+    if (!g_enabled) {
+        std::printf("[MP] multiplayer pronto (aguardando entrar na sala pelo F3 ou launcher)\n");
         return;
     }
     if (!runtime::mp_net::Start(g_config.server, g_config.room, g_config.name, g_config.password)) {
@@ -978,6 +985,28 @@ void Install(std::uint8_t* eboot_base) {
         return;
     }
     std::printf("[MP] multiplayer online ligado: sala %s, servidor %s\n", g_config.room.c_str(), g_config.server.c_str());
+}
+
+bool Connect(const std::string& server, const std::string& room, const std::string& name, const std::string& password) {
+    g_config.server = server;
+    g_config.room = room;
+    g_config.name = name;
+    g_config.password = password;
+    g_enabled = !server.empty() && !room.empty();
+    runtime::mp_net::Stop();
+    if (!g_enabled) return false;
+    if (!g_control || !g_spawn || !g_dtor) {
+        std::printf("[MP] ganchos nao instalados: nao e possivel conectar\n");
+        g_enabled = false;
+        return false;
+    }
+    if (!runtime::mp_net::Start(g_config.server, g_config.room, g_config.name, g_config.password)) {
+        std::printf("[MP] endereco do servidor invalido: %s\n", g_config.server.c_str());
+        g_enabled = false;
+        return false;
+    }
+    std::printf("[MP] multiplayer online conectado: sala %s, servidor %s\n", g_config.room.c_str(), g_config.server.c_str());
+    return true;
 }
 
 bool InWorld() { return g_enabled && g_in_world; }

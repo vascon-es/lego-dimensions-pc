@@ -287,6 +287,8 @@ void Run() {
         wait_ms = std::min(wait_ms * 2, 30000);
     }
     WinHttpCloseHandle(session);
+    g_in_session = false;
+    g_started = false;
 }
 
 } // namespace
@@ -294,7 +296,10 @@ void Run() {
 double Now() { return std::chrono::duration<double>(std::chrono::steady_clock::now() - g_epoch).count(); }
 
 bool Start(const std::string& url, const std::string& room, const std::string& name, const std::string& password) {
-    if (g_started || !ParseUrl(url, &g_url) || room.empty()) {
+    if (g_started) {
+        Stop();
+    }
+    if (!ParseUrl(url, &g_url) || room.empty()) {
         return false;
     }
     g_room = Clean(room, 32);
@@ -302,14 +307,27 @@ bool Start(const std::string& url, const std::string& room, const std::string& n
     g_password = Clean(password, 64);
     g_stop = false;
     g_started = true;
+    g_self = 0;
+    g_owner = 0;
+    g_rtt_ms = 0;
+    {
+        std::lock_guard lock(g_mutex);
+        g_refused.clear();
+        g_peers.clear();
+        g_commands.clear();
+    }
     std::thread(Run).detach();
-    std::atexit([] { Stop(); }); // fechar o jogo: avisa o servidor (senao os outros so veem a saida 12 s depois)
+    static bool atexit_set = false;
+    if (!atexit_set) {
+        std::atexit([] { Stop(); }); // fechar o jogo: avisa o servidor (senao os outros so veem a saida 12 s depois)
+        atexit_set = true;
+    }
     return true;
 }
 
 void Stop() {
     g_stop = true;
-    for (int i = 0; i < 25 && g_in_session; ++i) std::this_thread::sleep_for(std::chrono::milliseconds(20)); // o "q"
+    for (int i = 0; i < 25 && (g_in_session || g_started); ++i) std::this_thread::sleep_for(std::chrono::milliseconds(20)); // o "q"
 }
 
 void SetLocalState(const std::string& state) {

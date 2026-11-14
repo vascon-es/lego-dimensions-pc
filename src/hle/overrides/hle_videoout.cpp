@@ -39,6 +39,8 @@
 #include <vector>
 
 #include <windows.h>
+#include <bcrypt.h>
+#include <dwmapi.h>
 #include <objidl.h>
 #include <gdiplus.h>
 
@@ -190,6 +192,7 @@ enum MenuIdx {
     kMenuPopupStyle,
     kMenuBlankFreq,
     kMenuMpRoom,
+    kMenuMpJoin,
     kMenuCount
 };
 
@@ -208,7 +211,8 @@ static std::vector<MenuItem> g_menu_items = {
     {"RESET TROPHIES", {"< PRESS ENTER >", "TROPHIES RESET!"}, 0},
     {"POPUP STYLE", {"PS5", "PS4", "PS3", "XBOX ONE", "XBOX 360", "WII U", "STEAM", "SWITCH"}, 0}, // 3.0: trophy_popup::kStyleKeys
     {"BLANK FREQUENCY", {"900 HZ", "600 HZ", "300 HZ", "120 HZ", "60 HZ"}, 0},
-    {"MULTIPLAYER ROOM (F4)", {"< PRESS ENTER >"}, 0}
+    {"MULTIPLAYER ROOM (F4)", {"< PRESS ENTER >"}, 0},
+    {"JOIN/CONFIG ROOM (F3)", {"< PRESS ENTER >"}, 0}
 };
 
 static std::filesystem::path GetLauncherIniPath() {
@@ -226,6 +230,24 @@ static void WriteLauncherIni(const wchar_t* key, const wchar_t* val) {
     if (!ini.empty()) {
         WritePrivateProfileStringW(L"launcher", key, val, ini.wstring().c_str());
     }
+}
+
+static std::wstring ReadLauncherIni(const wchar_t* key, const wchar_t* def = L"") {
+    const std::filesystem::path ini = GetLauncherIniPath();
+    if (!ini.empty() && std::filesystem::exists(ini)) {
+        wchar_t buf[512] = {};
+        GetPrivateProfileStringW(L"launcher", key, def, buf, 512, ini.wstring().c_str());
+        return buf;
+    }
+    return def;
+}
+
+static std::string Narrow(const std::wstring& ws) {
+    if (ws.empty()) return {};
+    int size = WideCharToMultiByte(CP_UTF8, 0, ws.data(), static_cast<int>(ws.size()), nullptr, 0, nullptr, nullptr);
+    std::string s(size, 0);
+    WideCharToMultiByte(CP_UTF8, 0, ws.data(), static_cast<int>(ws.size()), s.data(), size, nullptr, nullptr);
+    return s;
 }
 
 void SetFullscreen(HWND hwnd, bool enabled) {
@@ -272,9 +294,14 @@ void SetWindowResolution(u32 width, u32 height) {
 namespace {
 
 static void ApplyAndSaveVideoSettings() {
-    if (g_menu_selected == kMenuMpRoom) { // 4.1: "SALA DO MULTIPLAYER"
+    if (g_menu_selected == kMenuMpRoom) { // 4.1: "SALA DO MULTIPLAYER (F4)"
         g_video_menu_open = false;
         ToggleMpRoomMenu();
+        return;
+    }
+    if (g_menu_selected == kMenuMpJoin) { // 4.1: "ENTRAR NA SALA (F3)"
+        g_video_menu_open = false;
+        OpenMpRoomDialog();
         return;
     }
     HWND hwnd = static_cast<HWND>(WindowHandle());
@@ -442,6 +469,8 @@ static void InitMenuDefaults() {
         g_menu_items[kMenuBlankFreq].options = {"900 HZ (FLUIDO)", "600 HZ", "300 HZ", "120 HZ", "60 HZ"};
         g_menu_items[kMenuMpRoom].label = "SALA DO MULTIPLAYER (F4)";
         g_menu_items[kMenuMpRoom].options = {"< APERTE ENTER >"};
+        g_menu_items[kMenuMpJoin].label = "ENTRAR NA SALA (F3)";
+        g_menu_items[kMenuMpJoin].options = {"< APERTE ENTER >"};
     }
     wchar_t exe[MAX_PATH];
     if (GetModuleFileNameW(nullptr, exe, MAX_PATH)) {
@@ -595,6 +624,8 @@ std::vector<MpRow> MpRows() {
     for (const auto& p : runtime::mp_net::Peers()) {
         if (p.id != self && !p.name.empty()) rows.push_back({p.id, p.name, false});
     }
+    // Linha interativa para entrar ou trocar de sala pelo F3
+    rows.push_back({-1, lang::Pt() ? "ENTRAR / CONFIGURAR SALA (F3)" : "JOIN / CONFIGURE ROOM (F3)", false});
     return rows;
 }
 
@@ -604,11 +635,18 @@ void MpMove(int delta) {
     g_mp_kick_id = 0;
 }
 
+void OpenMpRoomDialog();
+
 void MpActivate() {
-    if (!MpIsOwner()) return;
     const std::vector<MpRow> rows = MpRows();
     if (g_mp_selected < 0 || g_mp_selected >= static_cast<int>(rows.size())) return;
     const MpRow& row = rows[g_mp_selected];
+    if (row.id == -1) {
+        g_mp_panel_open = false;
+        OpenMpRoomDialog();
+        return;
+    }
+    if (!MpIsOwner()) return;
     if (row.id == 0) {
         runtime::mp_net::SetRoomLocked(!runtime::mp_net::RoomLocked());
         return;
@@ -644,7 +682,237 @@ std::string MpRefusedText() {
     return {};
 }
 
+// ---- Dialogo Win32 de configuracao / entrada de sala (F3) ----
+static HWND s_mp_dialog = nullptr;
+static HWND s_mp_edits[4] = {}; // servidor, sala, nome, senha
+static HBRUSH s_mp_bg_brush = nullptr;
+static HBRUSH s_mp_field_brush = nullptr;
+static HFONT s_mp_font = nullptr;
+static HFONT s_mp_bold_font = nullptr;
+
+enum InGameMpId {
+    kInGameMpSave = 1001,
+    kInGameMpCancel = 1002,
+    kInGameMpNewRoom = 1003,
+    kInGameMpEdit = 1100
+};
+
+static std::wstring CleanInGameRoom(std::wstring room) {
+    std::wstring out;
+    for (wchar_t c : room) {
+        if (c >= L'a' && c <= L'z') c = static_cast<wchar_t>(c - 32);
+        if ((c >= L'A' && c <= L'Z') || (c >= L'0' && c <= L'9')) out += c;
+    }
+    if (out.size() > 12) out.resize(12);
+    return out;
+}
+
+static std::wstring GetWindowTextString(HWND hwnd) {
+    if (!hwnd) return {};
+    int len = GetWindowTextLengthW(hwnd);
+    if (len <= 0) return {};
+    std::wstring str(len + 1, 0);
+    GetWindowTextW(hwnd, str.data(), len + 1);
+    str.resize(len);
+    return str;
+}
+
+static LRESULT CALLBACK InGameMpProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
+    switch (msg) {
+    case WM_CTLCOLORSTATIC: {
+        HDC dc = reinterpret_cast<HDC>(wp);
+        SetBkMode(dc, TRANSPARENT);
+        SetTextColor(dc, RGB(225, 230, 240));
+        return reinterpret_cast<LRESULT>(s_mp_bg_brush);
+    }
+    case WM_CTLCOLOREDIT: {
+        HDC dc = reinterpret_cast<HDC>(wp);
+        SetBkColor(dc, RGB(34, 40, 52));
+        SetTextColor(dc, RGB(245, 245, 245));
+        return reinterpret_cast<LRESULT>(s_mp_field_brush);
+    }
+    case WM_CTLCOLORBTN: {
+        return reinterpret_cast<LRESULT>(s_mp_bg_brush);
+    }
+    case WM_COMMAND: {
+        const int id = LOWORD(wp);
+        if (id == kInGameMpNewRoom) {
+            static const wchar_t kChars[] = L"ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+            std::wstring code;
+            unsigned char random[8] = {};
+            BCryptGenRandom(nullptr, random, sizeof(random), BCRYPT_USE_SYSTEM_PREFERRED_RNG);
+            for (unsigned char r : random) code += kChars[r % 32];
+            SetWindowTextW(s_mp_edits[1], code.c_str());
+        } else if (id == kInGameMpSave || id == IDOK) {
+            std::wstring server = GetWindowTextString(s_mp_edits[0]);
+            std::erase(server, L'"');
+            std::erase(server, L' ');
+            if (server.empty()) server = L"wss://lego-dimensions-mp-server.onrender.com";
+            std::wstring room = CleanInGameRoom(GetWindowTextString(s_mp_edits[1]));
+            std::wstring name = GetWindowTextString(s_mp_edits[2]);
+            std::erase(name, L'"');
+            if (name.empty()) name = L"Jogador";
+            std::wstring pass = GetWindowTextString(s_mp_edits[3]);
+            std::erase(pass, L'"');
+            std::erase(pass, L'|');
+
+            WriteLauncherIni(L"multiplayer", L"1");
+            WriteLauncherIni(L"mp_servidor", server.c_str());
+            WriteLauncherIni(L"mp_sala", room.c_str());
+            WriteLauncherIni(L"mp_nome", name.c_str());
+            WriteLauncherIni(L"mp_senha", pass.c_str());
+
+            const std::string s_server = Narrow(server);
+            const std::string s_room = Narrow(room);
+            const std::string s_name = Narrow(name);
+            const std::string s_pass = Narrow(pass);
+
+            runtime::multiplayer::Connect(s_server, s_room, s_name, s_pass);
+            DestroyWindow(hwnd);
+
+            if (!g_mp_panel_open.load()) {
+                ToggleMpRoomMenu();
+            }
+        } else if (id == kInGameMpCancel || id == IDCANCEL) {
+            DestroyWindow(hwnd);
+        }
+        return 0;
+    }
+    case WM_CLOSE:
+        DestroyWindow(hwnd);
+        return 0;
+    case WM_DESTROY:
+        s_mp_dialog = nullptr;
+        if (HWND game = static_cast<HWND>(WindowHandle())) {
+            SetForegroundWindow(game);
+            SetFocus(game);
+        }
+        return 0;
+    }
+    return DefWindowProcW(hwnd, msg, wp, lp);
+}
+
 } // namespace
+
+void OpenMpRoomDialog() {
+    if (s_mp_dialog && IsWindow(s_mp_dialog)) {
+        SetForegroundWindow(s_mp_dialog);
+        return;
+    }
+    g_video_menu_open = false;
+    g_achievements_overlay_open = false;
+    g_logs_overlay_open = false;
+
+    static bool s_registered = false;
+    if (!s_registered) {
+        WNDCLASSEXW wc{sizeof(wc)};
+        wc.lpfnWndProc = InGameMpProc;
+        wc.hInstance = GetModuleHandleW(nullptr);
+        wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+        s_mp_bg_brush = CreateSolidBrush(RGB(20, 24, 32));
+        s_mp_field_brush = CreateSolidBrush(RGB(34, 40, 52));
+        wc.hbrBackground = s_mp_bg_brush;
+        wc.lpszClassName = L"LegoDimensionsInGameMpDialog";
+        RegisterClassExW(&wc);
+        s_registered = true;
+    }
+    if (!s_mp_font) {
+        s_mp_font = CreateFontW(-14, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET,
+                               OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH, L"Segoe UI");
+        s_mp_bold_font = CreateFontW(-16, 0, 0, 0, FW_BOLD, FALSE, FALSE, FALSE, DEFAULT_CHARSET,
+                                    OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH, L"Segoe UI");
+    }
+
+    const int dlg_w = 460;
+    const int dlg_h = 440;
+    HWND parent = static_cast<HWND>(WindowHandle());
+    RECT prc{100, 100, 100 + dlg_w, 100 + dlg_h};
+    if (parent) GetWindowRect(parent, &prc);
+    const int x = prc.left + ((prc.right - prc.left) - dlg_w) / 2;
+    const int y = prc.top + ((prc.bottom - prc.top) - dlg_h) / 2;
+
+    const bool pt = lang::Pt();
+    s_mp_dialog = CreateWindowExW(WS_EX_DLGMODALFRAME | WS_EX_TOPMOST, L"LegoDimensionsInGameMpDialog",
+                                  pt ? L"Sala do Multiplayer (F3)" : L"Multiplayer Room (F3)",
+                                  WS_POPUP | WS_CAPTION | WS_SYSMENU | WS_CLIPCHILDREN | WS_VISIBLE,
+                                  x, y, dlg_w, dlg_h, parent, nullptr, GetModuleHandleW(nullptr), nullptr);
+
+    BOOL dark = TRUE;
+    DwmSetWindowAttribute(s_mp_dialog, 20, &dark, sizeof(dark));
+
+    std::wstring server = ReadLauncherIni(L"mp_servidor", L"wss://lego-dimensions-mp-server.onrender.com");
+    if (server.empty()) server = L"wss://lego-dimensions-mp-server.onrender.com";
+    std::wstring room = ReadLauncherIni(L"mp_sala", L"");
+    if (room.empty() && !runtime::mp_net::RoomCode().empty()) {
+        const std::string rc = runtime::mp_net::RoomCode();
+        room = std::wstring(rc.begin(), rc.end());
+    }
+    std::wstring name = ReadLauncherIni(L"mp_nome", L"");
+    if (name.empty()) {
+        const std::string sn = runtime::mp_net::SelfName();
+        name = sn.empty() ? L"Jogador" : std::wstring(sn.begin(), sn.end());
+    }
+    std::wstring pass = ReadLauncherIni(L"mp_senha", L"");
+
+    HWND hTitle = CreateWindowExW(0, L"STATIC", pt ? L"SALA DO MULTIPLAYER (ONLINE)" : L"ONLINE MULTIPLAYER ROOM",
+                                  WS_CHILD | WS_VISIBLE, 24, 16, 400, 24, s_mp_dialog, nullptr, nullptr, nullptr);
+    SendMessageW(hTitle, WM_SETFONT, reinterpret_cast<WPARAM>(s_mp_bold_font), TRUE);
+
+    HWND hHint = CreateWindowExW(0, L"STATIC",
+                                 pt ? L"Quem usar o mesmo código e servidor joga junto (até 16).\nCada um no seu jogo; os outros aparecem como personagens."
+                                    : L"Everyone with the same code and server plays together (up to 16).\nEach in their own game; others show up as characters.",
+                                 WS_CHILD | WS_VISIBLE, 24, 42, 400, 36, s_mp_dialog, nullptr, nullptr, nullptr);
+    SendMessageW(hHint, WM_SETFONT, reinterpret_cast<WPARAM>(s_mp_font), TRUE);
+
+    const wchar_t* labels[4] = {
+        pt ? L"SERVIDOR (WEBSOCKET):" : L"SERVER (WEBSOCKET):",
+        pt ? L"CÓDIGO DA SALA:" : L"ROOM CODE:",
+        pt ? L"SEU NOME NO JOGO:" : L"YOUR NICKNAME:",
+        pt ? L"SENHA DA SALA (OPCIONAL):" : L"ROOM PASSWORD (OPTIONAL):"
+    };
+    const std::wstring values[4] = {server, room, name, pass};
+
+    for (int i = 0; i < 4; ++i) {
+        const int row_y = 88 + i * 58;
+        HWND lbl = CreateWindowExW(0, L"STATIC", labels[i], WS_CHILD | WS_VISIBLE, 24, row_y, 400, 18,
+                                   s_mp_dialog, nullptr, nullptr, nullptr);
+        SendMessageW(lbl, WM_SETFONT, reinterpret_cast<WPARAM>(s_mp_font), TRUE);
+
+        const int edit_w = (i == 1) ? 260 : 400;
+        DWORD style = WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_AUTOHSCROLL;
+        if (i == 3) style |= ES_PASSWORD;
+        s_mp_edits[i] = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", values[i].c_str(), style,
+                                        24, row_y + 20, edit_w, 24, s_mp_dialog,
+                                        reinterpret_cast<HMENU>(static_cast<INT_PTR>(kInGameMpEdit + i)), nullptr, nullptr);
+        SendMessageW(s_mp_edits[i], WM_SETFONT, reinterpret_cast<WPARAM>(s_mp_font), TRUE);
+        SendMessageW(s_mp_edits[i], EM_LIMITTEXT, i == 0 ? 200 : (i == 1 ? 12 : (i == 3 ? 32 : 16)), 0);
+    }
+
+    HWND btnNew = CreateWindowExW(0, L"BUTTON", pt ? L"Nova sala" : L"New room",
+                                  WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON,
+                                  294, 88 + 1 * 58 + 20, 130, 24, s_mp_dialog,
+                                  reinterpret_cast<HMENU>(static_cast<INT_PTR>(kInGameMpNewRoom)), nullptr, nullptr);
+    SendMessageW(btnNew, WM_SETFONT, reinterpret_cast<WPARAM>(s_mp_font), TRUE);
+
+    HWND btnCancel = CreateWindowExW(0, L"BUTTON", pt ? L"Cancelar (Esc)" : L"Cancel (Esc)",
+                                     WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON,
+                                     24, 340, 150, 36, s_mp_dialog,
+                                     reinterpret_cast<HMENU>(static_cast<INT_PTR>(kInGameMpCancel)), nullptr, nullptr);
+    SendMessageW(btnCancel, WM_SETFONT, reinterpret_cast<WPARAM>(s_mp_font), TRUE);
+
+    HWND btnSave = CreateWindowExW(0, L"BUTTON", pt ? L"Entrar na Sala" : L"Join Room",
+                                   WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_DEFPUSHBUTTON,
+                                   244, 340, 180, 36, s_mp_dialog,
+                                   reinterpret_cast<HMENU>(static_cast<INT_PTR>(kInGameMpSave)), nullptr, nullptr);
+    SendMessageW(btnSave, WM_SETFONT, reinterpret_cast<WPARAM>(s_mp_bold_font), TRUE);
+
+    SetForegroundWindow(s_mp_dialog);
+    SetFocus(s_mp_edits[room.empty() ? 1 : 0]);
+}
+
+bool IsMpDialogOpen() {
+    return s_mp_dialog != nullptr && IsWindow(s_mp_dialog);
+}
 
 void ToggleMpRoomMenu() {
     const bool next = !g_mp_panel_open.load();
@@ -998,7 +1266,11 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
             TogglePadKeyboardPlayer();
             return 0;
         }
-        if ((wparam == VK_F4 || wparam == VK_F3) && !(lparam & (1 << 30))) { // 4.1: sala do multiplayer (F4 ou F3)
+        if (wparam == VK_F3 && !(lparam & (1 << 30))) { // 4.1: entrar na sala / configurar sala do multiplayer
+            OpenMpRoomDialog();
+            return 0;
+        }
+        if (wparam == VK_F4 && !(lparam & (1 << 30))) { // 4.1: sala do multiplayer (F4)
             ToggleMpRoomMenu();
             return 0;
         }
@@ -1019,7 +1291,10 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
                 }
             } else if (wparam == VK_RETURN && fresh) {
                 MpActivate();
-            } else if ((wparam == VK_ESCAPE || wparam == VK_F4 || wparam == VK_F3) && fresh) {
+            } else if (wparam == VK_F3 && fresh) {
+                g_mp_panel_open = false;
+                OpenMpRoomDialog();
+            } else if ((wparam == VK_ESCAPE || wparam == VK_F4) && fresh) {
                 g_mp_panel_open = false;
             }
             return 0;
@@ -2671,7 +2946,7 @@ void QueueStatsOverlay() {
         c.Write(info, x0 + 24.0f * s, y0 + 72.0f * s, fs, kWhite);
         std::string sub;
         if (!mp_refused.empty()) sub = mp_refused;
-        else if (!mp_on) sub = pt ? "PARA JOGAR ONLINE: ATIVE EM CONFIGURACOES > JOGO NO LAUNCHER" : "TO PLAY ONLINE: ENABLE IN SETTINGS > GAME IN LAUNCHER";
+        else if (!mp_on) sub = pt ? "PARA JOGAR ONLINE: APERTE F3 PARA ENTRAR NA SALA" : "TO PLAY ONLINE: PRESS F3 TO JOIN ROOM";
         else if (!runtime::mp_net::SelfId()) sub = pt ? "CONECTANDO AO SERVIDOR..." : "CONNECTING TO THE SERVER...";
         else sub = owner ? (pt ? "VOCE E O DONO DA SALA" : "YOU OWN THIS ROOM")
                          : (pt ? "SO O DONO DA SALA TRANCA OU EXPULSA" : "ONLY THE ROOM OWNER CAN LOCK OR KICK");
@@ -2686,6 +2961,10 @@ void QueueStatsOverlay() {
             if (r.id == 0) {
                 label = pt ? "TRANCAR A SALA" : "LOCK THE ROOM";
                 value = runtime::mp_net::RoomLocked() ? (pt ? "< SIM >" : "< ON >") : (pt ? "< NAO >" : "< OFF >");
+            } else if (r.id == -1) {
+                label = r.name;
+                value = pt ? "< APERTE ENTER / F3 >" : "< PRESS ENTER / F3 >";
+                value_color = sel ? kTitleYellow : kCyan;
             } else {
                 label = MpUpper(r.name);
                 if (r.self) label += pt ? " (VOCE)" : " (YOU)";
@@ -2701,9 +2980,9 @@ void QueueStatsOverlay() {
             row_y += 38.0f * s;
         }
         c.Rect(x0 + 20.0f * s, y1 - 60.0f * s, x1 - 20.0f * s, y1 - 58.0f * s, kGray);
-        const std::string footer = owner ? (pt ? "[CIMA/BAIXO] ESCOLHER  [ENTER/DIR] TRANCAR / EXPULSAR  [F4/F3/ESC] SAIR"
-                                               : "[UP/DOWN] SELECT  [ENTER/RIGHT] LOCK / KICK  [F4/F3/ESC] CLOSE")
-                                         : (pt ? "[F4/F3/ESC] SAIR" : "[F4/F3/ESC] CLOSE");
+        const std::string footer = owner ? (pt ? "[CIMA/BAIXO] ESCOLHER  [ENTER/DIR] TRANCAR/EXPULSAR  [F3] SALA  [F4/ESC] SAIR"
+                                               : "[UP/DOWN] SELECT  [ENTER/RIGHT] LOCK/KICK  [F3] ROOM  [F4/ESC] CLOSE")
+                                         : (pt ? "[F3] ENTRAR NA SALA  [F4/ESC] SAIR" : "[F3] JOIN ROOM  [F4/ESC] CLOSE");
         const float ff = 1.7f * s;
         c.Write(footer, x0 + (box_w - TextWidth(footer, ff)) / 2.0f, y1 - 40.0f * s, ff, kGray);
     }
