@@ -3902,7 +3902,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         if (g_busy && MessageBoxW(hwnd, ui::T(L"A preparacao ainda esta rodando. Fechar mesmo assim?", L"The preparation is still running. Close anyway?"), L"LEGO Dimensions PC", MB_YESNO) != IDYES) {
             return 0;
         }
-        if ((g_saw_game_running || g_toypad_opened_for_game) && !IsProcessRunning(L"lego_dimensions.exe")) {
+        if (!IsProcessRunning(L"lego_dimensions.exe")) {
             SyncLegoToypadState();
             toypad_proc::CloseAll();
         }

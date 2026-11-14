@@ -171,9 +171,7 @@ struct EntryParams {
 HLE_SYSV_ABI void ProgramExit() {
     std::printf("\nProgram called the exit handler passed in RSI. Exiting.\n");
     hle::toypad::SavePortalState();
-    if (!toypad_proc::IsExeRunning(L"LegoDimensionsLauncher.exe")) {
-        toypad_proc::CloseAll();
-    }
+    toypad_proc::CloseAll();
     hle::log::Shutdown(0);
 }
 
