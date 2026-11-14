@@ -1,0 +1,14 @@
+{
+  "name": "lego-dimensions-pc-mp-server",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Room server for the LEGO Dimensions PC port online multiplayer (relays player states, no dependencies)",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "license": "GPL-2.0-or-later"
+}

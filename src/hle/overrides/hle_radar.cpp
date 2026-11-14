@@ -1,4 +1,5 @@
 #include "hle/overrides/hle_radar.h"
+#include "runtime/multiplayer.h"
 
 #include <algorithm>
 #include <cctype>
@@ -23,6 +24,7 @@ struct Entry {
     u64 packed; // bytes ocupados no pacote
     std::string name;
     bool seen = false;
+    std::string area; // Fase 79: nome da area quando e o arquivo principal dela (levels/.../X/X.txt)
 };
 
 struct Pack {
@@ -156,6 +158,7 @@ void OnRead(const std::string& guest_path, s64 offset, u64 size) {
     }
     std::vector<std::string> screen_lines;
     std::vector<std::string> areas; // Fase 72
+    std::vector<std::string> mp_areas; // Fase 79
     {
         std::lock_guard lock(g_mutex);
         if (g_index_dir.empty()) {
@@ -180,7 +183,11 @@ void OnRead(const std::string& guest_path, s64 offset, u64 size) {
         }
         const double now = Seconds();
         for (; entry != pack.entries.end() && entry->offset < end; ++entry) {
-            if (entry->seen || entry->offset + std::max<u64>(entry->packed, 1) <= begin) {
+            if (entry->offset + std::max<u64>(entry->packed, 1) <= begin) {
+                continue;
+            }
+            if (entry->seen) { // Fase 79: a mesma area lida de novo (voltou para ela) tambem conta
+                if (!entry->area.empty() && entry->offset >= begin) mp_areas.push_back(entry->area);
                 continue;
             }
             entry->seen = true;
@@ -192,6 +199,8 @@ void OnRead(const std::string& guest_path, s64 offset, u64 size) {
             }
             const bool screen = IsScreenFile(lower);
             if (std::string area = AreaName(lower); !area.empty()) {
+                entry->area = area;
+                mp_areas.push_back(area);
                 areas.push_back(std::move(area)); // Fase 72
             }
             if (g_log) {
@@ -225,6 +234,9 @@ void OnRead(const std::string& guest_path, s64 offset, u64 size) {
     }
     for (const std::string& area : areas) {
         render::VulkanRenderer::Instance().SetCurrentLevel(area); // Fase 72: prioridade do aquecimento desta area
+    }
+    for (const std::string& area : mp_areas) {
+        runtime::multiplayer::OnArea(area); // Fase 79: multiplayer (nada se estiver desligado)
     }
 }
 

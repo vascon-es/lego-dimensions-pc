@@ -14,7 +14,10 @@
 namespace toypad_proc {
 
 inline bool IsToypadExeName(const wchar_t* name) {
-    return name && _wcsnicmp(name, L"LegoToypad", 10) == 0;
+    if (!name) return false;
+    if (_wcsnicmp(name, L"LegoToypad", 10) == 0) return true;
+    if (wcsstr(name, L"Toypad") || wcsstr(name, L"toypad") || wcsstr(name, L"ToyPad") || wcsstr(name, L"Harrysof")) return true;
+    return false;
 }
 
 template <typename Pred>
@@ -74,6 +77,27 @@ inline int CloseAll() {
             }
         }
     }
+
+    EnumWindows(
+        [](HWND hwnd, LPARAM lp) -> BOOL {
+            wchar_t title[256]{};
+            if (GetWindowTextW(hwnd, title, 256) > 0) {
+                if (wcsstr(title, L"Toypad") || wcsstr(title, L"toypad") ||
+                    wcsstr(title, L"Toy Pad") || wcsstr(title, L"Harrysof") ||
+                    wcsstr(title, L"LegoToypad")) {
+                    DWORD pid = 0;
+                    GetWindowThreadProcessId(hwnd, &pid);
+                    if (pid) {
+                        auto* pids = reinterpret_cast<std::vector<DWORD>*>(lp);
+                        if (std::find(pids->begin(), pids->end(), pid) == pids->end()) {
+                            pids->push_back(pid);
+                        }
+                    }
+                }
+            }
+            return TRUE;
+        },
+        reinterpret_cast<LPARAM>(&targets));
 
     struct EnumCtx {
         const std::vector<DWORD>* pids;

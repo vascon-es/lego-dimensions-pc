@@ -4667,6 +4667,11 @@ struct SceneCamera {
     u32 draws;
 };
 std::vector<SceneCamera> g_scene_cameras; // deste quadro
+// 4.0: a ultima camera escolhida e onde a imagem foi mostrada (nomes dos jogadores do multiplayer)
+std::mutex g_view_mutex;
+float g_view_proj[16] = {};
+float g_view_rect[4] = {}, g_view_extent[2] = {};
+bool g_view_valid = false;
 
 struct OwnImage {
     VkImage image = VK_NULL_HANDLE;
@@ -4928,11 +4933,24 @@ void UpdateFrameTemporal() {
                 have = true;
             }
         }
+        static const bool camera_debug = std::getenv("LD_MP_DEBUG") != nullptr; // 4.0: diagnostico dos nomes do multiplayer
+        static u64 camera_frames = 0;
+        if (camera_debug && ++camera_frames % 300 == 0) {
+            for (const SceneCamera& c : g_scene_cameras) {
+                std::printf("[MP] camera candidata: %u desenhos, prof %llx | w %.3f %.3f %.3f %.3f | t %.3f %.3f %.3f\n", c.draws,
+                            static_cast<unsigned long long>(c.depth), c.m[3], c.m[7], c.m[11], c.m[15], c.m[12], c.m[13], c.m[14]);
+            }
+        }
         g_scene_cameras.clear();
     }
     g_frame_temporal = FrameTemporal{};
     if (!have) {
         return;
+    }
+    {
+        std::lock_guard lock(g_view_mutex);
+        std::memcpy(g_view_proj, camera.m, sizeof(g_view_proj));
+        g_view_valid = true;
     }
     g_frame_temporal.camera = true;
     {   // projecao D3D (vetor-linha): coluna w = eixo z da vista; coluna z = P22 * coluna w (+ P32 na translacao)
@@ -6836,6 +6854,11 @@ bool VulkanRenderer::DrawFrame(u64 display_address) {
     VkImageView present_view = shown ? (shown->raw_view ? shown->raw_view : shown->view) : VK_NULL_HANDLE;
     VkDescriptorSet present_set = shown ? shown->present_set : VK_NULL_HANDLE;
     bool taa = false;
+    {
+        std::lock_guard lock(g_view_mutex);
+        g_view_rect[0] = out_x, g_view_rect[1] = out_y, g_view_rect[2] = out_w, g_view_rect[3] = out_h;
+        g_view_extent[0] = static_cast<float>(g.extent.width), g_view_extent[1] = static_cast<float>(g.extent.height);
+    }
     UpdateFrameTemporal();
     u32 upscale_w = static_cast<u32>(out_w), upscale_h = static_cast<u32>(out_h);
     const u32 target_w = g_upscale_target_w.load(std::memory_order_relaxed);
@@ -8664,6 +8687,15 @@ void NoteSceneCamera(const float matrix[16], u64 depth_address) {
         c.draws = 1;
         g_scene_cameras.push_back(c);
     }
+}
+
+bool SceneViewProjection(float m[16], float rect[4], float extent[2]) {
+    std::lock_guard lock(g_view_mutex);
+    if (!g_view_valid || g_view_extent[0] <= 0.0f) return false;
+    std::memcpy(m, g_view_proj, sizeof(g_view_proj));
+    std::memcpy(rect, g_view_rect, sizeof(g_view_rect));
+    std::memcpy(extent, g_view_extent, sizeof(g_view_extent));
+    return true;
 }
 
 void TemporalJitter(float* x, float* y) {

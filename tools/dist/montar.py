@@ -3,7 +3,7 @@
 
 Saida em dist/:
   LEGO Dimensions PC/               pasta montada (a mesma do .zip)
-  LEGO_Dimensions_PC_portatil.zip   versao portatil (descompactar e abrir LegoDimensionsLauncher.exe)
+  LEGO_Dimensions_PC_Portable.zip   versao portatil (descompactar e abrir LegoDimensionsLauncher.exe)
   LEGO_Dimensions_PC_Setup.exe      instalador (o mesmo conteudo colado no fim do instalador)
 
 Vai junto: o port, o compilador de shaders ao vivo, o launcher, o runtime do Visual C++ (redistribuivel),
@@ -147,7 +147,11 @@ def stage():
     if os.path.isdir(R('assets', 'trophy')):
         # 3.0: sem o progresso de quem monta (trophies.dat e os desbloqueios que o trophy_manager grava no XML)
         import re
-        copy_tree(R('assets', 'trophy'), S('assets', 'trophy'), skip_files=('trophies.dat', '.retro_done'))
+        # 3.0: os icones (Icons) e os textos (Xml) sao do jogo: o port e o launcher tiram os icones do trophy00.trp do proprio
+        # jogador. A pasta sounds leva so o LEIA-ME (os sons que alguem pos ali sao dele).
+        copy_tree(R('assets', 'trophy'), S('assets', 'trophy'), skip_dirs=('Icons', 'Xml', 'sounds'),
+                  skip_files=('trophies.dat', '.retro_done'))
+        copy(R('tools', 'dist', 'sons_LEIA-ME.txt'), S('assets', 'trophy', 'sounds', 'LEIA-ME.txt'))
         if os.path.isfile(S('assets', 'trophy', 'trophies.dat')):
             os.remove(S('assets', 'trophy', 'trophies.dat'))
         for root, _dirs, files in os.walk(S('assets', 'trophy')):
@@ -210,7 +214,7 @@ def main():
     files = sum(len(f) for _, _, f in os.walk(STAGE))
     size = sum(os.path.getsize(os.path.join(b, f)) for b, _, fs in os.walk(STAGE) for f in fs)
     print('montado: %d arquivos, %.0f MB em %s' % (files, size / 2 ** 20, STAGE))
-    portable = os.path.join(DIST, 'LEGO_Dimensions_PC_portatil.zip')
+    portable = os.path.join(DIST, 'LEGO_Dimensions_PC_Portable.zip')  # 4.0: nomes em ingles
     print('zip portatil: %.0f MB' % (write_zip(portable, NAME) / 2 ** 20))
     payload = os.path.join(DIST, 'payload.zip')
     write_zip(payload, '')

@@ -12,9 +12,12 @@
 // Nada e desenhado: a janela mostra o estado e o titulo traz os contadores. Os flips sao
 // concluidos por uma thread de VSync, que e quem dita o ritmo do jogo.
 #include "hle/overrides/hle_videoout.h"
+#include "runtime/multiplayer.h"
+#include "runtime/mp_net.h"
 #include "render/vulkan_backend.h"
 #include "runtime/lang.h"
 #include "hle/trophy_manager.h"
+#include "hle/trophy_popup.h"
 #include "hle/overrides/hle_toypad.h"
 #include "common/toypad_process.h"
 
@@ -22,6 +25,7 @@
 #include <atomic>
 #include <chrono>
 #include <cinttypes>
+#include <cmath>
 #include <condition_variable>
 #include <cstdio>
 #include <cstring>
@@ -30,6 +34,7 @@
 #include <filesystem>
 #include <string>
 #include <mutex>
+#include <optional>
 #include <thread>
 #include <vector>
 
@@ -131,6 +136,10 @@ std::atomic<bool> g_video_menu_open{false};
 std::atomic<bool> g_image_menu_open{false};
 std::atomic<bool> g_achievements_overlay_open{false};
 std::atomic<bool> g_logs_overlay_open{false};
+std::atomic<bool> g_mp_panel_open{false}; // 4.0: sala do multiplayer (F3, ou pelo menu F1)
+int g_mp_selected = 0;
+int g_mp_kick_id = 0; // primeiro Enter num jogador so pede a confirmacao
+std::chrono::steady_clock::time_point g_mp_kick_time;
 int g_achievements_selected = 0;
 int g_achievements_scroll = 0;
 int g_achievements_filter = 0; // 0 = all, 1 = unearned, 2 = earned
@@ -195,9 +204,9 @@ static std::vector<MenuItem> g_menu_items = {
     {"FRAME RATE (RESTART)", {"30 FPS", "60 FPS", "UNLOCKED", "UNLOCKED NO VSYNC"}, 1},
     {"FPS COUNTER (F10)", {"OFF", "ON"}, 0},
     {"CONTROLLER ICONS", {"AUTO", "PS4", "XBOX", "SWITCH", "KEYBOARD"}, 0},
-    {"TROPHY SOUND", {"PLAYSTATION", "XBOX", "STEAM", "OFF"}, 0},
+    {"TROPHY SOUND", {"AUTO (POPUP STYLE)", "PLAYSTATION", "XBOX", "STEAM", "OFF"}, 0}, // 3.0: auto = o som do console do pop-up
     {"RESET TROPHIES", {"< PRESS ENTER >", "TROPHIES RESET!"}, 0},
-    {"POPUP STYLE", {"PS5 (QUALIFIED)", "PS4", "XBOX", "XBOX 360", "STEAM"}, 0},
+    {"POPUP STYLE", {"PS5", "PS4", "PS3", "XBOX ONE", "XBOX 360", "WII U", "STEAM", "SWITCH"}, 0}, // 3.0: trophy_popup::kStyleKeys
     {"BLANK FREQUENCY", {"900 HZ", "600 HZ", "300 HZ", "120 HZ", "60 HZ"}, 0}
 };
 
@@ -429,6 +438,11 @@ void SetWindowResolution(u32 width, u32 height) {
 namespace {
 
 static void ApplyAndSaveVideoSettings() {
+    if (g_menu_items.size() > 10 && g_menu_selected == 10) { // 4.0: "SALA DO MULTIPLAYER"
+        g_video_menu_open = false;
+        ToggleMpRoomMenu();
+        return;
+    }
     HWND hwnd = static_cast<HWND>(WindowHandle());
 
     // Resolution: the window changes now; the game is drawn at the new resolution from the next start
@@ -518,15 +532,15 @@ static void ApplyAndSaveVideoSettings() {
 
     // Trophy sound
     if (g_menu_items.size() > static_cast<size_t>(kMenuTrophySound)) {
-        static const wchar_t* const kSoundStr[] = {L"playstation", L"xbox", L"steam", L"off"};
-        static const char* const kSoundAnsi[] = {"playstation", "xbox", "steam", "off"};
+        static const wchar_t* const kSoundStr[] = {L"auto", L"playstation", L"xbox", L"steam", L"off"};
+        static const char* const kSoundAnsi[] = {"auto", "playstation", "xbox", "steam", "off"};
         const int ts = g_menu_items[kMenuTrophySound].selected;
-        if (ts >= 0 && ts < 4) {
+        if (ts >= 0 && ts < 5) {
             WriteLauncherIni(L"trophy_sound", kSoundStr[ts]);
             auto& tm = hle::trophy::TrophyManager::Instance();
             tm.SetSoundType(kSoundAnsi[ts]);
             if (g_menu_selected == kMenuTrophySound) {
-                tm.PlayTrophySound();
+                tm.PlayPreviewSound();
             }
         }
     }
@@ -539,12 +553,11 @@ static void ApplyAndSaveVideoSettings() {
 
     // Popup style
     if (g_menu_items.size() > static_cast<size_t>(kMenuPopupStyle)) {
-        static const wchar_t* const kPopupStr[] = {L"ps5", L"ps4", L"xbox", L"xbox360", L"steam"};
-        static const char* const kPopupAnsi[] = {"ps5", "ps4", "xbox", "xbox360", "steam"};
         const int ps = g_menu_items[kMenuPopupStyle].selected;
-        if (ps >= 0 && ps < 5) {
-            WriteLauncherIni(L"popup_style", kPopupStr[ps]);
-            hle::trophy::TrophyManager::Instance().SetPopupStyle(kPopupAnsi[ps]);
+        if (ps >= 0 && ps < hle::trophy_popup::kStyleCount) {
+            const std::string key = hle::trophy_popup::kStyleKeys[ps];
+            WriteLauncherIni(L"popup_style", std::wstring(key.begin(), key.end()).c_str());
+            hle::trophy::TrophyManager::Instance().SetPopupStyle(key);
         }
     }
 
@@ -586,11 +599,11 @@ static void InitMenuDefaults() {
         g_menu_items[kMenuIcons].label = "ICONES DE CONTROLE";
         g_menu_items[kMenuIcons].options = {"AUTO", "PS4", "XBOX", "SWITCH", "TECLADO"};
         g_menu_items[kMenuTrophySound].label = "SOM DE CONQUISTA";
-        g_menu_items[kMenuTrophySound].options = {"PLAYSTATION", "XBOX", "STEAM", "DESLIGADO"};
+        g_menu_items[kMenuTrophySound].options = {"AUTO (DO ESTILO)", "PLAYSTATION", "XBOX", "STEAM", "DESLIGADO"};
         g_menu_items[kMenuResetTrophies].label = "REINICIAR CONQUISTAS";
         g_menu_items[kMenuResetTrophies].options = {"< APERTE ENTER >", "CONQUISTAS REINICIADAS!"};
         g_menu_items[kMenuPopupStyle].label = "ESTILO DO POP-UP";
-        g_menu_items[kMenuPopupStyle].options = {"PS5 (QUALIFICADO)", "PS4", "XBOX", "XBOX 360", "STEAM"};
+        g_menu_items[kMenuPopupStyle].options = {"PS5", "PS4", "PS3", "XBOX ONE", "XBOX 360", "WII U", "STEAM", "SWITCH"};
         g_menu_items[kMenuBlankFreq].label = "FREQUENCIA BLANK";
         g_menu_items[kMenuBlankFreq].options = {"900 HZ (FLUIDO)", "600 HZ", "300 HZ", "120 HZ", "60 HZ"};
     }
@@ -647,18 +660,17 @@ static void InitMenuDefaults() {
         else if (wcsstr(buf, L"keyboard")) g_menu_items[kMenuIcons].selected = 4;
         else g_menu_items[kMenuIcons].selected = 0;
 
-        GetPrivateProfileStringW(L"launcher", L"trophy_sound", L"playstation", buf, 64, ini.wstring().c_str());
-        if (!_wcsicmp(buf, L"xbox")) g_menu_items[kMenuTrophySound].selected = 1;
-        else if (!_wcsicmp(buf, L"steam")) g_menu_items[kMenuTrophySound].selected = 2;
-        else if (!_wcsicmp(buf, L"off") || !_wcsicmp(buf, L"desligado")) g_menu_items[kMenuTrophySound].selected = 3;
+        GetPrivateProfileStringW(L"launcher", L"trophy_sound", L"auto", buf, 64, ini.wstring().c_str());
+        if (!_wcsicmp(buf, L"playstation")) g_menu_items[kMenuTrophySound].selected = 1;
+        else if (!_wcsicmp(buf, L"xbox")) g_menu_items[kMenuTrophySound].selected = 2;
+        else if (!_wcsicmp(buf, L"steam")) g_menu_items[kMenuTrophySound].selected = 3;
+        else if (!_wcsicmp(buf, L"off") || !_wcsicmp(buf, L"desligado")) g_menu_items[kMenuTrophySound].selected = 4;
         else g_menu_items[kMenuTrophySound].selected = 0;
 
         GetPrivateProfileStringW(L"launcher", L"popup_style", L"ps5", buf, 64, ini.wstring().c_str());
-        if (!_wcsicmp(buf, L"ps4")) g_menu_items[kMenuPopupStyle].selected = 1;
-        else if (!_wcsicmp(buf, L"xbox")) g_menu_items[kMenuPopupStyle].selected = 2;
-        else if (!_wcsicmp(buf, L"xbox360")) g_menu_items[kMenuPopupStyle].selected = 3;
-        else if (!_wcsicmp(buf, L"steam")) g_menu_items[kMenuPopupStyle].selected = 4;
-        else g_menu_items[kMenuPopupStyle].selected = 0;
+        char style[64]{};
+        WideCharToMultiByte(CP_ACP, 0, buf, -1, style, sizeof(style), nullptr, nullptr);
+        g_menu_items[kMenuPopupStyle].selected = std::max(0, hle::trophy_popup::StyleIndex(style));
 
         int bf = GetPrivateProfileIntW(L"launcher", L"blank_frequency", 900, ini.wstring().c_str());
         if (bf == 600) g_menu_items[kMenuBlankFreq].selected = 1;
@@ -724,24 +736,26 @@ static void SwitchVideoImageTab(bool to_image) {
         g_video_menu_open = false;
         g_achievements_overlay_open = false;
         g_logs_overlay_open = false;
+        g_mp_panel_open = false;
         g_image_menu_open = true;
         log::Tagged("IMAGE-MENU", "open (tab)");
     } else {
         CloseImageMenuInternal();
         g_achievements_overlay_open = false;
         g_logs_overlay_open = false;
+        g_mp_panel_open = false;
         g_video_menu_open = true;
         log::Tagged("VIDEO-MENU", "open (tab)");
     }
 }
 
 static void PreviewCurrentTrophySound() {
-    static const char* const kSoundAnsi[] = {"playstation", "xbox", "steam", "off"};
+    static const char* const kSoundAnsi[] = {"auto", "playstation", "xbox", "steam", "off"};
     const int sel = g_menu_items[kMenuTrophySound].selected;
-    if (sel >= 0 && sel < 4) {
+    if (sel >= 0 && sel < 5) {
         auto& tm = hle::trophy::TrophyManager::Instance();
         tm.SetSoundType(kSoundAnsi[sel]);
-        tm.PlayTrophySound();
+        tm.PlayPreviewSound();
     }
 }
 
@@ -752,10 +766,135 @@ static void StepVideoMenuOption(int delta) {
     if (count <= 0) return;
     item.selected = ((item.selected + delta) % count + count) % count;
     if (g_menu_selected == kMenuPopupStyle) {
-        static const char* const kPopupAnsi[] = {"ps5", "ps4", "xbox", "xbox360", "steam"};
-        hle::trophy::TrophyManager::Instance().SetPopupStyle(kPopupAnsi[item.selected]);
+        if (item.selected >= 0 && item.selected < hle::trophy_popup::kStyleCount) {
+            hle::trophy::TrophyManager::Instance().SetPopupStyle(hle::trophy_popup::kStyleKeys[item.selected]);
+            hle::trophy::TrophyManager::Instance().PlayPreviewSound();
+        }
     } else if (g_menu_selected == kMenuTrophySound) {
         PreviewCurrentTrophySound();
+    }
+}
+
+// ---- 4.1: sala do multiplayer (quem esta, trancar, expulsar) ----
+namespace {
+
+struct MpRow {
+    int id = 0; // 0 = a linha "trancar sala" (so para o dono)
+    std::string name;
+    bool self = false;
+};
+
+bool MpIsOwner() {
+    const int self = runtime::mp_net::SelfId();
+    if (!self) return false;
+    const int owner = runtime::mp_net::OwnerId();
+    if (owner == self) return true;
+    if (runtime::mp_net::Peers().empty()) return true; // sozinho na sala: e o dono
+    if (owner == 0) return true; // fallback inicial
+    return false;
+}
+
+std::vector<MpRow> MpRows() {
+    std::vector<MpRow> rows;
+    const int self = runtime::mp_net::SelfId();
+    if (MpIsOwner()) rows.push_back({0, "", false});
+    if (self) rows.push_back({self, runtime::mp_net::SelfName(), true});
+    for (const auto& p : runtime::mp_net::Peers()) {
+        if (p.id != self && !p.name.empty()) rows.push_back({p.id, p.name, false});
+    }
+    return rows;
+}
+
+void MpMove(int delta) {
+    const int n = static_cast<int>(MpRows().size());
+    if (n > 0) g_mp_selected = (g_mp_selected + delta + n) % n;
+    g_mp_kick_id = 0;
+}
+
+void MpActivate() {
+    if (!MpIsOwner()) return;
+    const std::vector<MpRow> rows = MpRows();
+    if (g_mp_selected < 0 || g_mp_selected >= static_cast<int>(rows.size())) return;
+    const MpRow& row = rows[g_mp_selected];
+    if (row.id == 0) {
+        runtime::mp_net::SetRoomLocked(!runtime::mp_net::RoomLocked());
+        return;
+    }
+    if (row.self) return;
+    const auto now = std::chrono::steady_clock::now();
+    if (g_mp_kick_id == row.id && now - g_mp_kick_time < std::chrono::seconds(4)) {
+        runtime::mp_net::Kick(row.id);
+        log::Tagged("MP", "kicked %s from the room", row.name.c_str());
+        g_mp_kick_id = 0;
+        g_mp_selected = 0;
+    } else {
+        g_mp_kick_id = row.id; // Enter de novo em ate 4 s confirma
+        g_mp_kick_time = now;
+    }
+}
+
+std::string MpUpper(const std::string& text) {
+    std::string out;
+    for (char ch : text) out += static_cast<char>(std::toupper(static_cast<unsigned char>(ch)));
+    return out;
+}
+
+// Recusa definitiva do servidor, em texto para a tela (vazio = nenhuma)
+std::string MpRefusedText() {
+    const std::string code = runtime::mp_net::RefusedCode();
+    const bool pt = lang::Pt();
+    if (code == "senha") return pt ? "MULTIPLAYER: SENHA ERRADA (CONFIRA NO LAUNCHER)" : "MULTIPLAYER: WRONG ROOM PASSWORD (CHECK THE LAUNCHER)";
+    if (code == "trancada") return pt ? "MULTIPLAYER: A SALA ESTA TRANCADA" : "MULTIPLAYER: THE ROOM IS LOCKED";
+    if (code == "expulso") return pt ? "MULTIPLAYER: VOCE FOI EXPULSO DA SALA" : "MULTIPLAYER: YOU WERE KICKED FROM THE ROOM";
+    if (code == "cheia") return pt ? "MULTIPLAYER: A SALA ESTA CHEIA (16)" : "MULTIPLAYER: THE ROOM IS FULL (16)";
+    if (code == "versao") return pt ? "MULTIPLAYER: O SERVIDOR E DE OUTRA VERSAO" : "MULTIPLAYER: THE SERVER IS A DIFFERENT VERSION";
+    return {};
+}
+
+} // namespace
+
+void ToggleMpRoomMenu() {
+    if (!runtime::multiplayer::Enabled()) return;
+    const bool next = !g_mp_panel_open.load();
+    if (next) {
+        g_video_menu_open = false;
+        g_image_menu_open = false;
+        g_achievements_overlay_open = false;
+        g_logs_overlay_open = false;
+        g_mp_selected = 0;
+        g_mp_kick_id = 0;
+    }
+    g_mp_panel_open = next;
+    log::Tagged("MP-MENU", "%s", next ? "open" : "closed");
+}
+
+bool IsMpRoomMenuOpen() {
+    return g_mp_panel_open.load();
+}
+
+void HandleMpRoomMenuController(u32 pressed) {
+    if (!g_mp_panel_open) return;
+    static auto last_nav = std::chrono::steady_clock::now();
+    const auto now = std::chrono::steady_clock::now();
+    if (std::chrono::duration<float, std::milli>(now - last_nav).count() < 160.0f) return;
+    if (pressed & 0x10) { // cima
+        MpMove(-1);
+        last_nav = now;
+    } else if (pressed & 0x40) { // baixo
+        MpMove(1);
+        last_nav = now;
+    } else if (pressed & (0x20 | 0x80)) { // esquerda / direita: alterna trancar se na linha 0
+        const auto rows = MpRows();
+        if (g_mp_selected >= 0 && g_mp_selected < static_cast<int>(rows.size()) && rows[g_mp_selected].id == 0) {
+            MpActivate();
+            last_nav = now;
+        }
+    } else if (pressed & 0x4000) { // X: trancar / expulsar
+        MpActivate();
+        last_nav = now;
+    } else if (pressed & 0x2000) { // bola: fecha
+        g_mp_panel_open = false;
+        last_nav = now;
     }
 }
 
@@ -766,6 +905,7 @@ void ToggleVideoSettingsMenu() {
         CloseImageMenuInternal();
         g_achievements_overlay_open = false;
         g_logs_overlay_open = false;
+        g_mp_panel_open = false;
     }
     g_video_menu_open = next;
     log::Tagged("VIDEO-MENU", "%s", g_video_menu_open ? "open" : "closed");
@@ -1128,8 +1268,30 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
             ToggleImageSettingsMenu();
             return 0;
         }
+        if (wparam == VK_F4 && !(lparam & (1 << 30)) && runtime::multiplayer::Enabled()) { // 4.1: sala do multiplayer (F4)
+            ToggleMpRoomMenu();
+            return 0;
+        }
         if (wparam == VK_F8 && !(lparam & (1 << 30))) {
             ToggleAchievementsMenu();
+            return 0;
+        }
+        if (g_mp_panel_open.load()) {
+            const bool fresh = !(lparam & (1 << 30));
+            if (wparam == VK_UP) {
+                MpMove(-1);
+            } else if (wparam == VK_DOWN) {
+                MpMove(1);
+            } else if ((wparam == VK_LEFT || wparam == VK_RIGHT) && fresh) {
+                const auto rows = MpRows();
+                if (g_mp_selected >= 0 && g_mp_selected < static_cast<int>(rows.size()) && rows[g_mp_selected].id == 0) {
+                    MpActivate();
+                }
+            } else if (wparam == VK_RETURN && fresh) {
+                MpActivate();
+            } else if ((wparam == VK_ESCAPE || wparam == VK_F4) && fresh) {
+                g_mp_panel_open = false;
+            }
             return 0;
         }
         if (wparam == VK_F9 && !(lparam & (1 << 30))) {
@@ -1313,9 +1475,8 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
         hle::toypad::SavePortalState();
         render::VulkanRenderer::Instance().SavePipelineCache();
         hle::log::StopCapture();
-        if (!toypad_proc::IsExeRunning(L"LegoDimensionsLauncher.exe")) {
-            toypad_proc::CloseAll();
-        }
+        toypad_proc::CloseAll();
+        runtime::mp_net::Stop(); // 4.0: avisa o servidor que saiu (o TerminateProcess pula o atexit)
         TerminateProcess(GetCurrentProcess(), 0);
         return 0;
     default:
@@ -2208,6 +2369,102 @@ static void RenderTrophyToast(OverlayCanvas& c, const RECT& client, float scale_
     }
 }
 
+// ---- 3.0: pop-up de conquista em alta resolucao, no visual de cada console (hle/trophy_popup) ----
+// A imagem do pop-up vai para uma textura fixa (atlas) e o overlay desenha os retangulos da animacao por cima de tudo.
+struct PopupVertex {
+    float x, y, z;
+    u32 rgba;
+    float u, v;
+};
+constexpr u32 kPopupAtlasW = 2048, kPopupAtlasH = 1024;
+constexpr u64 kPopupAtlasKey = 0x7E0F'A11C'0000'0001ull;
+static hle::trophy_popup::Image g_popup_image;
+
+// Desenha a imagem do pop-up (so quando o conteudo, o estilo ou o tamanho da janela mudam) e a envia como textura.
+static bool PreparePopup(float ch, const std::string& style, int trophy_id, char type, const std::string& title,
+                         const std::string& desc) {
+    static std::string s_key;
+    static bool s_ok = false, s_uploaded = false;
+    static std::vector<u32> s_atlas;
+    const float scale = std::clamp(ch / 1080.0f, 0.6f, 2.2f);
+    char scale_text[16];
+    std::snprintf(scale_text, sizeof(scale_text), "%.3f", scale);
+    const std::string key = style + '\x1f' + std::to_string(trophy_id) + type + '\x1f' + title + '\x1f' + desc + '\x1f' +
+                            (lang::Pt() ? "pt" : "en") + scale_text;
+    if (key == s_key) {
+        return s_ok;
+    }
+    s_key = key;
+    const hle::trophy_popup::Request request{style, trophy_id, type, title, desc, lang::Pt(), scale};
+    s_ok = hle::trophy_popup::Render(request, &g_popup_image) && g_popup_image.w <= int(kPopupAtlasW) &&
+           g_popup_image.h <= int(kPopupAtlasH);
+    if (!s_ok) {
+        log::Tagged("TROPHY", "popup image failed (%s)", style.c_str());
+        return false;
+    }
+    s_atlas.assign(size_t(kPopupAtlasW) * kPopupAtlasH, 0);
+    for (int y = 0; y < g_popup_image.h; ++y) {
+        std::memcpy(&s_atlas[size_t(y) * kPopupAtlasW], &g_popup_image.rgba[size_t(y) * g_popup_image.w], size_t(g_popup_image.w) * 4);
+    }
+    render::TextureData texture;
+    texture.format = render::TextureData::kRgba8;
+    texture.width = kPopupAtlasW;
+    texture.height = kPopupAtlasH;
+    texture.data = s_atlas.data();
+    texture.bytes = s_atlas.size() * 4;
+    auto& renderer = render::VulkanRenderer::Instance();
+    s_ok = s_uploaded && renderer.HasTexture(kPopupAtlasKey) ? renderer.UpdateTexture(kPopupAtlasKey, texture)
+                                                              : renderer.UploadTexture(kPopupAtlasKey, texture);
+    s_uploaded = s_ok;
+    if (!s_ok) {
+        log::Tagged("TROPHY", "popup texture upload failed");
+    }
+    return s_ok;
+}
+
+static void QueuePopup(float cw, float ch, float elapsed, float remaining) {
+    static std::vector<hle::trophy_popup::Quad> quads;
+    static std::vector<PopupVertex> vertices;
+    quads.clear();
+    vertices.clear();
+    hle::trophy_popup::Layout(g_popup_image, cw, ch, elapsed, remaining, &quads);
+    for (const auto& q : quads) {
+        const u32 color = (q.tint & 0xFFFFFFu) | (static_cast<u32>(std::clamp(q.alpha, 0.0f, 1.0f) * 255.0f + 0.5f) << 24);
+        const float mx = (q.x0 + q.x1) * 0.5f, my = (q.y0 + q.y1) * 0.5f, cs = std::cos(q.angle), sn = std::sin(q.angle);
+        auto v = [&](float x, float y, float tu, float tv) {
+            if (q.angle != 0.0f) { // rotacao em volta do centro (o logo do Xbox One rolando)
+                const float dx = x - mx, dy = y - my;
+                x = mx + dx * cs - dy * sn, y = my + dx * sn + dy * cs;
+            }
+            vertices.push_back({x / (cw * 0.5f) - 1.0f, 1.0f - y / (ch * 0.5f), 0.0f, color, tu / kPopupAtlasW, tv / kPopupAtlasH});
+        };
+        v(q.x0, q.y0, q.u0, q.v0), v(q.x1, q.y0, q.u1, q.v0), v(q.x1, q.y1, q.u1, q.v1);
+        v(q.x0, q.y0, q.u0, q.v0), v(q.x1, q.y1, q.u1, q.v1), v(q.x0, q.y1, q.u0, q.v1);
+    }
+    if (vertices.empty()) {
+        return;
+    }
+    render::DrawCall draw;
+    draw.vertex_data = vertices.data();
+    draw.vertex_count = static_cast<u32>(vertices.size());
+    draw.stride = sizeof(PopupVertex);
+    draw.position_offset = 0;
+    draw.position_format = render::DrawCall::kFloat3;
+    draw.has_color = true;
+    draw.color_offset = 12;
+    draw.primitive = render::DrawCall::kTriangleList;
+    draw.blend = true;
+    draw.uv_format = render::DrawCall::kUvFloat2;
+    draw.uv_offset = 16;
+    draw.texture_key = kPopupAtlasKey;
+    static const float kIdentity[16] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};
+    std::memcpy(draw.mvp, kIdentity, sizeof(kIdentity));
+    draw.viewport[0] = draw.viewport[1] = 0.0f;
+    draw.viewport[2] = draw.target_size[0] = cw;
+    draw.viewport[3] = draw.target_size[1] = ch;
+    render::VulkanRenderer::Instance().QueueDraw(draw);
+}
+
 static std::vector<std::string> WrapText(const std::string& text, size_t max_chars, size_t max_lines) {
     std::vector<std::string> lines;
     if (text.empty() || max_chars == 0 || max_lines == 0) return lines;
@@ -2491,14 +2748,59 @@ void QueueStatsOverlay() {
             hle::log::FlushCapture();
         }
     }
+    const std::vector<runtime::multiplayer::NameTag> tags = runtime::multiplayer::NameTags(); // 4.0
+    // 4.0: a sala do multiplayer e o aviso de recusa (senha errada, expulso...), que fica 15 s na tela
+    const std::string mp_refused = runtime::multiplayer::Enabled() ? MpRefusedText() : std::string();
+    static std::chrono::steady_clock::time_point s_refused_since{};
+    static std::string s_refused_seen;
+    static bool s_refused_shown = false; // so comeca a contar com o jogador no mundo (a recusa chega antes do 1o quadro)
+    if (mp_refused != s_refused_seen) {
+        s_refused_seen = mp_refused;
+        s_refused_shown = false;
+    }
+    if (!mp_refused.empty() && !s_refused_shown && runtime::multiplayer::InWorld()) {
+        s_refused_shown = true;
+        s_refused_since = now;
+    }
+    const bool show_refused = s_refused_shown && !mp_refused.empty() && now - s_refused_since < std::chrono::seconds(15);
     if (!g_stats_overlay.load() && !g_video_menu_open.load() && !g_image_menu_open.load() &&
-        !g_achievements_overlay_open.load() && !g_logs_overlay_open.load() && !has_toast) {
+        !g_achievements_overlay_open.load() && !g_logs_overlay_open.load() && !has_toast &&
+        tags.empty() && !g_mp_panel_open.load() && !show_refused) {
         return;
     }
     static std::vector<LoadingVertex> vertices;
     vertices.clear();
     OverlayCanvas c{vertices, static_cast<float>(client.right), static_cast<float>(client.bottom)};
     const float p = client.bottom >= 1400 ? 3.0f : 2.0f; // tamanho do pixel da fonte
+
+    // 4.0: o nome de cada jogador do multiplayer em cima do personagem dele
+    float view[16], rect[4], extent[2];
+    if (!tags.empty() && render::SceneViewProjection(view, rect, extent)) {
+        const float kx = client.right / extent[0], ky = client.bottom / extent[1];
+        static const bool tag_debug = std::getenv("LD_MP_DEBUG") != nullptr;
+        static int tag_frames = 0;
+        if (tag_debug && ++tag_frames % 180 == 0) {
+            std::printf("[MP] camera: %.3f %.3f %.3f %.3f | %.3f %.3f %.3f %.3f | %.3f %.3f %.3f %.3f | %.3f %.3f %.3f %.3f rect %.0f %.0f %.0f %.0f\n",
+                        view[0], view[1], view[2], view[3], view[4], view[5], view[6], view[7], view[8], view[9], view[10], view[11],
+                        view[12], view[13], view[14], view[15], rect[0], rect[1], rect[2], rect[3]);
+        }
+        for (const auto& tag : tags) {
+            const float cx = tag.x * view[0] + tag.y * view[4] + tag.z * view[8] + view[12];
+            const float cy = tag.x * view[1] + tag.y * view[5] + tag.z * view[9] + view[13];
+            const float cw = tag.x * view[3] + tag.y * view[7] + tag.z * view[11] + view[15];
+            if (cw < 0.05f) continue; // atras da camera
+            const float nx = cx / cw, ny = cy / cw;
+            if (nx < -1.2f || nx > 1.2f || ny < -1.2f || ny > 1.2f) continue;
+            const float sx = (rect[0] + (nx * 0.5f + 0.5f) * rect[2]) * kx;
+            const float sy = (rect[1] + (0.5f - ny * 0.5f) * rect[3]) * ky;
+            const float tp = std::clamp(p * 4.0f / std::max(cw, 1.0f), p * 0.75f, p * 1.5f); // menor de longe
+            std::string name;
+            for (char ch : tag.name) name += static_cast<char>(std::toupper(static_cast<unsigned char>(ch)));
+            const float w = TextWidth(name, tp);
+            c.Pill(sx - w * 0.5f - 4 * tp, sy - 10 * tp, sx + w * 0.5f + 4 * tp, sy - 1 * tp, 0x99000000);
+            c.Write(name, sx - w * 0.5f, sy - 8.5f * tp, tp, 0xFFFFFFFF);
+        }
+    }
 
     if (g_stats_overlay.load()) {
         const runtime::hwmon::Snapshot s = runtime::hwmon::Get();
@@ -2785,15 +3087,97 @@ void QueueStatsOverlay() {
         }
     }
 
+    if (show_refused) {
+        const float tp = p * 1.2f;
+        const float w = TextWidth(mp_refused, tp);
+        const float x = (client.right - w) * 0.5f, y = 40.0f * p;
+        c.Pill(x - 6 * tp, y - 3 * tp, x + w + 6 * tp, y + 10 * tp, 0xCC000060);
+        c.Write(mp_refused, x, y, tp, 0xFFFFFFFF);
+    }
+
+    if (g_mp_panel_open.load()) {
+        constexpr u32 kBg = 0xEE121216, kBorder = 0xFF00D000, kTitleYellow = 0xFF00E0FF, kHiBg = 0xAA303038;
+        constexpr u32 kWhite = 0xFFFFFFFF, kGray = 0xFFA0A0A0, kCyan = 0xFFE0C040, kRed = 0xFF4040FF;
+        const bool pt = lang::Pt();
+        const std::vector<MpRow> rows = MpRows();
+        if (g_mp_selected >= static_cast<int>(rows.size())) g_mp_selected = 0;
+        const bool owner = MpIsOwner();
+        const int owner_id = runtime::mp_net::OwnerId();
+        const float s = client.bottom >= 1400 ? 1.5f : (client.bottom >= 1000 ? 1.0f : 0.75f);
+        const float box_w = 760.0f * s;
+        const float box_h = (175.0f + 38.0f * std::max<size_t>(rows.size(), 1) + 70.0f) * s;
+        const float x0 = (client.right - box_w) / 2.0f, y0 = std::max(10.0f, (client.bottom - box_h) / 2.0f);
+        const float x1 = x0 + box_w, y1 = y0 + box_h;
+        c.Rect(x0 - 4.0f, y0 - 4.0f, x1 + 4.0f, y1 + 4.0f, kBorder);
+        c.Rect(x0, y0, x1, y1, kBg);
+        const std::string title = pt ? "SALA DO MULTIPLAYER (F4)" : "MULTIPLAYER ROOM (F4)";
+        const float ft = 3.5f * s, fi = 2.4f * s, fs = 1.9f * s;
+        c.Write(title, x0 + (box_w - TextWidth(title, ft)) / 2.0f, y0 + 20.0f * s, ft, kTitleYellow);
+        c.Rect(x0 + 20.0f * s, y0 + 55.0f * s, x1 - 20.0f * s, y0 + 57.0f * s, kGray);
+        char info[160];
+        const int rtt = runtime::mp_net::RttMs();
+        std::snprintf(info, sizeof(info), pt ? "CODIGO %s - %s - PING %d MS" : "CODE %s - %s - PING %d MS",
+                      MpUpper(runtime::mp_net::RoomCode()).c_str(),
+                      runtime::mp_net::RoomLocked() ? (pt ? "TRANCADA" : "LOCKED") : (pt ? "ABERTA" : "OPEN"), rtt);
+        c.Write(info, x0 + 24.0f * s, y0 + 72.0f * s, fs, kWhite);
+        std::string sub;
+        if (!mp_refused.empty()) sub = mp_refused;
+        else if (!runtime::mp_net::SelfId()) sub = pt ? "CONECTANDO AO SERVIDOR..." : "CONNECTING TO THE SERVER...";
+        else sub = owner ? (pt ? "VOCE E O DONO DA SALA" : "YOU OWN THIS ROOM")
+                         : (pt ? "SO O DONO DA SALA TRANCA OU EXPULSA" : "ONLY THE ROOM OWNER CAN LOCK OR KICK");
+        c.Write(sub, x0 + 24.0f * s, y0 + 100.0f * s, fs, mp_refused.empty() ? kGray : kRed);
+        float row_y = y0 + 140.0f * s;
+        for (size_t i = 0; i < rows.size(); ++i) {
+            const MpRow& r = rows[i];
+            const bool sel = static_cast<int>(i) == g_mp_selected;
+            if (sel) c.Rect(x0 + 16.0f * s, row_y - 4.0f * s, x1 - 16.0f * s, row_y + 26.0f * s, kHiBg);
+            std::string label, value;
+            u32 value_color = sel ? kCyan : kGray;
+            if (r.id == 0) {
+                label = pt ? "TRANCAR A SALA" : "LOCK THE ROOM";
+                value = runtime::mp_net::RoomLocked() ? (pt ? "< SIM >" : "< ON >") : (pt ? "< NAO >" : "< OFF >");
+            } else {
+                label = MpUpper(r.name);
+                if (r.self) label += pt ? " (VOCE)" : " (YOU)";
+                if (r.id == owner_id) label += pt ? " - DONO" : " - OWNER";
+                if (owner && !r.self && sel) {
+                    const bool confirm = g_mp_kick_id == r.id && now - g_mp_kick_time < std::chrono::seconds(4);
+                    value = confirm ? (pt ? "ENTER DE NOVO: EXPULSAR" : "ENTER AGAIN: KICK") : (pt ? "ENTER: EXPULSAR" : "ENTER: KICK");
+                    if (confirm) value_color = kRed;
+                }
+            }
+            c.Write(sel ? "> " + label : "  " + label, x0 + 24.0f * s, row_y, fi, sel ? kTitleYellow : kWhite);
+            if (!value.empty()) c.Write(value, x1 - TextWidth(value, fi) - 32.0f * s, row_y, fi, value_color);
+            row_y += 38.0f * s;
+        }
+        c.Rect(x0 + 20.0f * s, y1 - 60.0f * s, x1 - 20.0f * s, y1 - 58.0f * s, kGray);
+        const std::string footer = owner ? (pt ? "[CIMA/BAIXO] ESCOLHER  [ENTER/DIR] TRANCAR / EXPULSAR  [F4/ESC] SAIR"
+                                               : "[UP/DOWN] SELECT  [ENTER/RIGHT] LOCK / KICK  [F4/ESC] CLOSE")
+                                         : (pt ? "[F4/ESC] SAIR" : "[F4/ESC] CLOSE");
+        const float ff = 1.7f * s;
+        c.Write(footer, x0 + (box_w - TextWidth(footer, ff)) / 2.0f, y1 - 40.0f * s, ff, kGray);
+    }
+
+    // 3.0: o pop-up (de verdade ou a previa do menu, que repete a animacao) vai por cima de tudo, depois do overlay
+    struct PendingPopup {
+        std::string style;
+        float elapsed, remaining;
+    };
+    std::optional<PendingPopup> popup;
     if (g_video_menu_open.load() && g_menu_selected == kMenuPopupStyle) {
-        static const char* const kStyles[] = {"ps5", "ps4", "xbox", "xbox360", "steam"};
-        int sel = g_menu_items[kMenuPopupStyle].selected;
-        if (sel >= 0 && sel < 5) {
-            float scale_toast = client.bottom >= 1400 ? 1.4f : (client.bottom >= 1000 ? 1.0f : 0.8f);
-            RenderTrophyToast(c, client, scale_toast, kStyles[sel], 16, 'G',
-                              lang::Pt() ? "Exemplo de Conquista" : "Sample Achievement",
-                              lang::Pt() ? "Pre-visualizacao do estilo selecionado" : "Selected popup style preview",
-                              1.0f, true);
+        const int sel = g_menu_items[kMenuPopupStyle].selected;
+        if (sel >= 0 && sel < hle::trophy_popup::kStyleCount) {
+            const std::string style = hle::trophy_popup::kStyleKeys[sel];
+            const char* title = lang::Pt() ? "Exemplo de Conquista" : "Sample Achievement";
+            const char* desc = lang::Pt() ? "Pré-visualização do estilo selecionado" : "Selected popup style preview";
+            const float show = hle::trophy_popup::Duration(style, 'G'), loop = show + 0.8f; // repete a animacao com uma pausa
+            const float t = std::fmod(static_cast<float>(std::chrono::duration<double>(now.time_since_epoch()).count()), loop);
+            if (PreparePopup(c.h, style, 16, 'G', title, desc)) {
+                popup = PendingPopup{style, t, t < show ? show - t : -1.0f};
+            } else {
+                float scale_toast = client.bottom >= 1400 ? 1.4f : (client.bottom >= 1000 ? 1.0f : 0.8f);
+                RenderTrophyToast(c, client, scale_toast, style, 16, 'G', title, desc, 1.0f, true);
+            }
         }
     }
 
@@ -3065,9 +3449,13 @@ void QueueStatsOverlay() {
             anim = toast.time_remaining / 0.35f;
         }
 
-        const float scale_ui = client.bottom >= 1400 ? 1.4f : (client.bottom >= 1000 ? 1.0f : 0.8f);
-        RenderTrophyToast(c, client, scale_ui, toast.popup_style.empty() ? "ps5" : toast.popup_style,
-                          toast.trophy_id, toast.type, toast.title, toast.desc, anim, false);
+        const std::string style = toast.popup_style.empty() ? "ps5" : toast.popup_style;
+        if (PreparePopup(c.h, style, toast.trophy_id, toast.type, toast.title, toast.desc)) {
+            popup = PendingPopup{style, time_in, toast.time_remaining};
+        } else {
+            const float scale_ui = client.bottom >= 1400 ? 1.4f : (client.bottom >= 1000 ? 1.0f : 0.8f);
+            RenderTrophyToast(c, client, scale_ui, style, toast.trophy_id, toast.type, toast.title, toast.desc, anim, false);
+        }
     }
 
     if (!vertices.empty()) {
@@ -3088,6 +3476,9 @@ void QueueStatsOverlay() {
         draw.viewport[2] = draw.target_size[0] = c.w;
         draw.viewport[3] = draw.target_size[1] = c.h;
         render::VulkanRenderer::Instance().QueueDraw(draw);
+    }
+    if (popup && popup->remaining >= 0.0f) {
+        QueuePopup(c.w, c.h, popup->elapsed, popup->remaining);
     }
 }
 

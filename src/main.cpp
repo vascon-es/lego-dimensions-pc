@@ -36,7 +36,10 @@
 #include "patcher/fs_tls_patcher.h"
 #include "runtime/lang.h"
 #include "hle/trophy_manager.h"
+#include "hle/trophy_popup.h"
 #include "runtime/crash_handler.h"
+#include "runtime/multiplayer.h"
+#include "runtime/mp_net.h"
 #include "runtime/orbis_tls.h"
 
 namespace hle {
@@ -109,6 +112,7 @@ namespace {
 // ser pulada: depois das checagens de estado, vale o "allowcutskip" do nivel ou o bit 0 de [obj+0xe8] (cena
 // ja vista / jogo completo). Troca essa ultima leitura por "mov al, 1", mantendo as checagens de antes.
 bool g_skip_cutscenes = false;
+runtime::multiplayer::Config g_mp_config; // Fase 79: --mp-server/--mp-room/--mp-name (caixa do launcher)
 bool g_keep_16x9 = false; // 1.9.1: --keep-16x9 = tela de outra proporcao com barras (sem corrigir a camera)
 
 bool PatchCutsceneSkip(const loader::ElfPieLoader& elf) {
@@ -1241,6 +1245,7 @@ int main(int argc, char** argv) {
     }
     std::filesystem::path elf_path = root / "assets" / "decrypted_elfs" / "eboot.bin.elf";
     std::filesystem::path app0 = DefaultApp0(root);
+    std::filesystem::path popup_test; // 3.0: --popup-test
     std::filesystem::path app0_patch; // Fase 58
     std::filesystem::path mods_cache = root / "assets" / "mods_cache"; // Fase 64: mods preparados pelo mods.py ("-" = --no-mods)
     bool live_compiler = true;
@@ -1340,6 +1345,8 @@ int main(int argc, char** argv) {
             hle::trophy::TrophyManager::Instance().SetSoundType(argv[++i]);
         } else if (!std::strcmp(argv[i], "--popup-style") && i + 1 < argc) {
             hle::trophy::TrophyManager::Instance().SetPopupStyle(argv[++i]);
+        } else if (!std::strcmp(argv[i], "--popup-test") && i + 1 < argc) {
+            popup_test = WideArg(i + 1, argv[i + 1]), ++i; // 3.0: desenha os pop-ups de conquista em arquivos e sai
         } else if (!std::strcmp(argv[i], "--blank-frequency") && i + 1 < argc) {
             hle::videoout::SetBlankFrequency(std::atoi(argv[++i]));
         } else if (!std::strcmp(argv[i], "--reset-trophies")) {
@@ -1368,6 +1375,14 @@ int main(int argc, char** argv) {
             render::VulkanRenderer::Instance().SetNoVsync(true); // 1.9.1: IMMEDIATE (mais FPS, com tearing)
         } else if (!std::strcmp(argv[i], "--keep-16x9")) {
             g_keep_16x9 = true;
+        } else if (!std::strcmp(argv[i], "--mp-server") && i + 1 < argc) {
+            g_mp_config.server = argv[++i]; // Fase 79: multiplayer online
+        } else if (!std::strcmp(argv[i], "--mp-room") && i + 1 < argc) {
+            g_mp_config.room = argv[++i];
+        } else if (!std::strcmp(argv[i], "--mp-name") && i + 1 < argc) {
+            g_mp_config.name = argv[++i];
+        } else if (!std::strcmp(argv[i], "--mp-pass") && i + 1 < argc) {
+            g_mp_config.password = argv[++i]; // testes; o launcher passa a senha em LD_MP_PASS (nao aparece nos logs)
         } else if (!std::strcmp(argv[i], "--skip-cutscenes")) {
             g_skip_cutscenes = true; // Fase 61: toda cutscene pode ser pulada, mesmo sem 100%
         } else if (!std::strcmp(argv[i], "--resolution") && i + 1 < argc) {
@@ -1588,6 +1603,38 @@ int main(int argc, char** argv) {
     hle::InitDataObjects();
     hle::fs::Configure(app0, root / "assets");
     hle::trophy::TrophyManager::Instance().Init(root, root / "assets" / "savedata0");
+    if (!popup_test.empty()) { // 3.0: cada estilo em <pasta>\<estilo>.rgba ("w h" + RGBA) e as posicoes da animacao em .txt
+        std::filesystem::create_directories(popup_test);
+        for (const char* style : hle::trophy_popup::kStyleKeys) {
+            for (const char type : {'G', 'P'}) {
+                hle::trophy_popup::Image image;
+                const hle::trophy_popup::Request request{style, 16, type, "Simply Walked Into... Metropolis", "Complete 'Painting the Town Black'",
+                                                         lang::Pt(), 1.0f};
+                if (!hle::trophy_popup::Render(request, &image)) {
+                    std::printf("popup-test: %s failed\n", style);
+                    continue;
+                }
+                const std::string name = std::string(style) + "_" + type;
+                std::ofstream raw(popup_test / (name + ".rgba"), std::ios::binary);
+                raw << image.w << ' ' << image.h << '\n';
+                raw.write(reinterpret_cast<const char*>(image.rgba.data()), static_cast<std::streamsize>(image.rgba.size() * 4));
+                std::ofstream layout(popup_test / (name + ".txt"));
+                const float total = hle::trophy_popup::Duration(style, type);
+                for (float t = 0.0f; t < total; t += 1.0f / 15.0f) {
+                    std::vector<hle::trophy_popup::Quad> quads;
+                    hle::trophy_popup::Layout(image, 1920.0f, 1080.0f, t, total - t, &quads);
+                    layout << "t " << t << '\n';
+                    for (const auto& q : quads) {
+                        layout << q.x0 << ' ' << q.y0 << ' ' << q.x1 << ' ' << q.y1 << ' ' << q.u0 << ' ' << q.v0 << ' ' << q.u1 << ' '
+                               << q.v1 << ' ' << q.alpha << ' ' << q.tint << ' ' << q.angle << '\n';
+                    }
+                }
+            }
+        }
+        std::printf("popup-test: written to %s\n", popup_test.string().c_str());
+        std::fflush(stdout);
+        ExitProcess(0); // sem destrutores estaticos (GDI+, threads do HLE)
+    }
 
     if (lang::Pt()) {
         std::string tid = game_region::TitleId(app0);
@@ -1734,6 +1781,9 @@ int main(int argc, char** argv) {
     }
     if (!selftest) {
         hle::anomaly::Install(elf.base()); // Fase 67: carregador de mods Anomaly (connorh315), se houver pacotes de mod
+        if (const char* pass = std::getenv("LD_MP_PASS"); pass && g_mp_config.password.empty()) g_mp_config.password = pass;
+        runtime::multiplayer::Configure(g_mp_config); // Fase 79: sem --mp-server/--mp-room nao faz nada
+        runtime::multiplayer::Install(elf.base());
     }
     if (!elf.Protect()) {
         std::printf("ERROR: %s\n", elf.error().c_str());
@@ -1776,6 +1826,7 @@ int main(int argc, char** argv) {
                         static_cast<unsigned long long>(memory.PeakWorkingSetSize >> 20));
         }
         renderer.SaveDiskPipelineCache();
+        runtime::mp_net::Stop(); // 4.0: avisa o servidor do multiplayer que saiu
         std::fflush(stdout);
         // Como o fechamento do jogo (hle_videoout): sem destrutores globais. Voltar do main com as threads de
         // pipeline vivas terminava em abort (0xC0000409). O driver ja guardou cada pipeline ao cria-lo.
