@@ -301,7 +301,7 @@ static void ApplyAndSaveVideoSettings() {
     }
     if (g_menu_selected == kMenuMpJoin) { // 4.1: "ENTRAR NA SALA (F3)"
         g_video_menu_open = false;
-        OpenMpRoomDialog();
+        hle::videoout::OpenMpRoomDialog();
         return;
     }
     HWND hwnd = static_cast<HWND>(WindowHandle());
@@ -635,15 +635,13 @@ void MpMove(int delta) {
     g_mp_kick_id = 0;
 }
 
-void OpenMpRoomDialog();
-
 void MpActivate() {
     const std::vector<MpRow> rows = MpRows();
     if (g_mp_selected < 0 || g_mp_selected >= static_cast<int>(rows.size())) return;
     const MpRow& row = rows[g_mp_selected];
     if (row.id == -1) {
         g_mp_panel_open = false;
-        OpenMpRoomDialog();
+        hle::videoout::OpenMpRoomDialog();
         return;
     }
     if (!MpIsOwner()) return;
