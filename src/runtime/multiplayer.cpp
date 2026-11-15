@@ -498,7 +498,9 @@ HLE_SYSV_ABI u64 FireEventHook(u64 ev, u64 sender, u64 payload, u64 a, u64 b, u6
         // pesquisa da campanha junto: eventos de troca de fase/area com os dados inteiros (e os textos para onde apontam)
         const std::string nm = name;
         if ((nm.find("Level") != std::string::npos || nm.find("Area") != std::string::npos || nm.find("Flow") != std::string::npos) &&
-            nm.find("onProcess") == std::string::npos && nm.find("SafeArea") == std::string::npos) {
+            nm.find("onProcess") == std::string::npos && nm.find("SafeArea") == std::string::npos &&
+            nm.find("MenuFlow2") == std::string::npos && nm.find("Subtitle") == std::string::npos &&
+            nm.find("GameDeactivate") == std::string::npos && nm.find("AvailableLevel") == std::string::npos) {
             std::printf("[EVL] t=%.2f %s ev %llx de %llx dados %llx chamado de eboot+%llx\n", now, name, static_cast<unsigned long long>(ev),
                         static_cast<unsigned long long>(sender), static_cast<unsigned long long>(payload),
                         static_cast<unsigned long long>(reinterpret_cast<u64>(__builtin_return_address(0)) - reinterpret_cast<u64>(g_base)));
@@ -571,6 +573,85 @@ HLE_SYSV_ABI u64 KillObjectHook(u64 obj, u64 reason, u64 killer, u64 a, u64 b, u
     return g_kill_object(obj, reason, killer, a, b, c, st0, st1);
 }
 
+// ---- pesquisa de montar (LD_MP_EVENTS): sondas nas funcoes candidatas. Chamam a original primeiro (registros e
+// xmm intactos) e depois registram o objeto (classe, primeiro texto) e quem chamou. Ate 4 por objeto, depois 1 a cada 100.
+struct ProbeDef {
+    const char* name;
+    u64 offset;
+};
+constexpr ProbeDef kProbes[] = {
+    {"som_peca_ou_fim(189c8e0)", 0x189c8e0}, // toca buildit_piece / buildit_end
+    {"montar_inicio(18a73b0)", 0x18a73b0},   // usa buildit_start
+    {"montar_pecas(189c9a0)", 0x189c9a0},    // usa buildit_piece / buildit_end
+    {"obstaculo_play(1802f50)", 0x1802f50},  // PlayObstacle (motor antigo): anda para a frente
+    {"peca_voa(189e8a0)", 0x189e8a0},        // (peca, habilidade, edx, xmm0 = dt): toca buildit_end no fim
+};
+constexpr int kProbeCount = sizeof(kProbes) / sizeof(kProbes[0]);
+KillFn g_probe_orig[kProbeCount] = {}; // 8 argumentos: 6 em registradores + 2 na pilha (18a73b0 le [rbp+0x18])
+std::mutex g_probe_mutex;
+std::map<std::pair<int, u64>, u64> g_probe_count;
+std::map<std::pair<int, u64>, u64> g_probe_last_ret;
+u64 g_probe_lines = 0;
+
+std::string Describe(u64 p) {
+    if (p < 0x10000 || !Readable(p, 8)) return "-";
+    char buf[160];
+    const u64 vt = At<u64>(p);
+    const u64 base = reinterpret_cast<u64>(g_base);
+    std::snprintf(buf, sizeof(buf), "%llx(vt %s%llx %s)", static_cast<unsigned long long>(p), vt >= base && vt < base + 0x3400000 ? "eboot+" : "",
+                  static_cast<unsigned long long>(vt >= base && vt < base + 0x3400000 ? vt - base : vt), FirstString(p).c_str());
+    return buf;
+}
+
+template <int K>
+HLE_SYSV_ABI u64 ProbeHook(u64 a, u64 b, u64 c, u64 d, u64 e, u64 f, u64 st0, u64 st1) {
+    const u64 caller = reinterpret_cast<u64>(__builtin_return_address(0)) - reinterpret_cast<u64>(g_base);
+    const u64 r = g_probe_orig[K](a, b, c, d, e, f, st0, st1);
+    u64 n;
+    bool changed;
+    {
+        std::lock_guard lock(g_probe_mutex);
+        n = ++g_probe_count[{K, a}];
+        auto [it, fresh] = g_probe_last_ret.try_emplace({K, a}, r);
+        changed = fresh || it->second != r;
+        it->second = r;
+    }
+    // inicio de montagem: todos os argumentos e o alvo ([[pilha1+8]+8]: referencia com contagem em +0x10)
+    if (K == 1) {
+        u64 target = 0;
+        if (Readable(st1 + 8, 8)) {
+            const u64 ref = At<u64>(st1 + 8);
+            if (Readable(ref + 8, 8)) target = At<u64>(ref + 8);
+        }
+        std::printf("[MONTAR] t=%.2f INICIO habilidade %llx personagem %s | dl=%llx rcx=%llx tipo(r8)=%llx r9=%llx pilha0=%s pilha1=%s | ALVO=%s | hab+598=%s\n",
+                    runtime::mp_net::Now(), static_cast<unsigned long long>(a), Describe(b).c_str(), static_cast<unsigned long long>(c),
+                    static_cast<unsigned long long>(d), static_cast<unsigned long long>(e), static_cast<unsigned long long>(f),
+                    Describe(st0).c_str(), Describe(st1).c_str(), Describe(target).c_str(),
+                    Readable(a + 0x598, 8) ? Describe(At<u64>(a + 0x598)).c_str() : "-");
+        std::fflush(stdout);
+    }
+    // pecas: so quando o retorno muda (o fim da montagem deve mudar o retorno), ate 3000 linhas
+    if ((K == 2 || K == 4) && (!changed || g_probe_lines > 3000)) return r;
+    ++g_probe_lines;
+    if (K == 2 || K == 4 || n <= 4 || n % 100 == 0) {
+        std::printf("[MONTAR] t=%.2f %s #%llu ret %llx de eboot+%llx | a=%s | b=%s | c=%s | [a+18]=%s\n", runtime::mp_net::Now(),
+                    kProbes[K].name, static_cast<unsigned long long>(n), static_cast<unsigned long long>(r),
+                    static_cast<unsigned long long>(caller), Describe(a).c_str(), Describe(b).c_str(), Describe(c).c_str(),
+                    Readable(a + 0x18, 8) ? Describe(At<u64>(a + 0x18)).c_str() : "-");
+        std::fflush(stdout);
+    }
+    return r;
+}
+
+template <int... K>
+void InstallProbes(std::integer_sequence<int, K...>) {
+    ((g_probe_orig[K] = reinterpret_cast<KillFn>(Hook(kProbes[K].offset, reinterpret_cast<const void*>(&ProbeHook<K>)))), ...);
+    for (int i = 0; i < kProbeCount; ++i) {
+        std::printf("[MONTAR] sonda %s: %s\n", kProbes[i].name, g_probe_orig[i] ? "ligada" : "NAO ligada");
+    }
+    std::fflush(stdout);
+}
+
 // a cada 2 s: os eventos que dispararam desde o ultimo relatorio (os de todo quadro aparecem com contagem alta)
 void ReportEventsLocked(double now) {
     static double last = 0;
@@ -626,6 +707,14 @@ u64 kMsRequestFn = 0xf31ac0;
 // ---- 4.2: montar. eboot+13b97f0(nao usado, montagem, quem) dispara a montagem (estado + evento OnTriggered: as pecas
 // se juntam e o roteiro do level recebe a mensagem). O estado fica no mesmo componente dos multiestados.
 u64 kReformTriggerFn = 0x13b97f0;
+// ---- 4.2: montinhos de pecas (motor antigo do jogo). Montagem: classe eboot+2b7ef50; +0x24c estado (0 parado, 1..3
+// montando, 4 pronto), +0x210 pecas, +0xa8 posicao, +0x220 tipo/etapa, +0x598 quem monta, +0xba bits 0|1 = "sendo
+// montado" (o jogo recalcula todo quadro; sem eles a atualizacao eboot+18a60b0(montagem, dt) para logo no comeco).
+// eboot+18a73b0(montagem, quem, 0, 0, tipo, 1, primeira peca, eboot+313e1d0) comeca a montar sem conferir o botao.
+constexpr u64 kBuildVtable = 0x2b7ef50;
+u64 kBuildStartFn = 0x18a73b0;
+u64 kBuildUpdateFn = 0x18a60b0;
+constexpr u64 kBuildInputEvent = 0x313e1d0;
 u64 kMsCurrentFn = 0xa0a770;
 constexpr u64 kMultiStateVtable = 0x2c0e3e0;
 // ---- campanha junto (4.1.1): a fase vem do objeto da fase atual; GotoLevel e o que o portal/portas chamam ----
@@ -667,10 +756,11 @@ double g_gadget_scan_time = -100;
 
 constexpr u64 kCharacterVtable = 0x2bdf860; // personagens (jogadores, capangas, Doc Brown...): nome em +0x10
 std::vector<u64> g_characters; // da ultima varredura (g_gadget_mutex)
+std::vector<u64> g_builds;     // montinhos de pecas (g_gadget_mutex)
 
 void ScanGadgets() {
     const u64 want_char = reinterpret_cast<u64>(g_base) + kCharacterVtable;
-    std::vector<u64> found, chars;
+    std::vector<u64> found, chars, builds_found;
     std::vector<u64> buf(1 << 17); // 1 MB
     HANDLE self = GetCurrentProcess();
     for (u64 addr = 0x1000000000ull; addr < 0x1100000000ull;) {
@@ -685,6 +775,7 @@ void ScanGadgets() {
                 if (!ReadProcessMemory(self, reinterpret_cast<void*>(p), buf.data(), want_bytes, &got)) continue;
                 for (SIZE_T i = 0; i < got / 8; ++i) {
                     if (buf[i] == want_char) chars.push_back(p + i * 8);
+                    else if (buf[i] == reinterpret_cast<u64>(g_base) + kBuildVtable) builds_found.push_back(p + i * 8);
                     else if ((buf[i] >> 24) == ((reinterpret_cast<u64>(g_base) + 0x2c00000) >> 24) && IsGadgetVtable(buf[i])) {
                         found.push_back(p + i * 8);
                     }
@@ -696,6 +787,7 @@ void ScanGadgets() {
     std::lock_guard lock(g_gadget_mutex);
     g_gadgets.swap(found);
     g_characters.swap(chars);
+    g_builds.swap(builds_found);
 }
 
 void StartGadgetScan(double now) {
@@ -757,6 +849,70 @@ std::mutex g_ms_mutex;
 std::vector<MsChange> g_ms_changes; // mudancas de estado deste jogo (nao as que nos aplicamos), para o Tick avisar
 SetupFn g_ms_request = nullptr;
 
+// ---- montinhos de pecas ----
+using BuildUpdateFn = u64(HLE_SYSV_ABI*)(u64, float);
+BuildUpdateFn g_build_update = nullptr;
+std::mutex g_build_mutex;
+std::map<u64, double> g_forced_builds; // montagens que um aviso mandou montar aqui -> quando comecou
+
+bool IsBuild(u64 b) { return b && Readable(b, 0x600) && At<u64>(b) == reinterpret_cast<u64>(g_base) + kBuildVtable; }
+
+HLE_SYSV_ABI u64 BuildUpdateHook(u64 build, float dt) {
+    bool forced = false;
+    {
+        std::lock_guard lock(g_build_mutex);
+        forced = g_forced_builds.count(build) != 0;
+    }
+    if (forced && IsBuild(build) && At<s32>(build + 0x24c) != 4) {
+        At<u16>(build + 0xba) |= 3; // "sendo montado": a atualizacao do proprio jogo anda o relogio e as pecas
+        At<u64>(build + 0x5e0) = 0; // sem a pergunta ao controle de quem monta (o padrao e "segurando")
+        At<s32>(build + 0x1d8) = 0; // pendencias (pecas que saem de objetos quebrados): o outro jogador ja resolveu
+        static const bool dbg = std::getenv("LD_MP_BUILDDBG") != nullptr;
+        if (dbg) {
+            static int shown = 0;
+            const u64 vfn = At<u64>(At<u64>(build) + 0x718);
+            const u16 ba = At<u16>(build + 0xba);
+            const u64 r = g_build_update(build, dt);
+            if (shown++ < 60) {
+                std::printf("[MONTAR-DBG] %llx dt %.3f ba antes %x depois %x st %d clock %.3f v718 %llx -> %d 218 %llx 210 %d builder %llx\n",
+                            static_cast<unsigned long long>(build), dt, ba, At<u16>(build + 0xba), At<s32>(build + 0x24c),
+                            At<float>(build + 0x390), static_cast<unsigned long long>(vfn - reinterpret_cast<u64>(g_base)),
+                            static_cast<int>(reinterpret_cast<u64(HLE_SYSV_ABI*)(u64)>(vfn)(build) & 0xff),
+                            static_cast<unsigned long long>(At<u64>(build + 0x218)), At<s32>(build + 0x210),
+                            static_cast<unsigned long long>(At<u64>(build + 0x598)));
+                std::fflush(stdout);
+            }
+            return r;
+        }
+    }
+    return g_build_update(build, dt);
+}
+
+std::string BuildKey(u64 b) {
+    char key[96];
+    std::snprintf(key, sizeof(key), "%.1f,%.1f,%.1f,%d", At<float>(b + 0xa8), At<float>(b + 0xac), At<float>(b + 0xb0),
+                  At<s32>(b + 0x210));
+    return key;
+}
+
+u64 FindBuild(const std::string& key) { // a mais perto da posicao, com o mesmo numero de pecas
+    float x = 0, y = 0, z = 0;
+    int n = 0;
+    if (std::sscanf(key.c_str(), "%f,%f,%f,%d", &x, &y, &z, &n) != 4) return 0;
+    u64 best = 0;
+    float best_d = 0.6f;
+    std::lock_guard lock(g_gadget_mutex);
+    for (u64 b : g_builds) {
+        if (!IsBuild(b) || At<s32>(b + 0x210) != n) continue;
+        const float d = std::hypot(At<float>(b + 0xa8) - x, std::hypot(At<float>(b + 0xac) - y, At<float>(b + 0xb0) - z));
+        if (d < best_d) {
+            best_d = d;
+            best = b;
+        }
+    }
+    return best;
+}
+
 int GadgetState(u64 obj) { // = eboot+a0a770
     const u64 c = Readable(obj + 0x120, 8) ? At<u64>(obj + 0x120) : 0;
     return c && Readable(c + 0xb9, 1) ? static_cast<int>(At<std::int8_t>(c + 0xb9)) : -1;
@@ -792,6 +948,14 @@ HLE_SYSV_ABI u64 ReformTriggerHook(u64 unused, u64 obj, u64 who, u64 a, u64 b, u
 }
 
 HLE_SYSV_ABI u64 MsRequestHook(u64 obj, u64 state, u64 param, u64 force, u64 immediate, u64 f) {
+    static const bool log_ms = std::getenv("LD_MP_EVENTS") != nullptr;
+    if (log_ms && Readable(obj, 0x460)) {
+        std::printf("[MONTAR] t=%.2f multiestado %s (eboot+%llx) estado %d -> %d param %d de eboot+%llx\n", runtime::mp_net::Now(),
+                    GadgetName(obj).c_str(), static_cast<unsigned long long>(At<u64>(obj) - reinterpret_cast<u64>(g_base)),
+                    GadgetState(obj), static_cast<int>(state), static_cast<int>(param),
+                    static_cast<unsigned long long>(reinterpret_cast<u64>(__builtin_return_address(0)) - reinterpret_cast<u64>(g_base)));
+        std::fflush(stdout);
+    }
     if (!g_applying && g_enabled && Readable(obj, 0x460) && At<u64>(obj) == reinterpret_cast<u64>(g_base) + kMultiStateVtable) {
         std::lock_guard lock(g_ms_mutex);
         if (g_ms_changes.size() < 256) g_ms_changes.push_back({obj, static_cast<int>(state), static_cast<int>(param)});
@@ -1627,7 +1791,8 @@ bool ResolveFunctions() {
     if (!g_base || FnAt(kControlFn) != kControlFn) return false;
     for (u64* f : {&kSpawnFn, &kRequestDtorFn, &kRequestDeleteFn, &kSlotLoadFn, &kListPushFn, &kSlotStateFn, &kLevelSetupFn,
                    &kDescFn, &kAllocFn, &kFreeFn, &kFireEventFn, &kKillObjectFn, &kBlowUpFn, &kTriggerObstacleFn,
-                   &kGotoLevelFn, &kLevelByIdFn, &kLevelValidFn, &kMsRequestFn, &kReformTriggerFn}) { // (eboot+a0a770 nao tem prologo: fica fixo, antes da parte deslocada)
+                   &kGotoLevelFn, &kLevelByIdFn, &kLevelValidFn, &kMsRequestFn, &kReformTriggerFn, &kBuildStartFn,
+                   &kBuildUpdateFn}) { // (eboot+a0a770 nao tem prologo: fica fixo, antes da parte deslocada)
         const u64 o = FnAt(*f);
         if (!o) {
             std::printf("[MP] eboot+0x%llx: funcao nao reconhecida, multiplayer desligado\n", static_cast<unsigned long long>(*f));
@@ -1657,8 +1822,9 @@ bool InstallHooks() {
     // Fase 80: objetos que os outros quebram no mundo deles quebram no nosso
     g_blowup = reinterpret_cast<BlowUpFn>(Hook(kBlowUpFn, reinterpret_cast<const void*>(&BlowUpHook)));
     g_trigger_obstacle = reinterpret_cast<SetupFn>(Hook(kTriggerObstacleFn, reinterpret_cast<const void*>(&TriggerObstacleHook)));
-    g_ms_request = reinterpret_cast<SetupFn>(Hook(kMsRequestFn, reinterpret_cast<const void*>(&MsRequestHook)));
-    g_reform_trigger = reinterpret_cast<SetupFn>(Hook(kReformTriggerFn, reinterpret_cast<const void*>(&ReformTriggerHook)));
+    if (!g_ms_request) g_ms_request = reinterpret_cast<SetupFn>(Hook(kMsRequestFn, reinterpret_cast<const void*>(&MsRequestHook)));
+    if (!g_build_update) g_build_update = reinterpret_cast<BuildUpdateFn>(Hook(kBuildUpdateFn, reinterpret_cast<const void*>(&BuildUpdateHook)));
+    if (!g_reform_trigger) g_reform_trigger = reinterpret_cast<SetupFn>(Hook(kReformTriggerFn, reinterpret_cast<const void*>(&ReformTriggerHook)));
     if (!g_kill_object) g_kill_object = reinterpret_cast<KillFn>(Hook(kKillObjectFn, reinterpret_cast<const void*>(&KillObjectHook)));
 
     if (!g_control || !g_spawn || !g_dtor) {
@@ -1677,6 +1843,10 @@ void Install(std::uint8_t* eboot_base) {
         g_fire_event = reinterpret_cast<SetupFn>(Hook(kFireEventFn, reinterpret_cast<const void*>(&FireEventHook)));
         g_kill_object = reinterpret_cast<KillFn>(Hook(kKillObjectFn, reinterpret_cast<const void*>(&KillObjectHook)));
         std::printf("[EV] registro de eventos ligado\n");
+        InstallProbes(std::make_integer_sequence<int, kProbeCount>{});
+        // estados dos multiestados e montagens (reform) tambem sem multiplayer
+        g_ms_request = reinterpret_cast<SetupFn>(Hook(kMsRequestFn, reinterpret_cast<const void*>(&MsRequestHook)));
+        g_reform_trigger = reinterpret_cast<SetupFn>(Hook(kReformTriggerFn, reinterpret_cast<const void*>(&ReformTriggerHook)));
     }
     if (!g_enabled) return; // desligado: nenhum gancho (a sala do F3 liga depois, pelo Connect)
     if (!ResolveFunctions() || !InstallHooks()) {
@@ -1801,7 +1971,45 @@ void Announce(const std::string& payload) {
 std::map<std::string, std::vector<double>> g_ms_times;
 std::set<std::string> g_ms_noisy;
 
+std::map<u64, int> g_build_seen_state;
+
+void WatchBuilds(double now, double area_time) {
+    static double last = 0;
+    if (now - last < 0.25) return;
+    last = now;
+    std::vector<u64> list;
+    {
+        std::lock_guard lock(g_gadget_mutex);
+        list = g_builds;
+    }
+    for (u64 b : list) {
+        if (!IsBuild(b)) continue;
+        const int st = At<s32>(b + 0x24c);
+        auto [it, fresh] = g_build_seen_state.try_emplace(b, st);
+        const int before = it->second;
+        it->second = st;
+        if (fresh || st == before || st != 4) continue;
+        bool forced;
+        {
+            std::lock_guard lock(g_build_mutex);
+            forced = g_forced_builds.erase(b) != 0;
+        }
+        if (forced) {
+            std::printf("[MP] montagem %s pronta aqui (aviso de outro jogador)\n", BuildKey(b).c_str());
+        } else if (now - area_time > 5.0) {
+            Announce("c|" + CurrentArea() + "|" + BuildKey(b) + "|" + std::to_string(At<s32>(b + 0x220)));
+            std::printf("[MP] montei %s (tipo %d): avisando a sala\n", BuildKey(b).c_str(), At<s32>(b + 0x220));
+        }
+        std::fflush(stdout);
+    }
+    std::lock_guard lock(g_build_mutex);
+    for (auto it = g_forced_builds.begin(); it != g_forced_builds.end();) { // desiste depois de 40 s
+        it = now - it->second > 40.0 ? g_forced_builds.erase(it) : std::next(it);
+    }
+}
+
 void SendStateChanges(double now, double area_time) {
+    WatchBuilds(now, area_time);
     std::vector<MsChange> changes;
     std::vector<ReformChange> reforms;
     {
@@ -1860,8 +2068,34 @@ void ApplyEvent(int from, const std::string& payload, double now) {
         if (bar == std::string::npos) break;
         pos = bar + 1;
     }
-    if (f.size() < 4 || (f[0] != "b" && f[0] != "k" && f[0] != "o" && f[0] != "m" && f[0] != "r")) return;
+    if (f.size() < 4 || (f[0] != "b" && f[0] != "k" && f[0] != "o" && f[0] != "m" && f[0] != "r" && f[0] != "c")) return;
     if (f[1] != CurrentArea()) return; // outra area: o objeto nem existe aqui
+    if (f[0] == "c") { // alguem montou um montinho de pecas: monta aqui tambem (o fantasma dele monta, se aparece)
+        const u64 b = FindBuild(f[2]);
+        if (!b) {
+            g_pending_events.push_back({from, payload, now});
+            if (now - g_gadget_scan_time > 2.0) StartGadgetScan(now);
+            return;
+        }
+        LogAreaEvent(payload);
+        if (At<s32>(b + 0x24c) == 4) return; // ja montado aqui
+        u64 who = At<u64>(reinterpret_cast<u64>(g_base) + kPlayerTable);
+        const auto pit = g_puppets.find(from);
+        if (pit != g_puppets.end() && pit->second.stage == Stage::kActive && pit->second.inst) who = pit->second.inst;
+        const u64 first = At<u64>(b + 0x200);
+        if (!who || !first) return;
+        {
+            std::lock_guard lock(g_build_mutex);
+            g_forced_builds[b] = now;
+        }
+        g_applying = true;
+        Call8(kBuildStartFn, b, who, 0, 0, static_cast<u64>(std::max(1, std::atoi(f[3].c_str()))), 1, first,
+              reinterpret_cast<u64>(g_base) + kBuildInputEvent);
+        g_applying = false;
+        std::printf("[MP] %d montou %s: montando aqui tambem\n", from, f[2].c_str());
+        std::fflush(stdout);
+        return;
+    }
     if (f[0] == "r") { // alguem montou (as pecas se juntam aqui tambem)
         if (f.size() < 5) return;
         const std::vector<u64> same = GadgetsNamed(f[2]);

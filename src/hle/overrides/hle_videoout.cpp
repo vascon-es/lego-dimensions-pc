@@ -1568,6 +1568,12 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
             ToggleMpRoomMenu();
             return 0;
         }
+        if (wparam == VK_F6 && !(lparam & (1 << 30)) && std::getenv("LD_MP_EVENTS")) { // pesquisa: marca no registro
+            static int mark = 0;
+            std::printf("[MARCA] %d t=%.2f ======================================================\n", ++mark, runtime::mp_net::Now());
+            std::fflush(stdout);
+            return 0;
+        }
         if (wparam == VK_F5 && !(lparam & (1 << 30))) { // 4.1.1: painel de imagem (era F3, que agora e a sala)
             ToggleImageSettingsMenu();
             return 0;
