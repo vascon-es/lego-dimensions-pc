@@ -12,7 +12,6 @@
 #define _UNICODE
 #include "ui.h"
 #include "../../src/common/game_region.h"
-#include "../../src/common/toypad_process.h"
 #include "../../src/common/trophy_sound_player.h"
 #include "../../src/hle/trophy_defs.h"
 #include "../../src/hle/trophy_trp.h" // 3.0: icones das conquistas do jogo do jogador
@@ -1463,8 +1462,6 @@ void OpenNamesDialog() {
 }
 
 void LaunchLegoToypad(bool notify_if_running = false);
-bool g_saw_game_running = false;
-bool g_toypad_opened_for_game = false;
 
 // ---- jogar ----
 void RunGame() {
@@ -1525,9 +1522,6 @@ void RunGame() {
     }
     if (g_opt_toypad) {
         LaunchLegoToypad();
-        g_toypad_opened_for_game = true;
-    } else {
-        g_toypad_opened_for_game = false;
     }
     PrepareMods(); // Fase 64
     PrepareCameras(); // 1.9.1
@@ -1637,10 +1631,6 @@ void RunGame() {
         ShowWindow(g_main, SW_MINIMIZE);
     } else {
         AppendLog(ui::T(L"ERRO: nao consegui abrir build\\lego_dimensions.exe", L"ERROR: could not start build\\lego_dimensions.exe"));
-        if (g_toypad_opened_for_game) {
-            toypad_proc::CloseAll();
-            g_toypad_opened_for_game = false;
-        }
     }
     if (log != INVALID_HANDLE_VALUE) {
         CloseHandle(log);
@@ -1701,7 +1691,22 @@ void CreateDesktopShortcut() {
 }
 
 bool IsProcessRunning(const wchar_t* process_name) {
-    return toypad_proc::IsExeRunning(process_name);
+    bool running = false;
+    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (snap == INVALID_HANDLE_VALUE) {
+        return false;
+    }
+    PROCESSENTRY32W entry{sizeof(entry)};
+    if (Process32FirstW(snap, &entry)) {
+        do {
+            if (_wcsicmp(entry.szExeFile, process_name) == 0) {
+                running = true;
+                break;
+            }
+        } while (Process32NextW(snap, &entry));
+    }
+    CloseHandle(snap);
+    return running;
 }
 
 fs::path FindLegoToypadExe() {
@@ -1730,7 +1735,7 @@ fs::path FindLegoToypadExe() {
 }
 
 void LaunchLegoToypad(bool notify_if_running) {
-    if (toypad_proc::IsRunning()) {
+    if (IsProcessRunning(L"LegoToypad.exe") || IsProcessRunning(L"LegoToypad.v1.9.Web.App.Extended.exe")) {
         if (notify_if_running) {
             MessageBoxW(g_main, ui::T(L"O LegoToypad já está em execução.", L"LegoToypad is already running."), L"LEGO Dimensions PC", MB_ICONINFORMATION);
         }
@@ -1873,85 +1878,69 @@ void SyncLegoToypadState() {
         ~Guard() { flag.store(false); }
     } guard{in_sync};
 
-    const bool running = toypad_proc::IsRunning();
-    const bool game_running = IsProcessRunning(L"lego_dimensions.exe");
-    if (game_running) {
-        g_saw_game_running = true;
-    }
+    const bool running = IsProcessRunning(L"LegoToypad.exe") || IsProcessRunning(L"LegoToypad.v1.9.Web.App.Extended.exe");
     if (!running) {
         g_toypad_api_restored = false;
-        if (!game_running) {
-            g_saw_game_running = false;
-            g_toypad_opened_for_game = false;
-        }
         return;
     }
 
     const std::string state = ToypadHttpGet(8765, L"/api/state");
-    if (!state.empty()) {
-        if (!g_toypad_api_restored) {
-            if (game_running) {
-                // Restaura o estado salvo no app do portal
-                std::error_code ec;
-                const fs::path p = ToypadLastStatePath();
-                if (fs::is_regular_file(p, ec)) {
-                    std::ifstream in(p);
-                    std::string saved((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
-                    size_t pos = 0;
-                    int count = 0;
-                    while ((pos = saved.find("{\"slot\":", pos)) != std::string::npos) {
-                        size_t end = saved.find('}', pos);
-                        if (end == std::string::npos) break;
-                        std::string obj = saved.substr(pos, end - pos + 1);
-                        ToypadHttpPost(8765, L"/api/load", obj);
-                        pos = end + 1;
-                        ++count;
-                    }
-                    if (count == 0 && saved.find("[]") != std::string::npos) {
-                        ToypadHttpPost(8765, L"/api/clearall", "{}");
-                    }
-                }
-                g_toypad_api_restored = true;
-            }
-        } else {
-            // Extrai figuras ocupadas de state: "index": X ... "occupied": true ... "bin": Y
-            std::string new_state = "[";
-            bool first = true;
-            size_t pos = 0;
-            while ((pos = state.find("\"index\":", pos)) != std::string::npos) {
-                size_t next_idx = state.find("\"index\":", pos + 8);
-                std::string pad_str = state.substr(pos, (next_idx != std::string::npos ? next_idx : state.size()) - pos);
-                if (pad_str.find("\"occupied\":true") != std::string::npos) {
-                    int slot = std::atoi(pad_str.c_str() + 8);
-                    size_t bin_pos = pad_str.find("\"bin\":");
-                    int bin = bin_pos != std::string::npos ? std::atoi(pad_str.c_str() + bin_pos + 6) : 0;
-                    if (bin > 0) {
-                        if (!first) new_state += ",";
-                        first = false;
-                        new_state += "{\"slot\":" + std::to_string(slot) + ",\"bin\":" + std::to_string(bin) + "}";
-                    }
-                }
-                pos = next_idx != std::string::npos ? next_idx : state.size();
-            }
-            new_state += "]";
+    if (state.empty()) return;
 
-            if (new_state != g_last_saved_toypad_state) {
-                g_last_saved_toypad_state = new_state;
-                std::ofstream out(ToypadLastStatePath(), std::ios::trunc);
-                if (out) {
-                    out << new_state << "\n";
+    const bool game_running = IsProcessRunning(L"lego_dimensions.exe");
+    if (!g_toypad_api_restored) {
+        if (game_running) {
+            // Restaura o estado salvo no app do portal
+            std::error_code ec;
+            const fs::path p = ToypadLastStatePath();
+            if (fs::is_regular_file(p, ec)) {
+                std::ifstream in(p);
+                std::string saved((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+                size_t pos = 0;
+                int count = 0;
+                while ((pos = saved.find("{\"slot\":", pos)) != std::string::npos) {
+                    size_t end = saved.find('}', pos);
+                    if (end == std::string::npos) break;
+                    std::string obj = saved.substr(pos, end - pos + 1);
+                    ToypadHttpPost(8765, L"/api/load", obj);
+                    pos = end + 1;
+                    ++count;
+                }
+                if (count == 0 && saved.find("[]") != std::string::npos) {
+                    ToypadHttpPost(8765, L"/api/clearall", "{}");
                 }
             }
+            g_toypad_api_restored = true;
         }
+        return;
     }
 
-    // Se o jogo acabou de ser fechado, encerra o LegoToypad junto para nao ficar em segundo plano.
-    if ((g_saw_game_running || g_toypad_opened_for_game) && !game_running) {
-        g_saw_game_running = false;
-        g_toypad_opened_for_game = false;
-        g_toypad_api_restored = false;
-        if (toypad_proc::CloseAll() > 0) {
-            AppendLog(ui::T(L"LegoToypad fechado com o jogo.", L"LegoToypad closed with the game."));
+    // Extrai figuras ocupadas de state: "index": X ... "occupied": true ... "bin": Y
+    std::string new_state = "[";
+    bool first = true;
+    size_t pos = 0;
+    while ((pos = state.find("\"index\":", pos)) != std::string::npos) {
+        size_t next_idx = state.find("\"index\":", pos + 8);
+        std::string pad_str = state.substr(pos, (next_idx != std::string::npos ? next_idx : state.size()) - pos);
+        if (pad_str.find("\"occupied\":true") != std::string::npos) {
+            int slot = std::atoi(pad_str.c_str() + 8);
+            size_t bin_pos = pad_str.find("\"bin\":");
+            int bin = bin_pos != std::string::npos ? std::atoi(pad_str.c_str() + bin_pos + 6) : 0;
+            if (bin > 0) {
+                if (!first) new_state += ",";
+                first = false;
+                new_state += "{\"slot\":" + std::to_string(slot) + ",\"bin\":" + std::to_string(bin) + "}";
+            }
+        }
+        pos = next_idx != std::string::npos ? next_idx : state.size();
+    }
+    new_state += "]";
+
+    if (new_state != g_last_saved_toypad_state) {
+        g_last_saved_toypad_state = new_state;
+        std::ofstream out(ToypadLastStatePath(), std::ios::trunc);
+        if (out) {
+            out << new_state << "\n";
         }
     }
 }
@@ -3902,10 +3891,6 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         if (g_busy && MessageBoxW(hwnd, ui::T(L"A preparacao ainda esta rodando. Fechar mesmo assim?", L"The preparation is still running. Close anyway?"), L"LEGO Dimensions PC", MB_YESNO) != IDYES) {
             return 0;
         }
-        if (!IsProcessRunning(L"lego_dimensions.exe")) {
-            SyncLegoToypadState();
-            toypad_proc::CloseAll();
-        }
         SaveSettings();
         DestroyWindow(hwnd);
         return 0;
@@ -3983,7 +3968,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show) {
     LoadXInput(); // issue #3: controle no launcher
     SetTimer(g_main, kPadTimer, 16, nullptr);
     SetTimer(g_main, kUpdateCheckTimer, 1000, nullptr); // verifica atualizacao ao abrir
-    SetTimer(g_main, kToypadSyncTimer, 500, nullptr);   // sincroniza persistencia do toypad e fecha com o jogo
+    SetTimer(g_main, kToypadSyncTimer, 1000, nullptr);  // sincroniza persistencia do toypad (harrysof)
     MSG msg;
     while (GetMessageW(&msg, nullptr, 0, 0)) {
         if ((!g_names_window || !IsDialogMessageW(g_names_window, &msg)) && (!g_mp_window || !IsDialogMessageW(g_mp_window, &msg))) {

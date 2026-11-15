@@ -36,13 +36,14 @@ namespace {
 // ---- enderecos do eboot (deslocamentos a partir da base) --------------------------------------------------------
 constexpr u64 kPlayerTable = 0x3163788;    // instancia do jogador 1 (+8 = jogador 2)
 constexpr u64 kControlFn = 0xd70730;       // atualizacao de controle de cada personagem (rdi = inst, xmm0 = dt)
-constexpr u64 kSpawnFn = 0x158c2d0;        // AttemptToSpawnObject_Internal(spawner, pedido, 1) (eboot+0x158c2d0)
-constexpr u64 kRequestDtorFn = 0x15857c0;  // destrutor do pedido (desfaz o personagem) (eboot+0x15857c0)
-constexpr u64 kRequestDeleteFn = 0x1585d50; // destrutor com delete (vtable[2] do pedido) (eboot+0x1585d50)
+// 4.1.1: as funcoes acima de ~0x1577000 ficam 0x10 depois em outro dump do eboot: FnAt() confere o prologo e escolhe
+u64 kSpawnFn = 0x158c2c0;        // AttemptToSpawnObject_Internal(spawner, pedido, 1)
+u64 kRequestDtorFn = 0x15857b0;  // destrutor do pedido (desfaz o personagem)
+u64 kRequestDeleteFn = 0x1585d40; // destrutor com delete (vtable[2] do pedido)
 constexpr u64 kDescFn = 0x937c20;          // descritor do personagem (desc, nome, 0x73db, 0)
-constexpr u64 kSlotLoadFn = 0x157f200;     // carrega o personagem num slot livre do portal (eboot+0x157f200)
+u64 kSlotLoadFn = 0x157f1f0;     // carrega o personagem num slot livre do portal
 constexpr u64 kAllocatorA = 0x4adb10, kAllocatorB = 0x4adb90, kAllocFn = 0x4a83d0, kFreeFn = 0x4a94a0;
-constexpr u64 kListPushFn = 0x22c0da0;     // lista do spawner (+0x1d0): {cabeca, cauda, contagem}, no {prox, ant, valor}
+u64 kListPushFn = 0x22c0d90;     // lista do spawner (+0x1d0): {cabeca, cauda, contagem}, no {prox, ant, valor}
 constexpr u64 kSpawnerVtable = 0x2cfada0, kRequestVtable = 0x2cfaca0;
 // Listas de slots: vetor {dados, tamanho, capacidade | 0x40000000 (memoria que o jogo nao libera)}.
 // Portal ("MechPortal Load Slot N", 7 na memoria do eboot) e jogador ("MechPortal Player Load Slot 0..3").
@@ -51,8 +52,8 @@ constexpr u64 kPortalSlots = 0x315ddd0, kPlayerSlots = 0x315f200, kSlotStep = 0x
 constexpr int kMaxSlotsSeen = 64;
 int g_nslots = 7, g_nall = 11; // atualizados a cada Tick (a lista do portal cresce no preparo da fase)
 constexpr int kKeepFreeSlots = 1; // nunca ocupar o ultimo slot livre do portal: o jogador pode por uma figura nova
-constexpr u64 kSlotStateFn = 0x157cde0; // (slot, estado, 0): 0 = cancela pedido / esvazia, 3 = descarrega (o jogo leva a 0)
-constexpr u64 kLevelSetupFn = 0x1577bb0; // prepara a memoria dos slots ao carregar a fase (rdi = config, +0x233)
+u64 kSlotStateFn = 0x157cdd0; // (slot, estado, 0): 0 = cancela pedido / esvazia, 3 = descarrega (o jogo leva a 0)
+u64 kLevelSetupFn = 0x1577ba0; // prepara a memoria dos slots ao carregar a fase (rdi = config, +0x233)
 
 constexpr u32 kCross = 0x40004000, kSquare = 0x10008000; // mascara de botoes do jogo
 constexpr u32 kSentButtons = kCross | kSquare;           // pulo e ataque
@@ -958,25 +959,62 @@ std::vector<NameTag> NameTags() {
     return g_tags;
 }
 
-void Install(std::uint8_t* eboot_base) {
-    g_base = eboot_base;
-    static bool s_hooks_installed = false;
-    if (!s_hooks_installed) {
-        g_control = reinterpret_cast<ControlFn>(Hook(kControlFn, reinterpret_cast<const void*>(&ControlHook)));
-        g_spawn = reinterpret_cast<SpawnFn>(Hook(kSpawnFn, reinterpret_cast<const void*>(&SpawnHook)));
-        g_dtor = reinterpret_cast<DtorFn>(Hook(kRequestDtorFn, reinterpret_cast<const void*>(&RequestDtorHook)));
-        if (const char* env = std::getenv("LD_MP_SLOTS")) g_extra_slots = std::clamp(std::atoi(env) - 7, 0, 1);
-        g_setup = reinterpret_cast<SetupFn>(Hook(kLevelSetupFn, reinterpret_cast<const void*>(&LevelSetupHook))); // sem ele: so o portal
-        g_slot_load = reinterpret_cast<SetupFn>(Hook(kSlotLoadFn, reinterpret_cast<const void*>(&SlotLoadHook)));
-        s_hooks_installed = true;
+// 4.1.1: inicio de funcao (push rbp; mov rbp, rsp) no deslocamento ou 0x10 depois (outro dump do eboot); 0 = nenhum
+u64 FnAt(u64 offset) {
+    static const u8 kPrologue[4] = {0x55, 0x48, 0x89, 0xe5};
+    for (u64 o : {offset, offset + 0x10}) {
+        if (std::memcmp(g_base + o, kPrologue, 4) == 0) return o;
     }
+    return 0;
+}
+
+// confere as funcoes do eboot (so leitura): false = eboot desconhecido, o multiplayer fica desligado
+bool ResolveFunctions() {
+    static int s_ok = -1;
+    if (s_ok >= 0) return s_ok == 1;
+    s_ok = 0;
+    if (!g_base || FnAt(kControlFn) != kControlFn) return false;
+    for (u64* f : {&kSpawnFn, &kRequestDtorFn, &kRequestDeleteFn, &kSlotLoadFn, &kListPushFn, &kSlotStateFn, &kLevelSetupFn}) {
+        const u64 o = FnAt(*f);
+        if (!o) {
+            std::printf("[MP] eboot+0x%llx: funcao nao reconhecida, multiplayer desligado\n", static_cast<unsigned long long>(*f));
+            return false;
+        }
+        *f = o;
+    }
+    if (kSpawnFn != 0x158c2c0) std::printf("[MP] eboot com as funcoes deslocadas: enderecos ajustados\n");
+    s_ok = 1;
+    return true;
+}
+
+// Os ganchos so entram com o multiplayer ligado (desligado, o jogo fica intocado). Pela sala do F3 entram no Tick,
+// na thread do jogo, para nao trocar o comeco de uma funcao que ela esteja executando.
+std::atomic<bool> g_hooks_wanted{false};
+bool g_hooks_installed = false;
+
+bool InstallHooks() {
+    if (g_hooks_installed) return g_control && g_spawn && g_dtor;
+    g_hooks_installed = true;
+    g_control = reinterpret_cast<ControlFn>(Hook(kControlFn, reinterpret_cast<const void*>(&ControlHook)));
+    g_spawn = reinterpret_cast<SpawnFn>(Hook(kSpawnFn, reinterpret_cast<const void*>(&SpawnHook)));
+    g_dtor = reinterpret_cast<DtorFn>(Hook(kRequestDtorFn, reinterpret_cast<const void*>(&RequestDtorHook)));
+    if (const char* env = std::getenv("LD_MP_SLOTS")) g_extra_slots = std::clamp(std::atoi(env) - 7, 0, 1);
+    g_setup = reinterpret_cast<SetupFn>(Hook(kLevelSetupFn, reinterpret_cast<const void*>(&LevelSetupHook))); // sem ele: so o portal
+    g_slot_load = reinterpret_cast<SetupFn>(Hook(kSlotLoadFn, reinterpret_cast<const void*>(&SlotLoadHook)));
     if (!g_control || !g_spawn || !g_dtor) {
         std::printf("[MP] eboot diferente: multiplayer desligado\n");
         g_enabled = false; // os ganchos que entraram so repassam (sem fantasmas nada muda)
-        return;
+        return false;
     }
-    if (!g_enabled) {
-        std::printf("[MP] multiplayer pronto (aguardando entrar na sala pelo F3 ou launcher)\n");
+    std::printf("[MP] ganchos instalados\n");
+    return true;
+}
+
+void Install(std::uint8_t* eboot_base) {
+    g_base = eboot_base;
+    if (!g_enabled) return; // desligado: nenhum gancho (a sala do F3 liga depois, pelo Connect)
+    if (!ResolveFunctions() || !InstallHooks()) {
+        g_enabled = false;
         return;
     }
     if (!runtime::mp_net::Start(g_config.server, g_config.room, g_config.name, g_config.password)) {
@@ -992,14 +1030,15 @@ bool Connect(const std::string& server, const std::string& room, const std::stri
     g_config.room = room;
     g_config.name = name;
     g_config.password = password;
-    g_enabled = !server.empty() && !room.empty();
+    g_enabled = false;
     runtime::mp_net::Stop();
-    if (!g_enabled) return false;
-    if (!g_control || !g_spawn || !g_dtor) {
-        std::printf("[MP] ganchos nao instalados: nao e possivel conectar\n");
-        g_enabled = false;
+    if (server.empty() || room.empty()) return false;
+    if (!ResolveFunctions() || (g_hooks_installed && !(g_control && g_spawn && g_dtor))) {
+        std::printf("[MP] eboot diferente: nao e possivel conectar\n");
         return false;
     }
+    if (!g_hooks_installed) g_hooks_wanted = true; // o Tick instala na thread do jogo
+    g_enabled = true;
     if (!runtime::mp_net::Start(g_config.server, g_config.room, g_config.name, g_config.password)) {
         std::printf("[MP] endereco do servidor invalido: %s\n", g_config.server.c_str());
         g_enabled = false;
@@ -1026,6 +1065,11 @@ void Tick() {
     if (!g_enabled) return;
     if (!g_main_tid) g_main_tid = GetCurrentThreadId();
     if (GetCurrentThreadId() != g_main_tid) return;
+    if (g_hooks_wanted.exchange(false) && !InstallHooks()) {
+        runtime::mp_net::Stop();
+        return;
+    }
+    if (!g_control) return; // ganchos ainda nao instalados
     const double now = runtime::mp_net::Now();
     static double regions_time = 0;
     if (now - regions_time > 2.0) { // a memoria pode mudar: confere de novo de vez em quando

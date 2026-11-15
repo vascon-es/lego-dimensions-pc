@@ -51,7 +51,7 @@ separate manual checks.
 
 ## Online multiplayer (alpha)
 
-From 4.1 (alpha), friends can play together online, like the Marvel's Spider-Man multiplayer mod: everyone plays their own
+From 4.0 (alpha), friends can play together online, like the Marvel's Spider-Man multiplayer mod: everyone plays their own
 game, and the other players in the same area show up as characters that run, jump and attack in your world. Up to 16
 players per room.
 
@@ -62,7 +62,8 @@ players per room.
 
 Rooms are private: they are never listed, the codes from **New room** have 8 characters, and the password is set
 by whoever creates the room. The first player in is the room owner: in the game, **F4** opens the **Multiplayer room**
-overlay to see who is in the room, lock the room or kick players (**F1** is dedicated to Video Settings and **F3** to Image Controls).
+overlay to see who is in the room, lock the room or kick players. **F3** joins or changes the room without leaving the
+game (multiplayer does not need to be on in the launcher for this). **F5** opens the Image Controls.
 
 The public server is free and sleeps after 15 minutes without players. The launcher wakes it up as soon as it opens
 (with multiplayer on), so it is usually awake by the time the game reaches the menu; otherwise the first connection

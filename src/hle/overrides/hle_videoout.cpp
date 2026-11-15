@@ -19,7 +19,6 @@
 #include "hle/trophy_manager.h"
 #include "hle/trophy_popup.h"
 #include "hle/overrides/hle_toypad.h"
-#include "common/toypad_process.h"
 
 #include <algorithm>
 #include <atomic>
@@ -135,6 +134,7 @@ std::atomic<u32> g_window_width{1920}, g_window_height{1080};
 bool g_fullscreen = false;
 std::atomic<bool> g_stats_overlay{false};
 std::atomic<bool> g_video_menu_open{false};
+std::atomic<bool> g_image_menu_open{false};
 std::atomic<bool> g_achievements_overlay_open{false};
 std::atomic<bool> g_logs_overlay_open{false};
 std::atomic<bool> g_mp_panel_open{false}; // 4.0: sala do multiplayer (F3, ou pelo menu F1)
@@ -248,6 +248,173 @@ static std::string Narrow(const std::wstring& ws) {
     std::string s(size, 0);
     WideCharToMultiByte(CP_UTF8, 0, ws.data(), static_cast<int>(ws.size()), s.data(), size, nullptr, nullptr);
     return s;
+}
+
+// ---- Controles de imagem ao vivo (aba F5) ----
+enum ImageItemIdx {
+    kImgPreset = 0,
+    kImgBrightness,
+    kImgContrast,
+    kImgSaturation,
+    kImgVibrance,
+    kImgGamma,
+    kImgTemperature,
+    kImgTint,
+    kImgRed,
+    kImgGreen,
+    kImgBlue,
+    kImgSharpness,
+    kImgReset,
+    kImgCount
+};
+
+enum class ImageFmt { kSigned, kPct, kGamma };
+
+struct ImageSliderDef {
+    const char* label_pt;
+    const char* label_en;
+    const wchar_t* ini_key;
+    int min_val, max_val, def_val, step;
+    ImageFmt fmt;
+};
+
+static constexpr int kImageSliderCount = 11;
+static constexpr ImageSliderDef kImageSliders[kImageSliderCount] = {
+    {"BRILHO",       "BRIGHTNESS",  L"img_brilho",      -50, 50,   0,   2, ImageFmt::kSigned},
+    {"CONTRASTE",    "CONTRAST",    L"img_contraste",    50, 200, 100, 5, ImageFmt::kPct},
+    {"SATURACAO",    "SATURATION",  L"img_saturacao",     0, 200, 100, 5, ImageFmt::kPct},
+    {"VIBRACAO",     "VIBRANCE",    L"img_vibracao",   -100, 100,  0,  5, ImageFmt::kSigned},
+    {"GAMA",         "GAMMA",       L"img_gama",         60, 180, 100, 5, ImageFmt::kGamma},
+    {"TEMPERATURA",  "TEMPERATURE", L"img_temperatura", -50, 50,   0,  5, ImageFmt::kSigned},
+    {"MATIZ",        "TINT",        L"img_matiz",       -50, 50,   0,  5, ImageFmt::kSigned},
+    {"VERMELHO (R)", "RED (R)",     L"img_vermelho",     50, 150, 100, 5, ImageFmt::kPct},
+    {"VERDE (G)",    "GREEN (G)",   L"img_verde",        50, 150, 100, 5, ImageFmt::kPct},
+    {"AZUL (B)",     "BLUE (B)",    L"img_azul",         50, 150, 100, 5, ImageFmt::kPct},
+    {"NITIDEZ",      "SHARPNESS",   L"img_nitidez",       0, 100,  0,  5, ImageFmt::kPct},
+};
+
+struct ImagePresetDef {
+    const char* name_pt;
+    const char* name_en;
+    int vals[kImageSliderCount];
+};
+
+static constexpr int kImageSelectablePresets = 7;
+static constexpr ImagePresetDef kImagePresets[kImageSelectablePresets] = {
+    {"PADRAO (ORIGINAL)", "DEFAULT (ORIGINAL)", {0,  100, 100,  0, 100,   0, 0, 100, 100, 100,  0}},
+    {"VIBRANTE (LEGO)",   "VIVID (LEGO)",       {0,  110, 125, 30, 105,   0, 0, 100, 100, 100, 20}},
+    {"CINEMA",            "CINEMA",             {-4, 115,  95, 15,  95,   5, 0, 100, 100, 100, 10}},
+    {"CLARO (CAVERNAS)",  "BRIGHT (CAVES)",     {12, 105, 105, 10, 120,   0, 0, 100, 100, 100,  0}},
+    {"QUENTE (SOL)",      "WARM (SUN)",         {0,  105, 110, 15, 100,  20, 0, 105, 100,  95,  0}},
+    {"FRIO (NEON)",       "COOL (NEON)",        {0,  110, 110, 10, 100, -20, 0,  95, 100, 105,  0}},
+    {"PRETO E BRANCO",    "BLACK & WHITE",      {0,  115,   0,  0, 100,   0, 0, 100, 100, 100, 15}},
+};
+
+static int g_img_vals[kImageSliderCount] = {0, 100, 100, 0, 100, 0, 0, 100, 100, 100, 0};
+static int g_img_preset = 0; // 0..6 preset, 7 = custom
+static int g_img_selected = 0;
+static bool g_img_dock_left = false;
+static bool g_img_ini_dirty = false;
+static int g_img_save_timer = 0;
+static bool g_img_save_was_reset = false;
+
+static void DetectImagePreset() {
+    for (int p = 0; p < kImageSelectablePresets; ++p) {
+        bool match = true;
+        for (int i = 0; i < kImageSliderCount; ++i) {
+            if (g_img_vals[i] != kImagePresets[p].vals[i]) {
+                match = false;
+                break;
+            }
+        }
+        if (match) {
+            g_img_preset = p;
+            return;
+        }
+    }
+    g_img_preset = kImageSelectablePresets;
+}
+
+static void SyncImageSettingsToRenderer() {
+    render::ImageColorSettings s{};
+    s.brightness = g_img_vals[0] * 0.004f;
+    s.contrast = g_img_vals[1] * 0.01f;
+    s.saturation = g_img_vals[2] * 0.01f;
+    s.vibrance = g_img_vals[3] * 0.01f;
+    s.gamma = g_img_vals[4] * 0.01f;
+    s.temperature = g_img_vals[5] / 50.0f;
+    s.tint = g_img_vals[6] / 50.0f;
+    s.red = g_img_vals[7] * 0.01f;
+    s.green = g_img_vals[8] * 0.01f;
+    s.blue = g_img_vals[9] * 0.01f;
+    s.sharpness = g_img_vals[10] * 0.01f;
+    render::SetImageColorSettings(s);
+}
+
+static void SaveImageSettingsToIni(bool show_banner = true, bool was_reset = false) {
+    const std::filesystem::path ini = GetLauncherIniPath();
+    if (!ini.empty()) {
+        const std::wstring wini = ini.wstring();
+        wchar_t buf[32];
+        for (int i = 0; i < kImageSliderCount; ++i) {
+            std::swprintf(buf, 32, L"%d", g_img_vals[i]);
+            WritePrivateProfileStringW(L"launcher", kImageSliders[i].ini_key, buf, wini.c_str());
+        }
+        WritePrivateProfileStringW(L"launcher", L"img_lado", g_img_dock_left ? L"left" : L"right", wini.c_str());
+    }
+    g_img_ini_dirty = false;
+    if (show_banner) {
+        g_img_save_was_reset = was_reset;
+        g_img_save_timer = 90;
+    }
+}
+
+static void ApplyImagePreset(int preset_idx, bool save_now = false) {
+    const int p = ((preset_idx % kImageSelectablePresets) + kImageSelectablePresets) % kImageSelectablePresets;
+    for (int i = 0; i < kImageSliderCount; ++i) {
+        g_img_vals[i] = kImagePresets[p].vals[i];
+    }
+    g_img_preset = p;
+    g_img_ini_dirty = true;
+    SyncImageSettingsToRenderer();
+    if (save_now) {
+        SaveImageSettingsToIni(true, p == 0);
+    }
+}
+
+static void AdjustImageRow(int row, int delta_dir) {
+    if (row == kImgPreset) {
+        const int base = (g_img_preset >= kImageSelectablePresets) ? 0 : g_img_preset;
+        ApplyImagePreset(base + delta_dir, false);
+        return;
+    }
+    if (row >= kImgBrightness && row <= kImgSharpness) {
+        const int idx = row - kImgBrightness;
+        const auto& def = kImageSliders[idx];
+        const int next = std::clamp(g_img_vals[idx] + delta_dir * def.step, def.min_val, def.max_val);
+        if (next != g_img_vals[idx]) {
+            g_img_vals[idx] = next;
+            g_img_ini_dirty = true;
+            DetectImagePreset();
+            SyncImageSettingsToRenderer();
+        }
+    }
+}
+
+static std::string FormatImageSliderValue(int slider_idx) {
+    const auto& def = kImageSliders[slider_idx];
+    const int val = g_img_vals[slider_idx];
+    char buf[32];
+    if (def.fmt == ImageFmt::kGamma) {
+        std::snprintf(buf, sizeof(buf), "%.2f", val * 0.01f);
+    } else if (def.fmt == ImageFmt::kPct) {
+        std::snprintf(buf, sizeof(buf), "%d%%", val);
+    } else if (val > 0) {
+        std::snprintf(buf, sizeof(buf), "+%d", val);
+    } else {
+        std::snprintf(buf, sizeof(buf), "%d", val);
+    }
+    return std::string(buf);
 }
 
 void SetFullscreen(HWND hwnd, bool enabled) {
@@ -561,9 +728,58 @@ static void InitMenuDefaults() {
 
 } // namespace
 
-void LoadImageSettingsFromIni() {}
-void FlushImageSettingsIni() {}
-static void CloseImageMenuInternal() {}
+void LoadImageSettingsFromIni() {
+    static bool s_loaded = false;
+    if (s_loaded) {
+        return;
+    }
+    s_loaded = true;
+    const std::filesystem::path ini = GetLauncherIniPath();
+    if (!ini.empty()) {
+        const std::wstring wini = ini.wstring();
+        for (int i = 0; i < kImageSliderCount; ++i) {
+            const auto& def = kImageSliders[i];
+            const int v = GetPrivateProfileIntW(L"launcher", def.ini_key, def.def_val, wini.c_str());
+            g_img_vals[i] = std::clamp(v, def.min_val, def.max_val);
+        }
+        wchar_t side[16]{};
+        GetPrivateProfileStringW(L"launcher", L"img_lado", L"right", side, 16, wini.c_str());
+        g_img_dock_left = (_wcsicmp(side, L"left") == 0);
+    }
+    DetectImagePreset();
+    SyncImageSettingsToRenderer();
+}
+
+void FlushImageSettingsIni() {
+    if (g_img_ini_dirty) {
+        SaveImageSettingsToIni(false, false);
+    }
+}
+
+static void CloseImageMenuInternal() {
+    if (g_image_menu_open.exchange(false)) {
+        FlushImageSettingsIni();
+    }
+}
+
+static void SwitchVideoImageTab(bool to_image) {
+    InitMenuDefaults();
+    if (to_image) {
+        g_video_menu_open = false;
+        g_achievements_overlay_open = false;
+        g_logs_overlay_open = false;
+        g_mp_panel_open = false;
+        g_image_menu_open = true;
+        log::Tagged("IMAGE-MENU", "open (tab)");
+    } else {
+        CloseImageMenuInternal();
+        g_achievements_overlay_open = false;
+        g_logs_overlay_open = false;
+        g_mp_panel_open = false;
+        g_video_menu_open = true;
+        log::Tagged("VIDEO-MENU", "open (tab)");
+    }
+}
 
 static void PreviewCurrentTrophySound() {
     static const char* const kSoundAnsi[] = {"auto", "playstation", "xbox", "steam", "off"};
@@ -916,6 +1132,7 @@ void ToggleMpRoomMenu() {
     const bool next = !g_mp_panel_open.load();
     if (next) {
         g_video_menu_open = false;
+        g_image_menu_open = false;
         g_achievements_overlay_open = false;
         g_logs_overlay_open = false;
         g_mp_selected = 0;
@@ -959,6 +1176,7 @@ void ToggleVideoSettingsMenu() {
     InitMenuDefaults();
     const bool next = !g_video_menu_open.load();
     if (next) {
+        CloseImageMenuInternal();
         g_achievements_overlay_open = false;
         g_logs_overlay_open = false;
         g_mp_panel_open = false;
@@ -979,8 +1197,11 @@ void HandleVideoMenuController(u32 pressed) {
         return;
     }
     // kUp = 0x10, kRight = 0x20, kDown = 0x40, kLeft = 0x80
-    // kCross = 0x4000, kCircle = 0x2000
-    if (pressed & 0x10) { // Up
+    // kL1 = 0x400 (LB), kR1 = 0x800 (RB), kCross = 0x4000, kCircle = 0x2000
+    if (pressed & (0x400 | 0x800)) { // LB / RB -> Aba Imagem [F5]
+        SwitchVideoImageTab(true);
+        last_nav = now;
+    } else if (pressed & 0x10) { // Up
         g_menu_selected = (g_menu_selected - 1 + static_cast<int>(g_menu_items.size())) % g_menu_items.size();
         last_nav = now;
     } else if (pressed & 0x40) { // Down
@@ -1002,14 +1223,68 @@ void HandleVideoMenuController(u32 pressed) {
 }
 
 void ToggleImageSettingsMenu() {
-    ToggleMpRoomMenu();
+    InitMenuDefaults();
+    LoadImageSettingsFromIni();
+    const bool next = !g_image_menu_open.load();
+    if (next) {
+        g_video_menu_open = false;
+        g_achievements_overlay_open = false;
+        g_logs_overlay_open = false;
+        g_mp_panel_open = false;
+        g_image_menu_open = true;
+    } else {
+        CloseImageMenuInternal();
+    }
+    log::Tagged("IMAGE-MENU", "%s", g_image_menu_open ? "open" : "closed");
 }
 
 bool IsImageSettingsMenuOpen() {
-    return false;
+    return g_image_menu_open.load();
 }
 
-void HandleImageMenuController(u32) {}
+void HandleImageMenuController(u32 pressed) {
+    if (!g_image_menu_open.load()) return;
+    static auto last_nav = std::chrono::steady_clock::now();
+    const auto now = std::chrono::steady_clock::now();
+    const bool lr = (pressed & (0x80 | 0x20)) != 0;
+    const float cooldown = (lr && g_img_selected != kImgPreset) ? 85.0f : 155.0f;
+    if (std::chrono::duration<float, std::milli>(now - last_nav).count() < cooldown) {
+        return;
+    }
+    if (pressed & (0x400 | 0x800)) { // LB / RB -> Aba Video [F1]
+        SwitchVideoImageTab(false);
+        last_nav = now;
+    } else if (pressed & 0x10) { // Up
+        g_img_selected = (g_img_selected - 1 + kImgCount) % kImgCount;
+        last_nav = now;
+    } else if (pressed & 0x40) { // Down
+        g_img_selected = (g_img_selected + 1) % kImgCount;
+        last_nav = now;
+    } else if (pressed & 0x80) { // Left
+        AdjustImageRow(g_img_selected, -1);
+        last_nav = now;
+    } else if (pressed & 0x20) { // Right
+        AdjustImageRow(g_img_selected, 1);
+        last_nav = now;
+    } else if (pressed & 0x1000) { // Triangle/Y -> Dock Left/Right
+        g_img_dock_left = !g_img_dock_left;
+        g_img_ini_dirty = true;
+        last_nav = now;
+    } else if (pressed & 0x8000) { // Square/X -> Reset
+        ApplyImagePreset(0, true);
+        last_nav = now;
+    } else if (pressed & 0x4000) { // Cross/A -> Apply & Save (or Reset row)
+        if (g_img_selected == kImgReset) {
+            ApplyImagePreset(0, true);
+        } else {
+            SaveImageSettingsToIni(true, false);
+        }
+        last_nav = now;
+    } else if (pressed & (0x2000 | 0x8)) { // Circle/B or Options -> Close & Save
+        CloseImageMenuInternal();
+        last_nav = now;
+    }
+}
 
 void ToggleAchievementsMenu() {
     const bool next = !g_achievements_overlay_open.load();
@@ -1260,7 +1535,7 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
             ToggleVideoSettingsMenu();
             return 0;
         }
-        if (wparam == VK_F2 && !(lparam & (1 << 30)) && !g_video_menu_open.load()) {
+        if (wparam == VK_F2 && !(lparam & (1 << 30)) && !g_video_menu_open.load() && !g_image_menu_open.load()) {
             TogglePadKeyboardPlayer();
             return 0;
         }
@@ -1270,6 +1545,10 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
         }
         if (wparam == VK_F4 && !(lparam & (1 << 30))) { // 4.1: sala do multiplayer (F4)
             ToggleMpRoomMenu();
+            return 0;
+        }
+        if (wparam == VK_F5 && !(lparam & (1 << 30))) { // 4.1.1: painel de imagem (era F3, que agora e a sala)
+            ToggleImageSettingsMenu();
             return 0;
         }
         if (wparam == VK_F8 && !(lparam & (1 << 30))) {
@@ -1396,6 +1675,10 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
                 StepVideoMenuOption(1);
                 return 0;
             }
+            if (wparam == VK_TAB && fresh) {
+                SwitchVideoImageTab(true);
+                return 0;
+            }
             if (wparam == VK_RETURN && fresh) {
                 ApplyAndSaveVideoSettings();
                 return 0;
@@ -1403,6 +1686,34 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
             if (wparam == VK_ESCAPE && fresh) {
                 g_video_menu_open = false;
                 return 0;
+            }
+            return 0;
+        }
+        if (g_image_menu_open.load()) {
+            const bool fresh = !(lparam & (1 << 30));
+            if (wparam == VK_UP) {
+                g_img_selected = (g_img_selected - 1 + kImgCount) % kImgCount;
+            } else if (wparam == VK_DOWN) {
+                g_img_selected = (g_img_selected + 1) % kImgCount;
+            } else if (wparam == VK_LEFT) {
+                AdjustImageRow(g_img_selected, -1);
+            } else if (wparam == VK_RIGHT) {
+                AdjustImageRow(g_img_selected, 1);
+            } else if (wparam == VK_TAB && fresh) {
+                SwitchVideoImageTab(false);
+            } else if (wparam == 'M' && fresh) {
+                g_img_dock_left = !g_img_dock_left;
+                g_img_ini_dirty = true;
+            } else if (wparam == 'R' && fresh) {
+                ApplyImagePreset(0, true);
+            } else if (wparam == VK_RETURN && fresh) {
+                if (g_img_selected == kImgReset) {
+                    ApplyImagePreset(0, true);
+                } else {
+                    SaveImageSettingsToIni(true, false);
+                }
+            } else if ((wparam == VK_ESCAPE || wparam == VK_F5) && fresh) {
+                CloseImageMenuInternal();
             }
             return 0;
         }
@@ -1446,7 +1757,6 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
         hle::toypad::SavePortalState();
         render::VulkanRenderer::Instance().SavePipelineCache();
         hle::log::StopCapture();
-        toypad_proc::CloseAll();
         runtime::mp_net::Stop(); // 4.0: avisa o servidor que saiu (o TerminateProcess pula o atexit)
         TerminateProcess(GetCurrentProcess(), 0);
         return 0;
@@ -2734,7 +3044,7 @@ void QueueStatsOverlay() {
         s_refused_since = now;
     }
     const bool show_refused = s_refused_shown && !mp_refused.empty() && now - s_refused_since < std::chrono::seconds(15);
-    if (!g_stats_overlay.load() && !g_video_menu_open.load() &&
+    if (!g_stats_overlay.load() && !g_video_menu_open.load() && !g_image_menu_open.load() &&
         !g_achievements_overlay_open.load() && !g_logs_overlay_open.load() && !has_toast &&
         tags.empty() && !g_mp_panel_open.load() && !show_refused) {
         return;
@@ -2833,6 +3143,39 @@ void QueueStatsOverlay() {
             c.Rect(px, py - p * 0.5f, px + (gx1 - gx0) / kFrames + 0.5f, py + p * 0.5f, kGray);
         }
     }
+    auto draw_tabs = [&](float bx0, float by0, float bw, float s, bool image_active) {
+        const float ty0 = by0 + 10.0f * s;
+        const float th = 24.0f * s;
+        const float tf = 1.45f * s;
+        const std::string t_vid = lang::Pt() ? "VIDEO [F1]" : "VIDEO [F1]";
+        const std::string t_img = lang::Pt() ? "IMAGEM [F5]" : "IMAGE [F5]";
+        const float w1 = TextWidth(t_vid, tf) + 22.0f * s;
+        const float w2 = TextWidth(t_img, tf) + 22.0f * s;
+        const float x1 = bx0 + 18.0f * s;
+        const float x2 = x1 + w1 + 8.0f * s;
+        const u32 vid_bg = !image_active ? Rgba(34, 88, 48, 245) : Rgba(28, 34, 46, 220);
+        const u32 img_bg = image_active ? Rgba(24, 82, 118, 245) : Rgba(28, 34, 46, 220);
+        c.Pill(x1, ty0, x1 + w1, ty0 + th, vid_bg);
+        if (!image_active) {
+            c.Rect(x1 + 8.0f * s, ty0 + th - 2.5f * s, x1 + w1 - 8.0f * s, ty0 + th, Rgba(0, 220, 90));
+        }
+        c.Write(t_vid, x1 + 11.0f * s, ty0 + 7.0f * s, tf, !image_active ? Rgba(255, 255, 255) : Rgba(155, 165, 185));
+
+        c.Pill(x2, ty0, x2 + w2, ty0 + th, img_bg);
+        if (image_active) {
+            c.Rect(x2 + 8.0f * s, ty0 + th - 2.5f * s, x2 + w2 - 8.0f * s, ty0 + th, Rgba(0, 210, 255));
+        }
+        c.Write(t_img, x2 + 11.0f * s, ty0 + 7.0f * s, tf, image_active ? Rgba(255, 255, 255) : Rgba(155, 165, 185));
+
+        const std::string hint = image_active ? (lang::Pt() ? "[TAB] ABA  [M] LADO" : "[TAB] TAB  [M] DOCK")
+                                              : (lang::Pt() ? "[TAB / LB / RB] TROCAR ABA" : "[TAB / LB / RB] SWITCH TAB");
+        const float hf = 1.25f * s;
+        const float hw = TextWidth(hint, hf);
+        if (x2 + w2 + 12.0f * s + hw < bx0 + bw - 16.0f * s) {
+            c.Write(hint, bx0 + bw - hw - 18.0f * s, ty0 + 8.0f * s, hf, Rgba(150, 165, 190));
+        }
+    };
+
     if (g_video_menu_open.load()) {
         constexpr u32 kBg = 0xEE121216, kBorder = 0xFF00D000, kTitleYellow = 0xFF00E0FF, kHiBg = 0xAA303038;
         constexpr u32 kWhite = 0xFFFFFFFF, kGray = 0xFFA0A0A0, kCyan = 0xFFE0C040;
@@ -2848,10 +3191,11 @@ void QueueStatsOverlay() {
 
         c.Rect(box_x0 - 4.0f, box_y0 - 4.0f, box_x1 + 4.0f, box_y1 + 4.0f, kBorder);
         c.Rect(box_x0, box_y0, box_x1, box_y1, kBg);
+        draw_tabs(box_x0, box_y0, box_w, scale_ui, false);
 
         const std::string title = lang::Pt() ? "CONFIGURACOES DE VIDEO" : "VIDEO SETTINGS";
         float font_title = 2.65f * scale_ui;
-        c.Write(title, box_x0 + (box_w - TextWidth(title, font_title)) / 2.0f, box_y0 + 24.0f * scale_ui, font_title, kTitleYellow);
+        c.Write(title, box_x0 + (box_w - TextWidth(title, font_title)) / 2.0f, box_y0 + 44.0f * scale_ui, font_title, kTitleYellow);
 
         u32 rw = 0, rh = 0, tw = 0, th = 0;
         render::VulkanRenderer::Instance().GetCurrentRenderResolution(&rw, &rh);
@@ -2861,11 +3205,11 @@ void QueueStatsOverlay() {
         const std::string res_info = (lang::Pt() ? "RENDER INTERNO: " : "INTERNAL RENDER: ") + std::to_string(rw) + "X" +
                                      std::to_string(rh) + (lang::Pt() ? "  ->  ALVO: " : "  ->  TARGET: ") + tgt_txt;
         float font_info = 1.55f * scale_ui;
-        c.Write(res_info, box_x0 + (box_w - TextWidth(res_info, font_info)) / 2.0f, box_y0 + 52.0f * scale_ui, font_info, kCyan);
+        c.Write(res_info, box_x0 + (box_w - TextWidth(res_info, font_info)) / 2.0f, box_y0 + 70.0f * scale_ui, font_info, kCyan);
 
-        c.Rect(box_x0 + 20.0f * scale_ui, box_y0 + 72.0f * scale_ui, box_x1 - 20.0f * scale_ui, box_y0 + 74.0f * scale_ui, kGray);
+        c.Rect(box_x0 + 20.0f * scale_ui, box_y0 + 90.0f * scale_ui, box_x1 - 20.0f * scale_ui, box_y0 + 92.0f * scale_ui, kGray);
 
-        float row_y = box_y0 + 86.0f * scale_ui;
+        float row_y = box_y0 + 104.0f * scale_ui;
         float font_item = 2.25f * scale_ui;
         for (size_t i = 0; i < g_menu_items.size(); ++i) {
             const auto& item = g_menu_items[i];
@@ -2892,14 +3236,135 @@ void QueueStatsOverlay() {
             c.Write(saved_msg, box_x0 + (box_w - TextWidth(saved_msg, font_item)) / 2.0f, box_y1 - 36.0f * scale_ui, font_item, kBorder);
         } else {
             const std::string footer = (g_menu_selected == kMenuTrophySound)
-                ? (lang::Pt() ? "[ESQ/DIR] OUVIR PREVIA  [ENTER] REPETIR E SALVAR  [F1/ESC] SAIR"
-                              : "[LEFT/RIGHT] PREVIEW SOUND  [ENTER] REPLAY & SAVE  [F1/ESC] CLOSE")
-                : (lang::Pt() ? "[CIMA/BAIXO] NAVEGAR  [ESQ/DIR] ALTERAR  [ENTER] SALVAR  [F1/ESC] SAIR"
-                              : "[UP/DOWN] SELECT  [LEFT/RIGHT] CHANGE  [ENTER] SAVE  [F1/ESC] CLOSE");
+                ? (lang::Pt() ? "[ESQ/DIR] OUVIR PREVIA  [ENTER] REPETIR E SALVAR  [TAB] IMAGEM  [F1/ESC] SAIR"
+                              : "[LEFT/RIGHT] PREVIEW SOUND  [ENTER] REPLAY & SAVE  [TAB] IMAGE  [F1/ESC] CLOSE")
+                : (lang::Pt() ? "[CIMA/BAIXO] NAVEGAR  [ESQ/DIR] ALTERAR  [TAB] IMAGEM  [ENTER] SALVAR  [F1/ESC] SAIR"
+                              : "[UP/DOWN] SELECT  [LEFT/RIGHT] CHANGE  [TAB] IMAGE  [ENTER] SAVE  [F1/ESC] CLOSE");
             float font_foot = 1.55f * scale_ui;
             const float fw = TextWidth(footer, font_foot);
             const float eff_f = (fw > box_w - 32.0f * scale_ui) ? (font_foot * (box_w - 32.0f * scale_ui) / fw) : font_foot;
             c.Write(footer, box_x0 + (box_w - TextWidth(footer, eff_f)) / 2.0f, box_y1 - 36.0f * scale_ui, eff_f, kGray);
+        }
+    }
+
+    if (g_image_menu_open.load()) {
+        const bool pt = lang::Pt();
+        float s = client.bottom >= 1400 ? 1.45f : (client.bottom >= 1000 ? 1.0f : 0.78f);
+        s = std::min(s, std::min((client.right - 36.0f) / 600.0f, client.bottom / 690.0f));
+        const float box_w = 590.0f * s;
+        const float box_h = 656.0f * s;
+        const float box_x0 = g_img_dock_left ? (22.0f * s) : (client.right - box_w - 22.0f * s);
+        const float box_y0 = (client.bottom - box_h) * 0.5f;
+        const float box_x1 = box_x0 + box_w;
+        const float box_y1 = box_y0 + box_h;
+
+        const u32 col_bg = Rgba(11, 15, 23, 214);
+        const u32 col_border = Rgba(0, 200, 255, 235);
+        const u32 col_title = Rgba(0, 225, 255);
+        const u32 col_gold = Rgba(255, 215, 64);
+        const u32 col_white = Rgba(245, 248, 255);
+        const u32 col_gray = Rgba(155, 166, 188);
+        const u32 col_hi = Rgba(34, 48, 72, 220);
+
+        c.Rect(box_x0 - 3.0f, box_y0 - 3.0f, box_x1 + 3.0f, box_y1 + 3.0f, col_border);
+        c.Rect(box_x0, box_y0, box_x1, box_y1, col_bg);
+        draw_tabs(box_x0, box_y0, box_w, s, true);
+
+        const std::string title = pt ? "CONTROLES DE IMAGEM" : "IMAGE CONTROLS";
+        const float f_title = 2.35f * s;
+        c.Write(title, box_x0 + 20.0f * s, box_y0 + 44.0f * s, f_title, col_title);
+        const std::string live_tag = pt ? "AO VIVO" : "LIVE";
+        const float lt_w = TextWidth(live_tag, 1.35f * s) + 14.0f * s;
+        c.Pill(box_x1 - lt_w - 18.0f * s, box_y0 + 43.0f * s, box_x1 - 18.0f * s, box_y0 + 61.0f * s, Rgba(20, 92, 54, 230));
+        c.Write(live_tag, box_x1 - lt_w - 11.0f * s, box_y0 + 47.0f * s, 1.35f * s, Rgba(130, 255, 165));
+
+        const std::string sub = pt ? "SATURACAO, COR, BRILHO, CONTRASTE E NITIDEZ" : "SATURATION, COLOR, BRIGHTNESS, CONTRAST & SHARPNESS";
+        c.Write(sub, box_x0 + 20.0f * s, box_y0 + 68.0f * s, 1.25f * s, col_gray);
+        c.Rect(box_x0 + 16.0f * s, box_y0 + 84.0f * s, box_x1 - 16.0f * s, box_y0 + 86.0f * s, Rgba(60, 76, 102));
+
+        const float f_item = 1.85f * s;
+        float row_y = box_y0 + 96.0f * s;
+        for (int row = 0; row < kImgCount; ++row) {
+            const bool sel = (row == g_img_selected);
+            if (sel) {
+                c.Rect(box_x0 + 12.0f * s, row_y - 4.0f * s, box_x1 - 12.0f * s, row_y + 24.0f * s, col_hi);
+                c.Rect(box_x0 + 12.0f * s, row_y - 4.0f * s, box_x0 + 16.0f * s, row_y + 24.0f * s, col_border);
+            }
+            if (row == kImgPreset) {
+                const std::string lbl = pt ? "PREDEFINICAO" : "PRESET";
+                const std::string p_name = (g_img_preset < kImageSelectablePresets)
+                    ? (pt ? kImagePresets[g_img_preset].name_pt : kImagePresets[g_img_preset].name_en)
+                    : (pt ? "PERSONALIZADO" : "CUSTOM");
+                c.Write(sel ? ("> " + lbl) : ("  " + lbl), box_x0 + 20.0f * s, row_y + 2.0f * s, f_item, sel ? col_gold : col_white);
+                const std::string val = "< " + p_name + " >";
+                c.Write(val, box_x1 - TextWidth(val, f_item) - 18.0f * s, row_y + 2.0f * s, f_item, sel ? col_title : col_gold);
+            } else if (row == kImgReset) {
+                const std::string btn = pt ? "[ RESTAURAR PADRAO (R) ]" : "[ RESET DEFAULTS (R) ]";
+                const float bw = TextWidth(btn, f_item) + 28.0f * s;
+                const float bx = box_x0 + (box_w - bw) * 0.5f;
+                c.Pill(bx, row_y - 2.0f * s, bx + bw, row_y + 22.0f * s, sel ? Rgba(155, 52, 42, 240) : Rgba(48, 32, 36, 210));
+                c.Write(btn, box_x0 + (box_w - TextWidth(btn, f_item)) * 0.5f, row_y + 3.0f * s, f_item, sel ? col_white : Rgba(255, 160, 150));
+            } else {
+                const int idx = row - kImgBrightness;
+                const auto& def = kImageSliders[idx];
+                const int val = g_img_vals[idx];
+                const std::string lbl = pt ? def.label_pt : def.label_en;
+                c.Write(sel ? ("> " + lbl) : ("  " + lbl), box_x0 + 20.0f * s, row_y + 2.0f * s, f_item, sel ? col_gold : col_white);
+
+                const float bar_x0 = box_x0 + 205.0f * s;
+                const float bar_x1 = box_x1 - 88.0f * s;
+                const float bar_w = bar_x1 - bar_x0;
+                const float bar_cy = row_y + 9.0f * s;
+                const float bar_h = 7.0f * s;
+                const float span = static_cast<float>(def.max_val - def.min_val);
+                const float frac = std::clamp((val - def.min_val) / span, 0.0f, 1.0f);
+                const float def_frac = std::clamp((def.def_val - def.min_val) / span, 0.0f, 1.0f);
+                const float val_x = bar_x0 + bar_w * frac;
+                const float def_x = bar_x0 + bar_w * def_frac;
+
+                c.Pill(bar_x0, bar_cy - bar_h * 0.5f, bar_x1, bar_cy + bar_h * 0.5f, Rgba(34, 42, 58, 235));
+                u32 fill_col = sel ? col_gold : Rgba(0, 185, 245);
+                if (idx == 7) fill_col = Rgba(240, 88, 88);       // Red channel accent
+                else if (idx == 8) fill_col = Rgba(80, 220, 110); // Green channel accent
+                else if (idx == 9) fill_col = Rgba(85, 165, 255); // Blue channel accent
+
+                if (def.min_val < 0) {
+                    const float fx0 = std::min(def_x, val_x);
+                    const float fx1 = std::max(def_x, val_x);
+                    if (fx1 - fx0 > 1.0f) {
+                        c.Rect(fx0, bar_cy - bar_h * 0.5f, fx1, bar_cy + bar_h * 0.5f, fill_col);
+                    }
+                } else if (val_x - bar_x0 > 1.0f) {
+                    c.Rect(bar_x0, bar_cy - bar_h * 0.5f, val_x, bar_cy + bar_h * 0.5f, fill_col);
+                }
+                // Default reference tick
+                c.Rect(def_x - 1.0f * s, bar_cy - bar_h * 0.85f, def_x + 1.0f * s, bar_cy + bar_h * 0.85f, Rgba(180, 192, 212, 200));
+                // Slider handle
+                c.Rect(val_x - 3.0f * s, bar_cy - bar_h * 0.95f, val_x + 3.0f * s, bar_cy + bar_h * 0.95f, sel ? col_white : Rgba(225, 235, 250));
+
+                const std::string vs = FormatImageSliderValue(idx);
+                const bool changed = (val != def.def_val);
+                c.Write(vs, box_x1 - TextWidth(vs, f_item) - 18.0f * s, row_y + 2.0f * s, f_item,
+                        sel ? col_gold : (changed ? col_title : col_gray));
+            }
+            row_y += 38.0f * s;
+        }
+
+        c.Rect(box_x0 + 16.0f * s, box_y1 - 54.0f * s, box_x1 - 16.0f * s, box_y1 - 52.0f * s, Rgba(60, 76, 102));
+        if (g_img_save_timer > 0) {
+            --g_img_save_timer;
+            const std::string saved_msg = g_img_save_was_reset
+                ? (pt ? "IMAGEM RESTAURADA AO PADRAO!" : "IMAGE SETTINGS RESET TO DEFAULT!")
+                : (pt ? "CONFIGURACOES DE IMAGEM SALVAS!" : "IMAGE SETTINGS SAVED!");
+            c.Write(saved_msg, box_x0 + (box_w - TextWidth(saved_msg, f_item)) * 0.5f, box_y1 - 36.0f * s, f_item, Rgba(95, 240, 130));
+        } else {
+            const std::string footer = pt
+                ? "[ESQ/DIR] AJUSTAR  [TAB] VIDEO  [M] LADO  [R] RESET  [ENTER] SALVAR  [F5/ESC] SAIR"
+                : "[L/R] ADJUST  [TAB] VIDEO  [M] DOCK  [R] RESET  [ENTER] SAVE  [F5/ESC] CLOSE";
+            const float f_foot = 1.35f * s;
+            const float fw = TextWidth(footer, f_foot);
+            const float eff_f = (fw > box_w - 28.0f * s) ? (f_foot * (box_w - 28.0f * s) / fw) : f_foot;
+            c.Write(footer, box_x0 + (box_w - TextWidth(footer, eff_f)) * 0.5f, box_y1 - 35.0f * s, eff_f, col_gray);
         }
     }
 
@@ -2961,7 +3426,7 @@ void QueueStatsOverlay() {
                 value = runtime::mp_net::RoomLocked() ? (pt ? "< SIM >" : "< ON >") : (pt ? "< NAO >" : "< OFF >");
             } else if (r.id == -1) {
                 label = r.name;
-                value = pt ? "< APERTE ENTER / F3 >" : "< PRESS ENTER / F3 >";
+                value = "< ENTER >"; // 4.1.1: o texto longo cobria o nome da linha
                 value_color = sel ? kTitleYellow : kCyan;
             } else {
                 label = MpUpper(r.name);
@@ -2978,8 +3443,8 @@ void QueueStatsOverlay() {
             row_y += 38.0f * s;
         }
         c.Rect(x0 + 20.0f * s, y1 - 60.0f * s, x1 - 20.0f * s, y1 - 58.0f * s, kGray);
-        const std::string footer = owner ? (pt ? "[CIMA/BAIXO] ESCOLHER  [ENTER/DIR] TRANCAR/EXPULSAR  [F3] SALA  [F4/ESC] SAIR"
-                                               : "[UP/DOWN] SELECT  [ENTER/RIGHT] LOCK/KICK  [F3] ROOM  [F4/ESC] CLOSE")
+        const std::string footer = owner ? (pt ? "[CIMA/BAIXO]  [ENTER] TRANCAR/EXPULSAR  [F3] SALA  [F4/ESC] SAIR"
+                                               : "[UP/DOWN]  [ENTER] LOCK/KICK  [F3] ROOM  [F4/ESC] CLOSE")
                                          : (pt ? "[F3] ENTRAR NA SALA  [F4/ESC] SAIR" : "[F3] JOIN ROOM  [F4/ESC] CLOSE");
         const float ff = 1.7f * s;
         c.Write(footer, x0 + (box_w - TextWidth(footer, ff)) / 2.0f, y1 - 40.0f * s, ff, kGray);

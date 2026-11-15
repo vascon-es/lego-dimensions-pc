@@ -35,7 +35,7 @@ Detalhes e dicas no [LEIA-ME](tools/dist/LEIA-ME.txt).
 
 ## Multiplayer online (alfa)
 
-A partir da versão 4.1 (alfa) dá para jogar com amigos pela internet, como no mod de multiplayer do Marvel's Spider-Man: cada um
+A partir da 4.0 (alfa) dá para jogar com amigos pela internet, como no mod de multiplayer do Marvel's Spider-Man: cada um
 joga o seu jogo, e os outros jogadores da mesma área aparecem como personagens que correm, pulam e atacam no seu
 mundo. Até 16 jogadores por sala.
 
@@ -46,7 +46,8 @@ mundo. Até 16 jogadores por sala.
 
 As salas são privadas: ninguém lista as salas, os códigos do **Nova sala** têm 8 caracteres e a senha é definida por
 quem cria a sala. O primeiro a entrar é o dono: no jogo, a tecla **F4** abre a tela da **Sala do multiplayer** para ver quem
-está na sala, e o dono pode trancar a sala e expulsar jogadores (o menu **F1** é exclusivo para Configurações de Vídeo e o **F3** para Controles de Imagem).
+está na sala, e o dono pode trancar a sala e expulsar jogadores. O **F3** entra numa sala ou troca de sala sem sair do
+jogo (não precisa ligar o multiplayer no launcher para isso). O **F5** abre os Controles de Imagem.
 
 O servidor público é gratuito e dorme depois de 15 minutos sem jogadores. O launcher acorda o servidor assim que
 abre (com o multiplayer ligado), então ele costuma estar acordado quando o jogo chega no menu; se não, a primeira
