@@ -1238,6 +1238,8 @@ int main(int argc, char** argv) {
         int bf = GetPrivateProfileIntW(L"launcher", L"blank_frequency", 900, (root / "launcher.ini").wstring().c_str());
         hle::videoout::SetBlankFrequency(bf > 0 ? bf : 900);
         hle::videoout::LoadImageSettingsFromIni();
+        // 4.1.1: campanha junto (seguir a fase do dono da sala); muda no F4
+        runtime::multiplayer::SetFollowOwner(GetPrivateProfileIntW(L"launcher", L"mp_seguir", 1, (root / "launcher.ini").wstring().c_str()) != 0);
     }
     std::filesystem::path elf_path = root / "assets" / "decrypted_elfs" / "eboot.bin.elf";
     std::filesystem::path app0 = DefaultApp0(root);

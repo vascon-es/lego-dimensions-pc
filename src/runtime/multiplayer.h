@@ -30,4 +30,8 @@ struct NameTag {
 std::vector<NameTag> NameTags();
 bool InWorld(); // o jogador 1 esta numa fase (nao em menus/carregamento)
 
+// 4.1.1: campanha junto: os outros jogadores vao para a fase em que o dono da sala esta (padrao: ligado)
+void SetFollowOwner(bool on);
+bool FollowOwnerEnabled();
+
 } // namespace runtime::multiplayer

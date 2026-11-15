@@ -31,7 +31,8 @@ std::atomic<int> g_rtt_ms{0};
 std::atomic<int> g_owner{0};
 std::atomic<bool> g_locked{false};
 std::string g_refused;               // codigo da recusa definitiva (g_mutex)
-std::vector<std::string> g_commands; // L/x do dono, mandados pela thread (g_mutex)
+std::vector<std::string> g_commands; // L/x do dono e eventos de jogo, mandados pela thread (g_mutex)
+std::vector<std::pair<int, std::string>> g_events_in; // eventos de jogo recebidos (g_mutex)
 std::string g_password;
 std::atomic<bool> g_in_session{false}; // conectado (Stop espera o "q" sair)
 std::atomic<bool> g_end_session{false}; // o servidor recusou: encerra (o proxy do Render nao repassa o fechamento)
@@ -142,6 +143,8 @@ void Handle(const std::string& msg) {
             std::printf("[MP] %s saiu da sala\n", it->second.name.c_str());
             g_peers.erase(it);
         }
+    } else if (kind == "s" && !tail.empty() && tail[0] == '!') { // s|id|!payload: evento de jogo (quebrou um objeto...)
+        if (g_events_in.size() < 512) g_events_in.emplace_back(id, tail.substr(1));
     } else if (kind == "s") {
         Peer& p = g_peers[id];
         p.id = id;
@@ -212,18 +215,23 @@ void Session(HINTERNET session) {
     std::thread receiver(Receiver, ws, &alive);
     auto last_keepalive = std::chrono::steady_clock::now();
     auto last_ping = last_keepalive - std::chrono::seconds(2);
+    auto last_state = last_keepalive;
     while (!g_stop && alive && !g_end_session) {
         std::string state;
         std::vector<std::string> commands;
+        const auto now = std::chrono::steady_clock::now();
         {
             std::lock_guard lock(g_mutex);
             commands.swap(g_commands);
-            if (g_local_dirty) {
+            // ate 4 na sala: 30 por segundo; ate 8: 20; mais: 12 (com 16, cada um recebe 15 x 12 = 180 por segundo)
+            const size_t others = g_peers.size();
+            const auto interval = std::chrono::milliseconds(others <= 3 ? 30 : others <= 7 ? 48 : 80);
+            if (g_local_dirty && now - last_state >= interval) {
                 state = g_local_state;
                 g_local_dirty = false;
+                last_state = now;
             }
         }
-        const auto now = std::chrono::steady_clock::now();
         if (now - last_ping > std::chrono::seconds(1)) { // mede a latencia (o servidor devolve o "t")
             char ping[48];
             std::snprintf(ping, sizeof(ping), "t|%.4f", Now());
@@ -361,6 +369,18 @@ void SetRoomLocked(bool locked) {
     g_locked = locked;
     std::lock_guard lock(g_mutex);
     g_commands.push_back(locked ? "L|1" : "L|0");
+}
+
+void SendEvent(const std::string& payload) {
+    std::lock_guard lock(g_mutex);
+    if (g_commands.size() < 256 && payload.size() < 560) g_commands.push_back("s|!" + payload);
+}
+
+std::vector<std::pair<int, std::string>> TakeEvents() {
+    std::lock_guard lock(g_mutex);
+    std::vector<std::pair<int, std::string>> out;
+    out.swap(g_events_in);
+    return out;
 }
 
 void Kick(int id) {

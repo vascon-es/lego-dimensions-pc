@@ -36,6 +36,9 @@ void SetRoomLocked(bool locked); // so o dono (o servidor ignora os outros)
 void Kick(int id);               // so o dono; o expulso nao volta para esta sala
 // Recusa definitiva do servidor ("senha", "trancada", "expulso", "versao", "cheia"): nao tenta de novo. Vazio = nenhuma.
 std::string RefusedCode();
+// Fase 80: eventos de jogo (o que um jogador fez no mundo dele, ex. quebrou um objeto) para os outros da sala.
+void SendEvent(const std::string& payload);                // vai dentro do "s" ("s|!payload"): o servidor so repassa
+std::vector<std::pair<int, std::string>> TakeEvents();     // (id de quem mandou, payload) chegados desde a ultima vez
 double Now();
 
 } // namespace runtime::mp_net

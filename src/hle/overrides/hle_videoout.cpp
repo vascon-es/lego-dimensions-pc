@@ -840,9 +840,25 @@ std::vector<MpRow> MpRows() {
     for (const auto& p : runtime::mp_net::Peers()) {
         if (p.id != self && !p.name.empty()) rows.push_back({p.id, p.name, false});
     }
+    // 4.1.1: campanha junto (quem nao e o dono vai para a fase do dono)
+    static bool follow_loaded = false;
+    if (!follow_loaded) {
+        follow_loaded = true;
+        const std::filesystem::path ini = GetLauncherIniPath();
+        if (!ini.empty()) {
+            runtime::multiplayer::SetFollowOwner(GetPrivateProfileIntW(L"launcher", L"mp_seguir", 1, ini.wstring().c_str()) != 0);
+        }
+    }
+    rows.push_back({-2, lang::Pt() ? "SEGUIR O DONO (CAMPANHA JUNTO)" : "FOLLOW THE OWNER (CAMPAIGN)", false});
     // Linha interativa para entrar ou trocar de sala pelo F3
     rows.push_back({-1, lang::Pt() ? "ENTRAR / CONFIGURAR SALA (F3)" : "JOIN / CONFIGURE ROOM (F3)", false});
     return rows;
+}
+
+void MpToggleFollow() {
+    const bool next = !runtime::multiplayer::FollowOwnerEnabled();
+    runtime::multiplayer::SetFollowOwner(next);
+    WriteLauncherIni(L"mp_seguir", next ? L"1" : L"0");
 }
 
 void MpMove(int delta) {
@@ -858,6 +874,10 @@ void MpActivate() {
     if (row.id == -1) {
         g_mp_panel_open = false;
         hle::videoout::OpenMpRoomDialog();
+        return;
+    }
+    if (row.id == -2) {
+        MpToggleFollow();
         return;
     }
     if (!MpIsOwner()) return;
@@ -1159,7 +1179,8 @@ void HandleMpRoomMenuController(u32 pressed) {
         last_nav = now;
     } else if (pressed & (0x20 | 0x80)) { // esquerda / direita: alterna trancar se na linha 0
         const auto rows = MpRows();
-        if (g_mp_selected >= 0 && g_mp_selected < static_cast<int>(rows.size()) && rows[g_mp_selected].id == 0) {
+        if (g_mp_selected >= 0 && g_mp_selected < static_cast<int>(rows.size()) &&
+            (rows[g_mp_selected].id == 0 || rows[g_mp_selected].id == -2)) {
             MpActivate();
             last_nav = now;
         }
@@ -1563,7 +1584,8 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
                 MpMove(1);
             } else if ((wparam == VK_LEFT || wparam == VK_RIGHT) && fresh) {
                 const auto rows = MpRows();
-                if (g_mp_selected >= 0 && g_mp_selected < static_cast<int>(rows.size()) && rows[g_mp_selected].id == 0) {
+                if (g_mp_selected >= 0 && g_mp_selected < static_cast<int>(rows.size()) &&
+                    (rows[g_mp_selected].id == 0 || rows[g_mp_selected].id == -2)) {
                     MpActivate();
                 }
             } else if (wparam == VK_RETURN && fresh) {
@@ -3424,6 +3446,9 @@ void QueueStatsOverlay() {
             if (r.id == 0) {
                 label = pt ? "TRANCAR A SALA" : "LOCK THE ROOM";
                 value = runtime::mp_net::RoomLocked() ? (pt ? "< SIM >" : "< ON >") : (pt ? "< NAO >" : "< OFF >");
+            } else if (r.id == -2) {
+                label = r.name;
+                value = runtime::multiplayer::FollowOwnerEnabled() ? (pt ? "< SIM >" : "< ON >") : (pt ? "< NAO >" : "< OFF >");
             } else if (r.id == -1) {
                 label = r.name;
                 value = "< ENTER >"; // 4.1.1: o texto longo cobria o nome da linha

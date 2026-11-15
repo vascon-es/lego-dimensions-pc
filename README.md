@@ -69,9 +69,16 @@ The public server is free and sleeps after 15 minutes without players. The launc
 (with multiplayer on), so it is usually awake by the time the game reaches the menu; otherwise the first connection
 can take up to a minute (the game keeps retrying on its own). You can also run your own: it is a small relay in
 [tools/mp_server](tools/mp_server/README.md) (Node.js, no dependencies) for your PC or a free Render service.
-In this first version the other players copy moving, running, jumping and attacking. All figures work, DLC included.
-When a room has more different characters than free character slots, the players farthest away show up only as
-their name until a slot frees up.
+The other players copy moving, running, jumping and attacking. All figures work, DLC included.
+
+From 4.2 (alpha):
+- **Campaign together:** everyone goes to the level the room owner is in (gateway, doors and level select), so you
+  play the story side by side. Each player can turn this off in **F4** (**Follow the owner**).
+- **Shared world:** objects someone breaks, henchmen someone defeats and levers someone pulls happen in everyone's
+  game in the same area.
+- **Up to 16 players visible:** the game only has memory for 8 characters at once, so when a room has more
+  different characters than that, the extra players show up as a character that is already loaded (with their own
+  name on top) and switch to their real character as soon as a slot frees up.
 
 ## Language
 

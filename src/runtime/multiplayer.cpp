@@ -24,6 +24,7 @@
 #include <set>
 #include <mutex>
 #include <sstream>
+#include <thread>
 #include <vector>
 
 #include "common/types.h"
@@ -31,6 +32,7 @@
 #include "runtime/mp_net.h"
 
 namespace runtime::multiplayer {
+void OnLocalKill(unsigned long long obj, unsigned long long killer); // Fase 80 (no fim do arquivo)
 namespace {
 
 // ---- enderecos do eboot (deslocamentos a partir da base) --------------------------------------------------------
@@ -40,9 +42,10 @@ constexpr u64 kControlFn = 0xd70730;       // atualizacao de controle de cada pe
 u64 kSpawnFn = 0x158c2c0;        // AttemptToSpawnObject_Internal(spawner, pedido, 1)
 u64 kRequestDtorFn = 0x15857b0;  // destrutor do pedido (desfaz o personagem)
 u64 kRequestDeleteFn = 0x1585d40; // destrutor com delete (vtable[2] do pedido)
-constexpr u64 kDescFn = 0x937c20;          // descritor do personagem (desc, nome, 0x73db, 0)
+u64 kDescFn = 0x937c20;          // descritor do personagem (desc, nome, 0x73db, 0)
 u64 kSlotLoadFn = 0x157f1f0;     // carrega o personagem num slot livre do portal
-constexpr u64 kAllocatorA = 0x4adb10, kAllocatorB = 0x4adb90, kAllocFn = 0x4a83d0, kFreeFn = 0x4a94a0;
+constexpr u64 kAllocatorA = 0x4adb10, kAllocatorB = 0x4adb90;
+u64 kAllocFn = 0x4a83d0, kFreeFn = 0x4a94a0;
 u64 kListPushFn = 0x22c0d90;     // lista do spawner (+0x1d0): {cabeca, cauda, contagem}, no {prox, ant, valor}
 constexpr u64 kSpawnerVtable = 0x2cfada0, kRequestVtable = 0x2cfaca0;
 // Listas de slots: vetor {dados, tamanho, capacidade | 0x40000000 (memoria que o jogo nao libera)}.
@@ -97,6 +100,11 @@ bool Readable(u64 address, u64 size) {
 u64 Call(u64 offset, u64 a = 0, u64 b = 0, u64 c = 0, u64 d = 0, u64 e = 0, u64 f = 0) {
     using Fn = u64(HLE_SYSV_ABI*)(u64, u64, u64, u64, u64, u64);
     return reinterpret_cast<Fn>(g_base + offset)(a, b, c, d, e, f);
+}
+
+u64 Call8(u64 offset, u64 a, u64 b, u64 c, u64 d, u64 e, u64 f, u64 g, u64 h) { // 7o e 8o na pilha
+    using Fn = u64(HLE_SYSV_ABI*)(u64, u64, u64, u64, u64, u64, u64, u64);
+    return reinterpret_cast<Fn>(g_base + offset)(a, b, c, d, e, f, g, h);
 }
 
 u64 GameAllocator() { return Call(kAllocatorB, Call(kAllocatorA)); }
@@ -165,6 +173,7 @@ double g_area_time = 0;
 struct SpawnerSeen {
     u64 spawner;
     unsigned epoch;
+    std::string area;
 };
 std::mutex g_spawner_mutex;
 std::vector<SpawnerSeen> g_spawners;
@@ -180,6 +189,7 @@ struct Remote {
     u32 held = 0;
     bool ingame = false;
     int rtt_ms = 0; // latencia dele ate o servidor
+    std::string level; // 4.1.1: fase atual ("LevelPack\...\Nome#ordem"); vazio = versao antiga / nao sabe
 };
 
 enum class Stage { kNone, kLoading, kReady, kSpawning, kActive };
@@ -192,6 +202,8 @@ struct Puppet {
     u64 slot = 0, spawner = 0, request = 0, inst = 0, inst_name = 0;
     double stage_time = 0, retry_time = 0, ready_time = 0, wait_since = 0, load_fail_time = -100;
     bool want = false;   // esta na mesma area e no jogo (aparece, ou so o nome enquanto nao ha slot)
+    double want_since = 0; // desde quando quer aparecer
+    bool standin = false;  // 4.1.1: sem slot para o personagem dele: aparece com um personagem ja carregado
     float distance = 0;  // ate o nosso jogador 1 (quem esta mais perto ganha os slots)
     float still_x = 0, still_z = 0; // ultimo lugar onde o fantasma andou (para ver se ficou preso)
     double still_time = 0;
@@ -268,6 +280,39 @@ bool SomeoneLoading() {
 // ---- ganchos ----------------------------------------------------------------------------------------------------
 std::atomic<u64> g_hook_calls{0}, g_hook_other_thread{0}, g_hook_driven{0};
 
+// Fase 80 (teste, LD_MP_PLAYERMODE): o fantasma vira um "jogador" de verdade. O jogo so deixa personagens de jogador
+// quebrar objetos, montar etc. (inst+0x399 = 1 e um controle em inst+0x3a0). Cada fantasma ganha uma copia do controle
+// do jogador 1 (+0x18 = suporte de botoes, +0x54 forca do analogico, +0x58/+0x5c direcao, +0xf8 = inst+0x370), que
+// a gente preenche com o que veio da rede. O sistema de controles do jogo nao conhece a copia (nao a sobrescreve).
+struct FakeController {
+    u64 ctrl = 0, holder = 0;
+};
+std::map<u64, FakeController> g_fake_ctrl;
+bool PlayerMode() {
+    static const bool on = std::getenv("LD_MP_PLAYERMODE") != nullptr;
+    return on;
+}
+u64 GameAlloc(u64 size);
+
+FakeController* FakeControllerFor(u64 inst) {
+    auto it = g_fake_ctrl.find(inst);
+    if (it != g_fake_ctrl.end()) return &it->second;
+    const u64 p1 = At<u64>(reinterpret_cast<u64>(g_base) + kPlayerTable);
+    const u64 src = p1 && Readable(p1 + 0x3a0, 8) ? At<u64>(p1 + 0x3a0) : 0;
+    if (!src || !Readable(src, 0x200)) return nullptr;
+    const u64 src_holder = At<u64>(src + 0x18);
+    // o estado bruto do controle (+0x18) tem listas internas: o fantasma aponta para o do jogador 1 (so leitura)
+    const u64 c = GameAlloc(0x200), h = src_holder;
+    if (!c || !h) return nullptr;
+    std::memcpy(reinterpret_cast<void*>(c), reinterpret_cast<const void*>(src), 0x200);
+    At<u64>(c + 0xf8) = inst + 0x370;
+    std::printf("[MP] fantasma %llx virou jogador: controle %llx (copia de %llx), botoes %llx\n",
+                static_cast<unsigned long long>(inst), static_cast<unsigned long long>(c),
+                static_cast<unsigned long long>(src), static_cast<unsigned long long>(h));
+    std::fflush(stdout);
+    return &(g_fake_ctrl[inst] = FakeController{c, h});
+}
+
 HLE_SYSV_ABI u64 ControlHook(u64 inst, float dt) {
     Drive* d = nullptr;
     ++g_hook_calls;
@@ -278,6 +323,24 @@ HLE_SYSV_ABI u64 ControlHook(u64 inst, float dt) {
         }
     }
     if (d) ++g_hook_driven;
+    if (d && PlayerMode()) {
+        if (FakeController* fc = FakeControllerFor(inst)) {
+            const bool moving = d->gear > 3;
+            At<u64>(inst + 0x3a0) = fc->ctrl;
+            // botoes: no controle (+0x24 segurados, +0x28 apertados agora, +0x2c soltos agora) e no estado bruto do
+            // controle (+0x18 -> +0 atual, +4 anterior, +8 apertados, +0xc soltos), como o do jogador 1
+            const u32 pressed = d->held & ~d->prev, released = d->prev & ~d->held;
+            At<u32>(fc->ctrl + 0x24) = d->held;
+            At<u32>(fc->ctrl + 0x28) = pressed;
+            At<u32>(fc->ctrl + 0x2c) = released;
+            d->prev = d->held;
+            At<float>(fc->ctrl + 0x54) = moving ? 1.4f : 0.0f;
+            At<float>(fc->ctrl + 0x58) = moving ? d->dx : 0.0f;
+            At<float>(fc->ctrl + 0x5c) = moving ? d->dz : 0.0f;
+            At<u8>(inst + 0x399) = 1;
+            return g_control(inst, dt);
+        }
+    }
     if (d) { // botoes antes: o pulo/ataque e lido dentro do controle
         At<u32>(inst + 0x4f8 + 0xc) = d->held;
         At<u32>(inst + 0x4f8 + 0x10) = d->held & ~d->prev;
@@ -369,19 +432,319 @@ HLE_SYSV_ABI u64 SpawnHook(u64 spawner, u64 request, u64 flag, u64 a, u64 b, u64
     if (!g_spawning) {
         std::lock_guard lock(g_spawner_mutex);
         const unsigned epoch = g_area_epoch;
+        std::string area;
+        {
+            std::lock_guard area_lock(g_area_mutex);
+            area = g_area;
+        }
         bool known = false;
         for (auto& s : g_spawners) {
             if (s.spawner == spawner) {
                 s.epoch = epoch;
+                s.area = area;
                 known = true;
             }
         }
         if (!known) {
             if (g_spawners.size() > 64) g_spawners.erase(g_spawners.begin());
-            g_spawners.push_back({spawner, epoch});
+            g_spawners.push_back({spawner, epoch, area});
         }
     }
     return g_spawn(spawner, request, flag, a, b, c);
+}
+
+// ---- pesquisa (sincronizar os jogos): LD_MP_EVENTS registra os eventos do jogo (eboot+4c2d00 = dispara um evento:
+// rdi = tipo do evento, objeto global com o nome em +8; rsi = quem manda; rdx = dados) ----
+u64 kFireEventFn = 0x4c2d00;
+SetupFn g_fire_event = nullptr;
+std::mutex g_event_mutex;
+struct EventStat {
+    u64 count = 0, shown = 0, window = 0; // window: neste relatorio de 2 s
+    u64 last_sender = 0, last_payload = 0;
+};
+std::map<std::string, EventStat> g_events;
+void ReportEventsLocked(double now);
+
+HLE_SYSV_ABI u64 FireEventHook(u64 ev, u64 sender, u64 payload, u64 a, u64 b, u64 c) {
+    if (ev && Readable(ev + 8, 8)) {
+        const u64 name_ptr = At<u64>(ev + 8);
+        char name[64] = {};
+        if (name_ptr && Readable(name_ptr, 1)) {
+            for (int i = 0; i < 63 && Readable(name_ptr + i, 1); ++i) {
+                name[i] = At<char>(name_ptr + i);
+                if (!name[i]) break;
+            }
+        }
+        const double now = runtime::mp_net::Now();
+        std::lock_guard lock(g_event_mutex);
+        EventStat& st = g_events[name[0] ? name : "?"];
+        if (!st.count) std::printf("[EV0] %s = %llx\n", name, static_cast<unsigned long long>(ev)); // o tipo (objeto global)
+        ++st.count;
+        ++st.window;
+        st.last_sender = sender;
+        st.last_payload = payload;
+        // eventos raros (os que interessam: quebrar, montar, bater...): cada um com a hora e os dados
+        if (st.window <= 3 && st.count > 0 && (st.count <= 40 || st.window <= 2)) {
+            u64 q[6] = {};
+            if (payload && Readable(payload, sizeof(q))) std::memcpy(q, reinterpret_cast<const void*>(payload), sizeof(q));
+            std::printf("[EV1] t=%.2f %s de %llx dados %llx: %llx %llx %llx %llx %llx %llx\n", now, name,
+                        static_cast<unsigned long long>(sender), static_cast<unsigned long long>(payload),
+                        static_cast<unsigned long long>(q[0]), static_cast<unsigned long long>(q[1]), static_cast<unsigned long long>(q[2]),
+                        static_cast<unsigned long long>(q[3]), static_cast<unsigned long long>(q[4]), static_cast<unsigned long long>(q[5]));
+        }
+        // pesquisa da campanha junto: eventos de troca de fase/area com os dados inteiros (e os textos para onde apontam)
+        const std::string nm = name;
+        if ((nm.find("Level") != std::string::npos || nm.find("Area") != std::string::npos || nm.find("Flow") != std::string::npos) &&
+            nm.find("onProcess") == std::string::npos && nm.find("SafeArea") == std::string::npos) {
+            std::printf("[EVL] t=%.2f %s ev %llx de %llx dados %llx chamado de eboot+%llx\n", now, name, static_cast<unsigned long long>(ev),
+                        static_cast<unsigned long long>(sender), static_cast<unsigned long long>(payload),
+                        static_cast<unsigned long long>(reinterpret_cast<u64>(__builtin_return_address(0)) - reinterpret_cast<u64>(g_base)));
+            for (u64 off = 0; payload && off < 0x80 && Readable(payload + off, 8); off += 8) {
+                const u64 v = At<u64>(payload + off);
+                std::string text;
+                if (v > 0x10000 && Readable(v, 1)) {
+                    for (int i = 0; i < 64 && Readable(v + i, 1); ++i) {
+                        const char ch = At<char>(v + i);
+                        if (!ch) break;
+                        if (ch < 32 || ch > 126) { text.clear(); break; }
+                        text += ch;
+                    }
+                }
+                std::printf("[EVL]   +%02llx %016llx %s\n", static_cast<unsigned long long>(off), static_cast<unsigned long long>(v),
+                            text.size() >= 3 ? ("\"" + text + "\"").c_str() : "");
+            }
+            std::fflush(stdout);
+        }
+        ReportEventsLocked(now);
+    }
+    return g_fire_event(ev, sender, payload, a, b, c);
+}
+
+// eboot+1707dd0 = destroi um objeto do jogo (rdi = objeto, esi = motivo, rdx = quem destruiu, ...): dispara
+// LegoGameObjects::EventShouldBeKilled (pode ser cancelado) e destroi. Pesquisa: registra o objeto (tipo, nome, posicao).
+u64 kKillObjectFn = 0x1707dd0;
+using KillFn = u64(HLE_SYSV_ABI*)(u64, u64, u64, u64, u64, u64, u64, u64);
+KillFn g_kill_object = nullptr;
+
+std::string FirstString(u64 obj) { // o primeiro ponteiro dos primeiros 0x200 bytes que aponta para um texto legivel
+    for (u64 off = 8; off < 0x200; off += 8) {
+        if (!Readable(obj + off, 8)) break;
+        const u64 p = At<u64>(obj + off);
+        if (p < 0x10000 || !Readable(p, 4)) continue;
+        std::string text;
+        for (int i = 0; i < 48 && Readable(p + i, 1); ++i) {
+            const char ch = At<char>(p + i);
+            if (!ch) break;
+            if (ch < 32 || ch > 126) {
+                text.clear();
+                break;
+            }
+            text += ch;
+        }
+        if (text.size() >= 4) {
+            char item[96];
+            std::snprintf(item, sizeof(item), "+%llx \"%s\"", static_cast<unsigned long long>(off), text.c_str());
+            return item;
+        }
+    }
+    return "-";
+}
+
+HLE_SYSV_ABI u64 KillObjectHook(u64 obj, u64 reason, u64 killer, u64 a, u64 b, u64 c, u64 st0, u64 st1) {
+    OnLocalKill(obj, killer);
+    static const bool log_kills = std::getenv("LD_MP_EVENTS") != nullptr;
+    if (!log_kills) return g_kill_object(obj, reason, killer, a, b, c, st0, st1);
+    const u64 caller = reinterpret_cast<u64>(__builtin_return_address(0));
+    float pos[3] = {};
+    // posicao: como nos personagens, objeto+0x60 = transform (matriz) com a posicao em +0x90 (se for legivel)
+    const u64 t = Readable(obj + 0x60, 8) ? At<u64>(obj + 0x60) : 0;
+    if (t && Readable(t + 0x90, 12)) std::memcpy(pos, reinterpret_cast<const void*>(t + 0x90), sizeof(pos));
+    std::printf("[KILL] t=%.2f obj %llx vtable %llx motivo %llu por %llx pos %.3f %.3f %.3f nome %s chamado de eboot+%llx\n",
+                runtime::mp_net::Now(), static_cast<unsigned long long>(obj),
+                static_cast<unsigned long long>(Readable(obj, 8) ? At<u64>(obj) : 0), static_cast<unsigned long long>(reason & 0xffffffff),
+                static_cast<unsigned long long>(killer), pos[0], pos[1], pos[2], FirstString(obj).c_str(),
+                static_cast<unsigned long long>(caller - reinterpret_cast<u64>(g_base)));
+    std::fflush(stdout);
+    return g_kill_object(obj, reason, killer, a, b, c, st0, st1);
+}
+
+// a cada 2 s: os eventos que dispararam desde o ultimo relatorio (os de todo quadro aparecem com contagem alta)
+void ReportEventsLocked(double now) {
+    static double last = 0;
+    if (now - last < 2.0) return;
+    last = now;
+    if (!g_enabled) g_region_count = g_region_next = 0; // sem o Tick: renova o mapa de memoria daqui
+    std::string line;
+    for (auto& [name, st] : g_events) {
+        if (st.count == st.shown) continue;
+        char item[160];
+        std::snprintf(item, sizeof(item), " %s x%llu (de %llx, dados %llx);", name.c_str(),
+                      static_cast<unsigned long long>(st.count - st.shown), static_cast<unsigned long long>(st.last_sender),
+                      static_cast<unsigned long long>(st.last_payload));
+        line += item;
+        st.shown = st.count;
+        st.window = 0;
+    }
+    if (!line.empty()) {
+        std::printf("[EV]%s\n", line.c_str());
+        std::fflush(stdout);
+    }
+}
+
+// ---- Fase 80: o que um jogador faz no mundo dele acontece no dos outros ----------------------------------------
+// O jogo so deixa jogadores de verdade quebrarem objetos: o fantasma so faz a animacao. Entao cada jogo avisa a sala
+// quando o SEU jogador quebra algo ("x|b|area|nome|ordem") e os outros quebram o objeto de mesmo nome.
+// Objetos explodiveis (arbustos, lixeiras, carrinhos...): contexto com vtable eboot+2c0d3e0, nome em +0xf0 (do
+// arquivo do level, ex. "BlowUp_Bush_INST08"), +0x260 != 0 = ja explodiu. eboot+f28ce0(ctx, quem, 0, 1, 0, 0, 0, 0)
+// explode (o jogo chama assim em eboot+f2afc5). Construtores (por ponteiro): eboot+f28410, f285a0, f28730.
+u64 kBlowUpFn = 0xf28ce0;
+constexpr u64 kBlowUpVtable = 0x2c0d3e0;
+using BlowUpFn = u64(HLE_SYSV_ABI*)(u64, u64, u64, u64, u64, u64, u64, u64);
+BlowUpFn g_blowup = nullptr;
+std::mutex g_gadget_mutex;
+std::vector<u64> g_gadgets; // contextos vistos nascer (validados no uso)
+bool g_applying = false;    // quebrando por um aviso: nao avisa de volta
+
+// classes de objeto do level (todas com o nome em +0xf0): explodivel, objeto simples, gatilho, multiestado,
+// obstaculo, pedra de dica, manivela, gancho, ponto de salvar, impulso de veiculo
+constexpr u64 kGadgetVtables[] = {0x2c0d3e0, 0x2c13830, 0x2c16120, 0x2c0e3e0, 0x2c11930,
+                                  0x2c1ad70, 0x2c12de0, 0x2c16f80, 0x2c19070, 0x2ca6c70};
+constexpr u64 kObstacleVtable = 0x2c11930;
+u64 kTriggerObstacleFn = 0xf46140;
+// ---- campanha junto (4.1.1): a fase vem do objeto da fase atual; GotoLevel e o que o portal/portas chamam ----
+constexpr u64 kGameGlobal = 0x3130890;   // jogo (eboot+cd4910 devolve): +0x120 +0x70 +0xdf8 +0x18 = fase atual
+constexpr u64 kLevelLoader = 0x3174668;  // LevelLoader global (rdi do GotoLevel)
+u64 kGotoLevelFn = 0x1a61330;            // (LevelLoader, numero da fase, 0, opcoes|0): pede a troca de fase
+u64 kLevelByIdFn = 0x1985250;            // (numero) -> objeto da fase (+0x48 caminho do pacote, +0x80 numero)
+u64 kLevelValidFn = 0x1985bc0;           // (numero) -> existe? // (nao usado, obstaculo, quem acionou): alavancas, coisas de usar
+
+bool IsGadgetVtable(u64 vt) {
+    for (u64 v : kGadgetVtables) {
+        if (vt == reinterpret_cast<u64>(g_base) + v) return true;
+    }
+    return false;
+}
+
+bool ValidGadget(u64 ctx) {
+    return ctx && Readable(ctx, 0x290) && IsGadgetVtable(At<u64>(ctx));
+}
+
+std::string GadgetName(u64 ctx) {
+    const u64 p = At<u64>(ctx + 0xf0);
+    if (!p || !Readable(p, 1)) return {};
+    std::string s;
+    for (int i = 0; i < 63 && Readable(p + i, 1); ++i) {
+        const char ch = At<char>(p + i);
+        if (!ch) break;
+        if (ch <= ' ' || ch == '|' || ch > '~') return {};
+        s += ch;
+    }
+    return s;
+}
+
+// Os gadgets nao passam por um construtor que de para interceptar (vem prontos do pacote do level): uma varredura da
+// memoria do jogo (0x1000000000..0x1100000000) em segundo plano acha os contextos pela vtable. ReadProcessMemory no
+// proprio processo: uma pagina liberada no meio do caminho so falha a leitura (nao derruba o jogo).
+std::atomic<bool> g_gadget_scan_busy{false};
+double g_gadget_scan_time = -100;
+
+constexpr u64 kCharacterVtable = 0x2bdf860; // personagens (jogadores, capangas, Doc Brown...): nome em +0x10
+std::vector<u64> g_characters; // da ultima varredura (g_gadget_mutex)
+
+void ScanGadgets() {
+    const u64 want_char = reinterpret_cast<u64>(g_base) + kCharacterVtable;
+    std::vector<u64> found, chars;
+    std::vector<u64> buf(1 << 17); // 1 MB
+    HANDLE self = GetCurrentProcess();
+    for (u64 addr = 0x1000000000ull; addr < 0x1100000000ull;) {
+        MEMORY_BASIC_INFORMATION mbi{};
+        if (!VirtualQuery(reinterpret_cast<void*>(addr), &mbi, sizeof(mbi))) break;
+        const u64 base = reinterpret_cast<u64>(mbi.BaseAddress), end = base + mbi.RegionSize;
+        if (mbi.State == MEM_COMMIT && (mbi.Protect & (PAGE_READWRITE | PAGE_READONLY | PAGE_EXECUTE_READWRITE)) &&
+            !(mbi.Protect & PAGE_GUARD)) {
+            for (u64 p = base; p < end; p += buf.size() * 8) {
+                const SIZE_T want_bytes = static_cast<SIZE_T>(std::min<u64>(buf.size() * 8, end - p));
+                SIZE_T got = 0;
+                if (!ReadProcessMemory(self, reinterpret_cast<void*>(p), buf.data(), want_bytes, &got)) continue;
+                for (SIZE_T i = 0; i < got / 8; ++i) {
+                    if (buf[i] == want_char) chars.push_back(p + i * 8);
+                    else if ((buf[i] >> 24) == ((reinterpret_cast<u64>(g_base) + 0x2c00000) >> 24) && IsGadgetVtable(buf[i])) {
+                        found.push_back(p + i * 8);
+                    }
+                }
+            }
+        }
+        addr = end;
+    }
+    std::lock_guard lock(g_gadget_mutex);
+    g_gadgets.swap(found);
+    g_characters.swap(chars);
+}
+
+void StartGadgetScan(double now) {
+    if (g_gadget_scan_busy.exchange(true)) return;
+    g_gadget_scan_time = now;
+    std::thread([] {
+        ScanGadgets();
+        g_gadget_scan_busy = false;
+    }).detach();
+}
+
+// os gadgets vivos com este nome, em ordem de endereco (o "ordem" do aviso desempata nomes repetidos)
+std::vector<u64> GadgetsNamed(const std::string& name) {
+    std::vector<u64> out;
+    std::lock_guard lock(g_gadget_mutex);
+    for (u64 g : g_gadgets) {
+        if (ValidGadget(g) && GadgetName(g) == name && std::find(out.begin(), out.end(), g) == out.end()) out.push_back(g);
+    }
+    std::sort(out.begin(), out.end());
+    return out;
+}
+
+bool IsLocalPlayer(u64 inst) {
+    if (!inst) return false;
+    for (int k = 0; k < 2; ++k) {
+        if (At<u64>(reinterpret_cast<u64>(g_base) + kPlayerTable + 8 * k) == inst) return true;
+    }
+    return false;
+}
+
+std::string CurrentArea() {
+    std::lock_guard lock(g_area_mutex);
+    return g_area;
+}
+
+HLE_SYSV_ABI u64 BlowUpHook(u64 ctx, u64 who, u64 a, u64 b, u64 c, u64 d, u64 st0, u64 st1) {
+    if (!g_applying && g_enabled && ValidGadget(ctx) && At<u64>(ctx) == reinterpret_cast<u64>(g_base) + kBlowUpVtable &&
+        !At<u8>(ctx + 0x260) && IsLocalPlayer(who)) {
+        const std::string name = GadgetName(ctx);
+        if (!name.empty()) {
+            const std::vector<u64> same = GadgetsNamed(name);
+            const auto it = std::find(same.begin(), same.end(), ctx);
+            const int order = it == same.end() ? 0 : static_cast<int>(it - same.begin());
+            runtime::mp_net::SendEvent("b|" + CurrentArea() + "|" + name + "|" + std::to_string(order));
+            std::printf("[MP] quebrei %s (#%d): avisando a sala\n", name.c_str(), order);
+            std::fflush(stdout);
+        }
+    }
+    return g_blowup(ctx, who, a, b, c, d, st0, st1);
+}
+
+SetupFn g_trigger_obstacle = nullptr;
+
+HLE_SYSV_ABI u64 TriggerObstacleHook(u64 unused, u64 ctx, u64 who, u64 a, u64 b, u64 c) {
+    if (!g_applying && g_enabled && ValidGadget(ctx) && IsLocalPlayer(who)) {
+        const std::string name = GadgetName(ctx);
+        if (!name.empty()) {
+            const std::vector<u64> same = GadgetsNamed(name);
+            const auto it = std::find(same.begin(), same.end(), ctx);
+            const int order = it == same.end() ? 0 : static_cast<int>(it - same.begin());
+            runtime::mp_net::SendEvent("o|" + CurrentArea() + "|" + name + "|" + std::to_string(order));
+            std::printf("[MP] acionei %s (#%d): avisando a sala\n", name.c_str(), order);
+            std::fflush(stdout);
+        }
+    }
+    return g_trigger_obstacle(unused, ctx, who, a, b, c);
 }
 
 HLE_SYSV_ABI u64 RequestDtorHook(u64 request, u64 a, u64 b, u64 c, u64 d, u64 e) {
@@ -688,6 +1051,19 @@ bool ReclaimForCloser(const Puppet& wanting, double now) {
     return true;
 }
 
+// 4.1.1: os slots nao dao para 16 personagens diferentes (o jogo tem memoria para 8). Quem fica sem slot aparece com
+// um personagem que ja esta carregado: primeiro um que NOS carregamos (nunca e descarregado com fantasma em cima), senao
+// o do proprio jogador. O nome em cima continua sendo o dele; quando sobra um slot, vira o personagem certo.
+u64 StandInSlot() {
+    for (int i = 0; i < g_nall; ++i) {
+        const u64 slot = SlotAddress(i);
+        const auto it = g_our_slots.find(slot);
+        if (SlotState(i) == 1 && it != g_our_slots.end() && SlotName(i) == it->second + ".cd") return slot;
+    }
+    const u64 p1 = At<u64>(reinterpret_cast<u64>(g_base) + kPlayerTable);
+    return p1 ? FindLoadedSlot(LocalCharacter(p1)) : 0;
+}
+
 // ---- spawn / despawn --------------------------------------------------------------------------------------------
 bool ValidSpawner(u64 spawner) {
     return Readable(spawner, 0x200) && At<u64>(spawner) == reinterpret_cast<u64>(g_base) + kSpawnerVtable;
@@ -717,12 +1093,57 @@ bool PickSpawner(u64* spawner, u64* request) {
             return true;
         }
     }
+    // Fases de historia: o jogo le sub-areas depois que a figura nasce (a epoca muda) e nenhuma figura nasce de novo.
+    // Vale um spawner de antes se o personagem do pedido dele e o jogador 1 ou 2 vivo agora (entao o spawner existe).
+    for (int k = 0; k < 2; ++k) {
+        const u64 player = At<u64>(reinterpret_cast<u64>(g_base) + kPlayerTable + 8 * k);
+        if (!player) continue;
+        for (auto it = g_spawners.rbegin(); it != g_spawners.rend(); ++it) {
+            if (!ValidSpawner(it->spawner)) continue;
+            const u64 r = TemplateRequest(it->spawner);
+            const u64 comp = r && Readable(r + 0x40, 8) ? At<u64>(r + 0x40) : 0;
+            if (comp && Readable(comp + 0x20, 8) && At<u64>(comp + 0x20) == player) {
+                it->epoch = epoch; // vale nesta area
+                *spawner = it->spawner;
+                *request = r;
+                return true;
+            }
+        }
+    }
+    // 4.1.1: o jogador trocou ou tirou a figura (o pedido nao aponta mais para ele) e a area foi relida: vale o spawner
+    // mais recente visto nesta mesma area que ainda tenha um pedido modelo
+    std::string area;
+    {
+        std::lock_guard area_lock(g_area_mutex);
+        area = g_area;
+    }
+    for (auto it = g_spawners.rbegin(); it != g_spawners.rend(); ++it) {
+        if (area.empty() || it->area != area || !ValidSpawner(it->spawner)) continue;
+        if (u64 r = TemplateRequest(it->spawner)) {
+            it->epoch = epoch;
+            *spawner = it->spawner;
+            *request = r;
+            return true;
+        }
+    }
     return false;
+}
+
+const char* SlotLabel(u64 slot) {
+    return slot && Readable(slot + 0xb8, 48) ? reinterpret_cast<const char*>(slot + 0xb8) : "-";
 }
 
 bool Spawn(Puppet& p) {
     u64 spawner = 0, model = 0;
-    if (!PickSpawner(&spawner, &model)) return false;
+    if (!PickSpawner(&spawner, &model)) {
+        static double last_note = -100;
+        if (runtime::mp_net::Now() - last_note > 10.0) {
+            last_note = runtime::mp_net::Now();
+            std::printf("[MP] sem spawner para o fantasma (%zu vistos)\n", g_spawners.size());
+            std::fflush(stdout);
+        }
+        return false;
+    }
     const u64 request = GameAlloc(0xf0);
     if (!request) return false;
     std::memcpy(reinterpret_cast<void*>(request), reinterpret_cast<const void*>(model), 0xf0);
@@ -737,8 +1158,8 @@ bool Spawn(Puppet& p) {
     p.request = request;
     p.spawner = spawner;
     LiveAdd(request);
-    std::printf("[MP] spawn: spawner %llx (slot %s) com slot %s\n", static_cast<unsigned long long>(spawner),
-                reinterpret_cast<const char*>(original_slot + 0xb8), reinterpret_cast<const char*>(p.slot + 0xb8));
+    std::printf("[MP] spawn: spawner %llx (slot %s) com slot %s%s\n", static_cast<unsigned long long>(spawner),
+                SlotLabel(original_slot), SlotLabel(p.slot), p.standin ? " (substituto)" : "");
     std::fflush(stdout);
     g_spawning = true;
     g_spawning_flag_for_load = true;
@@ -793,6 +1214,7 @@ bool ParseRemote(const std::string& text, Remote* r) {
     r->held = static_cast<u32>(std::strtoul(f[10].c_str(), nullptr, 16));
     r->ingame = f[11] == "1";
     r->rtt_ms = f.size() > 12 ? std::clamp(std::atoi(f[12].c_str()), 0, 2000) : 0;
+    r->level = f.size() > 13 ? f[13] : std::string();
     r->valid = std::isfinite(r->x) && std::isfinite(r->y) && std::isfinite(r->z);
     return r->valid;
 }
@@ -904,17 +1326,179 @@ std::string LocalCharacter(u64 inst) {
 
 std::atomic<bool> g_in_world{false}; // o jogador 1 esta numa fase (para os avisos na tela)
 
+// ---- campanha junto ------------------------------------------------------------------------------------------
+u64 CurrentLevelObj() {
+    u64 p = At<u64>(reinterpret_cast<u64>(g_base) + kGameGlobal);
+    for (u64 off : {0x120ull, 0x70ull, 0xdf8ull, 0x18ull}) {
+        if (!p || !Readable(p + off, 8)) return 0;
+        p = At<u64>(p + off);
+    }
+    return p && Readable(p, 0x88) ? p : 0;
+}
+
+std::string LevelPath(u64 obj) {
+    const u64 s = obj && Readable(obj + 0x48, 8) ? At<u64>(obj + 0x48) : 0;
+    if (!s || !Readable(s, 1)) return {};
+    std::string out;
+    for (int i = 0; i < 160 && Readable(s + i, 1); ++i) {
+        const char c = At<char>(s + i);
+        if (!c) break;
+        if (c < 32 || c > 126 || c == '|') return {};
+        out += c;
+    }
+    return out;
+}
+
+// caminho do pacote -> numeros das fases com ele, em ordem (o numero muda com as DLCs; a ordem dentro do pacote nao)
+std::map<std::string, std::vector<int>> g_level_index;
+double g_level_index_time = -100;
+
+// As listas de fases das DLCs sao lidas depois da tela de carregamento: uma fase que nao esta no indice refaz o
+// indice (no maximo a cada 10 s).
+void BuildLevelIndex(bool again = false) {
+    const double now = runtime::mp_net::Now();
+    if (g_level_index_time > -100 && !(again && now - g_level_index_time > 10.0)) return;
+    g_level_index_time = now;
+    g_level_index.clear();
+    int found = 0;
+    for (int id = 0; id < 8192; ++id) { // as das DLCs ficam depois de um buraco grande (~2600)
+        if (!(Call(kLevelValidFn, static_cast<u64>(id)) & 0xff)) continue;
+        const u64 obj = Call(kLevelByIdFn, static_cast<u64>(id));
+        const std::string path = LevelPath(obj);
+        if (path.empty()) continue;
+        g_level_index[path].push_back(id);
+        ++found;
+    }
+    std::printf("[MP] fases: %d (%zu pacotes)\n", found, g_level_index.size());
+    std::fflush(stdout);
+}
+
+std::string LevelKeyIn(const std::string& path, int id) {
+    const auto it = g_level_index.find(path);
+    if (it == g_level_index.end()) return {};
+    const auto pos = std::find(it->second.begin(), it->second.end(), id);
+    if (pos == it->second.end()) return {};
+    return path + "#" + std::to_string(pos - it->second.begin());
+}
+
+std::string LevelKey(u64 obj) {
+    if (!obj) return {};
+    const std::string path = LevelPath(obj);
+    if (path.empty()) return {};
+    const int id = At<s16>(obj + 0x80);
+    BuildLevelIndex();
+    std::string key = LevelKeyIn(path, id);
+    if (key.empty()) {
+        BuildLevelIndex(true);
+        key = LevelKeyIn(path, id);
+    }
+    return key;
+}
+
+int LevelIdIn(const std::string& key) {
+    const size_t hash = key.rfind('#');
+    if (hash == std::string::npos) return -1;
+    const auto it = g_level_index.find(key.substr(0, hash));
+    const int order = std::atoi(key.c_str() + hash + 1);
+    if (it == g_level_index.end() || order < 0 || order >= static_cast<int>(it->second.size())) return -1;
+    return it->second[order];
+}
+
+int LevelIdForKey(const std::string& key) {
+    BuildLevelIndex();
+    int id = LevelIdIn(key);
+    if (id < 0) {
+        BuildLevelIndex(true);
+        id = LevelIdIn(key);
+    }
+    return id;
+}
+
+std::string g_level_key; // a fase atual deste jogo (atualizada no Tick)
+double g_level_request_time = -100; // quando este jogo pediu uma troca de fase (seguindo o dono)
+u64 g_level_obj = 0;
+
+void UpdateLevelKey() {
+    const u64 obj = CurrentLevelObj();
+    if (obj == g_level_obj) return;
+    g_level_obj = obj;
+    const std::string key = LevelKey(obj);
+    if (key != g_level_key) {
+        g_level_key = key;
+        std::printf("[MP] fase atual: %s (%d)\n", key.empty() ? "-" : key.c_str(), obj ? At<s16>(obj + 0x80) : -1);
+        std::fflush(stdout);
+    }
+}
+
+// Todos seguem o dono da sala: quando ele esta em outra fase (2 s parado nela), este jogo pede a mesma fase.
+// Uma fase que nao deu (DLC que falta...) espera 60 s para tentar de novo.
+std::atomic<bool> g_follow_owner{true};
+
+void FollowOwner(double now) {
+    const bool off = !g_follow_owner || std::getenv("LD_MP_NOFOLLOW") != nullptr;
+    static std::string owner_key, failed_key, pending_key;
+    static double owner_since = 0, cooldown = 0, failed_until = 0, pending_time = 0;
+    const int owner = runtime::mp_net::OwnerId(), self = runtime::mp_net::SelfId();
+    if (off || !owner || !self || owner == self) return;
+    const auto it = g_puppets.find(owner);
+    if (it == g_puppets.end()) return;
+    const Remote& r = it->second.cur;
+    if (!r.valid || !r.ingame || now - it->second.cur_time > 3.0 || r.level.empty()) return;
+    if (r.level != owner_key) {
+        owner_key = r.level;
+        owner_since = now;
+    }
+    if (!pending_key.empty()) { // pediu a troca: deu certo?
+        if (g_level_key == pending_key) {
+            pending_key.clear();
+        } else if (now - pending_time > 25.0) {
+            Log("[MP] nao consegui ir para a fase %s do dono da sala (tento de novo em 60 s)", pending_key);
+            failed_key = pending_key;
+            failed_until = now + 60.0;
+            pending_key.clear();
+        }
+        return;
+    }
+    if (!g_in_world || g_level_key.empty() || r.level == g_level_key || now - owner_since < 2.0 || now < cooldown) return;
+    if (r.level == failed_key && now < failed_until) return;
+    {
+        std::lock_guard lock(g_area_mutex);
+        if (now - g_area_time < 4.0) return; // ainda carregando a area
+    }
+    const int id = LevelIdForKey(r.level);
+    if (id < 0) {
+        Log("[MP] o dono da sala esta na fase %s, que este jogo nao tem (DLC?)", r.level);
+        failed_key = r.level;
+        failed_until = now + 60.0;
+        return;
+    }
+    Log("[MP] seguindo o dono da sala %s: indo para a fase %s", it->second.name, r.level);
+    // os fantasmas saem antes (a fase vai ser desmontada)
+    for (auto& [pid, p] : g_puppets) {
+        if (p.stage == Stage::kSpawning || p.stage == Stage::kActive) Despawn(p);
+        p.stage = Stage::kNone;
+    }
+    g_drive_count = 0;
+    g_level_request_time = now;
+    Call(kGotoLevelFn, reinterpret_cast<u64>(g_base) + kLevelLoader, static_cast<u64>(id), 0, 0);
+    pending_key = r.level;
+    pending_time = now;
+    cooldown = now + 8.0;
+}
+
 void SendLocal(u64 p1, double now) {
     std::string area;
     {
         std::lock_guard lock(g_area_mutex);
         area = g_area;
     }
-    char text[256];
-    const u64 t = p1 ? Transform(p1) : 0;
-    const u64 loc = p1 && Readable(p1 + 0x90, 8) ? At<u64>(p1 + 0x90) : 0;
-    if (!p1 || !t || !loc || area.empty()) {
-        std::snprintf(text, sizeof(text), "%s|-|0|0|0|3|0|1|0|1|0|0", area.empty() ? "-" : area.c_str());
+    char text[448];
+    const u64 t0 = p1 ? Transform(p1) : 0;
+    const u64 t = t0 && Readable(t0 + 0x90, 12) ? t0 : 0;
+    const u64 loc0 = p1 && Readable(p1 + 0x90, 8) ? At<u64>(p1 + 0x90) : 0;
+    const u64 loc = loc0 && Readable(loc0 + 0x80, 0x1c0) ? loc0 : 0; // na troca de fase o ponteiro fica solto (lixo)
+    if (!p1 || !t || !loc || area.empty() || !Readable(p1 + 0x170, 0x240)) {
+        std::snprintf(text, sizeof(text), "%s|-|0|0|0|3|0|1|0|1|0|0|0|%s", area.empty() ? "-" : area.c_str(), g_level_key.c_str());
         runtime::mp_net::SetLocalState(text);
         g_in_world = false;
         return;
@@ -931,10 +1515,10 @@ void SendLocal(u64 p1, double now) {
     } else if (now - g_held_latch_time > 0.08) {
         g_held_latch = 0;
     }
-    std::snprintf(text, sizeof(text), "%s|%s|%.3f|%.3f|%.3f|%d|%.3f|%.3f|%.3f|%.3f|%x|1|%d", area.c_str(),
+    std::snprintf(text, sizeof(text), "%s|%s|%.3f|%.3f|%.3f|%d|%.3f|%.3f|%.3f|%.3f|%x|1|%d|%s", area.c_str(),
                   LocalCharacter(p1).c_str(), At<float>(t + 0x90), At<float>(t + 0x94), At<float>(t + 0x98),
                   At<s32>(loc + 0x238), At<float>(loc + 0x80), At<float>(loc + 0x88), At<float>(p1 + 0x170),
-                  At<float>(p1 + 0x178), held | g_held_latch, runtime::mp_net::RttMs());
+                  At<float>(p1 + 0x178), held | g_held_latch, runtime::mp_net::RttMs(), g_level_key.c_str());
     runtime::mp_net::SetLocalState(text);
 }
 
@@ -974,7 +1558,9 @@ bool ResolveFunctions() {
     if (s_ok >= 0) return s_ok == 1;
     s_ok = 0;
     if (!g_base || FnAt(kControlFn) != kControlFn) return false;
-    for (u64* f : {&kSpawnFn, &kRequestDtorFn, &kRequestDeleteFn, &kSlotLoadFn, &kListPushFn, &kSlotStateFn, &kLevelSetupFn}) {
+    for (u64* f : {&kSpawnFn, &kRequestDtorFn, &kRequestDeleteFn, &kSlotLoadFn, &kListPushFn, &kSlotStateFn, &kLevelSetupFn,
+                   &kDescFn, &kAllocFn, &kFreeFn, &kFireEventFn, &kKillObjectFn, &kBlowUpFn, &kTriggerObstacleFn,
+                   &kGotoLevelFn, &kLevelByIdFn, &kLevelValidFn}) {
         const u64 o = FnAt(*f);
         if (!o) {
             std::printf("[MP] eboot+0x%llx: funcao nao reconhecida, multiplayer desligado\n", static_cast<unsigned long long>(*f));
@@ -1001,6 +1587,11 @@ bool InstallHooks() {
     if (const char* env = std::getenv("LD_MP_SLOTS")) g_extra_slots = std::clamp(std::atoi(env) - 7, 0, 1);
     g_setup = reinterpret_cast<SetupFn>(Hook(kLevelSetupFn, reinterpret_cast<const void*>(&LevelSetupHook))); // sem ele: so o portal
     g_slot_load = reinterpret_cast<SetupFn>(Hook(kSlotLoadFn, reinterpret_cast<const void*>(&SlotLoadHook)));
+    // Fase 80: objetos que os outros quebram no mundo deles quebram no nosso
+    g_blowup = reinterpret_cast<BlowUpFn>(Hook(kBlowUpFn, reinterpret_cast<const void*>(&BlowUpHook)));
+    g_trigger_obstacle = reinterpret_cast<SetupFn>(Hook(kTriggerObstacleFn, reinterpret_cast<const void*>(&TriggerObstacleHook)));
+    if (!g_kill_object) g_kill_object = reinterpret_cast<KillFn>(Hook(kKillObjectFn, reinterpret_cast<const void*>(&KillObjectHook)));
+
     if (!g_control || !g_spawn || !g_dtor) {
         std::printf("[MP] eboot diferente: multiplayer desligado\n");
         g_enabled = false; // os ganchos que entraram so repassam (sem fantasmas nada muda)
@@ -1012,6 +1603,12 @@ bool InstallHooks() {
 
 void Install(std::uint8_t* eboot_base) {
     g_base = eboot_base;
+    ResolveFunctions(); // antes de qualquer gancho (o prologo e conferido)
+    if (std::getenv("LD_MP_EVENTS") && !g_fire_event) { // pesquisa: registra os eventos do jogo (mesmo sem multiplayer)
+        g_fire_event = reinterpret_cast<SetupFn>(Hook(kFireEventFn, reinterpret_cast<const void*>(&FireEventHook)));
+        g_kill_object = reinterpret_cast<KillFn>(Hook(kKillObjectFn, reinterpret_cast<const void*>(&KillObjectHook)));
+        std::printf("[EV] registro de eventos ligado\n");
+    }
     if (!g_enabled) return; // desligado: nenhum gancho (a sala do F3 liga depois, pelo Connect)
     if (!ResolveFunctions() || !InstallHooks()) {
         g_enabled = false;
@@ -1049,6 +1646,8 @@ bool Connect(const std::string& server, const std::string& room, const std::stri
 }
 
 bool InWorld() { return g_enabled && g_in_world; }
+void SetFollowOwner(bool on) { g_follow_owner = on; }
+bool FollowOwnerEnabled() { return g_follow_owner; }
 
 void OnArea(const std::string& area) {
     if (!g_enabled) return;
@@ -1059,6 +1658,112 @@ void OnArea(const std::string& area) {
     }
     g_area = area;
     g_area_time = now;
+}
+
+bool IsPuppet(u64 inst) {
+    for (const auto& [id, p] : g_puppets) {
+        if (p.inst == inst) return true;
+    }
+    return false;
+}
+
+// personagens vivos com este nome (sem jogadores nem fantasmas), em ordem de endereco
+std::vector<u64> CharactersNamed(const std::string& name) {
+    std::vector<u64> out;
+    const u64 want = reinterpret_cast<u64>(g_base) + kCharacterVtable;
+    std::lock_guard lock(g_gadget_mutex);
+    for (u64 c : g_characters) {
+        if (Readable(c, 0x500) && At<u64>(c) == want && !IsLocalPlayer(c) && !IsPuppet(c) && LocalCharacter(c) == name) out.push_back(c);
+    }
+    std::sort(out.begin(), out.end());
+    return out;
+}
+
+// O nosso jogador derrubou um personagem (capanga...): avisa a sala ("k|area|nome|ordem")
+void OnLocalKill(u64 obj, u64 killer) {
+    if (g_applying || !g_enabled || !IsLocalPlayer(killer) || !Readable(obj, 0x500)) return;
+    if (At<u64>(obj) != reinterpret_cast<u64>(g_base) + kCharacterVtable || IsLocalPlayer(obj) || IsPuppet(obj)) return;
+    const std::string name = LocalCharacter(obj);
+    if (name.empty()) return;
+    const std::vector<u64> same = CharactersNamed(name);
+    const auto it = std::find(same.begin(), same.end(), obj);
+    const int order = it == same.end() ? 0 : static_cast<int>(it - same.begin());
+    runtime::mp_net::SendEvent("k|" + CurrentArea() + "|" + name + "|" + std::to_string(order));
+    std::printf("[MP] derrubei %s (#%d): avisando a sala\n", name.c_str(), order);
+    std::fflush(stdout);
+}
+
+struct PendingEvent {
+    int from;
+    std::string payload;
+    double time;
+};
+std::vector<PendingEvent> g_pending_events; // esperando a varredura achar o objeto
+
+// Fase 80: aplica os avisos dos outros jogadores ("b|area|nome|ordem" = quebrou um objeto explodivel)
+void ApplyEvent(int from, const std::string& payload, double now) {
+    std::vector<std::string> f;
+    size_t pos = 0;
+    while (pos <= payload.size()) {
+        const size_t bar = payload.find('|', pos);
+        f.push_back(payload.substr(pos, bar == std::string::npos ? std::string::npos : bar - pos));
+        if (bar == std::string::npos) break;
+        pos = bar + 1;
+    }
+    if (f.size() < 4 || (f[0] != "b" && f[0] != "k" && f[0] != "o")) return;
+    if (f[1] != CurrentArea()) return; // outra area: o objeto nem existe aqui
+    if (f[0] == "k") { // derrubou um personagem
+        const std::vector<u64> same = CharactersNamed(f[2]);
+        if (same.empty()) {
+            g_pending_events.push_back({from, payload, now});
+            if (now - g_gadget_scan_time > 2.0) StartGadgetScan(now);
+            return;
+        }
+        const size_t order = static_cast<size_t>(std::max(0, std::atoi(f[3].c_str())));
+        const u64 victim = same[std::min(order, same.size() - 1)];
+        u64 who = At<u64>(reinterpret_cast<u64>(g_base) + kPlayerTable);
+        const auto it = g_puppets.find(from);
+        if (it != g_puppets.end() && it->second.stage == Stage::kActive && it->second.inst) who = it->second.inst;
+        g_applying = true;
+        Call8(kKillObjectFn, victim, 3, who, 0, 0, 0, 0, 0);
+        g_applying = false;
+        std::printf("[MP] %d derrubou %s: derrubado aqui tambem\n", from, f[2].c_str());
+        std::fflush(stdout);
+        return;
+    }
+    const std::vector<u64> same = GadgetsNamed(f[2]);
+    const size_t order = static_cast<size_t>(std::max(0, std::atoi(f[3].c_str())));
+    if (same.empty()) {
+        g_pending_events.push_back({from, payload, now});
+        if (now - g_gadget_scan_time > 2.0) StartGadgetScan(now);
+        return;
+    }
+    const u64 ctx = same[std::min(order, same.size() - 1)];
+    if (f[0] == "o") { // acionou um obstaculo (alavanca, coisa de usar...)
+        u64 user = At<u64>(reinterpret_cast<u64>(g_base) + kPlayerTable);
+        const auto pit = g_puppets.find(from);
+        if (pit != g_puppets.end() && pit->second.stage == Stage::kActive && pit->second.inst) user = pit->second.inst;
+        if (!user) return;
+        g_applying = true;
+        Call(kTriggerObstacleFn, 0, ctx, user);
+        g_applying = false;
+        std::printf("[MP] %d acionou %s: acionado aqui tambem\n", from, f[2].c_str());
+        std::fflush(stdout);
+        return;
+    }
+    if (At<u64>(ctx) != reinterpret_cast<u64>(g_base) + kBlowUpVtable) return;
+    if (At<u8>(ctx + 0x260)) return; // ja quebrado aqui tambem
+    // quem quebrou: o fantasma dele (se esta aparecendo), senao o nosso jogador (o jogo precisa de alguem)
+    u64 who = At<u64>(reinterpret_cast<u64>(g_base) + kPlayerTable);
+    const auto it = g_puppets.find(from);
+    if (it != g_puppets.end() && it->second.stage == Stage::kActive && it->second.inst) who = it->second.inst;
+    if (!who) return;
+    g_applying = true;
+    Call8(kBlowUpFn, ctx, who, 0, 1, 0, 0, 0, 0);
+    g_applying = false;
+    std::printf("[MP] %d quebrou %s: quebrado aqui tambem\n", from, f[2].c_str());
+    std::fflush(stdout);
+    (void)now;
 }
 
 void Tick() {
@@ -1076,8 +1781,15 @@ void Tick() {
         regions_time = now;
         g_region_count = g_region_next = 0;
     }
-    const u64 p1 = At<u64>(reinterpret_cast<u64>(g_base) + kPlayerTable);
+    u64 p1 = At<u64>(reinterpret_cast<u64>(g_base) + kPlayerTable);
+    // 4.1.1: na troca de fase o jogador 1 da tabela pode ja ter sido liberado (vtable lixo): nao mexe nele. E logo
+    // depois de NOS pedirmos a troca (seguindo o dono), espera 3 s.
+    if (p1 && (!Readable(p1, 0x500) || At<u64>(p1) < reinterpret_cast<u64>(g_base) ||
+               At<u64>(p1) >= reinterpret_cast<u64>(g_base) + 0x3400000 || now - g_level_request_time < 3.0)) {
+        p1 = 0;
+    }
     UpdateSlotCounts();
+    UpdateLevelKey();
     SendLocal(p1, now);
 
     std::string area;
@@ -1107,6 +1819,28 @@ void Tick() {
     for (auto& [id, p] : g_puppets) {
         if (p.slot && p.stage != Stage::kNone) g_slot_used[p.slot] = now;
     }
+    {
+        static unsigned scanned_epoch = ~0u;
+        if (scanned_epoch != g_area_epoch && now - g_area_time > 4.0) { // area nova carregada: lista os objetos
+            scanned_epoch = g_area_epoch;
+            StartGadgetScan(now);
+        }
+        if (!g_pending_events.empty() && !g_gadget_scan_busy) { // a varredura terminou: tenta de novo
+            std::vector<PendingEvent> retry;
+            retry.swap(g_pending_events);
+            for (const PendingEvent& e : retry) {
+                if (now - e.time > 6.0) {
+                    std::printf("[MP] aviso de %d (%s): objeto nao achado aqui\n", e.from, e.payload.c_str());
+                    std::fflush(stdout);
+                } else if (e.time < g_gadget_scan_time) {
+                    ApplyEvent(e.from, e.payload, e.time); // a lista ja inclui a varredura feita depois do aviso
+                } else {
+                    g_pending_events.push_back(e);
+                }
+            }
+        }
+    }
+    for (const auto& [from, payload] : runtime::mp_net::TakeEvents()) ApplyEvent(from, payload, now);
     TrackState2(now);
     SlotMaintenance(now);
     ReclaimReserve(now);
@@ -1123,6 +1857,7 @@ void Tick() {
             ++it;
         }
     }
+    FollowOwner(now);
     Drive old[kMaxPuppets];
     const int old_count = g_drive_count;
     std::copy(g_drive, g_drive + old_count, old);
@@ -1145,6 +1880,8 @@ void Tick() {
         const bool want = settled && p.cur.valid && p.cur.ingame && p.cur.area == area && now - p.cur_time < 6.0 &&
                           p.cur.chr != "-" && !p.cur.chr.empty();
         p.want = want;
+        if (!want) p.want_since = 0;
+        else if (!p.want_since) p.want_since = now;
         if (const u64 t = p1 ? Transform(p1) : 0) {
             p.distance = std::hypot(p.cur.x - At<float>(t + 0x90), p.cur.z - At<float>(t + 0x98));
         }
@@ -1156,10 +1893,18 @@ void Tick() {
         switch (p.stage) {
         case Stage::kNone:
             if (now < p.retry_time || now - g_last_spawn < 0.5) break;
-            if (g_unsupported.count(Lower(p.cur.chr))) break; // personagem que nao e figura (so o nome aparece)
             p.retry_time = now + 1.0;
+            if (g_unsupported.count(Lower(p.cur.chr))) { // personagem que nao e figura: aparece com um substituto
+                if (u64 slot = StandInSlot()) {
+                    p.slot = slot;
+                    p.standin = true;
+                    p.stage = Stage::kReady;
+                }
+                break;
+            }
             if (u64 slot = FindLoadedSlot(p.cur.chr)) {
                 p.slot = slot;
+                p.standin = false;
                 p.stage = Stage::kReady;
             } else if (CanLoad() && SomeoneLoading()) {
                 // o jogo carrega um personagem por vez: espera a vez (enquanto isso so o nome aparece)
@@ -1178,6 +1923,7 @@ void Tick() {
                     g_our_chars.push_back(low);
                 }
                 p.loading = p.cur.chr;
+                p.standin = false;
                 p.slot = IsSlot(slot) ? slot : 0;
                 if (p.slot) g_our_slots[p.slot] = Lower(p.cur.chr);
                 p.stage = p.slot ? Stage::kLoading : Stage::kNone;
@@ -1187,8 +1933,14 @@ void Tick() {
                 Log("[MP] carregando %s para %s", p.cur.chr, p.name);
             } else if (!SomeoneLoading() && now - p.load_fail_time > 15.0 && RecycleSlot()) {
                 p.retry_time = now + 1.0; // o slot esvazia em seguida; carrega na proxima tentativa
-            } else if (!SomeoneLoading()) {
-                ReclaimForCloser(p, now); // sem slot: tira de quem esta bem mais longe (senao, so o nome por enquanto)
+            } else if (!SomeoneLoading() && ReclaimForCloser(p, now)) {
+                // sem slot: tirou de quem esta bem mais longe (esse aparece com um substituto)
+            } else if (now - p.want_since > 3.0) {
+                if (u64 slot = StandInSlot()) { // sem slot por enquanto: aparece com um personagem ja carregado
+                    p.slot = slot;
+                    p.standin = true;
+                    p.stage = Stage::kReady;
+                }
             }
             break;
         case Stage::kLoading:
@@ -1229,7 +1981,9 @@ void Tick() {
                 // nome que o jogo nao conhece como figura (ex.: Wheatley): o descritor cai no personagem do spawner.
                 // A primeira vez pode ser so a carga recente; na terceira desiste e mostra so o nome.
                 const std::string low = Lower(p.cur.chr);
-                if (Lower(LocalCharacter(inst)) == low) {
+                if (p.standin) {
+                    // substituto: ja sabe que e outro personagem
+                } else if (Lower(LocalCharacter(inst)) == low) {
                     g_wrong_count.erase(low);
                 } else if (++g_wrong_count[low] >= 3) {
                     g_unsupported.insert(low);
@@ -1248,7 +2002,8 @@ void Tick() {
                 break;
             }
             // o amigo trocou de personagem: refaz o fantasma (se o novo ja esta carregado ou cabe num slot)
-            if (Lower(LocalCharacter(p.inst)) != Lower(p.cur.chr) && now - p.stage_time > 1.0 &&
+            if (Lower(LocalCharacter(p.inst)) != Lower(p.cur.chr) && now - p.stage_time > (p.standin ? 4.0 : 1.0) &&
+                !g_unsupported.count(Lower(p.cur.chr)) &&
                 (FindLoadedSlot(p.cur.chr) || (!SomeoneLoading() && now - p.load_fail_time > 15.0 && (CanLoad() || RecycleSlot())))) {
                 Despawn(p);
                 p.retry_time = 0;

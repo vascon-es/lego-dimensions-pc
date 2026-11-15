@@ -53,9 +53,16 @@ O servidor público é gratuito e dorme depois de 15 minutos sem jogadores. O la
 abre (com o multiplayer ligado), então ele costuma estar acordado quando o jogo chega no menu; se não, a primeira
 conexão pode levar até um minuto (o jogo tenta de novo sozinho). Dá também para rodar o seu: é um repassador pequeno em
 [tools/mp_server](tools/mp_server/README.md) (Node.js, sem dependências), no seu PC ou num serviço grátis do Render.
-Nesta primeira versão os outros jogadores copiam andar, correr, pular e atacar. Todas as figuras funcionam, DLC
-incluída. Quando a sala tem mais personagens diferentes do que os espaços livres de personagem, os jogadores mais
-longe aparecem só com o nome até um espaço liberar.
+Os outros jogadores copiam andar, correr, pular e atacar. Todas as figuras funcionam, DLC incluída.
+
+A partir da 4.2 (alfa):
+- **Campanha junto:** todo mundo vai para a fase em que o dono da sala está (portal, portas e seleção de fase), então
+  dá para jogar a história lado a lado. Cada jogador pode desligar isso no **F4** (**Seguir o dono**).
+- **Mundo compartilhado:** objetos que alguém quebra, capangas que alguém derruba e alavancas que alguém puxa
+  acontecem no jogo de todos na mesma área.
+- **Até 16 jogadores visíveis:** o jogo só tem memória para 8 personagens ao mesmo tempo; quando a sala tem mais
+  personagens diferentes do que isso, os jogadores a mais aparecem com um personagem já carregado (com o nome deles
+  em cima) e viram o personagem certo assim que um espaço libera.
 
 ## Estado
 
