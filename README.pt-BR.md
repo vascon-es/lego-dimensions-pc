@@ -58,8 +58,9 @@ Os outros jogadores copiam andar, correr, pular e atacar. Todas as figuras funci
 A partir da 4.2 (alfa):
 - **Campanha junto:** todo mundo vai para a fase em que o dono da sala está (portal, portas e seleção de fase), então
   dá para jogar a história lado a lado. Cada jogador pode desligar isso no **F4** (**Seguir o dono**).
-- **Mundo compartilhado:** objetos que alguém quebra, capangas que alguém derruba e alavancas que alguém puxa
-  acontecem no jogo de todos na mesma área.
+- **Mundo compartilhado:** objetos que alguém quebra, capangas que alguém derruba, alavancas que alguém puxa, montinhos
+  de peças que alguém monta e o avanço da história dentro da fase (portões, quebra-cabeças, coisas que mudam por etapas)
+  acontecem no jogo de todos na mesma área. Quem chega depois na área recebe do dono da sala o que já aconteceu ali.
 - **Até 16 jogadores visíveis:** o jogo só tem memória para 8 personagens ao mesmo tempo; quando a sala tem mais
   personagens diferentes do que isso, os jogadores a mais aparecem com um personagem já carregado (com o nome deles
   em cima) e viram o personagem certo assim que um espaço libera.

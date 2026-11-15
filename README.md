@@ -74,8 +74,9 @@ The other players copy moving, running, jumping and attacking. All figures work,
 From 4.2 (alpha):
 - **Campaign together:** everyone goes to the level the room owner is in (gateway, doors and level select), so you
   play the story side by side. Each player can turn this off in **F4** (**Follow the owner**).
-- **Shared world:** objects someone breaks, henchmen someone defeats and levers someone pulls happen in everyone's
-  game in the same area.
+- **Shared world:** objects someone breaks, henchmen someone defeats, levers someone pulls, brick piles someone builds
+  and story progress inside the level (gates, puzzles, things that change step by step) happen in everyone's game in
+  the same area. Whoever arrives in the area later gets what already happened there from the room owner.
 - **Up to 16 players visible:** the game only has memory for 8 characters at once, so when a room has more
   different characters than that, the extra players show up as a character that is already loaded (with their own
   name on top) and switch to their real character as soon as a slot frees up.
