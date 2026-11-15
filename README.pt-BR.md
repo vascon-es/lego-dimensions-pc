@@ -55,6 +55,13 @@ conexão pode levar até um minuto (o jogo tenta de novo sozinho). Dá também p
 [tools/mp_server](tools/mp_server/README.md) (Node.js, sem dependências), no seu PC ou num serviço grátis do Render.
 Os outros jogadores copiam andar, correr, pular e atacar. Todas as figuras funcionam, DLC incluída.
 
+A partir da 4.3 (alfa), **conexão direta (P2P)**: o servidor continua achando os jogadores e levando o que acontece no
+mundo, mas o movimento de cada jogador vai direto de PC para PC quando os roteadores deixam (menos atraso, menos carga
+no servidor). Quem não tem caminho direto (roteador ou firewall restrito, versão antiga) continua pelo servidor
+sozinho. O **F4** mostra **DIRETO** ou **VIA SERVIDOR** ao lado de cada jogador, e a linha **Conexão direta (P2P)**
+desliga. Com o P2P ligado, os jogadores da sua sala podem ver o seu IP da internet, como em qualquer jogo P2P. O Windows
+pode perguntar uma vez se deixa o jogo usar a rede: permita para o P2P funcionar.
+
 A partir da 4.2 (alfa):
 - **Campanha junto:** todo mundo vai para a fase em que o dono da sala está (portal, portas e seleção de fase), então
   dá para jogar a história lado a lado. Cada jogador pode desligar isso no **F4** (**Seguir o dono**).

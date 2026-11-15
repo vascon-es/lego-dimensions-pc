@@ -1491,7 +1491,7 @@ void Steer(Puppet& p, double now, Drive* d) {
             vz = r.dz / n * speed;
         }
     }
-    const double latency = (runtime::mp_net::RttMs() + r.rtt_ms) * 0.5e-3;
+    const double latency = runtime::mp_net::LatencySeconds(p.peer, r.rtt_ms); // Fase 82: direto (P2P) ou pelo servidor
     const float lead = static_cast<float>(std::clamp(age + latency, 0.0, 0.5));
     const float tx = r.x + vx * lead, tz = r.z + vz * lead;
     const u64 t = Transform(p.inst);

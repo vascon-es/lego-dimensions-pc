@@ -847,8 +847,10 @@ std::vector<MpRow> MpRows() {
         const std::filesystem::path ini = GetLauncherIniPath();
         if (!ini.empty()) {
             runtime::multiplayer::SetFollowOwner(GetPrivateProfileIntW(L"launcher", L"mp_seguir", 1, ini.wstring().c_str()) != 0);
+            runtime::mp_net::SetP2P(GetPrivateProfileIntW(L"launcher", L"mp_p2p", 1, ini.wstring().c_str()) != 0);
         }
     }
+    rows.push_back({-3, lang::Pt() ? "CONEXAO DIRETA (P2P)" : "DIRECT CONNECTION (P2P)", false}); // Fase 82
     rows.push_back({-2, lang::Pt() ? "SEGUIR O DONO (CAMPANHA JUNTO)" : "FOLLOW THE OWNER (CAMPAIGN)", false});
     // Linha interativa para entrar ou trocar de sala pelo F3
     rows.push_back({-1, lang::Pt() ? "ENTRAR / CONFIGURAR SALA (F3)" : "JOIN / CONFIGURE ROOM (F3)", false});
@@ -859,6 +861,12 @@ void MpToggleFollow() {
     const bool next = !runtime::multiplayer::FollowOwnerEnabled();
     runtime::multiplayer::SetFollowOwner(next);
     WriteLauncherIni(L"mp_seguir", next ? L"1" : L"0");
+}
+
+void MpToggleP2P() { // Fase 82
+    const bool next = !runtime::mp_net::P2PEnabled();
+    runtime::mp_net::SetP2P(next);
+    WriteLauncherIni(L"mp_p2p", next ? L"1" : L"0");
 }
 
 void MpMove(int delta) {
@@ -878,6 +886,10 @@ void MpActivate() {
     }
     if (row.id == -2) {
         MpToggleFollow();
+        return;
+    }
+    if (row.id == -3) {
+        MpToggleP2P();
         return;
     }
     if (!MpIsOwner()) return;
@@ -1180,7 +1192,7 @@ void HandleMpRoomMenuController(u32 pressed) {
     } else if (pressed & (0x20 | 0x80)) { // esquerda / direita: alterna trancar se na linha 0
         const auto rows = MpRows();
         if (g_mp_selected >= 0 && g_mp_selected < static_cast<int>(rows.size()) &&
-            (rows[g_mp_selected].id == 0 || rows[g_mp_selected].id == -2)) {
+            (rows[g_mp_selected].id == 0 || rows[g_mp_selected].id == -2 || rows[g_mp_selected].id == -3)) {
             MpActivate();
             last_nav = now;
         }
@@ -1591,7 +1603,7 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
             } else if ((wparam == VK_LEFT || wparam == VK_RIGHT) && fresh) {
                 const auto rows = MpRows();
                 if (g_mp_selected >= 0 && g_mp_selected < static_cast<int>(rows.size()) &&
-                    (rows[g_mp_selected].id == 0 || rows[g_mp_selected].id == -2)) {
+                    (rows[g_mp_selected].id == 0 || rows[g_mp_selected].id == -2 || rows[g_mp_selected].id == -3)) {
                     MpActivate();
                 }
             } else if (wparam == VK_RETURN && fresh) {
@@ -3443,6 +3455,7 @@ void QueueStatsOverlay() {
                          : (pt ? "SO O DONO DA SALA TRANCA OU EXPULSA" : "ONLY THE ROOM OWNER CAN LOCK OR KICK");
         c.Write(sub, x0 + 24.0f * s, y0 + 100.0f * s, fs, mp_refused.empty() ? (mp_on ? kGray : kCyan) : kRed);
         float row_y = y0 + 140.0f * s;
+        const std::vector<runtime::mp_net::Peer> peers_now = runtime::mp_net::Peers();
         for (size_t i = 0; i < rows.size(); ++i) {
             const MpRow& r = rows[i];
             const bool sel = static_cast<int>(i) == g_mp_selected;
@@ -3455,6 +3468,9 @@ void QueueStatsOverlay() {
             } else if (r.id == -2) {
                 label = r.name;
                 value = runtime::multiplayer::FollowOwnerEnabled() ? (pt ? "< SIM >" : "< ON >") : (pt ? "< NAO >" : "< OFF >");
+            } else if (r.id == -3) {
+                label = r.name;
+                value = runtime::mp_net::P2PEnabled() ? (pt ? "< SIM >" : "< ON >") : (pt ? "< NAO >" : "< OFF >");
             } else if (r.id == -1) {
                 label = r.name;
                 value = "< ENTER >"; // 4.1.1: o texto longo cobria o nome da linha
@@ -3467,6 +3483,17 @@ void QueueStatsOverlay() {
                     const bool confirm = g_mp_kick_id == r.id && now - g_mp_kick_time < std::chrono::seconds(4);
                     value = confirm ? (pt ? "ENTER DE NOVO: EXPULSAR" : "ENTER AGAIN: KICK") : (pt ? "ENTER: EXPULSAR" : "ENTER: KICK");
                     if (confirm) value_color = kRed;
+                } else if (!r.self) { // Fase 82: por onde chega o estado dele
+                    for (const auto& peer : peers_now) {
+                        if (peer.id != r.id) continue;
+                        if (peer.direct) {
+                            value = (pt ? "DIRETO" : "DIRECT") +
+                                    (peer.direct_rtt_ms > 0 ? " " + std::to_string(peer.direct_rtt_ms) + " MS" : std::string());
+                            value_color = 0xFF60E060;
+                        } else {
+                            value = pt ? "VIA SERVIDOR" : "VIA SERVER";
+                        }
+                    }
                 }
             }
             c.Write(sel ? "> " + label : "  " + label, x0 + 24.0f * s, row_y, fi, sel ? kTitleYellow : kWhite);

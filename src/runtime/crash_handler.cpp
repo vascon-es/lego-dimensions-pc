@@ -8,8 +8,11 @@
 
 #include <atomic>
 #include <cinttypes>
+#include <csignal>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
+#include <exception>
 #include <mutex>
 #include <vector>
 
@@ -233,8 +236,47 @@ std::string DescribeAddress(u64 address) {
     return buf;
 }
 
+// Fase 82: abort() / std::terminate (fast fail 0xc0000409) nao passam pelo VectoredHandler: mostra a pilha do host
+// (modulo+deslocamento; o .pdb resolve depois) antes de o processo morrer.
+void PrintHostStack(const char* why) {
+    hle::log::FlushGameText();
+    std::fflush(stdout);
+    std::printf("\n======================== %s ========================\n", why);
+    std::printf("Thread  : %s (tid %lu)\n", CurrentThreadName(), GetCurrentThreadId());
+    void* frames[48] = {};
+    const USHORT n = RtlCaptureStackBackTrace(0, 48, frames, nullptr);
+    for (USHORT i = 0; i < n; ++i) {
+        HMODULE module = nullptr;
+        char name[MAX_PATH] = "?";
+        if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                               static_cast<LPCSTR>(frames[i]), &module) && module) {
+            GetModuleFileNameA(module, name, sizeof(name));
+            const char* base = std::strrchr(name, '\\');
+            std::printf("  #%02u %s+0x%" PRIx64 "\n", i, base ? base + 1 : name,
+                        static_cast<u64>(reinterpret_cast<u64>(frames[i]) - reinterpret_cast<u64>(module)));
+        } else {
+            std::printf("  #%02u %s\n", i, DescribeAddress(reinterpret_cast<u64>(frames[i])).c_str());
+        }
+    }
+    std::printf("============================================================\n");
+    std::fflush(stdout);
+}
+
 void InstallCrashHandler() {
     AddVectoredExceptionHandler(1, VectoredHandler);
+    std::signal(SIGABRT, [](int) { PrintHostStack("ABORT"); });
+    std::set_terminate([] {
+        try {
+            if (auto e = std::current_exception()) std::rethrow_exception(e);
+            std::printf("std::terminate sem excecao\n");
+        } catch (const std::exception& e) {
+            std::printf("std::terminate: %s\n", e.what());
+        } catch (...) {
+            std::printf("std::terminate: excecao desconhecida\n");
+        }
+        PrintHostStack("TERMINATE");
+        std::_Exit(3);
+    });
 }
 
 GuestThread* RegisterCurrentThread(const char* name) {

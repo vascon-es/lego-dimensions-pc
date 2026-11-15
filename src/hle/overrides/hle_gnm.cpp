@@ -58,6 +58,7 @@ namespace {
 constexpr u32 kOpNop = 0x10;
 constexpr u32 kOpWriteData = 0x37;
 constexpr u32 kOpWaitRegMem = 0x3C;
+constexpr u32 kOpEventWrite = 0x46;
 constexpr u32 kOpEventWriteEop = 0x47;
 constexpr u32 kOpEventWriteEos = 0x48;
 constexpr u32 kOpReleaseMem = 0x49;
@@ -71,6 +72,10 @@ std::mutex g_mutex;
 std::array<u64, 256> g_opcode_count{};
 u64 g_submits = 0, g_packets = 0, g_label_writes = 0, g_interrupts = 0, g_bad_writes = 0, g_malformed = 0;
 u32 g_logged_labels = 0;
+// Fase 81: EVENT_WRITE por tipo de evento (body[0] & 0x3F) e consultas de oclusao respondidas.
+std::array<u64, 64> g_event_type_count{};
+u64 g_occlusion_dumps = 0, g_occlusion_refused = 0;
+u64 g_pixel_counter = 0;
 // Janela para o monitor de "draws por frame": uma mudanca brusca indica troca de tela.
 u64 g_window_draws = 0, g_window_frames = 0, g_window_packets = 0;
 constexpr u64 kWindowFrames = 120;
@@ -5382,6 +5387,15 @@ inline bool Overlaps(const u8* a, u64 na, const u8* b, u64 nb) {
     return a < b + nb && b < a + na;
 }
 
+// Fase 81: LD_OCCLUSION=0 volta ao comportamento antigo (nada escrito), para comparar.
+bool OcclusionQueriesVisible() {
+    static const bool on = [] {
+        const char* v = std::getenv("LD_OCCLUSION");
+        return !(v && v[0] == '0');
+    }();
+    return on;
+}
+
 void ProcessCommandBuffer(const u32* cmd, u64 size_bytes, u64 release_event) {
     struct FlushAtExit {
         ~FlushAtExit() {
@@ -5423,6 +5437,35 @@ void ProcessCommandBuffer(const u32* cmd, u64 size_bytes, u64 release_event) {
         }
 
         switch (opcode) {
+        case kOpEventWrite:
+            // Fase 81: consultas de oclusao (ZPASS_DONE + PIXEL_PIPE_STAT_DUMP). O jogo pergunta a GPU
+            // quantos pixels de um objeto passaram no teste de profundidade e so mostra / deixa usar
+            // marcadores (setas verdes), brilhos e reflexos de luz quando o resultado diz "visivel".
+            // Antes nada era escrito e tudo ficava "escondido". Como o shadPS4: cada leitura soma um
+            // passo grande ao contador, entao (fim - inicio) sempre da "visivel"; bit 63 = resultado valido.
+            if (body_dwords >= 1) {
+                const u32 ev_type = body[0] & 0x3F;
+                const u32 ev_index = (body[0] >> 8) & 0xF;
+                ++g_event_type_count[ev_type];
+                if (ev_index == 1 && (ev_type == 57 || ev_type == 21) && body_dwords >= 3 && OcclusionQueriesVisible()) {
+                    const u64 address = (body[1] & ~7u) | (static_cast<u64>(body[2] & 0xFFFF) << 32);
+                    constexpr u32 kRenderBackends = 8; // PS4 base: 8 pares de contadores, 16 bytes cada
+                    if (Writable(address, kRenderBackends * 16)) {
+                        u64* results = reinterpret_cast<u64*>(address);
+                        for (u32 i = 0; i < kRenderBackends; ++i) {
+                            results[i * 2] = g_pixel_counter | 0x8000000000000000ULL;
+                        }
+                        g_pixel_counter += 0x2FFFFFFULL;
+                        if (++g_occlusion_dumps == 1) {
+                            log::Call("PM4", 0, "Phase 81: game uses occlusion queries (event type %u, results at 0x%" PRIx64
+                                      "); answering 'visible'", ev_type, address);
+                        }
+                    } else {
+                        ++g_occlusion_refused;
+                    }
+                }
+            }
+            break;
         case kOpEventWriteEop:
             if (body_dwords >= 5) {
                 const u64 address = body[1] | (static_cast<u64>(body[2] & 0xFFFF) << 32);
@@ -7335,6 +7378,14 @@ void PrintStats() {
         }
         WriteUiShaderPairs();
     }
+    std::printf("  Phase 81: occlusion query dumps answered %" PRIu64 " (refused %" PRIu64 ") | EVENT_WRITE types:",
+                g_occlusion_dumps, g_occlusion_refused);
+    for (u32 i = 0; i < 64; ++i) {
+        if (g_event_type_count[i]) {
+            std::printf(" %u=%" PRIu64, i, g_event_type_count[i]);
+        }
+    }
+    std::printf("\n");
     std::vector<std::pair<u64, u32>> ops;
     for (u32 i = 0; i < 256; ++i) {
         if (g_opcode_count[i]) {

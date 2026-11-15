@@ -16,6 +16,8 @@ struct Peer {
     std::string state;      // ultimo estado recebido (texto do jogo)
     double state_time = 0;  // quando chegou (segundos, relogio local)
     unsigned seq = 0;       // conta estados recebidos (para o jogo saber que e novo)
+    bool direct = false;    // Fase 82: ligacao direta (P2P) funcionando com ele
+    int direct_rtt_ms = 0;  // ida e volta direta (0 = ainda nao medida)
 };
 
 // url = ws://host[:porta][/caminho] ou wss://...  Volta false se a url nao serve.
@@ -40,5 +42,11 @@ std::string RefusedCode();
 void SendEvent(const std::string& payload);                // vai dentro do "s" ("s|!payload"): o servidor so repassa
 std::vector<std::pair<int, std::string>> TakeEvents();     // (id de quem mandou, payload) chegados desde a ultima vez
 double Now();
+// Fase 82: conexao direta (P2P) por UDP. O servidor continua achando os jogadores e levando os eventos; o estado de
+// cada jogador vai direto quando a NAT deixa (STUN + abertura dos dois lados), senao continua pelo servidor.
+void SetP2P(bool on);
+bool P2PEnabled();
+// Atraso de um estado desse jogador ate nos (segundos): direto = metade da ida e volta com ele; servidor = as duas metades.
+double LatencySeconds(int peer, int their_server_rtt_ms);
 
 } // namespace runtime::mp_net

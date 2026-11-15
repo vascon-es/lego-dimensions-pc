@@ -71,6 +71,13 @@ can take up to a minute (the game keeps retrying on its own). You can also run y
 [tools/mp_server](tools/mp_server/README.md) (Node.js, no dependencies) for your PC or a free Render service.
 The other players copy moving, running, jumping and attacking. All figures work, DLC included.
 
+From 4.3 (alpha), **direct connection (P2P)**: the server still finds the players and carries what happens in the
+world, but each player's movement goes straight from PC to PC when the routers allow it (lower lag, less load on the
+server). Anyone without a direct path (strict router or firewall, older version) keeps going through the server
+automatically. **F4** shows **DIRECT** or **VIA SERVER** next to each player, and the **Direct connection (P2P)** row
+turns it off. With P2P on, the players in your room can see your internet IP address, as in any P2P game. Windows may
+ask once to allow the game on the network: allow it for P2P to work.
+
 From 4.2 (alpha):
 - **Campaign together:** everyone goes to the level the room owner is in (gateway, doors and level select), so you
   play the story side by side. Each player can turn this off in **F4** (**Follow the owner**).

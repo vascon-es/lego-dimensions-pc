@@ -1240,6 +1240,7 @@ int main(int argc, char** argv) {
         hle::videoout::LoadImageSettingsFromIni();
         // 4.1.1: campanha junto (seguir a fase do dono da sala); muda no F4
         runtime::multiplayer::SetFollowOwner(GetPrivateProfileIntW(L"launcher", L"mp_seguir", 1, (root / "launcher.ini").wstring().c_str()) != 0);
+        runtime::mp_net::SetP2P(GetPrivateProfileIntW(L"launcher", L"mp_p2p", 1, (root / "launcher.ini").wstring().c_str()) != 0); // Fase 82
     }
     std::filesystem::path elf_path = root / "assets" / "decrypted_elfs" / "eboot.bin.elf";
     std::filesystem::path app0 = DefaultApp0(root);
