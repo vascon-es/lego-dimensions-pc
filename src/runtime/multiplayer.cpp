@@ -33,6 +33,7 @@
 
 namespace runtime::multiplayer {
 void OnLocalKill(unsigned long long obj, unsigned long long killer); // Fase 80 (no fim do arquivo)
+void Announce(const std::string& payload); // 4.2: avisa a sala e guarda no registro da area (fora do namespace anonimo)
 namespace {
 
 // ---- enderecos do eboot (deslocamentos a partir da base) --------------------------------------------------------
@@ -204,6 +205,8 @@ struct Puppet {
     bool want = false;   // esta na mesma area e no jogo (aparece, ou so o nome enquanto nao ha slot)
     double want_since = 0; // desde quando quer aparecer
     bool standin = false;  // 4.1.1: sem slot para o personagem dele: aparece com um personagem ja carregado
+    double same_area_since = 0; // 4.2: desde quando esta na nossa area
+    bool replayed = false;      // 4.2: o dono ja reenviou o registro da area para ele
     float distance = 0;  // ate o nosso jogador 1 (quem esta mais perto ganha os slots)
     float still_x = 0, still_z = 0; // ultimo lugar onde o fantasma andou (para ver se ficou preso)
     double still_time = 0;
@@ -607,10 +610,24 @@ bool g_applying = false;    // quebrando por um aviso: nao avisa de volta
 
 // classes de objeto do level (todas com o nome em +0xf0): explodivel, objeto simples, gatilho, multiestado,
 // obstaculo, pedra de dica, manivela, gancho, ponto de salvar, impulso de veiculo
-constexpr u64 kGadgetVtables[] = {0x2c0d3e0, 0x2c13830, 0x2c16120, 0x2c0e3e0, 0x2c11930,
-                                  0x2c1ad70, 0x2c12de0, 0x2c16f80, 0x2c19070, 0x2ca6c70};
+// 4.2: todas as classes de gadget do eboot (vtable >70% igual a do multiestado): fixit, plataformas, escadas,
+// empurraveis, transmat, montagens (reform 2cbeae0, 2cbfba0)...
+constexpr u64 kGadgetVtables[] = {0x2c0d3e0, 0x2c13830, 0x2c16120, 0x2c0e3e0, 0x2c11930, 0x2c1ad70, 0x2c12de0,
+                                  0x2c16f80, 0x2c19070, 0x2ca6c70, 0x2cbeae0, 0x2cbfba0, 0x2c0c430, 0x2c0ee40,
+                                  0x2c0f8a0, 0x2c10520, 0x2c12390, 0x2c142a0, 0x2c15480, 0x2c92820, 0x2cacc30,
+                                  0x2cafc30, 0x2cb2300, 0x2cb33e0, 0x2cbaa70, 0x2cc2180};
+constexpr u64 kReformVtables[] = {0x2cbeae0, 0x2cbfba0};
 constexpr u64 kObstacleVtable = 0x2c11930;
 u64 kTriggerObstacleFn = 0xf46140;
+// ---- 4.2: historia dentro da fase. Objetos multiestado (portoes, predios montados por etapas, escombros...) mudam de
+// estado por eboot+f31ac0(objeto, estado, parametro, forcar, imediato); eboot+a0a770(objeto) = estado atual (-1 nenhum).
+// Mudar o estado pelo mesmo caminho dispara a animacao e as mensagens do level (o roteiro continua sozinho).
+u64 kMsRequestFn = 0xf31ac0;
+// ---- 4.2: montar. eboot+13b97f0(nao usado, montagem, quem) dispara a montagem (estado + evento OnTriggered: as pecas
+// se juntam e o roteiro do level recebe a mensagem). O estado fica no mesmo componente dos multiestados.
+u64 kReformTriggerFn = 0x13b97f0;
+u64 kMsCurrentFn = 0xa0a770;
+constexpr u64 kMultiStateVtable = 0x2c0e3e0;
 // ---- campanha junto (4.1.1): a fase vem do objeto da fase atual; GotoLevel e o que o portal/portas chamam ----
 constexpr u64 kGameGlobal = 0x3130890;   // jogo (eboot+cd4910 devolve): +0x120 +0x70 +0xdf8 +0x18 = fase atual
 constexpr u64 kLevelLoader = 0x3174668;  // LevelLoader global (rdi do GotoLevel)
@@ -722,7 +739,7 @@ HLE_SYSV_ABI u64 BlowUpHook(u64 ctx, u64 who, u64 a, u64 b, u64 c, u64 d, u64 st
             const std::vector<u64> same = GadgetsNamed(name);
             const auto it = std::find(same.begin(), same.end(), ctx);
             const int order = it == same.end() ? 0 : static_cast<int>(it - same.begin());
-            runtime::mp_net::SendEvent("b|" + CurrentArea() + "|" + name + "|" + std::to_string(order));
+            Announce("b|" + CurrentArea() + "|" + name + "|" + std::to_string(order));
             std::printf("[MP] quebrei %s (#%d): avisando a sala\n", name.c_str(), order);
             std::fflush(stdout);
         }
@@ -731,6 +748,56 @@ HLE_SYSV_ABI u64 BlowUpHook(u64 ctx, u64 who, u64 a, u64 b, u64 c, u64 d, u64 st
 }
 
 SetupFn g_trigger_obstacle = nullptr;
+
+struct MsChange {
+    u64 obj;
+    int state, param;
+};
+std::mutex g_ms_mutex;
+std::vector<MsChange> g_ms_changes; // mudancas de estado deste jogo (nao as que nos aplicamos), para o Tick avisar
+SetupFn g_ms_request = nullptr;
+
+int GadgetState(u64 obj) { // = eboot+a0a770
+    const u64 c = Readable(obj + 0x120, 8) ? At<u64>(obj + 0x120) : 0;
+    return c && Readable(c + 0xb9, 1) ? static_cast<int>(At<std::int8_t>(c + 0xb9)) : -1;
+}
+
+bool IsReform(u64 obj) {
+    if (!Readable(obj, 0x300)) return false;
+    for (u64 v : kReformVtables) {
+        if (At<u64>(obj) == reinterpret_cast<u64>(g_base) + v) return true;
+    }
+    return false;
+}
+
+struct ReformChange {
+    u64 obj;
+    int before;
+};
+std::vector<ReformChange> g_reform_changes; // montagens deste jogo (g_ms_mutex)
+SetupFn g_reform_trigger = nullptr;
+
+HLE_SYSV_ABI u64 ReformTriggerHook(u64 unused, u64 obj, u64 who, u64 a, u64 b, u64 c) {
+    if (Readable(obj, 0x300)) {
+        std::printf("[MP] montagem: objeto %llx classe eboot+%llx nome %s estado %d%s\n", static_cast<unsigned long long>(obj),
+                    static_cast<unsigned long long>(At<u64>(obj) - reinterpret_cast<u64>(g_base)), GadgetName(obj).c_str(),
+                    GadgetState(obj), g_applying ? " (aviso de outro jogador)" : "");
+        std::fflush(stdout);
+    }
+    if (!g_applying && g_enabled && Readable(obj, 0x300) && !GadgetName(obj).empty()) {
+        std::lock_guard lock(g_ms_mutex);
+        if (g_reform_changes.size() < 128) g_reform_changes.push_back({obj, GadgetState(obj)});
+    }
+    return g_reform_trigger(unused, obj, who, a, b, c);
+}
+
+HLE_SYSV_ABI u64 MsRequestHook(u64 obj, u64 state, u64 param, u64 force, u64 immediate, u64 f) {
+    if (!g_applying && g_enabled && Readable(obj, 0x460) && At<u64>(obj) == reinterpret_cast<u64>(g_base) + kMultiStateVtable) {
+        std::lock_guard lock(g_ms_mutex);
+        if (g_ms_changes.size() < 256) g_ms_changes.push_back({obj, static_cast<int>(state), static_cast<int>(param)});
+    }
+    return g_ms_request(obj, state, param, force, immediate, f);
+}
 
 HLE_SYSV_ABI u64 TriggerObstacleHook(u64 unused, u64 ctx, u64 who, u64 a, u64 b, u64 c) {
     if (!g_applying && g_enabled && ValidGadget(ctx) && IsLocalPlayer(who)) {
@@ -1560,7 +1627,7 @@ bool ResolveFunctions() {
     if (!g_base || FnAt(kControlFn) != kControlFn) return false;
     for (u64* f : {&kSpawnFn, &kRequestDtorFn, &kRequestDeleteFn, &kSlotLoadFn, &kListPushFn, &kSlotStateFn, &kLevelSetupFn,
                    &kDescFn, &kAllocFn, &kFreeFn, &kFireEventFn, &kKillObjectFn, &kBlowUpFn, &kTriggerObstacleFn,
-                   &kGotoLevelFn, &kLevelByIdFn, &kLevelValidFn}) {
+                   &kGotoLevelFn, &kLevelByIdFn, &kLevelValidFn, &kMsRequestFn, &kReformTriggerFn}) { // (eboot+a0a770 nao tem prologo: fica fixo, antes da parte deslocada)
         const u64 o = FnAt(*f);
         if (!o) {
             std::printf("[MP] eboot+0x%llx: funcao nao reconhecida, multiplayer desligado\n", static_cast<unsigned long long>(*f));
@@ -1590,6 +1657,8 @@ bool InstallHooks() {
     // Fase 80: objetos que os outros quebram no mundo deles quebram no nosso
     g_blowup = reinterpret_cast<BlowUpFn>(Hook(kBlowUpFn, reinterpret_cast<const void*>(&BlowUpHook)));
     g_trigger_obstacle = reinterpret_cast<SetupFn>(Hook(kTriggerObstacleFn, reinterpret_cast<const void*>(&TriggerObstacleHook)));
+    g_ms_request = reinterpret_cast<SetupFn>(Hook(kMsRequestFn, reinterpret_cast<const void*>(&MsRequestHook)));
+    g_reform_trigger = reinterpret_cast<SetupFn>(Hook(kReformTriggerFn, reinterpret_cast<const void*>(&ReformTriggerHook)));
     if (!g_kill_object) g_kill_object = reinterpret_cast<KillFn>(Hook(kKillObjectFn, reinterpret_cast<const void*>(&KillObjectHook)));
 
     if (!g_control || !g_spawn || !g_dtor) {
@@ -1688,9 +1757,90 @@ void OnLocalKill(u64 obj, u64 killer) {
     const std::vector<u64> same = CharactersNamed(name);
     const auto it = std::find(same.begin(), same.end(), obj);
     const int order = it == same.end() ? 0 : static_cast<int>(it - same.begin());
-    runtime::mp_net::SendEvent("k|" + CurrentArea() + "|" + name + "|" + std::to_string(order));
+    Announce("k|" + CurrentArea() + "|" + name + "|" + std::to_string(order));
     std::printf("[MP] derrubei %s (#%d): avisando a sala\n", name.c_str(), order);
     std::fflush(stdout);
+}
+
+// ---- 4.2: o que ja mudou nesta area (quebrados, derrubados, estados). Quem chega depois (seguindo o dono) recebe
+// tudo de novo do dono da sala e o mundo dele fica igual. Aplicar duas vezes nao faz nada (ja quebrado / mesmo estado).
+std::string g_log_area;
+std::vector<std::string> g_area_log;
+std::set<std::string> g_area_log_seen;
+
+void LogAreaEvent(const std::string& payload) {
+    const size_t a = payload.find('|'), b = a == std::string::npos ? a : payload.find('|', a + 1);
+    if (b == std::string::npos) return;
+    const std::string area = payload.substr(a + 1, b - a - 1);
+    if (area != g_log_area) {
+        g_log_area = area;
+        g_area_log.clear();
+        g_area_log_seen.clear();
+    }
+    if (payload[0] == 'm') { // estado: so o ultimo de cada objeto
+        const size_t last = payload.rfind('|'), state_bar = payload.rfind('|', last - 1);
+        const std::string key = payload.substr(0, state_bar);
+        for (auto it = g_area_log.begin(); it != g_area_log.end(); ++it) {
+            if (it->compare(0, key.size() + 1, key + "|") == 0) {
+                g_area_log.erase(it);
+                break;
+            }
+        }
+        g_area_log.push_back(payload);
+        return;
+    }
+    if (g_area_log_seen.insert(payload).second && g_area_log.size() < 600) g_area_log.push_back(payload);
+}
+
+void Announce(const std::string& payload) {
+    runtime::mp_net::SendEvent(payload);
+    LogAreaEvent(payload);
+}
+
+// mudancas de estado deste jogo -> sala. Objetos que mudam sozinhos o tempo todo (efeitos em ciclo) ficam de fora.
+std::map<std::string, std::vector<double>> g_ms_times;
+std::set<std::string> g_ms_noisy;
+
+void SendStateChanges(double now, double area_time) {
+    std::vector<MsChange> changes;
+    std::vector<ReformChange> reforms;
+    {
+        std::lock_guard lock(g_ms_mutex);
+        changes.swap(g_ms_changes);
+        reforms.swap(g_reform_changes);
+    }
+    for (const ReformChange& r : reforms) { // montagens: sempre de alguem (nao ha montagem no comeco da area)
+        if (!Readable(r.obj, 0x300)) continue;
+        const std::string name = GadgetName(r.obj);
+        if (name.empty()) continue;
+        const std::vector<u64> same = GadgetsNamed(name);
+        const auto it = std::find(same.begin(), same.end(), r.obj);
+        const int order = it == same.end() ? 0 : static_cast<int>(it - same.begin());
+        Announce("r|" + CurrentArea() + "|" + name + "|" + std::to_string(order) + "|" + std::to_string(r.before));
+        std::printf("[MP] montei %s (estado antes %d): avisando a sala\n", name.c_str(), r.before);
+        std::fflush(stdout);
+    }
+    if (changes.empty() || now - area_time < 5.0) return; // estados iniciais da area: nao sao de ninguem
+    for (const MsChange& c : changes) {
+        if (!Readable(c.obj, 0x460) || At<u64>(c.obj) != reinterpret_cast<u64>(g_base) + kMultiStateVtable) continue;
+        const std::string name = GadgetName(c.obj);
+        if (name.empty() || name.rfind("VFX_", 0) == 0 || g_ms_noisy.count(name)) continue;
+        auto& times = g_ms_times[name];
+        times.push_back(now);
+        while (!times.empty() && now - times.front() > 30.0) times.erase(times.begin());
+        if (times.size() > 6) {
+            g_ms_noisy.insert(name);
+            Log("[MP] %s muda sozinho o tempo todo: fica fora da sincronizacao", name);
+            continue;
+        }
+        const std::vector<u64> same = GadgetsNamed(name);
+        const auto it = std::find(same.begin(), same.end(), c.obj);
+        const int order = it == same.end() ? 0 : static_cast<int>(it - same.begin());
+        Announce("m|" + CurrentArea() + "|" + name + "|" + std::to_string(order) + "|" + std::to_string(c.state) + "|" +
+                 std::to_string(c.param));
+        std::printf("[MP] %s mudou para o estado %d: avisando a sala\n", name.c_str(), c.state);
+        std::fflush(stdout);
+    }
 }
 
 struct PendingEvent {
@@ -1710,8 +1860,46 @@ void ApplyEvent(int from, const std::string& payload, double now) {
         if (bar == std::string::npos) break;
         pos = bar + 1;
     }
-    if (f.size() < 4 || (f[0] != "b" && f[0] != "k" && f[0] != "o")) return;
+    if (f.size() < 4 || (f[0] != "b" && f[0] != "k" && f[0] != "o" && f[0] != "m" && f[0] != "r")) return;
     if (f[1] != CurrentArea()) return; // outra area: o objeto nem existe aqui
+    if (f[0] == "r") { // alguem montou (as pecas se juntam aqui tambem)
+        if (f.size() < 5) return;
+        const std::vector<u64> same = GadgetsNamed(f[2]);
+        if (same.empty()) {
+            g_pending_events.push_back({from, payload, now});
+            if (now - g_gadget_scan_time > 2.0) StartGadgetScan(now);
+            return;
+        }
+        const u64 obj = same[std::min(static_cast<size_t>(std::max(0, std::atoi(f[3].c_str()))), same.size() - 1)];
+        LogAreaEvent(payload);
+        if (GadgetState(obj) != std::atoi(f[4].c_str())) return; // ja montado aqui (ou em outra etapa)
+        g_applying = true;
+        Call(kReformTriggerFn, 0, obj, 0);
+        g_applying = false;
+        std::printf("[MP] %d montou %s: montado aqui tambem\n", from, f[2].c_str());
+        std::fflush(stdout);
+        return;
+    }
+    if (f[0] == "m") { // um objeto multiestado mudou de estado (historia)
+        if (f.size() < 6 || g_ms_noisy.count(f[2])) return;
+        const std::vector<u64> same = GadgetsNamed(f[2]);
+        if (same.empty()) {
+            g_pending_events.push_back({from, payload, now});
+            if (now - g_gadget_scan_time > 2.0) StartGadgetScan(now);
+            return;
+        }
+        const u64 obj = same[std::min(static_cast<size_t>(std::max(0, std::atoi(f[3].c_str()))), same.size() - 1)];
+        if (At<u64>(obj) != reinterpret_cast<u64>(g_base) + kMultiStateVtable) return;
+        const int state = std::atoi(f[4].c_str()), param = std::atoi(f[5].c_str());
+        LogAreaEvent(payload);
+        if (GadgetState(obj) == state) return; // ja esta assim aqui
+        g_applying = true;
+        Call(kMsRequestFn, obj, static_cast<u64>(static_cast<s64>(state)), static_cast<u64>(static_cast<s64>(param)), 0, 0);
+        g_applying = false;
+        std::printf("[MP] %d: %s no estado %d aqui tambem\n", from, f[2].c_str(), state);
+        std::fflush(stdout);
+        return;
+    }
     if (f[0] == "k") { // derrubou um personagem
         const std::vector<u64> same = CharactersNamed(f[2]);
         if (same.empty()) {
@@ -1727,6 +1915,7 @@ void ApplyEvent(int from, const std::string& payload, double now) {
         g_applying = true;
         Call8(kKillObjectFn, victim, 3, who, 0, 0, 0, 0, 0);
         g_applying = false;
+        LogAreaEvent(payload);
         std::printf("[MP] %d derrubou %s: derrubado aqui tambem\n", from, f[2].c_str());
         std::fflush(stdout);
         return;
@@ -1752,6 +1941,7 @@ void ApplyEvent(int from, const std::string& payload, double now) {
         return;
     }
     if (At<u64>(ctx) != reinterpret_cast<u64>(g_base) + kBlowUpVtable) return;
+    LogAreaEvent(payload);
     if (At<u8>(ctx + 0x260)) return; // ja quebrado aqui tambem
     // quem quebrou: o fantasma dele (se esta aparecendo), senao o nosso jogador (o jogo precisa de alguem)
     u64 who = At<u64>(reinterpret_cast<u64>(g_base) + kPlayerTable);
@@ -1841,6 +2031,7 @@ void Tick() {
         }
     }
     for (const auto& [from, payload] : runtime::mp_net::TakeEvents()) ApplyEvent(from, payload, now);
+    SendStateChanges(now, area_time);
     TrackState2(now);
     SlotMaintenance(now);
     ReclaimReserve(now);
@@ -1880,6 +2071,22 @@ void Tick() {
         const bool want = settled && p.cur.valid && p.cur.ingame && p.cur.area == area && now - p.cur_time < 6.0 &&
                           p.cur.chr != "-" && !p.cur.chr.empty();
         p.want = want;
+        // 4.2: chegou na nossa area ha 6 s (a lista de objetos dele ja esta pronta): o dono reenvia o que ja mudou aqui
+        const bool here = settled && p.cur.valid && p.cur.ingame && p.cur.area == area && now - p.cur_time < 6.0;
+        if (!here) {
+            p.same_area_since = 0;
+            p.replayed = false;
+        } else if (!p.same_area_since) {
+            p.same_area_since = now;
+        } else if (!p.replayed && now - p.same_area_since > 6.0) {
+            p.replayed = true;
+            const int self = runtime::mp_net::SelfId(), owner = runtime::mp_net::OwnerId();
+            if (self && (owner == self || !owner) && g_log_area == area && !g_area_log.empty()) {
+                for (const std::string& e : g_area_log) runtime::mp_net::SendEvent(e);
+                std::printf("[MP] %s chegou na area: reenviando %zu mudancas\n", p.name.c_str(), g_area_log.size());
+                std::fflush(stdout);
+            }
+        }
         if (!want) p.want_since = 0;
         else if (!p.want_since) p.want_since = now;
         if (const u64 t = p1 ? Transform(p1) : 0) {
