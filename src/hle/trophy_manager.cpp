@@ -103,15 +103,13 @@ void TrophyManager::GetUnlockState(uint32_t* flags, uint32_t* count) {
     if (!flags || !count) return;
     std::memcpy(flags, m_flags, sizeof(m_flags));
 
-    uint32_t total = 0;
-    for (int i = 0; i < 4; ++i) {
-        uint32_t w = m_flags[i];
-        while (w) {
-            total += (w & 1);
-            w >>= 1;
-        }
-    }
-    *count = total;
+    // The game eboot uses *count as an upper bounds check in its internal UnlockTrophy method:
+    //   0x55742f: cmp dword ptr [this + 0x2c], ecx   (cmp trophy_count, trophy_id)
+    //   0x557432: jbe 0x557460                        (if trophy_count <= trophy_id: return 0 / fail)
+    // Returning the count of unlocked trophies (e.g. 0 or 3) caused any trophy with ID >= count
+    // to be rejected as out-of-bounds, preventing achievements from unlocking.
+    // We must return the capacity / total trophy limit for this context (128).
+    *count = 128;
 }
 
 bool TrophyManager::UnlockTrophy(int trophy_id, int* platinum_id, bool notify) {
@@ -383,7 +381,10 @@ void TrophyManager::LoadTrophyXml() {
                     m_flags[id / 32] |= (1u << (id % 32));
                     auto ts_pos = line.find("timestamp=\"");
                     if (ts_pos != std::string::npos) {
-                        m_timestamps[id] = std::strtoull(line.c_str() + ts_pos + 11, nullptr, 10);
+                        uint64_t ts = std::strtoull(line.c_str() + ts_pos + 11, nullptr, 10);
+                        if (ts > m_timestamps[id]) {
+                            m_timestamps[id] = ts;
+                        }
                     }
                 }
             }
@@ -391,29 +392,34 @@ void TrophyManager::LoadTrophyXml() {
         }
     }
 
-    bool has_any_flag = false;
-    for (int i = 0; i < 4; ++i) {
-        if (m_flags[i]) has_any_flag = true;
-    }
-    if (!has_any_flag) {
-        const std::filesystem::path dat_paths[] = {
-            m_root_path / "assets" / "trophy" / "trophies.dat",
-            m_saves_dir / "trophies.dat",
-            m_root_path / "assets" / "savedata0" / "trophies.dat"
-        };
-        for (const auto& p : dat_paths) {
-            std::ifstream dat(p, std::ios::binary);
-            if (!dat) continue;
-            char magic[4] = {};
-            dat.read(magic, 4);
-            if (std::memcmp(magic, "LDT1", 4) == 0) {
-                uint32_t c = 0;
-                dat.read(reinterpret_cast<char*>(&c), 4);
-                dat.read(reinterpret_cast<char*>(m_flags), sizeof(m_flags));
-                dat.read(reinterpret_cast<char*>(m_timestamps), sizeof(m_timestamps));
-                log::Tagged("TROPHY", "Loaded trophies.dat from %s (%u unlocked)", p.string().c_str(), c);
-                break;
+    // Always merge unlocked trophies and timestamps from trophies.dat if available
+    const std::filesystem::path dat_paths[] = {
+        m_root_path / "assets" / "trophy" / "trophies.dat",
+        m_saves_dir / "trophies.dat",
+        m_root_path / "assets" / "savedata0" / "trophies.dat"
+    };
+    for (const auto& p : dat_paths) {
+        std::ifstream dat(p, std::ios::binary);
+        if (!dat) continue;
+        char magic[4] = {};
+        dat.read(magic, 4);
+        if (std::memcmp(magic, "LDT1", 4) == 0) {
+            uint32_t c = 0;
+            uint32_t file_flags[4] = {};
+            uint64_t file_timestamps[128] = {};
+            dat.read(reinterpret_cast<char*>(&c), 4);
+            dat.read(reinterpret_cast<char*>(file_flags), sizeof(file_flags));
+            dat.read(reinterpret_cast<char*>(file_timestamps), sizeof(file_timestamps));
+            for (int i = 0; i < 4; ++i) {
+                m_flags[i] |= file_flags[i];
             }
+            for (int i = 0; i < 128; ++i) {
+                if (file_timestamps[i] > m_timestamps[i]) {
+                    m_timestamps[i] = file_timestamps[i];
+                }
+            }
+            log::Tagged("TROPHY", "Loaded/merged trophies.dat from %s (%u in file)", p.string().c_str(), c);
+            break;
         }
     }
 }
@@ -486,8 +492,8 @@ void TrophyManager::CheckRetroactiveSaves() {
         std::ifstream mf(marker);
         std::string content;
         if (mf && std::getline(mf, content)) {
-            if (content == "reset" || content == "v2") {
-                return; // Already checked v2 or user explicitly reset
+            if (content == "reset" || content == "v3") {
+                return; // Already checked v3 or user explicitly reset
             }
         }
     }
@@ -530,7 +536,7 @@ void TrophyManager::CheckRetroactiveSaves() {
     SaveTrophyXml();
 
     std::ofstream m(marker, std::ios::trunc);
-    if (m) m << "v2\n";
+    if (m) m << "v3\n";
 }
 
 } // namespace hle::trophy

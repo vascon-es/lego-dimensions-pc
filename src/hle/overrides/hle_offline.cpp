@@ -91,6 +91,7 @@ HLE_OVERRIDE(sceNpTrophyRegisterContext);
 
 HLE_IMPL(int, sceNpTrophyUnlockTrophy, s32 context, s32 handle, s32 trophy_id, s32* platinum_id) {
     HLE_TRACE("TROPHY %d unlocked (context=%d)", trophy_id, context);
+    log::Tagged("TROPHY", "sceNpTrophyUnlockTrophy: ID=%d (context=%d)", trophy_id, context);
     int plat = -1;
     hle::trophy::TrophyManager::Instance().UnlockTrophy(trophy_id, &plat);
     if (platinum_id) {
@@ -107,6 +108,7 @@ HLE_IMPL(int, sceNpTrophyGetTrophyUnlockState, s32 context, s32 handle, u32* fla
         return kTrophyErrorInvalidArgument;
     }
     hle::trophy::TrophyManager::Instance().GetUnlockState(flags, count);
+    log::Tagged("TROPHY", "sceNpTrophyGetTrophyUnlockState: context=%d -> count=%u", context, *count);
     return err::OK;
 }
 HLE_OVERRIDE(sceNpTrophyGetTrophyUnlockState);
