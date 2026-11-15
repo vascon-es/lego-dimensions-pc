@@ -93,7 +93,7 @@ void HandleAchievementsMenuController(u32 pressed_buttons);
 void ToggleMpRoomMenu();
 bool IsMpRoomMenuOpen();
 void HandleMpRoomMenuController(u32 pressed_buttons);
-void OpenMpRoomDialog();
+void OpenMpRoomDialog(bool new_network = false); // Fase 83: true = "criar rede nova" (codigo novo)
 bool IsMpDialogOpen();
 
 // Painel de logs e diagnostico dentro do jogo (F9)

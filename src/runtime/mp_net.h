@@ -31,6 +31,7 @@ int SelfId();             // 0 enquanto nao conectou
 int RttMs();              // ida e volta ate o servidor (media), 0 = ainda nao medido
 std::string StatusText(); // para o log
 std::string RoomCode();
+std::string RoomPassword(); // Fase 83: senha da sala em que esta (para o convite)
 std::string SelfName();
 int OwnerId();            // dono da sala (0 = ainda nao sabe)
 bool RoomLocked();
@@ -48,5 +49,37 @@ void SetP2P(bool on);
 bool P2PEnabled();
 // Atraso de um estado desse jogador ate nos (segundos): direto = metade da ida e volta com ele; servidor = as duas metades.
 double LatencySeconds(int peer, int their_server_rtt_ms);
+
+// Fase 83: painel da rede (F4, estilo Radmin VPN)
+enum class Nat {
+    kTesting,     // perguntando aos servidores STUN
+    kOpen,        // a mesma porta para qualquer destino: a conexao direta costuma funcionar
+    kSymmetric,   // uma porta por destino: a conexao direta quase sempre falha (fica pelo servidor)
+    kBlocked,     // nenhuma resposta UDP: firewall ou rede que bloqueia UDP
+    kUnavailable, // sem socket UDP
+};
+struct NetInfo {
+    Nat nat = Nat::kTesting;
+    bool p2p_on = true, connected = false;
+    int server_rtt_ms = 0, udp_port = 0, peers = 0, direct = 0;
+};
+NetInfo GetNetInfo();
+struct ChatLine {
+    int from = 0;
+    std::string name, text;
+    double time = 0;
+    bool self = false;
+};
+void SendChat(const std::string& text);   // vai pela sala (as versoes antigas ignoram)
+std::vector<ChatLine> Chat();             // ultimas 60 mensagens
+unsigned ChatSeq();                       // cresce a cada mensagem nova (para o aviso na tela)
+struct PingResult {
+    bool valid = false, pending = false;  // pending: esperando a resposta pelo servidor (ate 4 s)
+    int direct_ms = -1, server_ms = -1;   // -1 = sem ligacao direta / sem resposta
+    double started = 0;
+};
+void PingPeer(int id);                    // teste: ida e volta pelo servidor (+ a direta, se houver)
+PingResult LastPing(int id);
+std::vector<std::pair<std::string, double>> LeftPlayers(); // quem saiu da sala nesta sessao (nome, quando)
 
 } // namespace runtime::mp_net

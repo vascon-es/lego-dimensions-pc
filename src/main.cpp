@@ -1426,6 +1426,8 @@ int main(int argc, char** argv) {
             }
         } else if (!std::strcmp(argv[i], "--fullscreen")) {
             hle::videoout::SetStartFullscreen(true); // Fase 60: tela cheia sem bordas (F11 alterna)
+        } else if (!std::strcmp(argv[i], "--windowed")) {
+            hle::videoout::SetStartFullscreen(false); // Fase 83: janela, mesmo com telacheia=1 no launcher.ini
         } else if (!std::strcmp(argv[i], "--fps60")) {
             hle::videoout::SetForce60Hz(true);
             hle::videoout::SetUnlockedFps(false);

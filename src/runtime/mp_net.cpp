@@ -10,6 +10,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstring>
+#include <deque>
 #include <cstdio>
 #include <cstdlib>
 #include <map>
@@ -81,6 +82,30 @@ std::atomic<bool> g_announce_now{false};
 double g_last_announce = -100, g_last_stun = -100, g_last_announce_reply = -100;
 int g_stun_tries = 0;
 unsigned g_udp_seq = 0;
+
+// ---- Fase 83: painel da rede (estilo Radmin VPN): diagnostico da NAT, chat, teste de ping, quem saiu ----
+std::string g_stun_seen[2];               // endereco que cada servidor STUN viu (g_mutex)
+double g_p2p_open_time = 0;               // quando o socket abriu (para dar o veredito da NAT)
+std::deque<ChatLine> g_chat;              // g_mutex
+unsigned g_chat_seq = 0;
+std::map<int, PingResult> g_pings;        // g_mutex
+std::map<int, std::pair<std::string, double>> g_left; // quem saiu: nome, quando (g_mutex)
+unsigned g_ping_seq = 0;
+
+std::string CleanChat(std::string t) {
+    std::string out;
+    for (char c : t) {
+        if (static_cast<unsigned char>(c) >= 32 && c != 127) out += c;
+    }
+    if (out.size() > 100) out.resize(100);
+    return out;
+}
+
+void AddChat(int from, const std::string& name, const std::string& text, bool self) { // g_mutex
+    g_chat.push_back({from, name, text, Now(), self});
+    while (g_chat.size() > 60) g_chat.pop_front();
+    ++g_chat_seq;
+}
 
 std::wstring Widen(const std::string& s) { return std::wstring(s.begin(), s.end()); }
 
@@ -205,16 +230,21 @@ void RebuildCandidates() {
     }
 }
 
+// Pergunta aos dois servidores ao mesmo tempo, do mesmo socket. Se os dois virem a mesma porta, a NAT mantem o
+// mapeamento para qualquer destino ("cone"): a abertura dos dois lados funciona. Portas diferentes = NAT simetrica
+// (cada destino ganha uma porta nova): a conexao direta quase sempre falha e o jogo fica pelo servidor.
 void SendStun() {
     if (g_stun_servers.empty()) return;
     unsigned char req[20] = {0x00, 0x01, 0x00, 0x00, 0x21, 0x12, 0xA4, 0x42};
     std::memcpy(req + 8, g_stun_tx, 12);
-    const sockaddr_in& to = g_stun_servers[g_stun_tries++ % g_stun_servers.size()];
-    sendto(g_udp, reinterpret_cast<const char*>(req), sizeof(req), 0, reinterpret_cast<const sockaddr*>(&to), sizeof(to));
+    ++g_stun_tries;
+    for (const sockaddr_in& to : g_stun_servers) {
+        sendto(g_udp, reinterpret_cast<const char*>(req), sizeof(req), 0, reinterpret_cast<const sockaddr*>(&to), sizeof(to));
+    }
 }
 
 // Resposta do STUN: o nosso endereco visto da internet (XOR-MAPPED-ADDRESS, ou MAPPED-ADDRESS nos antigos).
-void HandleStun(const unsigned char* b, int n) {
+void HandleStun(const unsigned char* b, int n, const sockaddr_in& from) {
     if (n < 20 || b[0] != 0x01 || b[1] != 0x01 || b[4] != 0x21 || b[5] != 0x12 || b[6] != 0xA4 || b[7] != 0x42) return;
     if (std::memcmp(b + 8, g_stun_tx, 12) != 0) return;
     int pos = 20;
@@ -240,6 +270,9 @@ void HandleStun(const unsigned char* b, int n) {
                 std::lock_guard lock(g_mutex);
                 changed = g_public_ep != ep;
                 g_public_ep = ep;
+                for (size_t i = 0; i < g_stun_servers.size() && i < 2; ++i) {
+                    if (SameEp(g_stun_servers[i], from)) g_stun_seen[i] = ep;
+                }
                 RebuildCandidates();
             }
             if (changed) {
@@ -267,7 +300,7 @@ std::vector<std::string> Split(const std::string& s, char sep, size_t max_parts)
 
 void HandleUdp(const char* data, int n, const sockaddr_in& from) {
     if (n >= 20 && static_cast<unsigned char>(data[0]) == 0x01) {
-        HandleStun(reinterpret_cast<const unsigned char*>(data), n);
+        HandleStun(reinterpret_cast<const unsigned char*>(data), n, from);
         return;
     }
     if (n < 8 || std::memcmp(data, "LD2P|", 5) != 0 || !g_p2p_on) return;
@@ -380,6 +413,9 @@ void P2POpen() {
     }
     g_stun_tries = 0;
     g_last_stun = -100;
+    g_stun_seen[0].clear();
+    g_stun_seen[1].clear();
+    g_p2p_open_time = Now();
     g_udp_run = true;
     g_udp_thread = std::thread(UdpReceiver);
 }
@@ -550,15 +586,39 @@ void Handle(const std::string& msg) {
         p.name = tail;
         std::printf("[MP] %s entrou na sala\n", tail.c_str());
         g_announce_now = true; // o novo precisa dos nossos enderecos
+        g_left.erase(id);
     } else if (kind == "l") {
         auto it = g_peers.find(id);
         if (it != g_peers.end()) {
             std::printf("[MP] %s saiu da sala\n", it->second.name.c_str());
+            g_left[id] = {it->second.name, Now()};
             g_peers.erase(it);
         }
         g_links.erase(id);
+        g_pings.erase(id);
     } else if (kind == "s" && tail.rfind("!~p|", 0) == 0) { // Fase 82: enderecos para a conexao direta
         OnAnnouncement(id, tail.substr(4));
+    } else if (kind == "s" && tail.rfind("!~c|", 0) == 0) { // Fase 83: chat da sala
+        auto peer = g_peers.find(id);
+        const std::string text = CleanChat(tail.substr(4));
+        if (!text.empty() && id != g_self) {
+            const std::string name = peer == g_peers.end() ? "?" : peer->second.name;
+            AddChat(id, name, text, false);
+            std::printf("[MP] chat %s: %s\n", name.c_str(), text.c_str());
+        }
+    } else if (kind == "s" && tail.rfind("!~q|", 0) == 0) { // Fase 83: alguem testa o ping comigo (pelo servidor)
+        const std::vector<std::string> f = Split(tail.substr(4), '|', 3);
+        if (f.size() == 3 && std::atoi(f[0].c_str()) == g_self && g_commands.size() < 256) {
+            g_commands.push_back("s|!~r|" + std::to_string(id) + "|" + f[1] + "|" + f[2]);
+        }
+    } else if (kind == "s" && tail.rfind("!~r|", 0) == 0) { // Fase 83: resposta ao nosso teste de ping
+        const std::vector<std::string> f = Split(tail.substr(4), '|', 3);
+        auto it = g_pings.find(id);
+        if (f.size() == 3 && std::atoi(f[0].c_str()) == g_self && it != g_pings.end() && it->second.pending) {
+            const int ms = static_cast<int>((Now() - std::atof(f[2].c_str())) * 1000.0);
+            if (ms >= 0 && ms < 10000) it->second.server_ms = ms;
+            it->second.pending = false;
+        }
     } else if (kind == "s" && !tail.empty() && tail[0] == '!') { // s|id|!payload: evento de jogo (quebrou um objeto...)
         if (g_events_in.size() < 512) g_events_in.emplace_back(id, tail.substr(1));
     } else if (kind == "s") {
@@ -747,6 +807,8 @@ bool Start(const std::string& url, const std::string& room, const std::string& n
         g_peers.clear();
         g_links.clear();
         g_commands.clear();
+        g_left.clear();
+        g_pings.clear();
     }
     std::thread(Run).detach();
     static bool atexit_set = false;
@@ -800,6 +862,7 @@ std::string StatusText() {
 }
 
 std::string RoomCode() { return g_room; }
+std::string RoomPassword() { return g_password; }
 std::string SelfName() { return g_name; }
 int OwnerId() { return g_owner; }
 bool RoomLocked() { return g_locked; }
@@ -846,6 +909,82 @@ void SetP2P(bool on) {
 }
 
 bool P2PEnabled() { return g_p2p_on; }
+
+NetInfo GetNetInfo() {
+    std::lock_guard lock(g_mutex);
+    NetInfo info;
+    info.p2p_on = g_p2p_on;
+    info.connected = g_self != 0;
+    info.server_rtt_ms = g_rtt_ms;
+    if (g_udp == INVALID_SOCKET) {
+        info.nat = Nat::kUnavailable;
+        return info;
+    }
+    sockaddr_in bound{};
+    int len = sizeof(bound);
+    if (getsockname(g_udp, reinterpret_cast<sockaddr*>(&bound), &len) == 0) info.udp_port = ntohs(bound.sin_port);
+    const bool a = !g_stun_seen[0].empty(), b = !g_stun_seen[1].empty();
+    const double waited = Now() - g_p2p_open_time;
+    if (a && b) {
+        info.nat = g_stun_seen[0] == g_stun_seen[1] ? Nat::kOpen : Nat::kSymmetric;
+    } else if (a || b) {
+        info.nat = waited > 10.0 ? Nat::kOpen : Nat::kTesting; // so um servidor respondeu: o mapeamento existe
+    } else {
+        info.nat = waited > 10.0 ? Nat::kBlocked : Nat::kTesting;
+    }
+    for (const auto& [id, p] : g_peers) {
+        if (id == g_self) continue;
+        ++info.peers;
+        auto it = g_links.find(id);
+        info.direct += g_p2p_on && it != g_links.end() && it->second.direct;
+    }
+    return info;
+}
+
+void SendChat(const std::string& text) {
+    const std::string clean = CleanChat(text);
+    if (clean.empty()) return;
+    std::lock_guard lock(g_mutex);
+    if (g_commands.size() < 256) g_commands.push_back("s|!~c|" + clean);
+    AddChat(g_self, g_name, clean, true);
+}
+
+std::vector<ChatLine> Chat() {
+    std::lock_guard lock(g_mutex);
+    return {g_chat.begin(), g_chat.end()};
+}
+
+unsigned ChatSeq() { return g_chat_seq; }
+
+void PingPeer(int id) {
+    std::lock_guard lock(g_mutex);
+    PingResult& r = g_pings[id];
+    r = PingResult{};
+    r.started = Now();
+    r.pending = true;
+    char cmd[80];
+    std::snprintf(cmd, sizeof(cmd), "s|!~q|%d|%u|%.4f", id, ++g_ping_seq, Now());
+    if (g_commands.size() < 256) g_commands.push_back(cmd);
+}
+
+PingResult LastPing(int id) {
+    std::lock_guard lock(g_mutex);
+    auto it = g_pings.find(id);
+    if (it == g_pings.end()) return {};
+    PingResult r = it->second;
+    r.valid = true;
+    auto link = g_links.find(id);
+    if (g_p2p_on && link != g_links.end() && link->second.direct) r.direct_ms = link->second.rtt_ms;
+    if (r.pending && Now() - r.started > 4.0) r.pending = false; // sem resposta (versao antiga ou caiu)
+    return r;
+}
+
+std::vector<std::pair<std::string, double>> LeftPlayers() {
+    std::lock_guard lock(g_mutex);
+    std::vector<std::pair<std::string, double>> out;
+    for (const auto& [id, v] : g_left) out.push_back(v);
+    return out;
+}
 
 double LatencySeconds(int peer, int their_server_rtt_ms) {
     {

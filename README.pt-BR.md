@@ -62,6 +62,12 @@ sozinho. O **F4** mostra **DIRETO** ou **VIA SERVIDOR** ao lado de cada jogador,
 desliga. Com o P2P ligado, os jogadores da sua sala podem ver o seu IP da internet, como em qualquer jogo P2P. O Windows
 pode perguntar uma vez se deixa o jogo usar a rede: permita para o P2P funcionar.
 
+A partir da 4.4 (alfa), o **F4** é um painel de rede no estilo do Radmin VPN: teste da internet (NAT aberta, NAT
+simétrica ou UDP bloqueado; o seu IP nunca aparece na tela), cada jogador com uma bolinha de status (**DIRETO**, **VIA
+SERVIDOR** ou **SAIU**) e teste de ping (**Enter**), chat da sala (**C** para escrever; as mensagens novas também aparecem
+num canto da tela) e as ações de rede: **Criar rede nova**, **Entrar em uma rede (F3)**, **Copiar convite** (código e
+senha, para colar no Discord ou no WhatsApp) e **Sair da rede**. O **F3** lembra as últimas 8 redes em que você entrou.
+
 A partir da 4.2 (alfa):
 - **Campanha junto:** todo mundo vai para a fase em que o dono da sala está (portal, portas e seleção de fase), então
   dá para jogar a história lado a lado. Cada jogador pode desligar isso no **F4** (**Seguir o dono**).

@@ -78,6 +78,12 @@ automatically. **F4** shows **DIRECT** or **VIA SERVER** next to each player, an
 turns it off. With P2P on, the players in your room can see your internet IP address, as in any P2P game. Windows may
 ask once to allow the game on the network: allow it for P2P to work.
 
+From 4.4 (alpha), **F4** is a network panel in the style of Radmin VPN: an internet test (open NAT, symmetric NAT
+or UDP blocked; your IP is never shown on screen), each player with a status dot (**DIRECT**, **VIA SERVER** or
+**LEFT**) and a ping test (**Enter**), a room chat (**C** to type; new messages also pop up in a corner of the screen),
+and the network actions: **Create a new network**, **Join a network (F3)**, **Copy invite** (code and password, to paste
+in Discord or WhatsApp) and **Leave the network**. **F3** remembers the last 8 networks you joined.
+
 From 4.2 (alpha):
 - **Campaign together:** everyone goes to the level the room owner is in (gateway, doors and level select), so you
   play the story side by side. Each player can turn this off in **F4** (**Follow the owner**).

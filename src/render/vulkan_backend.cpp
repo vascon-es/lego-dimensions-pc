@@ -156,6 +156,10 @@ struct State {
     VkCommandPool pool = VK_NULL_HANDLE;
     VkCommandBuffer command = VK_NULL_HANDLE;
     VkSemaphore image_available = VK_NULL_HANDLE;
+    // Fase 83: o acquire tambem sinaliza esta fence, e a CPU espera por ela antes do submit (ver DrawFrame)
+    VkFence acquire_fence = VK_NULL_HANDLE;
+    std::vector<VkSemaphore> abandoned_semaphores; // de acquires que nunca terminaram (so destruidos no fim)
+    std::vector<VkFence> abandoned_fences;
     // Um semaforo de "render terminou" por imagem do swapchain: a apresentacao segura o
     // semaforo ate a imagem voltar, entao um unico semaforo podia ser sinalizado ainda em uso
     // (VUID-vkQueueSubmit-pSignalSemaphores-00067, apontado pela validacao na Fase 19).
@@ -1137,6 +1141,10 @@ bool CreateFrameObjects() {
     if (vk.vkCreateSemaphore(g.device, &semaphore, nullptr, &g.image_available) != VK_SUCCESS ||
         vk.vkCreateFence(g.device, &fence, nullptr, &g.in_flight) != VK_SUCCESS) {
         return Fail("semaphore / fence creation");
+    }
+    VkFenceCreateInfo acquire_fence{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+    if (vk.vkCreateFence(g.device, &acquire_fence, nullptr, &g.acquire_fence) != VK_SUCCESS) {
+        return Fail("acquire fence creation");
     }
     return true;
 }
@@ -4127,6 +4135,11 @@ void DestroyAll() {
         DestroySwapchainObjects();
         if (g.in_flight) vk.vkDestroyFence(g.device, g.in_flight, nullptr);
         if (g.image_available) vk.vkDestroySemaphore(g.device, g.image_available, nullptr);
+        if (g.acquire_fence) vk.vkDestroyFence(g.device, g.acquire_fence, nullptr);
+        for (VkSemaphore old : g.abandoned_semaphores) vk.vkDestroySemaphore(g.device, old, nullptr);
+        for (VkFence old : g.abandoned_fences) vk.vkDestroyFence(g.device, old, nullptr);
+        g.abandoned_semaphores.clear();
+        g.abandoned_fences.clear();
         if (g.pool) vk.vkDestroyCommandPool(g.device, g.pool, nullptr);
         if (g.swapchain) vk.vkDestroySwapchainKHR(g.device, g.swapchain, nullptr);
         {
@@ -4149,6 +4162,7 @@ void DestroyAll() {
     if (g.instance) vk.vkDestroyInstance(g.instance, nullptr);
     g.in_flight = VK_NULL_HANDLE;
     g.image_available = VK_NULL_HANDLE;
+    g.acquire_fence = VK_NULL_HANDLE;
     g.pool = VK_NULL_HANDLE;
     g.command = VK_NULL_HANDLE;
     g.swapchain = VK_NULL_HANDLE;
@@ -6304,7 +6318,37 @@ bool VulkanRenderer::DrawFrame(u64 display_address) {
                     started & 0xFFFFF, started >> 20, finished & 0xFFFFF, finished >> 20, g.frame_draws.size());
     }
     u32 image_index = 0;
-    VkResult result = vk.vkAcquireNextImageKHR(g.device, g.swapchain, timeout_ns, g.image_available, VK_NULL_HANDLE, &image_index);
+    // Fase 83: em ~25% das partidas (AMD, quadro 6 da tela de carregamento) a GPU ficava esperando para sempre o
+    // semaforo do acquire: a fence do frame nunca mais sinalizava e TODO quadro perdia 250 + 250 ms (2 FPS ate fechar
+    // o jogo; no jogo, picos de ~500 ms). Agora o acquire tambem sinaliza uma fence e a CPU espera a imagem ficar
+    // livre de verdade antes do submit (custa ~0,2 ms). Se nao ficar em 100 ms, o quadro e descartado e o swapchain
+    // refeito - a GPU nunca recebe uma espera que pode nao terminar. (Medido: 8 travadas em 24 partidas antes, 0 em 11.)
+    VkResult result = vk.vkAcquireNextImageKHR(g.device, g.swapchain, timeout_ns, g.image_available, g.acquire_fence, &image_index);
+    if (result == VK_SUCCESS || result == VK_SUBOPTIMAL_KHR) {
+        const VkResult ready = vk.vkWaitForFences(g.device, 1, &g.acquire_fence, VK_TRUE, 100'000'000ull);
+        if (ready != VK_SUCCESS) {
+            static u32 logged = 0;
+            if (logged++ < 8) {
+                std::printf("[ACQUIRE] frame %u: swapchain image %u not free after 100 ms (%s): frame dropped, swapchain rebuilt\n",
+                            g.frame_serial + 1, image_index, ResultName(ready));
+                std::fflush(stdout);
+            }
+            // o semaforo e a fence ainda podem ser sinalizados pelo acquire pendente: nao servem mais
+            g.abandoned_semaphores.push_back(g.image_available);
+            g.abandoned_fences.push_back(g.acquire_fence);
+            g.image_available = VK_NULL_HANDLE;
+            g.acquire_fence = VK_NULL_HANDLE;
+            VkSemaphoreCreateInfo semaphore{VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO};
+            VkFenceCreateInfo fence{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+            if (vk.vkCreateSemaphore(g.device, &semaphore, nullptr, &g.image_available) != VK_SUCCESS ||
+                vk.vkCreateFence(g.device, &fence, nullptr, &g.acquire_fence) != VK_SUCCESS) {
+                Fail("acquire semaphore / fence re-creation");
+                return false;
+            }
+            return skip(true);
+        }
+        vk.vkResetFences(g.device, 1, &g.acquire_fence);
+    }
     if (result == VK_ERROR_OUT_OF_DATE_KHR) {
         return skip(true);
     }

@@ -1861,7 +1861,26 @@ void Install(std::uint8_t* eboot_base) {
     std::printf("[MP] multiplayer online ligado: sala %s, servidor %s\n", g_config.room.c_str(), g_config.server.c_str());
 }
 
+// Fase 83: sair da sala pelo painel. A rede para; os fantasmas somem no proximo Tick (os pares da sala ficam
+// vazios) e so entao o multiplayer desliga - desligar antes deixaria os personagens dos outros parados no mundo.
+std::atomic<bool> g_leaving{false};
+
+void Disconnect() {
+    if (!g_enabled) return;
+    std::printf("[MP] saindo da sala %s\n", g_config.room.c_str());
+    std::fflush(stdout);
+    runtime::mp_net::Stop();
+    if (!g_control) { // ganchos ainda nao instalados: nao ha fantasma nenhum
+        g_enabled = false;
+        return;
+    }
+    g_leaving = true;
+}
+
+bool Leaving() { return g_leaving; }
+
 bool Connect(const std::string& server, const std::string& room, const std::string& name, const std::string& password) {
+    g_leaving = false;
     g_config.server = server;
     g_config.room = room;
     g_config.name = name;
@@ -2281,6 +2300,17 @@ void Tick() {
         } else {
             ++it;
         }
+    }
+    if (g_leaving && g_puppets.empty()) { // Fase 83: saiu da sala e os fantasmas ja sumiram
+        g_leaving = false;
+        g_enabled = false;
+        {
+            std::lock_guard lock(g_tags_mutex);
+            g_tags.clear();
+        }
+        std::printf("[MP] fora da sala (multiplayer desligado ate entrar de novo)\n");
+        std::fflush(stdout);
+        return;
     }
     FollowOwner(now);
     Drive old[kMaxPuppets];

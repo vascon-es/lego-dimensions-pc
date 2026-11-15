@@ -18,6 +18,8 @@ struct Config {
 void Configure(const Config& config); // antes do Install (argumentos da linha de comando)
 bool Enabled();
 bool Connect(const std::string& server, const std::string& room, const std::string& name, const std::string& password = {});
+void Disconnect(); // Fase 83: sai da sala (os fantasmas somem, depois o multiplayer desliga)
+bool Leaving();    // saindo (esperando os fantasmas sumirem)
 void Install(std::uint8_t* eboot_base); // ganchos no eboot + rede (so se Enabled)
 void Tick();                            // thread principal, uma vez por quadro (leitura do controle do jogador 1)
 void OnArea(const std::string& area);   // radar: o jogo leu o arquivo principal de uma area (\levels\...\X\X.txt)

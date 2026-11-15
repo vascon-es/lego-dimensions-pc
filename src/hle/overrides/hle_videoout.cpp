@@ -141,6 +141,14 @@ std::atomic<bool> g_mp_panel_open{false}; // 4.0: sala do multiplayer (F3, ou pe
 int g_mp_selected = 0;
 int g_mp_kick_id = 0; // primeiro Enter num jogador so pede a confirmacao
 std::chrono::steady_clock::time_point g_mp_kick_time;
+// Fase 83: painel da rede (estilo Radmin VPN)
+bool g_mp_chat_typing = false;   // escrevendo uma mensagem no chat (teclado)
+bool g_mp_chat_skip_c = false;   // a tecla C que abriu o chat tambem gera um WM_CHAR 'c': nao entra no texto
+std::string g_mp_chat_buf;
+std::string g_mp_flash;          // aviso curto no rodape do painel (convite copiado, saindo...)
+std::chrono::steady_clock::time_point g_mp_flash_time;
+std::chrono::steady_clock::time_point g_mp_leave_time; // primeiro Enter em SAIR DA REDE so pede a confirmacao
+bool g_mp_leave_armed = false;
 int g_achievements_selected = 0;
 int g_achievements_scroll = 0;
 int g_achievements_filter = 0; // 0 = all, 1 = unearned, 2 = earned
@@ -826,10 +834,39 @@ bool MpIsOwner() {
     return false;
 }
 
+// Fase 83: linhas do painel. id > 0: jogador na sala; id <= kMpLeftBase: jogador que saiu; o resto: opcoes.
+enum MpOption {
+    kMpOptLock = 0,
+    kMpOptJoin = -1,
+    kMpOptFollow = -2,
+    kMpOptP2P = -3,
+    kMpOptCreate = -4,
+    kMpOptInvite = -5,
+    kMpOptLeave = -6,
+    kMpOptChat = -7,
+    kMpLeftBase = -100,
+};
+
+bool MpIsOption(int id) { return id <= 0 && id > kMpLeftBase; }
+bool MpIsToggle(int id) { return id == kMpOptLock || id == kMpOptFollow || id == kMpOptP2P; }
+
+void MpLoadOptions() { // 4.1.1 / Fase 82: opcoes guardadas no launcher.ini
+    static bool loaded = false;
+    if (loaded) return;
+    loaded = true;
+    const std::filesystem::path ini = GetLauncherIniPath();
+    if (!ini.empty()) {
+        runtime::multiplayer::SetFollowOwner(GetPrivateProfileIntW(L"launcher", L"mp_seguir", 1, ini.wstring().c_str()) != 0);
+        runtime::mp_net::SetP2P(GetPrivateProfileIntW(L"launcher", L"mp_p2p", 1, ini.wstring().c_str()) != 0);
+    }
+}
+
 std::vector<MpRow> MpRows() {
+    MpLoadOptions();
+    const bool pt = lang::Pt();
+    const bool online = runtime::multiplayer::Enabled() && !runtime::multiplayer::Leaving();
     std::vector<MpRow> rows;
     const int self = runtime::mp_net::SelfId();
-    if (MpIsOwner()) rows.push_back({0, "", false});
     if (self) {
         rows.push_back({self, runtime::mp_net::SelfName(), true});
     } else {
@@ -837,23 +874,26 @@ std::vector<MpRow> MpRows() {
         if (name.empty()) name = "Player1";
         rows.push_back({1, name, true});
     }
-    for (const auto& p : runtime::mp_net::Peers()) {
-        if (p.id != self && !p.name.empty()) rows.push_back({p.id, p.name, false});
-    }
-    // 4.1.1: campanha junto (quem nao e o dono vai para a fase do dono)
-    static bool follow_loaded = false;
-    if (!follow_loaded) {
-        follow_loaded = true;
-        const std::filesystem::path ini = GetLauncherIniPath();
-        if (!ini.empty()) {
-            runtime::multiplayer::SetFollowOwner(GetPrivateProfileIntW(L"launcher", L"mp_seguir", 1, ini.wstring().c_str()) != 0);
-            runtime::mp_net::SetP2P(GetPrivateProfileIntW(L"launcher", L"mp_p2p", 1, ini.wstring().c_str()) != 0);
+    if (online) {
+        for (const auto& p : runtime::mp_net::Peers()) {
+            if (p.id != self && !p.name.empty()) rows.push_back({p.id, p.name, false});
         }
+        const auto left = runtime::mp_net::LeftPlayers(); // os 4 que sairam por ultimo
+        std::vector<int> order(left.size());
+        for (size_t i = 0; i < left.size(); ++i) order[i] = static_cast<int>(i);
+        std::sort(order.begin(), order.end(), [&](int a, int b) { return left[a].second > left[b].second; });
+        for (size_t i = 0; i < order.size() && i < 4; ++i) rows.push_back({kMpLeftBase - order[i], left[order[i]].first, false});
+        rows.push_back({kMpOptChat, pt ? "ESCREVER NO CHAT (C)" : "WRITE IN THE CHAT (C)", false});
     }
-    rows.push_back({-3, lang::Pt() ? "CONEXAO DIRETA (P2P)" : "DIRECT CONNECTION (P2P)", false}); // Fase 82
-    rows.push_back({-2, lang::Pt() ? "SEGUIR O DONO (CAMPANHA JUNTO)" : "FOLLOW THE OWNER (CAMPAIGN)", false});
-    // Linha interativa para entrar ou trocar de sala pelo F3
-    rows.push_back({-1, lang::Pt() ? "ENTRAR / CONFIGURAR SALA (F3)" : "JOIN / CONFIGURE ROOM (F3)", false});
+    rows.push_back({kMpOptP2P, pt ? "CONEXAO DIRETA (P2P)" : "DIRECT CONNECTION (P2P)", false});
+    rows.push_back({kMpOptFollow, pt ? "SEGUIR O DONO (CAMPANHA JUNTO)" : "FOLLOW THE OWNER (CAMPAIGN)", false});
+    if (online && MpIsOwner()) rows.push_back({kMpOptLock, pt ? "TRANCAR A REDE" : "LOCK THE NETWORK", false});
+    rows.push_back({kMpOptCreate, pt ? "CRIAR REDE NOVA" : "CREATE A NEW NETWORK", false});
+    rows.push_back({kMpOptJoin, pt ? "ENTRAR EM UMA REDE (F3)" : "JOIN A NETWORK (F3)", false});
+    if (online) {
+        rows.push_back({kMpOptInvite, pt ? "COPIAR CONVITE (CODIGO E SENHA)" : "COPY INVITE (CODE AND PASSWORD)", false});
+        rows.push_back({kMpOptLeave, pt ? "SAIR DA REDE" : "LEAVE THE NETWORK", false});
+    }
     return rows;
 }
 
@@ -869,45 +909,129 @@ void MpToggleP2P() { // Fase 82
     WriteLauncherIni(L"mp_p2p", next ? L"1" : L"0");
 }
 
+void MpFlash(const std::string& text) {
+    g_mp_flash = text;
+    g_mp_flash_time = std::chrono::steady_clock::now();
+}
+
 void MpMove(int delta) {
     const int n = static_cast<int>(MpRows().size());
     if (n > 0) g_mp_selected = (g_mp_selected + delta + n) % n;
     g_mp_kick_id = 0;
+    g_mp_leave_armed = false;
 }
 
-void MpActivate() {
+// Convite para colar no Discord/WhatsApp: codigo, senha e servidor (so se nao for o publico).
+void MpCopyInvite() {
+    const bool pt = lang::Pt();
+    const std::string room = runtime::mp_net::RoomCode();
+    const std::string live_pass = runtime::mp_net::RoomPassword(); // a da sala em que esta (pode ter vindo da linha de comando)
+    const std::wstring pass(live_pass.begin(), live_pass.end());
+    const std::wstring server = ReadLauncherIni(L"mp_servidor", L"");
+    std::wstring text = pt ? L"LEGO Dimensions PC - multiplayer\r\nCódigo da sala: " : L"LEGO Dimensions PC - multiplayer\r\nRoom code: ";
+    text += std::wstring(room.begin(), room.end());
+    text += pt ? L"\r\nSenha: " : L"\r\nPassword: ";
+    text += pass.empty() ? (pt ? L"(sem senha)" : L"(none)") : pass;
+    if (!server.empty() && server.find(L"lego-dimensions-mp-server.onrender.com") == std::wstring::npos) {
+        text += pt ? L"\r\nServidor: " : L"\r\nServer: ";
+        text += server;
+    }
+    text += pt ? L"\r\nNo jogo: F3 > código e senha > Entrar na Sala" : L"\r\nIn game: F3 > code and password > Join Room";
+    bool ok = false;
+    if (OpenClipboard(static_cast<HWND>(WindowHandle()))) {
+        EmptyClipboard();
+        const size_t bytes = (text.size() + 1) * sizeof(wchar_t);
+        if (HGLOBAL mem = GlobalAlloc(GMEM_MOVEABLE, bytes)) {
+            std::memcpy(GlobalLock(mem), text.c_str(), bytes);
+            GlobalUnlock(mem);
+            ok = SetClipboardData(CF_UNICODETEXT, mem) != nullptr;
+            if (!ok) GlobalFree(mem);
+        }
+        CloseClipboard();
+    }
+    MpFlash(ok ? (pt ? "CONVITE COPIADO: COLE NO DISCORD / WHATSAPP" : "INVITE COPIED: PASTE IT IN DISCORD / WHATSAPP")
+               : (pt ? "NAO DEU PARA COPIAR (AREA DE TRANSFERENCIA OCUPADA)" : "COULD NOT COPY (CLIPBOARD BUSY)"));
+}
+
+void MpStartChat() {
+    if (!runtime::multiplayer::Enabled() || runtime::multiplayer::Leaving()) return;
+    g_mp_chat_typing = true;
+    g_mp_chat_buf.clear();
+}
+
+// Enter (ou X) na linha escolhida; `kick` = Delete (ou quadrado): expulsar o jogador escolhido (so o dono).
+void MpActivate(bool kick = false) {
     const std::vector<MpRow> rows = MpRows();
     if (g_mp_selected < 0 || g_mp_selected >= static_cast<int>(rows.size())) return;
     const MpRow& row = rows[g_mp_selected];
-    if (row.id == -1) {
+    const bool pt = lang::Pt();
+    const auto now = std::chrono::steady_clock::now();
+    switch (row.id) {
+    case kMpOptJoin:
         g_mp_panel_open = false;
-        hle::videoout::OpenMpRoomDialog();
+        hle::videoout::OpenMpRoomDialog(false);
         return;
-    }
-    if (row.id == -2) {
+    case kMpOptCreate:
+        g_mp_panel_open = false;
+        hle::videoout::OpenMpRoomDialog(true);
+        return;
+    case kMpOptFollow:
         MpToggleFollow();
         return;
-    }
-    if (row.id == -3) {
+    case kMpOptP2P:
         MpToggleP2P();
         return;
+    case kMpOptChat:
+        MpStartChat();
+        return;
+    case kMpOptInvite:
+        MpCopyInvite();
+        return;
+    case kMpOptLeave:
+        if (g_mp_leave_armed && now - g_mp_leave_time < std::chrono::seconds(4)) {
+            g_mp_leave_armed = false;
+            runtime::multiplayer::Disconnect();
+            log::Tagged("MP", "left the network from the panel");
+            MpFlash(pt ? "SAINDO DA REDE..." : "LEAVING THE NETWORK...");
+            g_mp_selected = 0;
+        } else {
+            g_mp_leave_armed = true;
+            g_mp_leave_time = now;
+        }
+        return;
+    case kMpOptLock:
+        if (MpIsOwner()) runtime::mp_net::SetRoomLocked(!runtime::mp_net::RoomLocked());
+        return;
+    default:
+        break;
     }
-    if (!MpIsOwner()) return;
-    if (row.id == 0) {
-        runtime::mp_net::SetRoomLocked(!runtime::mp_net::RoomLocked());
+    if (row.self || row.id <= kMpLeftBase) return;
+    if (!kick) { // teste de ping (como o "Ping" do Radmin)
+        runtime::mp_net::PingPeer(row.id);
+        MpFlash((pt ? "TESTANDO O PING COM " : "PINGING ") + row.name + "...");
         return;
     }
-    if (row.self) return;
-    const auto now = std::chrono::steady_clock::now();
+    if (!MpIsOwner()) {
+        MpFlash(pt ? "SO O DONO DA REDE PODE EXPULSAR" : "ONLY THE NETWORK OWNER CAN KICK");
+        return;
+    }
     if (g_mp_kick_id == row.id && now - g_mp_kick_time < std::chrono::seconds(4)) {
         runtime::mp_net::Kick(row.id);
         log::Tagged("MP", "kicked %s from the room", row.name.c_str());
         g_mp_kick_id = 0;
         g_mp_selected = 0;
     } else {
-        g_mp_kick_id = row.id; // Enter de novo em ate 4 s confirma
+        g_mp_kick_id = row.id; // de novo em ate 4 s confirma
         g_mp_kick_time = now;
     }
+}
+
+// Teclado do Windows (cp1252) -> o que a fonte do painel desenha: acentos viram a letra sem acento.
+char MpFoldChar(unsigned char c) {
+    if (c >= 32 && c < 127) return static_cast<char>(c);
+    static const char kHigh[] = "AAAAAAACEEEEIIIIDNOOOOOxOUUUUYPsaaaaaaaceeeeiiiidnooooo/ouuuuypy";
+    if (c >= 0xC0) return kHigh[c - 0xC0];
+    return 0;
 }
 
 std::string MpUpper(const std::string& text) {
@@ -940,8 +1064,42 @@ enum InGameMpId {
     kInGameMpSave = 1001,
     kInGameMpCancel = 1002,
     kInGameMpNewRoom = 1003,
+    kInGameMpSaved = 1004, // Fase 83: redes salvas
     kInGameMpEdit = 1100
 };
+static HWND s_mp_saved = nullptr;
+
+// Fase 83: redes salvas (como a lista de redes do Radmin): mp_rede1..8 = "CODIGO<tab>SENHA" no launcher.ini
+struct SavedNetwork {
+    std::wstring code, pass;
+};
+
+static std::vector<SavedNetwork> LoadSavedNetworks() {
+    std::vector<SavedNetwork> out;
+    for (int i = 1; i <= 8; ++i) {
+        const std::wstring v = ReadLauncherIni((L"mp_rede" + std::to_wstring(i)).c_str(), L"");
+        if (v.empty()) continue;
+        const size_t tab = v.find(L'\t');
+        out.push_back({v.substr(0, tab), tab == std::wstring::npos ? L"" : v.substr(tab + 1)});
+    }
+    return out;
+}
+
+static void RememberNetwork(const std::wstring& code, const std::wstring& pass) {
+    if (code.empty()) return;
+    std::vector<SavedNetwork> list = LoadSavedNetworks();
+    std::erase_if(list, [&](const SavedNetwork& n) { return n.code == code; });
+    list.insert(list.begin(), {code, pass});
+    const std::filesystem::path ini = GetLauncherIniPath();
+    for (int i = 1; i <= 8; ++i) {
+        const std::wstring key = L"mp_rede" + std::to_wstring(i);
+        if (i <= static_cast<int>(list.size())) {
+            WriteLauncherIni(key.c_str(), (list[i - 1].code + L"\t" + list[i - 1].pass).c_str());
+        } else if (!ini.empty()) {
+            WritePrivateProfileStringW(L"launcher", key.c_str(), nullptr, ini.wstring().c_str()); // sem chave vazia
+        }
+    }
+}
 
 static std::wstring CleanInGameRoom(std::wstring room) {
     std::wstring out;
@@ -982,6 +1140,15 @@ static LRESULT CALLBACK InGameMpProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) 
     }
     case WM_COMMAND: {
         const int id = LOWORD(wp);
+        if (id == kInGameMpSaved && HIWORD(wp) == CBN_SELCHANGE) { // escolheu uma rede salva
+            const int sel = static_cast<int>(SendMessageW(s_mp_saved, CB_GETCURSEL, 0, 0)) - 1; // item 0 = "escolha..."
+            const std::vector<SavedNetwork> list = LoadSavedNetworks();
+            if (sel >= 0 && sel < static_cast<int>(list.size())) {
+                SetWindowTextW(s_mp_edits[1], list[sel].code.c_str());
+                SetWindowTextW(s_mp_edits[3], list[sel].pass.c_str());
+            }
+            return 0;
+        }
         if (id == kInGameMpNewRoom) {
             static const wchar_t kChars[] = L"ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
             std::wstring code;
@@ -1007,6 +1174,7 @@ static LRESULT CALLBACK InGameMpProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) 
             WriteLauncherIni(L"mp_sala", room.c_str());
             WriteLauncherIni(L"mp_nome", name.c_str());
             WriteLauncherIni(L"mp_senha", pass.c_str());
+            RememberNetwork(room, pass);
 
             const std::string s_server = Narrow(server);
             const std::string s_room = Narrow(room);
@@ -1029,6 +1197,7 @@ static LRESULT CALLBACK InGameMpProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) 
         return 0;
     case WM_DESTROY:
         s_mp_dialog = nullptr;
+        s_mp_saved = nullptr;
         if (HWND game = static_cast<HWND>(WindowHandle())) {
             SetForegroundWindow(game);
             SetFocus(game);
@@ -1040,7 +1209,7 @@ static LRESULT CALLBACK InGameMpProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) 
 
 } // namespace
 
-void OpenMpRoomDialog() {
+void OpenMpRoomDialog(bool new_network) {
     if (s_mp_dialog && IsWindow(s_mp_dialog)) {
         SetForegroundWindow(s_mp_dialog);
         return;
@@ -1070,7 +1239,7 @@ void OpenMpRoomDialog() {
     }
 
     const int dlg_w = 460;
-    const int dlg_h = 440;
+    const int dlg_h = 500; // Fase 83: + redes salvas
     HWND parent = static_cast<HWND>(WindowHandle());
     RECT prc{100, 100, 100 + dlg_w, 100 + dlg_h};
     if (parent) GetWindowRect(parent, &prc);
@@ -1099,8 +1268,17 @@ void OpenMpRoomDialog() {
         name = sn.empty() ? L"Jogador" : std::wstring(sn.begin(), sn.end());
     }
     std::wstring pass = ReadLauncherIni(L"mp_senha", L"");
+    if (new_network) { // Fase 83: "criar rede nova" no painel: codigo novo de 8 letras, senha em branco para escolher
+        static const wchar_t kChars[] = L"ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+        unsigned char random[8] = {};
+        BCryptGenRandom(nullptr, random, sizeof(random), BCRYPT_USE_SYSTEM_PREFERRED_RNG);
+        room.clear();
+        for (unsigned char r : random) room += kChars[r % 32];
+        pass.clear();
+    }
 
-    HWND hTitle = CreateWindowExW(0, L"STATIC", pt ? L"SALA DO MULTIPLAYER (ONLINE)" : L"ONLINE MULTIPLAYER ROOM",
+    HWND hTitle = CreateWindowExW(0, L"STATIC", new_network ? (pt ? L"CRIAR REDE NOVA" : L"CREATE A NEW NETWORK")
+                                                            : (pt ? L"SALA DO MULTIPLAYER (ONLINE)" : L"ONLINE MULTIPLAYER ROOM"),
                                   WS_CHILD | WS_VISIBLE, 24, 16, 400, 24, s_mp_dialog, nullptr, nullptr, nullptr);
     SendMessageW(hTitle, WM_SETFONT, reinterpret_cast<WPARAM>(s_mp_bold_font), TRUE);
 
@@ -1118,8 +1296,31 @@ void OpenMpRoomDialog() {
     };
     const std::wstring values[4] = {server, room, name, pass};
 
+    // Fase 83: redes salvas (as ultimas 8 em que entrou): escolher preenche codigo e senha
+    HWND lblSaved = CreateWindowExW(0, L"STATIC", pt ? L"REDES SALVAS:" : L"SAVED NETWORKS:", WS_CHILD | WS_VISIBLE, 24, 86, 400, 18,
+                                    s_mp_dialog, nullptr, nullptr, nullptr);
+    SendMessageW(lblSaved, WM_SETFONT, reinterpret_cast<WPARAM>(s_mp_font), TRUE);
+    s_mp_saved = CreateWindowExW(0, L"COMBOBOX", L"", WS_CHILD | WS_VISIBLE | WS_TABSTOP | CBS_DROPDOWNLIST | WS_VSCROLL,
+                                 24, 106, 400, 200, s_mp_dialog,
+                                 reinterpret_cast<HMENU>(static_cast<INT_PTR>(kInGameMpSaved)), nullptr, nullptr);
+    SendMessageW(s_mp_saved, WM_SETFONT, reinterpret_cast<WPARAM>(s_mp_font), TRUE);
+    const std::vector<SavedNetwork> saved = LoadSavedNetworks();
+    if (!saved.empty()) {
+        SendMessageW(s_mp_saved, CB_ADDSTRING, 0,
+                     reinterpret_cast<LPARAM>(pt ? L"(escolha uma rede salva para preencher)" : L"(pick a saved network to fill in)"));
+    }
+    for (const SavedNetwork& n : saved) {
+        const std::wstring item = n.code + (n.pass.empty() ? (pt ? L"   (sem senha)" : L"   (no password)") : (pt ? L"   (com senha)" : L"   (password)"));
+        SendMessageW(s_mp_saved, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(item.c_str()));
+    }
+    if (saved.empty()) {
+        SendMessageW(s_mp_saved, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(pt ? L"(nenhuma ainda)" : L"(none yet)"));
+        EnableWindow(s_mp_saved, FALSE);
+    }
+    SendMessageW(s_mp_saved, CB_SETCURSEL, 0, 0);
+
     for (int i = 0; i < 4; ++i) {
-        const int row_y = 88 + i * 58;
+        const int row_y = 146 + i * 58;
         HWND lbl = CreateWindowExW(0, L"STATIC", labels[i], WS_CHILD | WS_VISIBLE, 24, row_y, 400, 18,
                                    s_mp_dialog, nullptr, nullptr, nullptr);
         SendMessageW(lbl, WM_SETFONT, reinterpret_cast<WPARAM>(s_mp_font), TRUE);
@@ -1136,24 +1337,25 @@ void OpenMpRoomDialog() {
 
     HWND btnNew = CreateWindowExW(0, L"BUTTON", pt ? L"Nova sala" : L"New room",
                                   WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON,
-                                  294, 88 + 1 * 58 + 20, 130, 24, s_mp_dialog,
+                                  294, 146 + 1 * 58 + 20, 130, 24, s_mp_dialog,
                                   reinterpret_cast<HMENU>(static_cast<INT_PTR>(kInGameMpNewRoom)), nullptr, nullptr);
     SendMessageW(btnNew, WM_SETFONT, reinterpret_cast<WPARAM>(s_mp_font), TRUE);
 
     HWND btnCancel = CreateWindowExW(0, L"BUTTON", pt ? L"Cancelar (Esc)" : L"Cancel (Esc)",
                                      WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON,
-                                     24, 340, 150, 36, s_mp_dialog,
+                                     24, 400, 150, 36, s_mp_dialog,
                                      reinterpret_cast<HMENU>(static_cast<INT_PTR>(kInGameMpCancel)), nullptr, nullptr);
     SendMessageW(btnCancel, WM_SETFONT, reinterpret_cast<WPARAM>(s_mp_font), TRUE);
 
-    HWND btnSave = CreateWindowExW(0, L"BUTTON", pt ? L"Entrar na Sala" : L"Join Room",
+    HWND btnSave = CreateWindowExW(0, L"BUTTON", new_network ? (pt ? L"Criar e Entrar" : L"Create and Join")
+                                                             : (pt ? L"Entrar na Sala" : L"Join Room"),
                                    WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_DEFPUSHBUTTON,
-                                   244, 340, 180, 36, s_mp_dialog,
+                                   244, 400, 180, 36, s_mp_dialog,
                                    reinterpret_cast<HMENU>(static_cast<INT_PTR>(kInGameMpSave)), nullptr, nullptr);
     SendMessageW(btnSave, WM_SETFONT, reinterpret_cast<WPARAM>(s_mp_bold_font), TRUE);
 
     SetForegroundWindow(s_mp_dialog);
-    SetFocus(s_mp_edits[room.empty() ? 1 : 0]);
+    SetFocus(s_mp_edits[new_network ? 3 : (room.empty() ? 1 : 0)]);
 }
 
 bool IsMpDialogOpen() {
@@ -1169,7 +1371,9 @@ void ToggleMpRoomMenu() {
         g_logs_overlay_open = false;
         g_mp_selected = 0;
         g_mp_kick_id = 0;
+        g_mp_leave_armed = false;
     }
+    g_mp_chat_typing = false;
     g_mp_panel_open = next;
     log::Tagged("MP-MENU", "%s", next ? "open" : "closed");
 }
@@ -1189,15 +1393,17 @@ void HandleMpRoomMenuController(u32 pressed) {
     } else if (pressed & 0x40) { // baixo
         MpMove(1);
         last_nav = now;
-    } else if (pressed & (0x20 | 0x80)) { // esquerda / direita: alterna trancar se na linha 0
+    } else if (pressed & (0x20 | 0x80)) { // esquerda / direita: liga / desliga as opcoes SIM/NAO
         const auto rows = MpRows();
-        if (g_mp_selected >= 0 && g_mp_selected < static_cast<int>(rows.size()) &&
-            (rows[g_mp_selected].id == 0 || rows[g_mp_selected].id == -2 || rows[g_mp_selected].id == -3)) {
+        if (g_mp_selected >= 0 && g_mp_selected < static_cast<int>(rows.size()) && MpIsToggle(rows[g_mp_selected].id)) {
             MpActivate();
             last_nav = now;
         }
-    } else if (pressed & 0x4000) { // X: trancar / expulsar
+    } else if (pressed & 0x4000) { // X: acao da linha (ping, opcao)
         MpActivate();
+        last_nav = now;
+    } else if (pressed & 0x8000) { // quadrado: expulsar (dono)
+        MpActivate(true);
         last_nav = now;
     } else if (pressed & 0x2000) { // bola: fecha
         g_mp_panel_open = false;
@@ -1563,7 +1769,32 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
         EndPaint(hwnd, &ps);
         return 0;
     }
+    case WM_CHAR: // Fase 83: texto do chat do painel da rede
+        if (g_mp_panel_open.load() && g_mp_chat_typing) {
+            const char c = MpFoldChar(static_cast<unsigned char>(wparam));
+            if (g_mp_chat_skip_c && (c == 'c' || c == 'C')) {
+                g_mp_chat_skip_c = false;
+                return 0;
+            }
+            g_mp_chat_skip_c = false;
+            if (c && g_mp_chat_buf.size() < 100) g_mp_chat_buf += c;
+            return 0;
+        }
+        break;
     case WM_KEYDOWN:
+        if (g_mp_panel_open.load() && g_mp_chat_typing) { // escrevendo no chat: as teclas sao do texto
+            if (wparam == VK_RETURN) {
+                if (!g_mp_chat_buf.empty()) runtime::mp_net::SendChat(g_mp_chat_buf);
+                g_mp_chat_buf.clear();
+                g_mp_chat_typing = false;
+            } else if (wparam == VK_ESCAPE) {
+                g_mp_chat_buf.clear();
+                g_mp_chat_typing = false;
+            } else if (wparam == VK_BACK && !g_mp_chat_buf.empty()) {
+                g_mp_chat_buf.pop_back();
+            }
+            return 0;
+        }
         if (wparam == VK_F1 && !(lparam & (1 << 30))) { // 2.0.2: era F2 (agora o F2 e o do jogador 2, como nos jogos LEGO de PC)
             ToggleVideoSettingsMenu();
             return 0;
@@ -1602,12 +1833,19 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
                 MpMove(1);
             } else if ((wparam == VK_LEFT || wparam == VK_RIGHT) && fresh) {
                 const auto rows = MpRows();
-                if (g_mp_selected >= 0 && g_mp_selected < static_cast<int>(rows.size()) &&
-                    (rows[g_mp_selected].id == 0 || rows[g_mp_selected].id == -2 || rows[g_mp_selected].id == -3)) {
+                if (g_mp_selected >= 0 && g_mp_selected < static_cast<int>(rows.size()) && MpIsToggle(rows[g_mp_selected].id)) {
                     MpActivate();
                 }
             } else if (wparam == VK_RETURN && fresh) {
                 MpActivate();
+            } else if (wparam == VK_DELETE && fresh) { // Fase 83: expulsar (dono)
+                MpActivate(true);
+            } else if (wparam == 'C' && fresh) { // Fase 83: chat
+                MpStartChat();
+                g_mp_chat_skip_c = g_mp_chat_typing;
+            } else if (wparam == 'P' && fresh) { // Fase 83: ping no jogador escolhido
+                const auto rows = MpRows();
+                if (g_mp_selected >= 0 && g_mp_selected < static_cast<int>(rows.size()) && rows[g_mp_selected].id > 0) MpActivate();
             } else if (wparam == VK_F3 && fresh) {
                 g_mp_panel_open = false;
                 OpenMpRoomDialog();
@@ -3084,9 +3322,18 @@ void QueueStatsOverlay() {
         s_refused_since = now;
     }
     const bool show_refused = s_refused_shown && !mp_refused.empty() && now - s_refused_since < std::chrono::seconds(15);
+    // Fase 83: mensagem nova no chat com o painel fechado: aparece 8 s no canto da tela
+    static unsigned s_chat_seen = 0;
+    static std::chrono::steady_clock::time_point s_chat_since{};
+    if (const unsigned seq = runtime::mp_net::ChatSeq(); seq != s_chat_seen) {
+        s_chat_seen = seq;
+        s_chat_since = now;
+    }
+    const bool show_chat = runtime::multiplayer::Enabled() && s_chat_seen && !g_mp_panel_open.load() &&
+                           now - s_chat_since < std::chrono::seconds(8);
     if (!g_stats_overlay.load() && !g_video_menu_open.load() && !g_image_menu_open.load() &&
         !g_achievements_overlay_open.load() && !g_logs_overlay_open.load() && !has_toast &&
-        tags.empty() && !g_mp_panel_open.load() && !show_refused) {
+        tags.empty() && !g_mp_panel_open.load() && !show_refused && !show_chat) {
         return;
     }
     static std::vector<LoadingVertex> vertices;
@@ -3416,96 +3663,264 @@ void QueueStatsOverlay() {
         c.Write(mp_refused, x, y, tp, 0xFFFFFFFF);
     }
 
-    if (g_mp_panel_open.load()) {
-        constexpr u32 kBg = 0xEE121216, kBorder = 0xFF00D000, kTitleYellow = 0xFF00E0FF, kHiBg = 0xAA303038;
-        constexpr u32 kWhite = 0xFFFFFFFF, kGray = 0xFFA0A0A0, kCyan = 0xFFE0C040, kRed = 0xFF4040FF;
+    if (show_chat) { // Fase 83: ultimas mensagens do chat, no canto de baixo a esquerda
+        const std::vector<runtime::mp_net::ChatLine> chat = runtime::mp_net::Chat();
+        const float tp = p * 1.1f;
+        float y = client.bottom * 0.66f;
+        const size_t first = chat.size() > 3 ? chat.size() - 3 : 0;
+        for (size_t i = first; i < chat.size(); ++i) {
+            std::string line = MpUpper(chat[i].name + ": " + chat[i].text);
+            const size_t max_chars = static_cast<size_t>(client.right * 0.45f / (6.0f * tp));
+            if (line.size() > max_chars) line = line.substr(0, max_chars - 3) + "...";
+            const float w = TextWidth(line, tp);
+            c.Pill(14 * tp, y - 3 * tp, 14 * tp + w + 12 * tp, y + 10 * tp, 0xB0000000);
+            c.Write(line, 20 * tp, y, tp, chat[i].self ? Rgba(120, 220, 255) : 0xFFFFFFFF);
+            y += 15.0f * tp;
+        }
+    }
+
+    if (g_mp_panel_open.load()) { // Fase 83: painel da rede, estilo Radmin VPN
         const bool pt = lang::Pt();
+        const u32 kBg = Rgba(16, 20, 26, 238), kBorder = Rgba(0, 200, 90), kTitle = Rgba(255, 224, 0), kHiBg = Rgba(48, 56, 70, 220);
+        const u32 kWhite = 0xFFFFFFFF, kGray = Rgba(150, 156, 168), kDim = Rgba(95, 100, 112), kCyan = Rgba(110, 210, 255);
+        const u32 kGreen = Rgba(70, 230, 110), kYellow = Rgba(255, 200, 60), kRed = Rgba(255, 80, 80);
         const std::vector<MpRow> rows = MpRows();
         if (g_mp_selected >= static_cast<int>(rows.size())) g_mp_selected = 0;
-        const bool owner = MpIsOwner();
+        const bool online = runtime::multiplayer::Enabled() && !runtime::multiplayer::Leaving();
+        const bool owner = online && MpIsOwner();
         const int owner_id = runtime::mp_net::OwnerId();
-        const float s = client.bottom >= 1400 ? 1.5f : (client.bottom >= 1000 ? 1.0f : 0.75f);
-        const float box_w = 760.0f * s;
-        const float box_h = (175.0f + 38.0f * std::max<size_t>(rows.size(), 1) + 70.0f) * s;
-        const float x0 = (client.right - box_w) / 2.0f, y0 = std::max(10.0f, (client.bottom - box_h) / 2.0f);
+        const runtime::mp_net::NetInfo net = runtime::mp_net::GetNetInfo();
+        const std::vector<runtime::mp_net::Peer> peers_now = runtime::mp_net::Peers();
+        const std::vector<std::pair<std::string, double>> left = runtime::mp_net::LeftPlayers();
+        const std::vector<runtime::mp_net::ChatLine> chat = runtime::mp_net::Chat();
+        const double t_now = runtime::mp_net::Now();
+        size_t members = 0, options = 0;
+        for (const MpRow& r : rows) (MpIsOption(r.id) ? options : members) += 1;
+        constexpr int kChatLines = 5;
+        // a altura e linear na escala: se nao cabe (muitos jogadores numa tela pequena), diminui tudo na proporcao
+        const float units = (64 + 62 + 30) + 31.0f * members + 16 + (30 + 22 * kChatLines + 30) + 14 + 31.0f * options + 76;
+        float s = client.bottom >= 1400 ? 1.5f : (client.bottom >= 1000 ? 1.0f : 0.72f);
+        s = std::min(s, (client.bottom - 16.0f) / units);
+        const float ft = 3.2f * s, fi = 2.1f * s, fs = 1.8f * s, fc = 1.7f * s;
+        const float row_h = 31.0f * s, opt_h = 31.0f * s;
+        const float box_w = std::min(1000.0f * s, client.right - 20.0f);
+        const float box_h = units * s;
+        const float x0 = (client.right - box_w) / 2.0f, y0 = std::max(8.0f, (client.bottom - box_h) / 2.0f);
         const float x1 = x0 + box_w, y1 = y0 + box_h;
+        const float pad = 24.0f * s;
+        auto fit = [&](std::string text, float size, float width) {
+            const size_t max_chars = static_cast<size_t>(std::max(4.0f, width / (6.0f * size)));
+            if (text.size() > max_chars) text = text.substr(0, max_chars - 3) + "...";
+            return text;
+        };
+        auto line = [&](float y) { c.Rect(x0 + 20.0f * s, y, x1 - 20.0f * s, y + 2.0f * s, Rgba(60, 68, 82)); };
         c.Rect(x0 - 4.0f, y0 - 4.0f, x1 + 4.0f, y1 + 4.0f, kBorder);
         c.Rect(x0, y0, x1, y1, kBg);
-        const std::string title = pt ? "SALA DO MULTIPLAYER (F4)" : "MULTIPLAYER ROOM (F4)";
-        const float ft = 3.5f * s, fi = 2.4f * s, fs = 1.9f * s;
-        c.Write(title, x0 + (box_w - TextWidth(title, ft)) / 2.0f, y0 + 20.0f * s, ft, kTitleYellow);
-        c.Rect(x0 + 20.0f * s, y0 + 55.0f * s, x1 - 20.0f * s, y0 + 57.0f * s, kGray);
-        char info[160];
-        const int rtt = runtime::mp_net::RttMs();
-        const bool mp_on = runtime::multiplayer::Enabled();
-        if (!mp_on) {
-            std::snprintf(info, sizeof(info), "%s", pt ? "MODO OFFLINE (MULTIPLAYER DESATIVADO NO LAUNCHER)" : "OFFLINE MODE (MULTIPLAYER DISABLED IN LAUNCHER)");
+
+        // titulo + "botao de ligar" do P2P (o power do Radmin)
+        const std::string title = pt ? "REDE P2P (F4)" : "P2P NETWORK (F4)";
+        c.Write(title, x0 + pad, y0 + 20.0f * s, ft, kTitle);
+        const std::string power = net.p2p_on ? (pt ? "P2P LIGADO" : "P2P ON") : (pt ? "P2P DESLIGADO" : "P2P OFF");
+        const float pw = TextWidth(power, fi);
+        c.Pill(x1 - pad - pw - 34 * s, y0 + 16 * s, x1 - pad, y0 + 46 * s, net.p2p_on ? Rgba(20, 90, 45) : Rgba(70, 70, 76));
+        c.Circle(x1 - pad - pw - 18 * s, y0 + 31 * s, 6 * s, net.p2p_on ? kGreen : kDim);
+        c.Write(power, x1 - pad - pw - 8 * s, y0 + 24 * s, fi, kWhite);
+        float y = y0 + 64.0f * s;
+        line(y - 8 * s);
+
+        // rede, voce, internet (o "status" do Radmin)
+        std::string net_line, you;
+        u32 net_color = kWhite;
+        if (runtime::multiplayer::Leaving()) {
+            net_line = pt ? "SAINDO DA REDE..." : "LEAVING THE NETWORK...";
+            net_color = kYellow;
+        } else if (!online) {
+            net_line = pt ? "SEM REDE: CRIE UMA REDE NOVA OU ENTRE EM UMA (ABAIXO)" : "NO NETWORK: CREATE A NEW ONE OR JOIN ONE (BELOW)";
+            net_color = kCyan;
         } else {
-            std::snprintf(info, sizeof(info), pt ? "CODIGO %s - %s - PING %d MS" : "CODE %s - %s - PING %d MS",
-                          MpUpper(runtime::mp_net::RoomCode()).c_str(),
-                          runtime::mp_net::RoomLocked() ? (pt ? "TRANCADA" : "LOCKED") : (pt ? "ABERTA" : "OPEN"),
-                          rtt >= 0 ? rtt : 0);
+            net_line = (pt ? "REDE " : "NETWORK ") + MpUpper(runtime::mp_net::RoomCode()) + " - " +
+                       (runtime::mp_net::RoomLocked() ? (pt ? "TRANCADA" : "LOCKED") : (pt ? "ABERTA" : "OPEN")) + " - " +
+                       std::to_string(net.connected ? net.peers + 1 : 0) + "/16 ONLINE";
         }
-        c.Write(info, x0 + 24.0f * s, y0 + 72.0f * s, fs, kWhite);
-        std::string sub;
-        if (!mp_refused.empty()) sub = mp_refused;
-        else if (!mp_on) sub = pt ? "PARA JOGAR ONLINE: APERTE F3 PARA ENTRAR NA SALA" : "TO PLAY ONLINE: PRESS F3 TO JOIN ROOM";
-        else if (!runtime::mp_net::SelfId()) sub = pt ? "CONECTANDO AO SERVIDOR..." : "CONNECTING TO THE SERVER...";
-        else sub = owner ? (pt ? "VOCE E O DONO DA SALA" : "YOU OWN THIS ROOM")
-                         : (pt ? "SO O DONO DA SALA TRANCA OU EXPULSA" : "ONLY THE ROOM OWNER CAN LOCK OR KICK");
-        c.Write(sub, x0 + 24.0f * s, y0 + 100.0f * s, fs, mp_refused.empty() ? (mp_on ? kGray : kCyan) : kRed);
-        float row_y = y0 + 140.0f * s;
-        const std::vector<runtime::mp_net::Peer> peers_now = runtime::mp_net::Peers();
-        for (size_t i = 0; i < rows.size(); ++i) {
-            const MpRow& r = rows[i];
-            const bool sel = static_cast<int>(i) == g_mp_selected;
-            if (sel) c.Rect(x0 + 16.0f * s, row_y - 4.0f * s, x1 - 16.0f * s, row_y + 26.0f * s, kHiBg);
-            std::string label, value;
-            u32 value_color = sel ? kCyan : kGray;
-            if (r.id == 0) {
-                label = pt ? "TRANCAR A SALA" : "LOCK THE ROOM";
-                value = runtime::mp_net::RoomLocked() ? (pt ? "< SIM >" : "< ON >") : (pt ? "< NAO >" : "< OFF >");
-            } else if (r.id == -2) {
-                label = r.name;
-                value = runtime::multiplayer::FollowOwnerEnabled() ? (pt ? "< SIM >" : "< ON >") : (pt ? "< NAO >" : "< OFF >");
-            } else if (r.id == -3) {
-                label = r.name;
-                value = runtime::mp_net::P2PEnabled() ? (pt ? "< SIM >" : "< ON >") : (pt ? "< NAO >" : "< OFF >");
-            } else if (r.id == -1) {
-                label = r.name;
-                value = "< ENTER >"; // 4.1.1: o texto longo cobria o nome da linha
-                value_color = sel ? kTitleYellow : kCyan;
+        you = (pt ? "VOCE: " : "YOU: ") + MpUpper(runtime::mp_net::SelfName().empty() ? "Player1" : runtime::mp_net::SelfName()) +
+              (owner ? (pt ? " - DONO" : " - OWNER") : "");
+        c.Write(fit(net_line, fs, box_w * 0.62f), x0 + pad, y, fs, net_color);
+        c.Write(you, x1 - pad - TextWidth(you, fs), y, fs, kGray);
+        y += 26.0f * s;
+        std::string inet;
+        u32 inet_color = kGray;
+        switch (net.nat) {
+        case runtime::mp_net::Nat::kTesting: inet = pt ? "INTERNET: TESTANDO..." : "INTERNET: TESTING..."; break;
+        case runtime::mp_net::Nat::kOpen:
+            inet = pt ? "INTERNET: NAT ABERTA - CONEXAO DIRETA OK" : "INTERNET: OPEN NAT - DIRECT CONNECTION OK";
+            inet_color = kGreen;
+            break;
+        case runtime::mp_net::Nat::kSymmetric:
+            inet = pt ? "INTERNET: NAT SIMETRICA - DIRETA DIFICIL (VAI PELO SERVIDOR)" : "INTERNET: SYMMETRIC NAT - DIRECT IS HARD (USES THE SERVER)";
+            inet_color = kYellow;
+            break;
+        case runtime::mp_net::Nat::kBlocked:
+            inet = pt ? "INTERNET: UDP BLOQUEADO (FIREWALL?) - SO PELO SERVIDOR" : "INTERNET: UDP BLOCKED (FIREWALL?) - SERVER ONLY";
+            inet_color = kRed;
+            break;
+        case runtime::mp_net::Nat::kUnavailable:
+            inet = pt ? "INTERNET: P2P INDISPONIVEL NESTE PC - SO PELO SERVIDOR" : "INTERNET: P2P UNAVAILABLE ON THIS PC - SERVER ONLY";
+            inet_color = kRed;
+            break;
+        }
+        if (!online) {
+            inet = pt ? "INTERNET: ENTRE EM UMA REDE PARA TESTAR" : "INTERNET: JOIN A NETWORK TO TEST IT";
+            inet_color = kDim;
+        } else if (!mp_refused.empty()) {
+            inet = mp_refused;
+            inet_color = kRed;
+        } else if (!net.connected) {
+            inet = pt ? "CONECTANDO AO SERVIDOR (PODE LEVAR 1 MINUTO SE ELE ESTIVER DORMINDO)..." : "CONNECTING TO THE SERVER (UP TO 1 MINUTE IF IT IS ASLEEP)...";
+            inet_color = kYellow;
+        }
+        c.Write(fit(inet, fs, box_w * 0.70f), x0 + pad, y, fs, inet_color);
+        if (online && net.connected) {
+            char srv[64];
+            std::snprintf(srv, sizeof(srv), pt ? "SERVIDOR %d MS" : "SERVER %d MS", net.server_rtt_ms);
+            c.Write(srv, x1 - pad - TextWidth(srv, fs), y, fs, kGray);
+        }
+        y += 36.0f * s;
+        line(y - 10 * s);
+
+        // membros: bolinha, nome, conexao, ping (as colunas do Radmin)
+        const float col_conn = x0 + box_w * 0.50f, col_ping = x0 + box_w * 0.80f;
+        c.Write(pt ? "JOGADOR" : "PLAYER", x0 + pad + 26 * s, y, fc, kDim);
+        c.Write(pt ? "CONEXAO" : "CONNECTION", col_conn, y, fc, kDim);
+        c.Write("PING", col_ping, y, fc, kDim);
+        y += 22.0f * s;
+        size_t index = 0;
+        for (; index < rows.size() && !MpIsOption(rows[index].id); ++index) {
+            const MpRow& r = rows[index];
+            const bool sel = static_cast<int>(index) == g_mp_selected;
+            if (sel) c.Rect(x0 + 14 * s, y - 5 * s, x1 - 14 * s, y + row_h - 9 * s, kHiBg);
+            std::string name = MpUpper(r.name), conn = "-", ping = "-";
+            u32 dot = kDim, conn_color = kGray, ping_color = kGray;
+            if (r.id <= kMpLeftBase) {
+                const size_t k = static_cast<size_t>(kMpLeftBase - r.id);
+                const int mins = k < left.size() ? static_cast<int>((t_now - left[k].second) / 60.0) : 0;
+                conn = pt ? (mins < 1 ? "SAIU AGORA" : "SAIU HA " + std::to_string(mins) + " MIN")
+                          : (mins < 1 ? "LEFT JUST NOW" : "LEFT " + std::to_string(mins) + " MIN AGO");
+            } else if (r.self) {
+                dot = online && net.connected ? kCyan : kDim;
+                name += pt ? " (VOCE)" : " (YOU)";
+                conn = online ? (net.connected ? (pt ? "ESTE PC" : "THIS PC") : (pt ? "CONECTANDO" : "CONNECTING")) : (pt ? "FORA DA REDE" : "OFFLINE");
             } else {
-                label = MpUpper(r.name);
-                if (r.self) label += pt ? " (VOCE)" : " (YOU)";
-                if (r.id == owner_id) label += pt ? " - DONO" : " - OWNER";
-                if (owner && !r.self && sel) {
-                    const bool confirm = g_mp_kick_id == r.id && now - g_mp_kick_time < std::chrono::seconds(4);
-                    value = confirm ? (pt ? "ENTER DE NOVO: EXPULSAR" : "ENTER AGAIN: KICK") : (pt ? "ENTER: EXPULSAR" : "ENTER: KICK");
-                    if (confirm) value_color = kRed;
-                } else if (!r.self) { // Fase 82: por onde chega o estado dele
-                    for (const auto& peer : peers_now) {
-                        if (peer.id != r.id) continue;
-                        if (peer.direct) {
-                            value = (pt ? "DIRETO" : "DIRECT") +
-                                    (peer.direct_rtt_ms > 0 ? " " + std::to_string(peer.direct_rtt_ms) + " MS" : std::string());
-                            value_color = 0xFF60E060;
-                        } else {
-                            value = pt ? "VIA SERVIDOR" : "VIA SERVER";
-                        }
+                const auto peer = std::find_if(peers_now.begin(), peers_now.end(), [&](const auto& q) { return q.id == r.id; });
+                const bool direct = peer != peers_now.end() && peer->direct;
+                dot = direct ? kGreen : kYellow;
+                conn = direct ? (pt ? "DIRETO (P2P)" : "DIRECT (P2P)") : (pt ? "VIA SERVIDOR" : "VIA SERVER");
+                conn_color = direct ? kGreen : kYellow;
+                const runtime::mp_net::PingResult pr = runtime::mp_net::LastPing(r.id);
+                if (pr.valid) {
+                    if (pr.direct_ms >= 0) {
+                        ping = std::to_string(pr.direct_ms) + " MS";
+                        if (pr.server_ms >= 0) ping += (pt ? " (SERV " : " (SRV ") + std::to_string(pr.server_ms) + ")";
+                    } else if (pr.server_ms >= 0) {
+                        ping = std::to_string(pr.server_ms) + " MS";
+                    } else {
+                        ping = pr.pending ? "..." : (pt ? "SEM RESPOSTA" : "NO REPLY");
                     }
+                    ping_color = kWhite;
+                } else if (direct && peer->direct_rtt_ms > 0) {
+                    ping = std::to_string(peer->direct_rtt_ms) + " MS";
+                    ping_color = kWhite;
+                } else if (sel) {
+                    ping = pt ? "ENTER: TESTAR" : "ENTER: TEST";
+                    ping_color = kCyan;
                 }
             }
-            c.Write(sel ? "> " + label : "  " + label, x0 + 24.0f * s, row_y, fi, sel ? kTitleYellow : kWhite);
-            if (!value.empty()) c.Write(value, x1 - TextWidth(value, fi) - 32.0f * s, row_y, fi, value_color);
-            row_y += 38.0f * s;
+            if (r.id == owner_id && online && r.id > 0) name += pt ? " - DONO" : " - OWNER";
+            c.Circle(x0 + pad + 8 * s, y + 6 * s, 6 * s, dot);
+            const u32 name_color = r.id <= kMpLeftBase ? kDim : (sel ? kTitle : kWhite);
+            c.Write(fit(name, fi, col_conn - x0 - pad - 40 * s), x0 + pad + 26 * s, y, fi, name_color);
+            c.Write(conn, col_conn, y, fi, r.id <= kMpLeftBase ? kDim : conn_color);
+            if (sel && owner && !r.self && r.id > 0) { // expulsar: so o dono, com confirmacao
+                const bool confirm = g_mp_kick_id == r.id && now - g_mp_kick_time < std::chrono::seconds(4);
+                ping = confirm ? (pt ? "DEL DE NOVO: EXPULSA" : "DEL AGAIN: KICK") : ping;
+                if (confirm) ping_color = kRed;
+            }
+            c.Write(fit(ping, fi, x1 - col_ping - pad), col_ping, y, fi, ping_color);
+            y += row_h;
         }
-        c.Rect(x0 + 20.0f * s, y1 - 60.0f * s, x1 - 20.0f * s, y1 - 58.0f * s, kGray);
-        const std::string footer = owner ? (pt ? "[CIMA/BAIXO]  [ENTER] TRANCAR/EXPULSAR  [F3] SALA  [F4/ESC] SAIR"
-                                               : "[UP/DOWN]  [ENTER] LOCK/KICK  [F3] ROOM  [F4/ESC] CLOSE")
-                                         : (pt ? "[F3] ENTRAR NA SALA  [F4/ESC] SAIR" : "[F3] JOIN ROOM  [F4/ESC] CLOSE");
-        const float ff = 1.7f * s;
-        c.Write(footer, x0 + (box_w - TextWidth(footer, ff)) / 2.0f, y1 - 40.0f * s, ff, kGray);
+        y += 6 * s;
+        line(y - 6 * s);
+
+        // chat
+        y += 6 * s;
+        c.Write("CHAT", x0 + pad, y, fs, kGray);
+        if (!g_mp_chat_typing && online) {
+            const std::string hint = pt ? "C: ESCREVER" : "C: WRITE";
+            c.Write(hint, x1 - pad - TextWidth(hint, fc), y, fc, kDim);
+        }
+        y += 26 * s;
+        const size_t first = chat.size() > kChatLines ? chat.size() - kChatLines : 0;
+        for (int i = 0; i < kChatLines; ++i) {
+            const size_t k = first + i;
+            if (k < chat.size()) {
+                const std::string msg = MpUpper(chat[k].name + ": " + chat[k].text);
+                c.Write(fit(msg, fc, box_w - 2 * pad), x0 + pad, y, fc, chat[k].self ? kCyan : kWhite);
+            } else if (i == 0 && chat.empty()) {
+                c.Write(online ? (pt ? "NENHUMA MENSAGEM AINDA" : "NO MESSAGES YET") : (pt ? "O CHAT FUNCIONA DENTRO DE UMA REDE" : "THE CHAT WORKS INSIDE A NETWORK"),
+                        x0 + pad, y, fc, kDim);
+            }
+            y += 22 * s;
+        }
+        if (g_mp_chat_typing) {
+            const bool caret = (std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch()).count() / 450) % 2 == 0;
+            std::string input = "> " + MpUpper(g_mp_chat_buf) + (caret ? "_" : " ");
+            const size_t max_chars = static_cast<size_t>((box_w - 2 * pad) / (6.0f * fi));
+            if (input.size() > max_chars) input = input.substr(input.size() - max_chars);
+            c.Rect(x0 + 14 * s, y - 5 * s, x1 - 14 * s, y + 22 * s, Rgba(30, 36, 48, 230));
+            c.Write(input, x0 + pad, y, fi, kTitle);
+        } else {
+            c.Write(pt ? "ENTER ENVIA, ESC CANCELA (TECLADO)" : "ENTER SENDS, ESC CANCELS (KEYBOARD)", x0 + pad, y, fc, kDim);
+        }
+        y += 30 * s;
+        line(y - 6 * s);
+        y += 8 * s;
+
+        // opcoes (criar / entrar / convite / sair: as acoes de rede do Radmin)
+        for (; index < rows.size(); ++index) {
+            const MpRow& r = rows[index];
+            const bool sel = static_cast<int>(index) == g_mp_selected;
+            if (sel) c.Rect(x0 + 14 * s, y - 5 * s, x1 - 14 * s, y + opt_h - 9 * s, kHiBg);
+            std::string value;
+            u32 value_color = sel ? kCyan : kGray;
+            if (r.id == kMpOptLock) {
+                value = runtime::mp_net::RoomLocked() ? (pt ? "< SIM >" : "< ON >") : (pt ? "< NAO >" : "< OFF >");
+            } else if (r.id == kMpOptFollow) {
+                value = runtime::multiplayer::FollowOwnerEnabled() ? (pt ? "< SIM >" : "< ON >") : (pt ? "< NAO >" : "< OFF >");
+            } else if (r.id == kMpOptP2P) {
+                value = net.p2p_on ? (pt ? "< SIM >" : "< ON >") : (pt ? "< NAO >" : "< OFF >");
+            } else if (r.id == kMpOptLeave && g_mp_leave_armed && now - g_mp_leave_time < std::chrono::seconds(4)) {
+                value = pt ? "ENTER DE NOVO PARA SAIR" : "ENTER AGAIN TO LEAVE";
+                value_color = kRed;
+            } else if (r.id == kMpOptChat && g_mp_chat_typing) {
+                value = pt ? "ESCREVENDO..." : "TYPING...";
+            } else if (sel) {
+                value = "< ENTER >";
+                value_color = kTitle;
+            }
+            c.Write((sel ? "> " : "  ") + r.name, x0 + pad, y, fi, sel ? kTitle : kWhite);
+            if (!value.empty()) c.Write(value, x1 - pad - TextWidth(value, fi), y, fi, value_color);
+            y += opt_h;
+        }
+
+        // aviso curto + teclas
+        line(y1 - 64 * s);
+        if (!g_mp_flash.empty() && now - g_mp_flash_time < std::chrono::milliseconds(3500)) {
+            c.Write(fit(g_mp_flash, fs, box_w - 2 * pad), x0 + (box_w - TextWidth(fit(g_mp_flash, fs, box_w - 2 * pad), fs)) / 2.0f,
+                    y1 - 52 * s, fs, kGreen);
+        }
+        const std::string footer = pt ? "[CIMA/BAIXO] ESCOLHER  [ENTER/X] PING OU ACAO  [C] CHAT  [DEL/QUADRADO] EXPULSAR  [F4/ESC] FECHAR"
+                                      : "[UP/DOWN] SELECT  [ENTER/X] PING OR ACTION  [C] CHAT  [DEL/SQUARE] KICK  [F4/ESC] CLOSE";
+        const std::string foot = fit(footer, 1.5f * s, box_w - 2 * pad);
+        c.Write(foot, x0 + (box_w - TextWidth(foot, 1.5f * s)) / 2.0f, y1 - 26 * s, 1.5f * s, kDim);
     }
 
     // 3.0: o pop-up (de verdade ou a previa do menu, que repete a animacao) vai por cima de tudo, depois do overlay
