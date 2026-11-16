@@ -19,6 +19,7 @@
 #include "hle/trophy_manager.h"
 #include "hle/trophy_popup.h"
 #include "hle/overrides/hle_toypad.h"
+#include "common/toypad_process.h"
 
 #include <algorithm>
 #include <atomic>
@@ -2036,6 +2037,9 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
         render::VulkanRenderer::Instance().SavePipelineCache();
         hle::log::StopCapture();
         runtime::mp_net::Stop(); // 4.0: avisa o servidor que saiu (o TerminateProcess pula o atexit)
+        if (!toypad_proc::IsExeRunning(L"LegoDimensionsLauncher.exe")) {
+            toypad_proc::CloseAll();
+        }
         TerminateProcess(GetCurrentProcess(), 0);
         return 0;
     default:

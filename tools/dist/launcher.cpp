@@ -12,6 +12,7 @@
 #define _UNICODE
 #include "ui.h"
 #include "../../src/common/game_region.h"
+#include "../../src/common/toypad_process.h"
 #include "../../src/common/trophy_sound_player.h"
 #include "../../src/hle/trophy_defs.h"
 #include "../../src/hle/trophy_trp.h" // 3.0: icones das conquistas do jogo do jogador
@@ -1462,6 +1463,8 @@ void OpenNamesDialog() {
 }
 
 void LaunchLegoToypad(bool notify_if_running = false);
+bool g_saw_game_running = false;
+bool g_toypad_opened_for_game = false;
 
 // ---- jogar ----
 void RunGame() {
@@ -1522,6 +1525,9 @@ void RunGame() {
     }
     if (g_opt_toypad) {
         LaunchLegoToypad();
+        g_toypad_opened_for_game = true;
+    } else {
+        g_toypad_opened_for_game = false;
     }
     PrepareMods(); // Fase 64
     PrepareCameras(); // 1.9.1
@@ -1626,11 +1632,16 @@ void RunGame() {
                        &si, &pi)) {
         CloseHandle(pi.hThread);
         CloseHandle(pi.hProcess);
+        g_saw_game_running = true;
         g_step = ui::T(L"Jogo aberto. Bom jogo!", L"Game started. Have fun!");
         Redraw();
         ShowWindow(g_main, SW_MINIMIZE);
     } else {
         AppendLog(ui::T(L"ERRO: nao consegui abrir build\\lego_dimensions.exe", L"ERROR: could not start build\\lego_dimensions.exe"));
+        if (g_toypad_opened_for_game) {
+            toypad_proc::CloseAll();
+            g_toypad_opened_for_game = false;
+        }
     }
     if (log != INVALID_HANDLE_VALUE) {
         CloseHandle(log);
@@ -1691,22 +1702,7 @@ void CreateDesktopShortcut() {
 }
 
 bool IsProcessRunning(const wchar_t* process_name) {
-    bool running = false;
-    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
-    if (snap == INVALID_HANDLE_VALUE) {
-        return false;
-    }
-    PROCESSENTRY32W entry{sizeof(entry)};
-    if (Process32FirstW(snap, &entry)) {
-        do {
-            if (_wcsicmp(entry.szExeFile, process_name) == 0) {
-                running = true;
-                break;
-            }
-        } while (Process32NextW(snap, &entry));
-    }
-    CloseHandle(snap);
-    return running;
+    return toypad_proc::IsExeRunning(process_name);
 }
 
 fs::path FindLegoToypadExe() {
@@ -1735,7 +1731,7 @@ fs::path FindLegoToypadExe() {
 }
 
 void LaunchLegoToypad(bool notify_if_running) {
-    if (IsProcessRunning(L"LegoToypad.exe") || IsProcessRunning(L"LegoToypad.v1.9.Web.App.Extended.exe")) {
+    if (toypad_proc::IsRunning()) {
         if (notify_if_running) {
             MessageBoxW(g_main, ui::T(L"O LegoToypad já está em execução.", L"LegoToypad is already running."), L"LEGO Dimensions PC", MB_ICONINFORMATION);
         }
@@ -1878,7 +1874,28 @@ void SyncLegoToypadState() {
         ~Guard() { flag.store(false); }
     } guard{in_sync};
 
-    const bool running = IsProcessRunning(L"LegoToypad.exe") || IsProcessRunning(L"LegoToypad.v1.9.Web.App.Extended.exe");
+    const bool running = toypad_proc::IsRunning();
+    const bool game_running = toypad_proc::IsExeRunning(L"lego_dimensions.exe");
+    if (game_running) {
+        g_saw_game_running = true;
+    }
+
+    // Se o jogo acabou de ser fechado, encerra o LegoToypad junto para nao ficar em segundo plano
+    // e restaura a janela do launcher (o launcher NAO fecha, volta para a tela).
+    if (g_saw_game_running && !game_running) {
+        g_saw_game_running = false;
+        g_toypad_opened_for_game = false;
+        g_toypad_api_restored = false;
+        if (toypad_proc::CloseAll() > 0) {
+            AppendLog(ui::T(L"LegoToypad fechado com o jogo.", L"LegoToypad closed with the game."));
+        }
+        if (g_main && IsWindow(g_main)) {
+            ShowWindow(g_main, SW_RESTORE);
+            SetForegroundWindow(g_main);
+        }
+        return;
+    }
+
     if (!running) {
         g_toypad_api_restored = false;
         return;
@@ -1887,7 +1904,6 @@ void SyncLegoToypadState() {
     const std::string state = ToypadHttpGet(8765, L"/api/state");
     if (state.empty()) return;
 
-    const bool game_running = IsProcessRunning(L"lego_dimensions.exe");
     if (!g_toypad_api_restored) {
         if (game_running) {
             // Restaura o estado salvo no app do portal
@@ -3968,7 +3984,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show) {
     LoadXInput(); // issue #3: controle no launcher
     SetTimer(g_main, kPadTimer, 16, nullptr);
     SetTimer(g_main, kUpdateCheckTimer, 1000, nullptr); // verifica atualizacao ao abrir
-    SetTimer(g_main, kToypadSyncTimer, 1000, nullptr);  // sincroniza persistencia do toypad (harrysof)
+    SetTimer(g_main, kToypadSyncTimer, 500, nullptr);   // sincroniza persistencia do toypad e fecha com o jogo
     MSG msg;
     while (GetMessageW(&msg, nullptr, 0, 0)) {
         if ((!g_names_window || !IsDialogMessageW(g_names_window, &msg)) && (!g_mp_window || !IsDialogMessageW(g_mp_window, &msg))) {

@@ -32,6 +32,7 @@
 #include "loader/elf_pie_loader.h"
 #include "common/game_region.h"
 #include "common/cutscene_patch.h"
+#include "common/toypad_process.h"
 #include "patcher/fs_tls_patcher.h"
 #include "runtime/lang.h"
 #include "hle/trophy_manager.h"
@@ -170,6 +171,9 @@ struct EntryParams {
 HLE_SYSV_ABI void ProgramExit() {
     std::printf("\nProgram called the exit handler passed in RSI. Exiting.\n");
     hle::toypad::SavePortalState();
+    if (!toypad_proc::IsExeRunning(L"LegoDimensionsLauncher.exe")) {
+        toypad_proc::CloseAll();
+    }
     hle::log::Shutdown(0);
 }
 
