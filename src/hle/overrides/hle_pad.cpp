@@ -325,7 +325,7 @@ bool FreshKey(int vk) {
 
 void ReadKeyboard(Input& in, bool player1 = true) {
     const bool any_overlay = videoout::IsVideoSettingsMenuOpen() || videoout::IsImageSettingsMenuOpen() ||
-                             videoout::IsMpRoomMenuOpen() ||
+                             videoout::IsMpRoomMenuOpen() || videoout::IsChatTyping() ||
                              videoout::IsMpDialogOpen() ||
                              videoout::IsAchievementsMenuOpen() || videoout::IsLogsMenuOpen();
     if (!g_keyboard_enabled || !videoout::WindowHasFocus() || any_overlay) {

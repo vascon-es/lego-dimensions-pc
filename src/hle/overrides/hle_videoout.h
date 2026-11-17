@@ -92,6 +92,7 @@ void HandleAchievementsMenuController(u32 pressed_buttons);
 // 4.0/4.1: sala do multiplayer dentro do jogo: overlay de participantes (F4) e configuracao/entrar na sala (F3)
 void ToggleMpRoomMenu();
 bool IsMpRoomMenuOpen();
+bool IsChatTyping(); // 4.5: o teclado esta escrevendo no chat (painel F4 ou chat direto da tecla C)
 void HandleMpRoomMenuController(u32 pressed_buttons);
 void OpenMpRoomDialog(bool new_network = false); // Fase 83: true = "criar rede nova" (codigo novo)
 bool IsMpDialogOpen();

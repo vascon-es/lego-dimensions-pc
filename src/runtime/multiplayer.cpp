@@ -27,8 +27,10 @@
 #include <thread>
 #include <vector>
 
+#include "common/game_region.h"
 #include "common/types.h"
 #include "hle/generated/hle_stub.h"
+#include "hle/overrides/hle_filesystem.h"
 #include "runtime/mp_net.h"
 
 namespace runtime::multiplayer {
@@ -210,6 +212,7 @@ struct Puppet {
     float distance = 0;  // ate o nosso jogador 1 (quem esta mais perto ganha os slots)
     float still_x = 0, still_z = 0; // ultimo lugar onde o fantasma andou (para ver se ficou preso)
     double still_time = 0;
+    int clashes = 0; // 4.5: vezes que o pedido acabou preso na party do jogador local (Task 6)
     unsigned seq = 0;
     Remote cur, prev;
     double cur_time = 0, prev_time = 0;
@@ -341,7 +344,14 @@ HLE_SYSV_ABI u64 ControlHook(u64 inst, float dt) {
             At<float>(fc->ctrl + 0x58) = moving ? d->dx : 0.0f;
             At<float>(fc->ctrl + 0x5c) = moving ? d->dz : 0.0f;
             At<u8>(inst + 0x399) = 1;
-            return g_control(inst, dt);
+            const u64 result = g_control(inst, dt);
+            // 4.5: o analogico alimenta so a caminhada; a cara continua sendo a do outro jogo (sem isto o motor vira
+            // o personagem na direcao do analógico e o fantasma "anda de lado")
+            if (std::isfinite(d->fx) && std::isfinite(d->fz) && std::fabs(d->fx) + std::fabs(d->fz) > 0.01f) {
+                At<float>(inst + 0x170) = d->fx;
+                At<float>(inst + 0x178) = d->fz;
+            }
+            return result;
         }
     }
     if (d) { // botoes antes: o pulo/ataque e lido dentro do controle
@@ -359,14 +369,18 @@ HLE_SYSV_ABI u64 ControlHook(u64 inst, float dt) {
             if (d->speed > 0.0f) At<float>(loc + 0x70) = d->speed; // rapidez propria (alcanca o ponto recebido)
             else At<u32>(loc + 0x70) = 0xff7fffffu; // rapidez = tabela da marcha
             At<s32>(loc + 0x238) = d->gear;
-            if (d->gear > 3) {
-                At<float>(loc + 0x80) = d->dx;
+            if (d->gear > 3 && std::isfinite(d->dx) && std::isfinite(d->dz)) {
+                At<float>(loc + 0x80) = d->dx; // loc+0x80: SO a velocidade (direcao da caminhada)
                 At<float>(loc + 0x84) = 0.0f;
                 At<float>(loc + 0x88) = d->dz;
             }
         }
-        At<float>(inst + 0x170) = d->fx; // rumo desejado
-        At<float>(inst + 0x178) = d->fz;
+        // 4.5: inst+0x170 e SO o rumo do corpo (a cara), que vem do outro jogo. A correcao de posicao vive em
+        // loc+0x80 - se ela for escrita aqui tambem, o fantasma anda de lado/gira ao corrigir a deriva lateral.
+        if (std::isfinite(d->fx) && std::isfinite(d->fz) && std::fabs(d->fx) + std::fabs(d->fz) > 0.01f) {
+            At<float>(inst + 0x170) = d->fx;
+            At<float>(inst + 0x178) = d->fz;
+        }
     }
     return result;
 }
@@ -456,6 +470,22 @@ HLE_SYSV_ABI u64 SpawnHook(u64 spawner, u64 request, u64 flag, u64 a, u64 b, u64
     return g_spawn(spawner, request, flag, a, b, c);
 }
 
+// ---- 4.5: eventos de interface (dialogo, camera, cutscene, minigame) ---------------------------------------------
+// Aplicar o progresso de missao de outro jogador nao pode abrir janela/camera neste jogo. Enquanto g_quest_silent esta
+// ligado (so durante o pedido de multiestado que aplica um aviso "q"), os eventos de interface que o motor dispara
+// por causa daquele estado morrem no gancho; o estado em si ja foi escrito pelo pedido.
+std::atomic<bool> g_quest_silent{false};
+
+bool IsUiEventName(const char* name) {
+    static const char* kUi[] = {"Dialog", "Speech", "Subtitle", "Camera", "Cutscene", "Cinematic", "Movie",
+                                "Keystone", "Hack", "Minigame", "MiniGame", "Wheel", "Terminal", "Prompt",
+                                "Menu", "Hud", "HUD", "Banner", "Tutorial"};
+    for (const char* ui : kUi) {
+        if (std::strstr(name, ui)) return true;
+    }
+    return false;
+}
+
 // ---- pesquisa (sincronizar os jogos): LD_MP_EVENTS registra os eventos do jogo (eboot+4c2d00 = dispara um evento:
 // rdi = tipo do evento, objeto global com o nome em +8; rsi = quem manda; rdx = dados) ----
 u64 kFireEventFn = 0x4c2d00;
@@ -469,15 +499,23 @@ std::map<std::string, EventStat> g_events;
 void ReportEventsLocked(double now);
 
 HLE_SYSV_ABI u64 FireEventHook(u64 ev, u64 sender, u64 payload, u64 a, u64 b, u64 c) {
+    static const bool log_events = std::getenv("LD_MP_EVENTS") != nullptr;
+    const bool silent = g_quest_silent.load();
+    if (!silent && !log_events) return g_fire_event(ev, sender, payload, a, b, c); // custo zero no caminho normal
+    char name[64] = {};
     if (ev && Readable(ev + 8, 8)) {
         const u64 name_ptr = At<u64>(ev + 8);
-        char name[64] = {};
         if (name_ptr && Readable(name_ptr, 1)) {
             for (int i = 0; i < 63 && Readable(name_ptr + i, 1); ++i) {
                 name[i] = At<char>(name_ptr + i);
                 if (!name[i]) break;
             }
         }
+    }
+    // 4.5: aviso de missao aplicado aqui: dialogo, camera, cutscene ou minigame do outro jogador nao abrem neste
+    if (silent && name[0] && IsUiEventName(name)) return 0;
+    if (!log_events) return g_fire_event(ev, sender, payload, a, b, c);
+    if (ev && Readable(ev + 8, 8)) {
         const double now = runtime::mp_net::Now();
         std::lock_guard lock(g_event_mutex);
         EventStat& st = g_events[name[0] ? name : "?"];
@@ -823,6 +861,27 @@ std::string CurrentArea() {
     return g_area;
 }
 
+// ---- 4.5: historia/objetivo x minigame local -------------------------------------------------------------------
+// O roteiro do level progride por objetos de estado (gatilho de objetivo, NPC, marco da missao). Esses avisos vao para
+// a sala como "q|area|nome#ordem|estado" e sao aplicados no outro jogo SEM abrir dialogo/camera/menu (g_quest_silent).
+// O que e claramente uma interacao local (roda de keystone, terminal de hack, minigame) nao sai daqui e tambem nao e
+// aplicado quando chega: a janela do minigame de um jogador nunca aparece na tela do outro.
+bool IsLocalOnlyGadget(const std::string& name) {
+    static const char* kLocal[] = {"Keystone", "Hack", "Terminal", "Minigame", "MiniGame", "Arcade", "WheelUI"};
+    for (const char* local : kLocal) {
+        if (name.find(local) != std::string::npos) return true;
+    }
+    return false;
+}
+
+bool IsQuestGadget(const std::string& name) {
+    static const char* kQuest[] = {"Quest", "Objective", "Mission", "Story", "Goal", "Dialog", "Dialogue", "Npc", "NPC"};
+    for (const char* quest : kQuest) {
+        if (name.find(quest) != std::string::npos) return true;
+    }
+    return false;
+}
+
 HLE_SYSV_ABI u64 BlowUpHook(u64 ctx, u64 who, u64 a, u64 b, u64 c, u64 d, u64 st0, u64 st1) {
     if (!g_applying && g_enabled && ValidGadget(ctx) && At<u64>(ctx) == reinterpret_cast<u64>(g_base) + kBlowUpVtable &&
         !At<u8>(ctx + 0x260) && IsLocalPlayer(who)) {
@@ -988,6 +1047,7 @@ HLE_SYSV_ABI u64 RequestDtorHook(u64 request, u64 a, u64 b, u64 c, u64 d, u64 e)
 u64 SlotAddress(int i) {
     const u64 portal = At<u64>(reinterpret_cast<u64>(g_base) + kPortalSlots);
     const u64 player = At<u64>(reinterpret_cast<u64>(g_base) + kPlayerSlots);
+    if (!portal || !player) return 0; // antes do preparo da fase nao ha lista de slots
     return i < g_nslots ? portal + i * kSlotStep : player + (i - g_nslots) * kSlotStep;
 }
 
@@ -995,9 +1055,14 @@ void UpdateSlotCounts() {
     g_nslots = std::clamp(At<s32>(reinterpret_cast<u64>(g_base) + kPortalSlots + 8), 0, 48);
     g_nall = g_nslots + std::clamp(At<s32>(reinterpret_cast<u64>(g_base) + kPlayerSlots + 8), 0, 4);
 }
-int SlotState(int i) { return At<s32>(SlotAddress(i) + 0x2c8); }
+int SlotState(int i) {
+    const u64 slot = SlotAddress(i);
+    return slot && Readable(slot + 0x2c8, 4) ? At<s32>(slot + 0x2c8) : -1;
+}
 std::string SlotName(int i) {
-    const char* name = reinterpret_cast<const char*>(SlotAddress(i) + 0xb8);
+    const u64 slot = SlotAddress(i);
+    if (!slot || !Readable(slot + 0xb8, 48)) return {};
+    const char* name = reinterpret_cast<const char*>(slot + 0xb8);
     return std::string(name, strnlen(name, 48));
 }
 
@@ -1009,16 +1074,32 @@ bool OursFamily(const std::string& slot_name);
 // Um slot que o jogo carregou como VARIANTE de um fantasma (o proximo Doctor, o Homer bravo...) pertence ao fantasma
 // que o pediu: e solto quando ele some. Fantasma nenhum nasce dele (nascer de la e depois perder o slot derrubava a
 // thread de fundo). Servem: os slots que nos carregamos e os das figuras do proprio jogador.
+std::string LocalCharacter(u64 inst);
+bool LocalPlayerUses(const std::string& slot_name);
+
+// 4.5: personagem repetido (P1 e P2 escolhem o mesmo, ex. o Batman). O slot da figura do jogador local NAO serve para
+// o fantasma: o motor liga o pedido ao mesmo personagem da party (inst+0x3a0), um dos dois some e a troca de figura
+// derruba o jogo. Se for o mesmo personagem que o jogador local usa, esta funcao devolve 0 e o Tick carrega o
+// personagem num "Player Load Slot" proprio (duas instancias isoladas).
 u64 FindLoadedSlot(const std::string& chr) {
     const std::string want = Lower(chr) + ".cd";
+    u64 ours = 0;
     for (int i = 0; i < g_nall; ++i) {
-        if (SlotState(i) != 1 || SlotName(i) != want) continue;
+        if (SlotState(i) != 1) continue;
+        const std::string name = SlotName(i);
+        if (name != want) continue;
         const u64 slot = SlotAddress(i);
+        if (!slot) continue;
         const auto it = g_our_slots.find(slot);
-        if (it != g_our_slots.end() && it->second + ".cd" == want) return slot; // nosso, deste personagem
-        if (it == g_our_slots.end() && !OursFamily(want)) return slot;           // figura do jogador
+        if (it != g_our_slots.end()) { // nosso, deste personagem: instancia separada, serve
+            if (it->second + ".cd" == want && !ours) ours = slot;
+            continue;
+        }
+        if (OursFamily(want)) continue;        // variante de um personagem nosso: pertence a outro fantasma
+        if (LocalPlayerUses(name)) continue;   // figura do jogador local: nunca compartilha a party com um fantasma
+        return slot;                           // figura do jogador, livre
     }
-    return 0;
+    return ours;
 }
 
 int FreeSlots() { // do portal
@@ -1035,8 +1116,10 @@ bool CanLoad() { return UsePlayerSlot() || FreeSlots() >= kKeepFreeSlots + 1; }
 
 bool FreePlayerSlot() { // slot de jogador vazio e com memoria (preparo da fase com o gancho)
     for (int i = g_nslots; i < g_nall; ++i) {
+        const u64 slot = SlotAddress(i);
+        if (!slot || !Readable(slot + 0x58, 8) || !Readable(slot + 0x2d4, 4)) continue;
         // com memoria propria (os 2 ultimos usam a memoria geral e nao carregam: +0x2d4 = 1)
-        if (SlotState(i) == 0 && At<u32>(SlotAddress(i) + 0x58) != 0 && !At<u8>(SlotAddress(i) + 0x2d4)) return true;
+        if (SlotState(i) == 0 && At<u32>(slot + 0x58) != 0 && !At<u8>(slot + 0x2d4)) return true;
     }
     return false;
 }
@@ -1058,7 +1141,7 @@ bool Ours(const std::string& slot_name) {
     return false;
 }
 
-std::string LocalCharacter(u64 inst);
+std::string LocalCharacter(u64 inst); // (declarado acima, antes de FindLoadedSlot)
 void Log(const char* fmt, const std::string& a, const std::string& b = {});
 
 bool LocalPlayerUses(const std::string& slot_name) { // o jogador 1 ou 2 deste PC esta com esse personagem
@@ -1111,6 +1194,7 @@ bool LocalFamily(const std::string& slot_name) {
 // da carga de uma variante que um fantasma pediu (Homer bravo, o proximo Doctor, o chi do Laval). Como o jogo
 // (eboot+157d9c0): so descarrega com o trabalho terminado, e sempre pelo estado 3, que espera o resto e leva a 0.
 bool SlotJobDone(u64 slot) {
+    if (!slot || !Readable(slot + 0x88 + 0x18, 8)) return false; // sem endereco de slot: nada a descarregar
     return At<u64>(slot + 0x88 + 0x18) == 0; // trabalho em andamento (eboot+d193b0)
 }
 
@@ -1288,11 +1372,24 @@ bool ReclaimForCloser(const Puppet& wanting, double now) {
 u64 StandInSlot() {
     for (int i = 0; i < g_nall; ++i) {
         const u64 slot = SlotAddress(i);
+        if (!slot) continue;
         const auto it = g_our_slots.find(slot);
         if (SlotState(i) == 1 && it != g_our_slots.end() && SlotName(i) == it->second + ".cd") return slot;
     }
-    const u64 p1 = At<u64>(reinterpret_cast<u64>(g_base) + kPlayerTable);
-    return p1 ? FindLoadedSlot(LocalCharacter(p1)) : 0;
+    // 4.5: antes o substituto caia no slot do personagem do jogador local - o mesmo problema da party compartilhada
+    // (Task 6). Sem um personagem NOSSO livre, so o nome flutuando aparece ate sobrar um slot.
+    return 0;
+}
+
+// O slot (endereco) esta carregado com o personagem que o jogador 1/2 deste PC esta usando agora?
+bool SlotUsedByLocalPlayer(u64 slot) {
+    if (!slot) return false;
+    for (int i = 0; i < g_nall; ++i) {
+        if (SlotAddress(i) != slot) continue;
+        const std::string name = SlotName(i);
+        return !name.empty() && LocalPlayerUses(name);
+    }
+    return false;
 }
 
 // ---- spawn / despawn --------------------------------------------------------------------------------------------
@@ -1365,6 +1462,15 @@ const char* SlotLabel(u64 slot) {
 }
 
 bool Spawn(Puppet& p) {
+    // 4.5: nunca prende o pedido ao slot do personagem do jogador 1/2 (a party seria a mesma: um some e a troca cai)
+    if (SlotUsedByLocalPlayer(p.slot)) {
+        Log("[MP] %s: o slot de %s e do jogador local, carrego um slot de jogador proprio", p.cur.chr, p.name);
+        p.slot = 0;
+        p.stage = Stage::kNone;
+        p.load_fail_time = 0;
+        p.retry_time = runtime::mp_net::Now() + 1.0;
+        return false;
+    }
     u64 spawner = 0, model = 0;
     if (!PickSpawner(&spawner, &model)) {
         static double last_note = -100;
@@ -1495,6 +1601,15 @@ void Steer(Puppet& p, double now, Drive* d) {
     const float lead = static_cast<float>(std::clamp(age + latency, 0.0, 0.5));
     const float tx = r.x + vx * lead, tz = r.z + vz * lead;
     const u64 t = Transform(p.inst);
+    if (!t || !Readable(t + 0x90, 12)) { // sem matriz de posicao: nada a dirigir neste quadro (nada velho no Drive)
+        d->inst = 0;
+        d->gear = 3;
+        d->speed = 0.0f;
+        d->dx = d->dz = 0.0f;
+        d->fx = d->fz = 0.0f;
+        d->held = d->prev = 0;
+        return;
+    }
     const float px = At<float>(t + 0x90), py = At<float>(t + 0x94), pz = At<float>(t + 0x98);
     const float ex = tx - px, ez = tz - pz;
     const float dist = std::sqrt(ex * ex + ez * ez);
@@ -1504,6 +1619,24 @@ void Steer(Puppet& p, double now, Drive* d) {
     d->inst = p.inst;
     d->speed = 0.0f;
     d->held = age < 1.0 ? (r.held & kSentButtons) : 0;
+    // 4.5: rumo do corpo x direcao da caminhada (coisas separadas). A cara vem SEMPRE do outro jogo (r.fx, r.fz =
+    // inst+0x170 do dono). Antes a correcao de posicao era escrita tambem na cara e o fantasma andava de lado/girava
+    // a cada correcao da deriva lateral.
+    {
+        const float fx = r.fx, fz = r.fz;
+        const float n = std::sqrt(fx * fx + fz * fz);
+        if (!std::isfinite(n) || n < 0.01f) { // versao antiga (sem rumo) ou estado zerado: a cara segue o movimento
+            const float mx = r.gear > 3 ? r.dx : 1.0f, mz = r.gear > 3 ? r.dz : 0.0f;
+            const float m = std::sqrt(mx * mx + mz * mz);
+            d->fx = m > 0.001f ? mx / m : 0.0f;
+            d->fz = m > 0.001f ? mz / m : 1.0f;
+        } else {
+            d->fx = fx / n;
+            d->fz = fz / n;
+        }
+    }
+    d->dx = 0.0f; // parado: sem velocidade (a velocidade so vale para marcha > 3)
+    d->dz = 0.0f;
     const bool stale = age > 3.0;
     if (!stale && r.gear > 3) {
         const float k = 0.8f * std::min(dist, 1.5f);
@@ -1514,8 +1647,8 @@ void Steer(Puppet& p, double now, Drive* d) {
             dz /= n;
         }
         d->gear = r.gear;
-        d->dx = d->fx = dx;
-        d->dz = d->fz = dz;
+        d->dx = dx; // loc+0x80: so a velocidade (pode divergir da cara: andar de lado e' normal)
+        d->dz = dz;
         // atras do ponto (na direcao do movimento): um pouco mais rapido ate encostar; na frente: um pouco mais devagar
         const float base = TableSpeed(p.inst, r.gear);
         if (base > 0.0f) {
@@ -1526,12 +1659,10 @@ void Steer(Puppet& p, double now, Drive* d) {
         d->gear = 6;
         const float base = TableSpeed(p.inst, 6);
         if (base > 0.0f) d->speed = std::clamp(dist * 4.0f, 0.3f, base);
-        d->dx = d->fx = ex / dist;
-        d->dz = d->fz = ez / dist;
+        d->dx = ex / dist;
+        d->dz = ez / dist;
     } else {
         d->gear = 3;
-        d->dx = d->fx = r.fx;
-        d->dz = d->fz = r.fz;
     }
     // preso (outro personagem, parede): tentando andar ha 1 s sem sair do lugar -> vai direto para o ponto
     if (std::hypot(px - p.still_x, pz - p.still_z) > 0.05f || d->gear <= 3 || dist < 0.6f) {
@@ -1584,6 +1715,60 @@ std::string LevelPath(u64 obj) {
 std::map<std::string, std::vector<int>> g_level_index;
 double g_level_index_time = -100;
 
+// ---- 4.5: mundo do dono da sala x mundo liberado no save do convidado -----------------------------------------
+// O convidado pode nao ter no savedata0 dele o mundo/DLC que o dono esta jogando (os gold bricks dele nao abrem o
+// mundo). O que conta e o pacote estar instalado: com DLC no addcont a fase do dono fica autorizada - so ela, e so
+// durante a sessao da sala. Sem DLC instalado o jogo responde como sempre (a fase nao existe).
+bool DlcContentInstalled() {
+    static int cached = -1; // -1 ainda nao perguntou, 0 sem DLC, 1 com DLC
+    if (cached >= 0) return cached == 1;
+    cached = 0;
+    const std::filesystem::path game = hle::fs::App0();
+    const char* appdata = std::getenv("APPDATA");
+    if (!game.empty() && game_region::HasAddcontContent(game, appdata ? appdata : "")) {
+        cached = 1; // a pasta de DLC do shadPS4 (ou <jogo>/assets/addcont)
+    } else if (const std::filesystem::path writable = hle::fs::WritableRoot();
+               !writable.empty() && !game_region::AddcontPacks(writable / "addcont").empty()) {
+        cached = 1; // a pasta de DLC do port (main.cpp: <port>/assets/addcont)
+    }
+    return cached == 1;
+}
+
+u64 g_level_gate_id = ~0ull;        // fase do dono autorizada agora (pula o "mundo liberado" do save local)
+double g_level_gate_time = -100;    // quando foi autorizada
+bool g_level_index_building = false; // so a NOSSA lista de fases aceita as fases de DLC que o save local nao liberou
+SetupFn g_level_valid = nullptr;
+constexpr int kDlcLevelBase = 2600; // ate aqui as fases do jogo base; as das DLCs vem depois deste buraco
+
+// (fase) -> existe? Gancho em kLevelValidFn (o portao do jogo para carregar uma fase).
+//  - durante a sessao: responde "sim" para a fase que o dono da sala mandou carregar (FollowOwner autoriza);
+//  - enquanto montamos a nossa lista de fases: aceita as fases de DLC instaladas, para o LevelKey do dono achar o
+//    numero certo aqui (a lista e so nossa; o jogo continua com a dele).
+// Sem DLC instalado (e para as fases do jogo base fora da fase do dono) a resposta e a do jogo, sem mudanca nenhuma.
+HLE_SYSV_ABI u64 LevelValidHook(u64 id, u64 a, u64 b, u64 c, u64 d, u64 e) {
+    const u64 result = g_level_valid(id, a, b, c, d, e);
+    if (result & 0xff) return result;
+    if (!g_enabled || !runtime::mp_net::SelfId()) return result; // fora de uma sala: nada muda
+    static thread_local bool inside = false; // o proprio jogo pode consultar de novo na busca pelo numero
+    if (inside) return result;
+    const bool authorized = id == g_level_gate_id && runtime::mp_net::Now() - g_level_gate_time < 60.0;
+    if (!authorized && !g_level_index_building) return result;
+    const bool from_dlc = id >= static_cast<u64>(kDlcLevelBase);
+    if (!from_dlc && !authorized) return result;                  // o jogo base fica como o jogo respondeu
+    if (from_dlc && !DlcContentInstalled()) return result;        // DLC: so com o pacote instalado
+    u64 obj = 0;
+    inside = true;
+    obj = Call(kLevelByIdFn, id);
+    inside = false;
+    if (!obj || LevelPath(obj).empty()) return result; // a fase nao existe neste jogo
+    static u64 last_logged = ~0ull;
+    if (authorized && last_logged != id) {
+        last_logged = id;
+        Log("[MP] fase %s liberada para a sessao (mundo nao liberado no save local)", std::to_string(id));
+    }
+    return 1;
+}
+
 // As listas de fases das DLCs sao lidas depois da tela de carregamento: uma fase que nao esta no indice refaz o
 // indice (no maximo a cada 10 s).
 void BuildLevelIndex(bool again = false) {
@@ -1592,6 +1777,7 @@ void BuildLevelIndex(bool again = false) {
     g_level_index_time = now;
     g_level_index.clear();
     int found = 0;
+    g_level_index_building = true; // as fases de DLC instaladas entram na NOSSA lista mesmo sem o save liberar
     for (int id = 0; id < 8192; ++id) { // as das DLCs ficam depois de um buraco grande (~2600)
         if (!(Call(kLevelValidFn, static_cast<u64>(id)) & 0xff)) continue;
         const u64 obj = Call(kLevelByIdFn, static_cast<u64>(id));
@@ -1600,6 +1786,7 @@ void BuildLevelIndex(bool again = false) {
         g_level_index[path].push_back(id);
         ++found;
     }
+    g_level_index_building = false;
     std::printf("[MP] fases: %d (%zu pacotes)\n", found, g_level_index.size());
     std::fflush(stdout);
 }
@@ -1665,6 +1852,36 @@ void UpdateLevelKey() {
 // Uma fase que nao deu (DLC que falta...) espera 60 s para tentar de novo.
 std::atomic<bool> g_follow_owner{true};
 
+// 4.5: ele ja esteve num mundo alguma vez nesta sessao (nao puxa o jogador para a fase do dono estando no menu).
+std::atomic<bool> g_seen_world{false};
+
+// A cena do tubo do vorton tranca o controle: o mundo local fica sem jogador/area por varios segundos. Enquanto isso o
+// seguidor nao pode exigir estabilidade - era por isso que o convidado ficava preso caindo no tubo enquanto o dono ja
+// estava na fase.
+bool LocalTransition() {
+    if (!g_in_world || g_level_key.empty()) return true;
+    {
+        std::lock_guard lock(g_area_mutex);
+        if (g_area.empty() || runtime::mp_net::Now() - g_area_time < 4.0) return true;
+    }
+    const u64 p1 = At<u64>(reinterpret_cast<u64>(g_base) + kPlayerTable);
+    return !p1 || !Readable(p1, 0x500);
+}
+
+// 4.5: interrompe a queda/animacao do tubo antes de desmontar a fase. So usa os campos que este modulo ja escreve no
+// gancho de controle (velocidade em loc+0x80, marcha em loc+0x238): nenhum deslocamento novo no personagem.
+void StopLocalFall() {
+    const u64 p1 = At<u64>(reinterpret_cast<u64>(g_base) + kPlayerTable);
+    if (!p1 || !Readable(p1 + 0x90, 8)) return;
+    const u64 loc = At<u64>(p1 + 0x90);
+    if (!loc || !Readable(loc + 0x70, 0x1d0)) return;
+    At<float>(loc + 0x80) = 0.0f;
+    At<float>(loc + 0x84) = 0.0f;
+    At<float>(loc + 0x88) = 0.0f;
+    At<u32>(loc + 0x70) = 0xff7fffffu; // rapidez = tabela da marcha
+    At<s32>(loc + 0x238) = 3;          // parado
+}
+
 void FollowOwner(double now) {
     const bool off = !g_follow_owner || std::getenv("LD_MP_NOFOLLOW") != nullptr;
     static std::string owner_key, failed_key, pending_key;
@@ -1682,20 +1899,26 @@ void FollowOwner(double now) {
     if (!pending_key.empty()) { // pediu a troca: deu certo?
         if (g_level_key == pending_key) {
             pending_key.clear();
+            g_level_gate_id = ~0ull; // a fase do dono ja e a nossa: o portao volta ao normal
         } else if (now - pending_time > 25.0) {
             Log("[MP] nao consegui ir para a fase %s do dono da sala (tento de novo em 60 s)", pending_key);
             failed_key = pending_key;
             failed_until = now + 60.0;
             pending_key.clear();
+            g_level_gate_id = ~0ull;
         }
         return;
     }
-    if (!g_in_world || g_level_key.empty() || r.level == g_level_key || now - owner_since < 2.0 || now < cooldown) return;
-    if (r.level == failed_key && now < failed_until) return;
-    {
+    if (r.level == g_level_key || now < cooldown) return;
+    if (!g_seen_world) return; // ainda no menu/front-end: nao puxa o jogador para a fase do dono
+    // 4.5: na cena do tubo/queda nao ha mundo estavel para esperar: segue o dono no quadro seguinte
+    const bool transition = LocalTransition();
+    if (now - owner_since < (transition ? 0.25 : 2.0)) return;
+    if (!transition) {
         std::lock_guard lock(g_area_mutex);
-        if (now - g_area_time < 4.0) return; // ainda carregando a area
+        if (now - g_area_time < 4.0) return; // ainda carregando a area (mundo estavel)
     }
+    if (r.level == failed_key && now < failed_until) return;
     const int id = LevelIdForKey(r.level);
     if (id < 0) {
         Log("[MP] o dono da sala esta na fase %s, que este jogo nao tem (DLC?)", r.level);
@@ -1704,6 +1927,7 @@ void FollowOwner(double now) {
         return;
     }
     Log("[MP] seguindo o dono da sala %s: indo para a fase %s", it->second.name, r.level);
+    StopLocalFall(); // a queda/animacao do tubo para aqui: a fase vai ser desmontada agora
     // os fantasmas saem antes (a fase vai ser desmontada)
     for (auto& [pid, p] : g_puppets) {
         if (p.stage == Stage::kSpawning || p.stage == Stage::kActive) Despawn(p);
@@ -1711,6 +1935,10 @@ void FollowOwner(double now) {
     }
     g_drive_count = 0;
     g_level_request_time = now;
+    // 4.5: a fase do dono fica autorizada durante a carga (o convidado pode nao ter o mundo liberado no save local;
+    // o pacote da DLC, se for o caso, esta instalado - ver LevelValidHook)
+    g_level_gate_id = static_cast<u64>(id);
+    g_level_gate_time = now;
     Call(kGotoLevelFn, reinterpret_cast<u64>(g_base) + kLevelLoader, static_cast<u64>(id), 0, 0);
     pending_key = r.level;
     pending_time = now;
@@ -1735,6 +1963,7 @@ void SendLocal(u64 p1, double now) {
         return;
     }
     g_in_world = true;
+    g_seen_world = true; // 4.5: ja jogou num mundo (o seguidor de fase so age depois disto)
     u32 held = 0;
     const u64 party = At<u64>(p1 + 0x3a0);
     if (party && Readable(party + 0x18, 0x10)) held = At<u32>(party + 0x18 + 0xc);
@@ -1826,6 +2055,10 @@ bool InstallHooks() {
     if (!g_build_update) g_build_update = reinterpret_cast<BuildUpdateFn>(Hook(kBuildUpdateFn, reinterpret_cast<const void*>(&BuildUpdateHook)));
     if (!g_reform_trigger) g_reform_trigger = reinterpret_cast<SetupFn>(Hook(kReformTriggerFn, reinterpret_cast<const void*>(&ReformTriggerHook)));
     if (!g_kill_object) g_kill_object = reinterpret_cast<KillFn>(Hook(kKillObjectFn, reinterpret_cast<const void*>(&KillObjectHook)));
+    // 4.5: avisos de missao aplicados aqui nao abrem dialogo/camera/minigame (FireEvent) e a fase do dono da sala
+    // passa pelo portao do save quando o pacote (DLC) esta instalado (LevelValid)
+    if (!g_fire_event) g_fire_event = reinterpret_cast<SetupFn>(Hook(kFireEventFn, reinterpret_cast<const void*>(&FireEventHook)));
+    if (!g_level_valid) g_level_valid = reinterpret_cast<SetupFn>(Hook(kLevelValidFn, reinterpret_cast<const void*>(&LevelValidHook)));
 
     if (!g_control || !g_spawn || !g_dtor) {
         std::printf("[MP] eboot diferente: multiplayer desligado\n");
@@ -2052,6 +2285,7 @@ void SendStateChanges(double now, double area_time) {
         if (!Readable(c.obj, 0x460) || At<u64>(c.obj) != reinterpret_cast<u64>(g_base) + kMultiStateVtable) continue;
         const std::string name = GadgetName(c.obj);
         if (name.empty() || name.rfind("VFX_", 0) == 0 || g_ms_noisy.count(name)) continue;
+        if (IsLocalOnlyGadget(name)) continue; // 4.5: minigame local (roda de keystone, terminal de hack): nao sai daqui
         auto& times = g_ms_times[name];
         times.push_back(now);
         while (!times.empty() && now - times.front() > 30.0) times.erase(times.begin());
@@ -2063,9 +2297,16 @@ void SendStateChanges(double now, double area_time) {
         const std::vector<u64> same = GadgetsNamed(name);
         const auto it = std::find(same.begin(), same.end(), c.obj);
         const int order = it == same.end() ? 0 : static_cast<int>(it - same.begin());
-        Announce("m|" + CurrentArea() + "|" + name + "|" + std::to_string(order) + "|" + std::to_string(c.state) + "|" +
-                 std::to_string(c.param));
-        std::printf("[MP] %s mudou para o estado %d: avisando a sala\n", name.c_str(), c.state);
+        if (IsQuestGadget(name)) {
+            // 4.5: historia/objetivo (gatilho de missao, NPC, marco): vai como "q" e o outro jogo aplica o estado em
+            // memoria sem abrir dialogo/camera/menu (ver g_quest_silent). Nao vai como "m" para nao aplicar 2 vezes.
+            Announce("q|" + CurrentArea() + "|" + name + "#" + std::to_string(order) + "|" + std::to_string(c.state));
+            std::printf("[MP] missao %s no estado %d: avisando a sala (sem janela no outro)\n", name.c_str(), c.state);
+        } else {
+            Announce("m|" + CurrentArea() + "|" + name + "|" + std::to_string(order) + "|" + std::to_string(c.state) + "|" +
+                     std::to_string(c.param));
+            std::printf("[MP] %s mudou para o estado %d: avisando a sala\n", name.c_str(), c.state);
+        }
         std::fflush(stdout);
     }
 }
@@ -2087,8 +2328,37 @@ void ApplyEvent(int from, const std::string& payload, double now) {
         if (bar == std::string::npos) break;
         pos = bar + 1;
     }
-    if (f.size() < 4 || (f[0] != "b" && f[0] != "k" && f[0] != "o" && f[0] != "m" && f[0] != "r" && f[0] != "c")) return;
+    if (f.size() < 4 || (f[0] != "b" && f[0] != "k" && f[0] != "o" && f[0] != "m" && f[0] != "r" && f[0] != "c" &&
+                         f[0] != "q"))
+        return;
     if (f[1] != CurrentArea()) return; // outra area: o objeto nem existe aqui
+    if (IsLocalOnlyGadget(f[2])) return; // 4.5: minigame local do outro: nunca aparece neste jogo
+    if (f[0] == "q") { // 4.5: historia/objetivo de outro jogador: progride o estado em memoria, sem janela/camera
+        std::string name = f[2];
+        int order = 0;
+        if (const size_t hash = name.rfind('#'); hash != std::string::npos) {
+            order = std::max(0, std::atoi(name.c_str() + hash + 1));
+            name = name.substr(0, hash);
+        }
+        const std::vector<u64> same = GadgetsNamed(name);
+        if (same.empty()) {
+            g_pending_events.push_back({from, payload, now});
+            if (now - g_gadget_scan_time > 2.0) StartGadgetScan(now);
+            return;
+        }
+        const u64 obj = same[std::min(static_cast<size_t>(order), same.size() - 1)];
+        const int state = std::atoi(f[3].c_str());
+        LogAreaEvent(payload);
+        if (GadgetState(obj) == state) return; // ja esta assim aqui
+        g_applying = true;
+        g_quest_silent = true; // dialogo/camera/minigame disparados por este estado nao abrem aqui
+        Call(kMsRequestFn, obj, static_cast<u64>(static_cast<s64>(state)), 0, 0, 0);
+        g_quest_silent = false;
+        g_applying = false;
+        std::printf("[MP] %d: missao %s no estado %d aqui tambem (sem janela)\n", from, name.c_str(), state);
+        std::fflush(stdout);
+        return;
+    }
     if (f[0] == "c") { // alguem montou um montinho de pecas: monta aqui tambem (o fantasma dele monta, se aparece)
         const u64 b = FindBuild(f[2]);
         if (!b) {
@@ -2380,9 +2650,13 @@ void Tick() {
             } else if (CanLoad() && SomeoneLoading()) {
                 // o jogo carrega um personagem por vez: espera a vez (enquanto isso so o nome aparece)
                 if (!p.wait_since) p.wait_since = now;
-            } else if (CanLoad() && now - p.load_fail_time > 15.0 && now - g_last_unload > 8.0) { // carrega num slot livre
+            } else if (const bool shares_local = LocalPlayerUses(Lower(p.cur.chr) + ".cd");
+                       CanLoad() && now - p.load_fail_time > 15.0 && now - g_last_unload > 8.0 &&
+                       (!shares_local || FreePlayerSlot())) { // carrega num slot livre
                 p.wait_since = 0;
-                const bool player_slot = UsePlayerSlot(); // primeiro os de jogador (nao disputam com as figuras)
+                // 4.5: personagem igual ao do jogador local (o mesmo Batman nos dois): o slot TEM de ser um "Player Load
+                // Slot" proprio, nunca o do portal/party do jogador (duas instancias isoladas, sem colisao de ponteiro)
+                const bool player_slot = shares_local || UsePlayerSlot(); // primeiro os de jogador (nao disputam com as figuras)
                 std::memset(p.load_buffer, 0, sizeof(p.load_buffer));
                 At<s32>(reinterpret_cast<u64>(p.load_buffer) + 96) = player_slot ? 1 : 0; // tipo: 0 portal, 1 jogador
                 std::snprintf(p.load_name, sizeof(p.load_name), "%s", p.cur.chr.c_str());
@@ -2415,7 +2689,7 @@ void Tick() {
             }
             break;
         case Stage::kLoading:
-            if (At<s32>(p.slot + 0x2c8) == 1) {
+            if (p.slot && Readable(p.slot + 0x2c8, 4) && At<s32>(p.slot + 0x2c8) == 1) {
                 if (!p.ready_time) p.ready_time = now;
                 if (now - p.ready_time < 2.0) break;
                 p.ready_time = 0;
@@ -2428,7 +2702,7 @@ void Tick() {
             break;
         case Stage::kReady:
             if (now - g_last_spawn < 0.5) break;
-            if (At<s32>(p.slot + 0x2c8) != 1) {
+            if (!p.slot || !Readable(p.slot + 0x2c8, 4) || At<s32>(p.slot + 0x2c8) != 1) {
                 p.stage = Stage::kNone;
                 break;
             }
@@ -2466,10 +2740,26 @@ void Tick() {
             }
             break;
         }
-        case Stage::kActive:
+        case Stage::kActive: {
             if (!PuppetAlive(p)) {
                 p.stage = Stage::kNone;
                 p.request = p.inst = 0;
+                break;
+            }
+            // 4.5: o pedido acabou preso na party do jogador local (inst+0x3a0 igual): desfaz agora para nao derrubar o
+            // jogo na troca de figura e volta com um slot independente
+            const u64 local_party = p1 && Readable(p1 + 0x3a0, 8) ? At<u64>(p1 + 0x3a0) : 0;
+            if (local_party && Readable(p.inst + 0x3a0, 8) && At<u64>(p.inst + 0x3a0) == local_party) {
+                Despawn(p);
+                if (++p.clashes >= 3) { // ja tentou 3 vezes: fica so o nome (nao entra em laco de spawn)
+                    g_unsupported.insert(Lower(p.cur.chr));
+                    Log("[MP] %s continua preso na party do jogador local: so o nome de %s aparece", p.cur.chr, p.name);
+                    p.retry_time = now + 30.0;
+                } else {
+                    Log("[MP] %s ficou com a party do jogador local: desfazendo o fantasma", p.name);
+                    p.retry_time = now + 2.0;
+                    p.load_fail_time = 0;
+                }
                 break;
             }
             // o amigo trocou de personagem: refaz o fantasma (se o novo ja esta carregado ou cabe num slot)
@@ -2491,6 +2781,7 @@ void Tick() {
                 ++g_drive_count;
             }
             break;
+        }
         }
     }
     {

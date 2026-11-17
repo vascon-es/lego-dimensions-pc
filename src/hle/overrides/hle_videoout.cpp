@@ -954,10 +954,25 @@ void MpCopyInvite() {
                : (pt ? "NAO DEU PARA COPIAR (AREA DE TRANSFERENCIA OCUPADA)" : "COULD NOT COPY (CLIPBOARD BUSY)"));
 }
 
-void MpStartChat() {
-    if (!runtime::multiplayer::Enabled() || runtime::multiplayer::Leaving()) return;
+// 4.5: chat direto (estilo Minecraft): a tecla C abre a barra de texto no jogo, sem precisar do painel F4.
+bool MpStartChat() {
+    if (!runtime::multiplayer::Enabled() || runtime::multiplayer::Leaving()) return false;
     g_mp_chat_typing = true;
     g_mp_chat_buf.clear();
+    return true;
+}
+
+// Enter: manda o texto para a sala e fecha a barra (painel aberto ou chat direto).
+void MpSubmitChat() {
+    if (!g_mp_chat_buf.empty()) runtime::mp_net::SendChat(g_mp_chat_buf);
+    g_mp_chat_buf.clear();
+    g_mp_chat_typing = false;
+}
+
+// Esc: joga o texto fora e fecha a barra.
+void MpCancelChat() {
+    g_mp_chat_buf.clear();
+    g_mp_chat_typing = false;
 }
 
 // Enter (ou X) na linha escolhida; `kick` = Delete (ou quadrado): expulsar o jogador escolhido (so o dono).
@@ -1383,6 +1398,10 @@ bool IsMpRoomMenuOpen() {
     return g_mp_panel_open.load();
 }
 
+bool IsChatTyping() {
+    return g_mp_chat_typing;
+}
+
 void HandleMpRoomMenuController(u32 pressed) {
     if (!g_mp_panel_open) return;
     static auto last_nav = std::chrono::steady_clock::now();
@@ -1770,8 +1789,8 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
         EndPaint(hwnd, &ps);
         return 0;
     }
-    case WM_CHAR: // Fase 83: texto do chat do painel da rede
-        if (g_mp_panel_open.load() && g_mp_chat_typing) {
+    case WM_CHAR: // Fase 83: texto do chat (painel da rede ou chat direto da tecla C)
+        if (g_mp_chat_typing && (g_mp_panel_open.load() || runtime::multiplayer::Enabled())) {
             const char c = MpFoldChar(static_cast<unsigned char>(wparam));
             if (g_mp_chat_skip_c && (c == 'c' || c == 'C')) {
                 g_mp_chat_skip_c = false;
@@ -1783,18 +1802,20 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
         }
         break;
     case WM_KEYDOWN:
-        if (g_mp_panel_open.load() && g_mp_chat_typing) { // escrevendo no chat: as teclas sao do texto
+        // 4.5: escrevendo no chat - painel F4 aberto ou a barra do chat direto (tecla C): as teclas sao do texto
+        if (g_mp_chat_typing && (g_mp_panel_open.load() || runtime::multiplayer::Enabled())) {
             if (wparam == VK_RETURN) {
-                if (!g_mp_chat_buf.empty()) runtime::mp_net::SendChat(g_mp_chat_buf);
-                g_mp_chat_buf.clear();
-                g_mp_chat_typing = false;
+                MpSubmitChat();
             } else if (wparam == VK_ESCAPE) {
-                g_mp_chat_buf.clear();
-                g_mp_chat_typing = false;
+                MpCancelChat();
             } else if (wparam == VK_BACK && !g_mp_chat_buf.empty()) {
                 g_mp_chat_buf.pop_back();
             }
             return 0;
+        }
+        if (g_mp_chat_typing && !g_mp_panel_open.load() && !runtime::multiplayer::Enabled()) {
+            g_mp_chat_typing = false; // a rede caiu com a barra aberta: fecha (nao ha para quem mandar)
+            g_mp_chat_buf.clear();
         }
         if (wparam == VK_F1 && !(lparam & (1 << 30))) { // 2.0.2: era F2 (agora o F2 e o do jogador 2, como nos jogos LEGO de PC)
             ToggleVideoSettingsMenu();
@@ -1826,6 +1847,15 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
             ToggleAchievementsMenu();
             return 0;
         }
+        // 4.5: chat direto (estilo Minecraft). Com o multiplayer ligado, C abre a barra de texto com o painel F4
+        // fechado; o WM_CHAR do mesmo C e descartado (skip_c) para nao entrar no texto. Os paineis que usam C para
+        // outra coisa (logs, video, imagem, conquistas) continuam com a tecla deles.
+        if (wparam == 'C' && !(lparam & (1 << 30)) && !g_mp_panel_open.load() && runtime::multiplayer::Enabled() &&
+            !runtime::multiplayer::Leaving() && !g_video_menu_open.load() && !g_image_menu_open.load() &&
+            !g_achievements_overlay_open.load() && !g_logs_overlay_open.load() && !IsMpDialogOpen()) {
+            if (MpStartChat()) g_mp_chat_skip_c = true;
+            return 0;
+        }
         if (g_mp_panel_open.load()) {
             const bool fresh = !(lparam & (1 << 30));
             if (wparam == VK_UP) {
@@ -1842,8 +1872,7 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
             } else if (wparam == VK_DELETE && fresh) { // Fase 83: expulsar (dono)
                 MpActivate(true);
             } else if (wparam == 'C' && fresh) { // Fase 83: chat
-                MpStartChat();
-                g_mp_chat_skip_c = g_mp_chat_typing;
+                if (MpStartChat()) g_mp_chat_skip_c = g_mp_chat_typing;
             } else if (wparam == 'P' && fresh) { // Fase 83: ping no jogador escolhido
                 const auto rows = MpRows();
                 if (g_mp_selected >= 0 && g_mp_selected < static_cast<int>(rows.size()) && rows[g_mp_selected].id > 0) MpActivate();
@@ -3337,7 +3366,7 @@ void QueueStatsOverlay() {
                            now - s_chat_since < std::chrono::seconds(8);
     if (!g_stats_overlay.load() && !g_video_menu_open.load() && !g_image_menu_open.load() &&
         !g_achievements_overlay_open.load() && !g_logs_overlay_open.load() && !has_toast &&
-        tags.empty() && !g_mp_panel_open.load() && !show_refused && !show_chat) {
+        tags.empty() && !g_mp_panel_open.load() && !g_mp_chat_typing && !show_refused && !show_chat) {
         return;
     }
     static std::vector<LoadingVertex> vertices;
@@ -3681,6 +3710,21 @@ void QueueStatsOverlay() {
             c.Write(line, 20 * tp, y, tp, chat[i].self ? Rgba(120, 220, 255) : 0xFFFFFFFF);
             y += 15.0f * tp;
         }
+    }
+
+    if (g_mp_chat_typing && !g_mp_panel_open.load()) { // 4.5: barra do chat direto, no canto de baixo a esquerda
+        const bool pt = lang::Pt();
+        const bool caret =
+            (std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch()).count() / 450) % 2 == 0;
+        const float tp = p * 1.1f;
+        const float y = client.bottom - 34.0f * p;
+        std::string input = "> " + MpUpper(g_mp_chat_buf) + (caret ? "_" : " ");
+        const size_t max_chars = static_cast<size_t>(std::max(8.0f, client.right * 0.6f / (6.0f * tp)));
+        if (input.size() > max_chars) input = input.substr(input.size() - max_chars);
+        const float w = std::max(TextWidth(input, tp), 120.0f * tp);
+        c.Pill(14 * tp, y - 4 * tp, 14 * tp + w + 12 * tp, y + 11 * tp, 0xB0000000);
+        c.Write(input, 20 * tp, y, tp, 0xFFFFFFFF);
+        c.Write(pt ? "ENTER ENVIA, ESC CANCELA" : "ENTER SENDS, ESC CANCELS", 20 * tp, y + 13 * tp, p * 0.8f, 0xFFC0C0C0);
     }
 
     if (g_mp_panel_open.load()) { // Fase 83: painel da rede, estilo Radmin VPN
