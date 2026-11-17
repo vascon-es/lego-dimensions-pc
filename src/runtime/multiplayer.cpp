@@ -202,7 +202,7 @@ struct Remote {
     bool ingame = false;
     int rtt_ms = 0; // latencia dele ate o servidor
     std::string level; // 4.1.1: fase atual ("LevelPack\...\Nome#ordem"); vazio = versao antiga / nao sabe
-    std::string region; // 4.5.1: CUSA01176 (USA) ou CUSA00935 (EUR): as fases sao mapeadas pelo pacote, mas o aviso ajuda
+    std::string region; // 4.5.1: CUSA01176 (EUR) ou CUSA00935 (USA): as fases sao mapeadas pelo pacote, mas o aviso ajuda
     std::vector<std::string> party; // 4.5.1: os outros personagens equipados dele (o ativo e o `chr`)
 };
 
@@ -2050,7 +2050,7 @@ void FollowOwner(double now) {
     cooldown = now + 8.0;
 }
 
-// 4.5.1: USA (CUSA01176) x EUR (CUSA00935). As fases das duas versoes tem numeros diferentes, por isso a sala troca
+// 4.5.1: EUR (CUSA01176) x USA (CUSA00935). As fases das duas versoes tem numeros diferentes, por isso a sala troca
 // o caminho do pacote (LevelKey) e nunca o numero. O id da versao vai no estado para avisar quando sao diferentes.
 std::string LocalRegion() {
     static const std::string id = game_region::TitleId(hle::fs::App0());
@@ -2139,7 +2139,7 @@ std::vector<NameTag> NameTags() {
 // 4.1.1: inicio de funcao (push rbp; mov rbp, rsp) no deslocamento ou 0x10 depois (outro dump do eboot); 0 = nenhum
 u64 FnAt(u64 offset) {
     static const u8 kPrologue[4] = {0x55, 0x48, 0x89, 0xe5};
-    // 4.4.4: no dump EUR (CUSA00935) as funcoes acima de 0x1577000 ficam 0x10 depois; outros dumps podem vir 0x20
+    // 4.4.4: no dump USA (CUSA00935) as funcoes acima de 0x1577000 ficam 0x10 depois; outros dumps podem vir 0x20
     // depois (ou 0x10 antes). Em vez de recusar o eboot, procura o comeco de verdade perto do endereco conhecido.
     for (u64 o : {offset, offset + 0x10, offset + 0x20, offset - 0x10}) {
         if (Readable(o, 4) && std::memcmp(g_base + o, kPrologue, 4) == 0) return o;
