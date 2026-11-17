@@ -2300,6 +2300,16 @@ bool ResolveFunctions(bool again = false) {
                     static_cast<long long>(kSpawnFn) - static_cast<long long>(0x158c2c0));
         std::fflush(stdout);
     }
+    // 4.4.15: mostra no log quais opcoes de teste estao ligadas (aparece na aba MULTIPLAYER do F9)
+    {
+        std::string opts = "MP ligado";
+        if (const char* v = std::getenv("LD_MP_PLAYERMODE")) opts += std::string(" | PLAYERMODE=1");
+        if (const char* v = std::getenv("LD_MP_MOVE")) opts += std::string(" | MOVE=") + v;
+        if (std::getenv("LD_MP_DEBUG")) opts += " | DEBUG=1";
+        if (std::getenv("LD_MP_EVENTS")) opts += " | EVENTS=1";
+        std::printf("[MP] opcoes: %s\n", opts.c_str());
+        std::fflush(stdout);
+    }
     g_last_error.clear();
     s_ok = 1;
     return true;

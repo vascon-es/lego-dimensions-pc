@@ -413,6 +413,23 @@ void UpdateStatus() {
     Redraw();
 }
 
+// 4.4.15: "env=LD_MP_PLAYERMODE=1;LD_MP_MOVE=world" no launcher.ini vira variavel de ambiente do jogo.
+void ApplyEnvFromIni() {
+    std::wstring all = ReadIni(L"env", L"");
+    if (ReadIni(L"mp_player", L"0") == L"1") all = L"LD_MP_PLAYERMODE=1;" + all; // atalho: mp_player=1
+    if (!all.empty()) all += L';';
+    size_t pos = 0;
+    while (pos < all.size()) {
+        const size_t end = all.find(L';', pos);
+        const std::wstring one = all.substr(pos, end == std::wstring::npos ? std::wstring::npos : end - pos);
+        pos = end == std::wstring::npos ? all.size() : end + 1;
+        const size_t eq = one.find(L'=');
+        if (eq == std::wstring::npos || eq == 0) continue;
+        const std::wstring name = one.substr(0, eq), value = one.substr(eq + 1);
+        SetEnvironmentVariableW(name.c_str(), value.empty() ? nullptr : value.c_str());
+    }
+}
+
 void SaveSettings() {
     if (g_self_test) return;
     WriteIni(L"jogo", g_game_dir);
@@ -1629,6 +1646,9 @@ void RunGame() {
             si.hStdInput = GetStdHandle(STD_INPUT_HANDLE);
         }
     }
+    // 4.4.15: variaveis de ambiente do jogo por launcher.ini, ex.:  env=LD_MP_PLAYERMODE=1;LD_MP_MOVE=world
+    // (o processo do jogo herda o ambiente daqui). Assim nao precisa de .bat nem de variavel do Windows.
+    ApplyEnvFromIni();
     PROCESS_INFORMATION pi{};
     if (CreateProcessW(nullptr, command.data(), nullptr, nullptr, log != INVALID_HANDLE_VALUE, console ? 0 : CREATE_NO_WINDOW, nullptr, g_root.c_str(),
                        &si, &pi)) {
