@@ -683,7 +683,9 @@ void GetCaptureStats(LogStats* out) {
 std::vector<LogEntry> GetCapturedLogs(LogFilter filter) {
     std::lock_guard lock(g_cap_mutex);
     std::vector<LogEntry> result;
-    const auto& source = (filter == LogFilter::kAll || filter == LogFilter::kGame) ? g_all_lines : g_important_lines;
+    const auto& source = (filter == LogFilter::kAll || filter == LogFilter::kGame || filter == LogFilter::kMultiplayer)
+                             ? g_all_lines
+                             : g_important_lines;
     result.reserve(source.size());
     for (const auto& e : source) {
         switch (filter) {
@@ -704,6 +706,9 @@ std::vector<LogEntry> GetCapturedLogs(LogFilter filter) {
             break;
         case LogFilter::kGame:
             if (e.is_game) result.push_back(e);
+            break;
+        case LogFilter::kMultiplayer: // 4.4.9: as linhas do multiplayer comecam sempre com "[MP]"
+            if (e.text.find("[MP]") != std::string::npos) result.push_back(e);
             break;
         default:
             break;
@@ -844,7 +849,7 @@ std::string SaveDiagnosticReport(LogFilter filter, const LogEntry* selected, boo
         report += ts + e.text + "\n";
     }
 
-    if (filter == LogFilter::kAll || filter == LogFilter::kGame) {
+    if (filter == LogFilter::kAll || filter == LogFilter::kGame || filter == LogFilter::kMultiplayer) {
         report += "\n--- RECENT VIEW LINES ---\n";
         for (const auto& e : entries) {
             char ts[32];

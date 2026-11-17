@@ -24,6 +24,7 @@ enum class LogFilter {
     kCutscene,
     kStubs,
     kGame,
+    kMultiplayer, // 4.4.9: tudo do multiplayer ("[MP] ..."): movimento, fases, spawn, conexao
     kCount
 };
 

@@ -68,10 +68,10 @@ constexpr int kPuppetStride = 16; // chave no mapa dos fantasmas: id do amigo * 
 // 4.5.1: quantos personagens de cada amigo aparecem ao mesmo tempo. Com 2 pessoas na sala: 6 de cada (sobra sempre
 // um personagem do outro para voce ver); com 3: 5 de cada; com mais: o que couber em 12 dividido pelas pessoas.
 int PartyCap(size_t peers) {
-    const int people = std::max<int>(2, static_cast<int>(peers) + 1);
-    if (people <= 2) return 6;
-    if (people == 3) return 5;
-    return std::max(2, 12 / people);
+    // 4.4.9: um personagem por amigo. Os personagens extras da party copiavam a posicao do dono e ficavam andando
+    // sozinhos procurando o mesmo ponto (pareciam "sem comando"). O nome do amigo continua no personagem dele.
+    (void)peers;
+    return 1;
 }
 
 const char kAllocTag[] = "MPGHOST";
@@ -282,6 +282,7 @@ struct Drive {
     float speed; // 0 = a da tabela da marcha
     float dx, dz, fx, fz;
     u32 held, prev;
+    bool hold = false; // 4.4.9: espelho puro - rapidez 0 e a posicao vem do Teleport (nada de IA andando sozinha)
 };
 
 // nomes em cima dos fantasmas (o overlay le de outra thread)
@@ -367,9 +368,10 @@ HLE_SYSV_ABI u64 ControlHook(u64 inst, float dt) {
             At<u32>(fc->ctrl + 0x28) = pressed;
             At<u32>(fc->ctrl + 0x2c) = released;
             d->prev = d->held;
-            At<float>(fc->ctrl + 0x54) = moving ? 1.4f : 0.0f;
-            At<float>(fc->ctrl + 0x58) = moving ? d->dx : 0.0f;
-            At<float>(fc->ctrl + 0x5c) = moving ? d->dz : 0.0f;
+            const bool walk = moving && !d->hold;
+            At<float>(fc->ctrl + 0x54) = walk ? 1.4f : 0.0f;
+            At<float>(fc->ctrl + 0x58) = walk ? d->dx : 0.0f;
+            At<float>(fc->ctrl + 0x5c) = walk ? d->dz : 0.0f;
             At<u8>(inst + 0x399) = 1;
             const u64 result = g_control(inst, dt);
             // 4.5: o analogico alimenta so a caminhada; a cara continua sendo a do outro jogo (sem isto o motor vira
@@ -393,7 +395,8 @@ HLE_SYSV_ABI u64 ControlHook(u64 inst, float dt) {
         At<u8>(inst + 0x399) = 0;
         const u64 loc = At<u64>(inst + 0x90);
         if (loc) {
-            if (d->speed > 0.0f) At<float>(loc + 0x70) = d->speed; // rapidez propria (alcanca o ponto recebido)
+            if (d->hold) At<float>(loc + 0x70) = 0.0f; // 4.4.9: parado de verdade (a posicao vem do espelho)
+            else if (d->speed > 0.0f) At<float>(loc + 0x70) = d->speed; // rapidez propria (alcanca o ponto recebido)
             else At<u32>(loc + 0x70) = 0xff7fffffu; // rapidez = tabela da marcha
             At<s32>(loc + 0x238) = d->gear;
             if (d->gear > 3 && std::isfinite(d->dx) && std::isfinite(d->dz)) {
@@ -1685,152 +1688,36 @@ void Steer(Puppet& p, double now, Drive* d) {
         return;
     }
     const float px = At<float>(t + 0x90), py = At<float>(t + 0x94), pz = At<float>(t + 0x98);
-    // 4.4.8: o fantasma andou para onde foi mandado? Se andou de lado, a convencao esta trocada (calibra sozinho).
-    if (p.have_last) {
-        const float mvx = px - p.last_px, mvz = pz - p.last_pz;
-        const float mlen = std::sqrt(mvx * mvx + mvz * mvz);
-        const float wlen = std::sqrt(p.last_wx * p.last_wx + p.last_wz * p.last_wz);
-        if (mlen > 0.01f && wlen > 0.001f && p.cur.gear > 3 && age < 1.0 && p.last_dist < 0.5f) {
-            const float dot = (mvx * p.last_wx + mvz * p.last_wz) / (mlen * wlen);
-            const float sum = g_move_probe_dot.load(std::memory_order_relaxed) + dot;
-            g_move_probe_dot.store(sum, std::memory_order_relaxed);
-            const int cnt = g_move_probe_n.load(std::memory_order_relaxed) + 1;
-            g_move_probe_n.store(cnt, std::memory_order_relaxed);
-            if (cnt >= 20) {
-                const float mean = sum / static_cast<float>(cnt);
-                g_move_probe_n.store(0, std::memory_order_relaxed);
-                g_move_probe_dot.store(0.0f, std::memory_order_relaxed);
-                const bool flip = mean < 0.35f && std::getenv("LD_MP_MOVE") == nullptr; // anda de lado: troca
-                if (flip) g_move_local.store(!g_move_local.load(std::memory_order_relaxed), std::memory_order_relaxed);
-                std::printf("[MP] direcao do fantasma: %s%s (alinha %.2f)\n",
-                            flip ? "convencao trocada para " : "",
-                            g_move_local.load() ? "espaco do corpo" : "espaco do mundo", static_cast<double>(mean));
-                std::fflush(stdout);
-            }
-        }
-    }
     const float ex = tx - px, ez = tz - pz;
     const float dist = std::sqrt(ex * ex + ez * ez);
-    // 4.5.1: teleporte so quando o fantasma esta realmente longe (entrou agora, trocou de area, caiu). Antes ele
-    // pulava a cada 4 m e o outro parecia estar com a conexao ruim.
-    if (dist > 20.0f || std::fabs(ty - py) > 8.0f) {
-        Teleport(p.inst, tx, ty, tz);
-    } else if (dist > 1.2f) {
-        // 4.5.1: a posicao de quem joga manda: corrige a deriva aos poucos (sem pulo) - antes o fantasma chegava a
-        // ficar 2-3 m atras e os golpes do outro nao encostavam em ninguem.
-        const float blend = dist > 6.0f ? 0.5f : (dist > 2.0f ? 0.3f : 0.15f);
-        Teleport(p.inst, px + ex * blend, py + (ty - py) * blend, pz + ez * blend);
-    }
+    // 4.4.9: ESPELHO. A posicao do outro jogador manda, ponto. Nada de "andar ate o ponto", nada de desviar de lado,
+    // nada de teleporte so quando longe: antes a IA do fantasma andava sozinha e parava em posicao errada (no mesmo
+    // mundo, com os dois jogadores parados, os bonecos saiam andando). Agora a matriz de posicao e' escrita do alvo
+    // interpolado em todo quadro e o motor nao move (hold): as posicoes batem sempre com as do outro jogo.
+    Teleport(p.inst, tx, ty, tz);
     d->inst = p.inst;
     d->speed = 0.0f;
+    d->hold = true;
+    d->gear = age < 3.0 ? r.gear : 3;
     d->held = age < 1.0 ? (r.held & kSentButtons) : 0;
-    // 4.5: rumo do corpo x direcao da caminhada (coisas separadas). A cara vem SEMPRE do outro jogo (r.fx, r.fz =
-    // inst+0x170 do dono). Antes a correcao de posicao era escrita tambem na cara e o fantasma andava de lado/girava
-    // a cada correcao da deriva lateral.
     {
         const float fx = r.fx, fz = r.fz;
         const float n = std::sqrt(fx * fx + fz * fz);
-        if (!std::isfinite(n) || n < 0.01f) { // versao antiga (sem rumo) ou estado zerado: a cara segue o movimento
-            const float mx = r.gear > 3 ? r.dx : 1.0f, mz = r.gear > 3 ? r.dz : 0.0f;
-            const float m = std::sqrt(mx * mx + mz * mz);
-            d->fx = m > 0.001f ? mx / m : 0.0f;
-            d->fz = m > 0.001f ? mz / m : 1.0f;
+        if (!std::isfinite(n) || n < 0.01f) { // sem rumo no pacote: a cara segue o deslocamento
+            const float ax = (mx != 0.0f || mz != 0.0f) ? mx : 1.0f, az = (mx != 0.0f || mz != 0.0f) ? mz : 0.0f;
+            d->fx = ax;
+            d->fz = az;
         } else {
             d->fx = fx / n;
             d->fz = fz / n;
         }
     }
-    d->dx = 0.0f; // parado: sem velocidade (a velocidade so vale para marcha > 3)
+    d->dx = 0.0f;
     d->dz = 0.0f;
-    const bool stale = age > 3.0;
-    // 4.4.8: o gancho de controle espera a direcao no espaco DO CORPO (x = lado, z = frente): o jogo gira o corpo
-    // pela cara e anda para frente. Mandando o vetor do mundo, o boneco andava de lado quando o outro virava.
-    static const bool move_env = [] { // LD_MP_MOVE=world|local fixa a convencao (teste)
-        const char* v = std::getenv("LD_MP_MOVE");
-        if (!v) return false;
-        g_move_local = std::strcmp(v, "world") != 0;
-        return true;
-    }();
-    (void)move_env;
-    const auto to_body = [&](float& dx, float& dz) {
-        if (!g_move_local.load(std::memory_order_relaxed)) return;
-        const float fx = d->fx, fz = d->fz;    // cara ja normalizada
-        const float forward = dx * fx + dz * fz; // quanto do movimento e' para frente
-        const float side = dx * fz - dz * fx;    // e quanto e' para o lado
-        dx = side;
-        dz = forward;
-    };
-    if (!stale && r.gear > 3 && (mx != 0.0f || mz != 0.0f)) {
-        const float k = 0.8f * std::min(dist, 1.5f);
-        float dx = mx + (dist > 0.001f ? ex / dist * k : 0), dz = mz + (dist > 0.001f ? ez / dist * k : 0);
-        const float n = std::sqrt(dx * dx + dz * dz);
-        if (n > 0.001f) {
-            dx /= n;
-            dz /= n;
-        }
-        d->gear = r.gear;
-        // atras do ponto (na direcao do movimento): um pouco mais rapido ate encostar; na frente: um pouco mais devagar
-        const float base = TableSpeed(p.inst, r.gear);
-        if (base > 0.0f) {
-            const float along = ex * dx + ez * dz;
-            // 4.5.1: alcanca o amigo andando, nao pulando: ate 3x a velocidade dele quando o erro e grande
-            const float boost = dist > 3.0f ? 3.0f : 1.9f;
-            d->speed = std::clamp(base + 3.0f * along, base * 0.5f, base * boost);
-        }
-        to_body(dx, dz); // mundo -> corpo (por ultimo: vale para a direcao e para a correcao juntas)
-        d->dx = dx;      // loc+0x80: so a velocidade
-        d->dz = dz;
-    } else if (r.gear > 3 && mx == 0.0f && mz == 0.0f && dist < 0.6f) {
-        d->gear = 3; // girando no lugar: nao anda, so a cara (r.fx/r.fz) muda
-    } else if (dist > 0.12f) { // parado la e o fantasma longe: vai ate o lugar (devagar quando perto)
-        d->gear = 6;
-        const float base = TableSpeed(p.inst, 6);
-        if (base > 0.0f) d->speed = std::clamp(dist * 4.0f, 0.3f, base * (dist > 3.0f ? 3.0f : 1.0f));
-        float dx = ex / dist, dz = ez / dist;
-        to_body(dx, dz);
-        d->dx = dx;
-        d->dz = dz;
-    } else {
-        d->gear = 3;
-    }
     p.last_px = px;
     p.last_pz = pz;
     p.last_dist = dist;
     p.have_last = true;
-    { // direcao no mundo equivalente ao que foi mandado (para a sonda do proximo quadro)
-        float wx = d->dx, wz = d->dz;
-        if (g_move_local.load(std::memory_order_relaxed)) {
-            const float fx = d->fx, fz = d->fz; // corpo -> mundo: frente na cara, lado na perpendicular
-            wx = d->dz * fx + d->dx * fz;
-            wz = d->dz * fz - d->dx * fx;
-        }
-        p.last_wx = wx;
-        p.last_wz = wz;
-    }
-    // preso (outro personagem, parede): em vez de teleportar (aquilo parecia lag), desvia de lado ate passar
-    if (std::hypot(px - p.still_x, pz - p.still_z) > 0.05f || d->gear <= 3 || dist < 0.6f) {
-        p.still_x = px;
-        p.still_z = pz;
-        p.still_time = now;
-        p.stuck_side = 0;
-    } else if (now - p.still_time > 0.8 && dist > 0.6f) {
-        // gira a direcao em ~65 graus para um lado (troca de lado a cada 1.2 s) e segue tentando
-        static const float kCos = 0.42f, kSin = 0.91f;
-        const float side = p.stuck_side % 2 ? 1.0f : -1.0f;
-        const float sx = d->dx * kCos - d->dz * kSin * side, sz = d->dx * kSin * side + d->dz * kCos;
-        const float n = std::sqrt(sx * sx + sz * sz);
-        if (n > 0.001f) {
-            d->dx = sx / n;
-            d->dz = sz / n;
-            d->gear = std::max(d->gear, 6);
-            const float base = TableSpeed(p.inst, d->gear);
-            if (base > 0.0f) d->speed = base;
-        }
-        if (now - p.still_time > 2.0) {
-            p.still_time = now;
-            ++p.stuck_side;
-        }
-    }
 }
 
 std::string LocalCharacter(u64 inst) {
@@ -2627,6 +2514,115 @@ std::vector<PendingEvent> g_pending_events; // esperando a varredura achar o obj
 // Fase 80: aplica os avisos dos outros jogadores ("b|area|nome|ordem" = quebrou um objeto explodivel)
 double g_push_request_time = -100; // 4.4.8: quando este jogo pediu a fase do outro por aviso ("L|")
 
+// 4.4.9: estado do multiplayer para o painel F9 (linha viva, atualizada ~2x por segundo na thread principal).
+std::mutex g_summary_mutex;
+std::string g_summary;
+
+std::string DebugSummary() {
+    std::lock_guard lock(g_summary_mutex);
+    return g_summary;
+}
+
+std::string Trim(std::string s) {
+    while (!s.empty() && (s.front() == ' ' || s.front() == '\t')) s.erase(s.begin());
+    while (!s.empty() && (s.back() == ' ' || s.back() == '\t' || s.back() == '\r')) s.pop_back();
+    return s;
+}
+
+// Acha a posicao de um jogador pelo nome: aqui (este PC) ou um amigo da sala. false = nao achou.
+bool PositionOfPlayer(const std::string& name, float& x, float& y, float& z) {
+    if (Lower(name) == Lower(runtime::mp_net::SelfName())) {
+        const u64 inst = At<u64>(reinterpret_cast<u64>(g_base) + kPlayerTable);
+        const u64 t = inst ? Transform(inst) : 0;
+        if (!t) return false;
+        x = At<float>(t + 0x90);
+        y = At<float>(t + 0x94);
+        z = At<float>(t + 0x98);
+        return true;
+    }
+    for (const auto& peer : runtime::mp_net::Peers()) {
+        if (Lower(peer.name) != Lower(name)) continue;
+        const auto it = g_puppets.find(peer.id * kPuppetStride);
+        if (it != g_puppets.end()) {
+            if (const u64 t = it->second.inst ? Transform(it->second.inst) : 0) {
+                x = At<float>(t + 0x90);
+                y = At<float>(t + 0x94);
+                z = At<float>(t + 0x98);
+                return true;
+            }
+            if (it->second.cur.valid) { // ainda sem boneco: usa a posicao que veio no estado
+                x = it->second.cur.x;
+                y = it->second.cur.y;
+                z = it->second.cur.z;
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+// /tp <quem> to <para quem>  (ou "/tp <para quem>" = eu). O comando vai como mensagem do chat: cada jogo ve e so
+// leva os SEUS personagens - quem foi citado. 4.4.9
+void DoTeleport(const std::string& from, const std::string& to) {
+    if (to.empty()) {
+        std::printf("[MP] /tp: falta o nome de quem vai receber (use /tp <quem> to <para quem>)\n");
+        std::fflush(stdout);
+        return;
+    }
+    float x = 0, y = 0, z = 0;
+    if (!PositionOfPlayer(to, x, y, z)) {
+        std::printf("[MP] /tp: nao achei %s na sala\n", to.c_str());
+        std::fflush(stdout);
+        return;
+    }
+    if (!from.empty() && Lower(from) != Lower(runtime::mp_net::SelfName())) return; // nao sou eu: outro jogo leva
+    u64 moved = 0;
+    for (int k = 0; k < 2; ++k) { // os dois personagens deste PC (se houver dois jogadores locais)
+        const u64 inst = At<u64>(reinterpret_cast<u64>(g_base) + kPlayerTable + 8 * k);
+        if (!inst || !Transform(inst)) continue;
+        Teleport(inst, x + 0.55f * static_cast<float>(k), y, z - 0.55f * static_cast<float>(k));
+        ++moved;
+    }
+    std::printf("[MP] /tp: %s foi para %s (%.2f %.2f %.2f) - %llu personagem(ns)\n",
+                from.empty() ? "eu" : from.c_str(), to.c_str(), x, y, z, static_cast<unsigned long long>(moved));
+    std::fflush(stdout);
+}
+
+// Le as mensagens do chat que ainda nao foram vistas e executa os comandos ("/tp ..."). Chamado no Tick.
+void HandleChatCommands(double now) {
+    static double last_time = -1;
+    static bool started = false;
+    const auto lines = runtime::mp_net::Chat();
+    if (!started) { // a primeira vez so marca o fim do historico (comando antigo nao vale)
+        if (!lines.empty()) last_time = lines.back().time;
+        started = true;
+        return;
+    }
+    for (const auto& l : lines) {
+        if (started && l.time <= last_time) continue;
+        if (l.text.rfind("/tp", 0) != 0) continue;
+        last_time = l.time;
+        std::string rest = Trim(l.text.substr(3));
+        std::string a, b;
+        const size_t to = rest.find(" to ");
+        if (to != std::string::npos) {
+            a = Trim(rest.substr(0, to));
+            b = Trim(rest.substr(to + 4));
+        } else {
+            const size_t sp = rest.find(' ');
+            if (sp == std::string::npos) {
+                b = rest;
+            } else {
+                a = Trim(rest.substr(0, sp));
+                b = Trim(rest.substr(sp + 1));
+            }
+        }
+        DoTeleport(a, b);
+    }
+    if (!lines.empty()) last_time = std::max(last_time, lines.back().time);
+    (void)now;
+}
+
 void ApplyEvent(int from, const std::string& payload, double now) {
     std::vector<std::string> f;
     size_t pos = 0;
@@ -2941,6 +2937,7 @@ void Tick() {
             }
         }
     }
+    HandleChatCommands(now);
     FollowOwner(now);
     Drive old[kMaxPuppets];
     const int old_count = g_drive_count;
@@ -3193,6 +3190,9 @@ void Tick() {
             }
             if (now - p.stage_time > 1.5 && g_drive_count < kMaxPuppets) { // deixa a chegada pelo portal terminar
                 Drive& d = g_drive[g_drive_count];
+                d.hold = false; // 4.4.9: zera antes do Steer (a struct e' reaproveitada de quadros anteriores)
+                d.speed = 0.0f;
+                d.dx = d.dz = 0.0f;
                 u32 prev = 0;
                 for (int k = 0; k < old_count; ++k) {
                     if (old[k].inst == p.inst) prev = old[k].prev; // botoes do quadro anterior (bordas)
@@ -3205,6 +3205,30 @@ void Tick() {
         }
         }
         } // 4.5.1: fim dos personagens da party deste amigo
+    }
+    { // 4.4.9: resumo para o painel F9 (MULTIPLAYER): posicao do amigo x posicao do fantasma, marcha e atraso
+        std::string line = "MP: ";
+        const int self = runtime::mp_net::SelfId();
+        if (!self) {
+            line += "fora da rede";
+        } else {
+            line += "sala " + runtime::mp_net::RoomCode() + " (id " + std::to_string(self) + ")";
+        }
+        line += " | " + runtime::mp_net::StatusText();
+        for (const auto& [id, p] : g_puppets) {
+            if (!p.cur.valid) continue;
+            const u64 t = p.stage == Stage::kActive ? Transform(p.inst) : 0;
+            char buf[320];
+            std::snprintf(buf, sizeof(buf),
+                          " | %s remoto (%.1f %.1f %.1f) m%d %s fantasma (%.1f %.1f %.1f) erro %.2fm pacote %.1fs",
+                          p.name.c_str(), p.cur.x, p.cur.y, p.cur.z, p.cur.gear, t ? "|" : "SEM BONECO", t ? At<float>(t + 0x90) : 0.f,
+                          t ? At<float>(t + 0x94) : 0.f, t ? At<float>(t + 0x98) : 0.f,
+                          t ? std::hypot(At<float>(t + 0x90) - p.cur.x, At<float>(t + 0x98) - p.cur.z) : 0.f,
+                          now - p.cur_time);
+            line += buf;
+        }
+        std::lock_guard lock(g_summary_mutex);
+        g_summary = line;
     }
     {
         std::vector<NameTag> tags;

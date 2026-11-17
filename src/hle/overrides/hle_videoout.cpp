@@ -3284,6 +3284,7 @@ static void RenderLogsOverlay(OverlayCanvas& c, const RECT& client) {
         {hle::log::LogFilter::kCutscene, (pt ? "CUTSCENE/AV (" : "CUTSCENE/AV (") + std::to_string(stats.cutscene_count) + ")", Rgba(80, 225, 255)},
         {hle::log::LogFilter::kStubs,    "STUBS (" + std::to_string(stats.stub_count) + ")", Rgba(215, 170, 255)},
         {hle::log::LogFilter::kGame,     pt ? "JOGO [GAME]" : "GAME [GAME]", Rgba(130, 235, 155)},
+        {hle::log::LogFilter::kMultiplayer, "MULTIPLAYER [MP]", Rgba(255, 150, 90)}, // 4.4.9
     };
     float tab_x = box_x0 + 16.0f * scale_ui;
     for (const auto& t : tabs) {
@@ -3297,12 +3298,29 @@ static void RenderLogsOverlay(OverlayCanvas& c, const RECT& client) {
         tab_x += tw + 8.0f * scale_ui;
     }
 
+    // 4.4.9: linha viva do multiplayer (posicao de cada amigo x posicao do fantasma aqui) - so na aba MULTIPLAYER
+    float mp_bar_bottom = tab_y0 + tab_h;
+    if (g_logs_filter == hle::log::LogFilter::kMultiplayer) {
+        const std::string mp_line = runtime::multiplayer::DebugSummary();
+        if (!mp_line.empty()) {
+            const float mp_y0 = tab_y0 + tab_h + 6.0f * scale_ui;
+            const float mp_h = 24.0f * scale_ui;
+            const float mp_font = 1.3f * scale_ui;
+            c.Rect(box_x0 + 14.0f * scale_ui, mp_y0, box_x1 - 14.0f * scale_ui, mp_y0 + mp_h, Rgba(40, 26, 16, 235));
+            const size_t mp_max = static_cast<size_t>(std::max(30.0f, (box_w - 44.0f * scale_ui) / (6.0f * mp_font)));
+            std::string shown = mp_line;
+            if (shown.size() > mp_max) shown = shown.substr(0, mp_max > 3 ? mp_max - 3 : mp_max) + "...";
+            c.Write(shown, box_x0 + 22.0f * scale_ui, mp_y0 + 7.0f * scale_ui, mp_font, Rgba(255, 190, 120));
+            mp_bar_bottom = mp_y0 + mp_h;
+        }
+    }
+
     // Geometry for list vs bottom Inspector Box
     const float footer_y = box_y1 - 22.0f * scale_ui;
     const float insp_h = 114.0f * scale_ui;
     const float insp_y1 = footer_y - 8.0f * scale_ui;
     const float insp_y0 = insp_y1 - insp_h;
-    const float list_y0 = tab_y0 + tab_h + 10.0f * scale_ui;
+    const float list_y0 = mp_bar_bottom + 10.0f * scale_ui;
     const float list_y1 = insp_y0 - 8.0f * scale_ui;
     const float list_h = std::max(60.0f * scale_ui, list_y1 - list_y0);
 
