@@ -35,6 +35,11 @@ std::string LastError(); // 4.4.5: motivo da ultima falha de conexao (vazio = ne
 void ClearLastError();       // 4.4.6: a janela do F3 limpa o aviso antigo ao abrir
 // 4.4.9: estado do multiplayer numa linha, para o painel de logs (F9 -> MULTIPLAYER)
 std::string DebugSummary();
+// 4.4.17: espaco da direcao da caminhada, mudavel na hora pelo painel F4 (vale para a sala toda)
+// 0 = automatico (o port descobre), 1 = espaco do corpo (local), 2 = espaco do mundo
+int MoveMode();
+void SetMoveMode(int mode, bool broadcast = true);
+std::string MoveModeName();
 
 // 4.1.1: campanha junto: os outros jogadores vao para a fase em que o dono da sala esta (padrao: ligado)
 void SetFollowOwner(bool on);

@@ -20,6 +20,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <deque>
 #include <map>
 #include <set>
 #include <mutex>
@@ -238,6 +239,8 @@ struct Puppet {
     bool have_face = false;
     bool have_last = false;
     Remote cur, prev;
+    // 4.4.17: ultimos estados (posicao + cara) para desenhar ~100 ms atras e interpolar de verdade, sem adivinhar
+    std::deque<std::pair<double, Remote>> hist;
     double cur_time = 0, prev_time = 0;
     alignas(16) u8 load_buffer[256] = {}; // descritor + saida do carregamento do slot (o jogo escreve aqui)
     char load_name[64] = {};
@@ -249,6 +252,7 @@ std::map<int, Puppet> g_puppets; // so a thread principal mexe
 // port descobre sozinho: se o fantasma anda perpendicular ao que foi mandado (de lado), troca a convencao. O
 // LD_MP_MOVE=world|local fixa uma delas para teste.
 std::atomic<bool> g_move_local{true};
+std::atomic<int> g_move_mode{0}; // 4.4.17: 0 = automatico, 1 = local (corpo), 2 = mundo
 std::atomic<int> g_vote_world{0}, g_vote_local{0}; // 4.4.11: votos da convencao da direcao (decide uma vez)
 std::atomic<int> g_move_probe_n{0};
 std::atomic<float> g_move_probe_dot{0.0f};
@@ -1439,6 +1443,23 @@ u64 StandInSlot() {
 }
 
 // O slot (endereco) esta carregado com o personagem que o jogador 1/2 deste PC esta usando agora?
+// 4.4.17: slot do portal = aparece na roda de figuras (o jogador local consegue pegar o personagem do outro).
+// Por padrao o fantasma so usa slot de JOGADOR. LD_MP_SLOT=portal volta ao antigo.
+bool PortalSlotsAllowed() {
+    static const bool allowed = [] {
+        const char* v = std::getenv("LD_MP_SLOT");
+        return v && std::strcmp(v, "portal") == 0;
+    }();
+    return allowed;
+}
+
+int SlotIndexOf(u64 slot) {
+    for (int i = 0; i < g_nall; ++i) {
+        if (SlotAddress(i) == slot) return i;
+    }
+    return -1;
+}
+
 bool SlotUsedByLocalPlayer(u64 slot) {
     if (!slot) return false;
     for (int i = 0; i < g_nall; ++i) {
@@ -1664,7 +1685,7 @@ float TableSpeed(u64 inst, int gear) {
 // fazia o boneco ficar alternando entre andar para frente e para o lado).
 void VoteDirection(const Remote& r, float wx, float wz, float fx, float fz) {
     static bool decided = false;
-    if (decided || std::getenv("LD_MP_MOVE") != nullptr) return;
+    if (decided || std::getenv("LD_MP_MOVE") != nullptr || g_move_mode.load() != 0) return; // 4.4.17
     const float wxlen = std::sqrt(wx * wx + wz * wz);
     const float rlen = std::sqrt(r.dx * r.dx + r.dz * r.dz);
     if (wxlen < 0.03f || rlen < 0.01f) return;
@@ -1717,19 +1738,51 @@ void Steer(Puppet& p, double now, Drive* d) {
         }
     }
     const double latency = runtime::mp_net::LatencySeconds(p.peer, r.rtt_ms); // Fase 82: direto (P2P) ou pelo servidor
-    // 4.4.7: mostra o outro onde ele REALMENTE estava quando o pacote saiu (agora - metade da ida e volta) e caminha
-    // entre o pacote anterior e o atual. Antes era so "pacote + velocidade x atraso": a posicao pulava a cada pacote.
-    const double shown = now - latency;
+    // 4.4.17: desenha ~100 ms atras (LD_MP_DELAY em ms) e interpola entre os DOIS estados que cercam esse instante.
+    // Antes so existiam "o pacote anterior e o atual": com qualquer atraso maior que o intervalo dos pacotes a posicao
+    // pulava (mini-flicks). Um decimo de segundo de atraso extra e' invisivel e deixa o movimento liso.
+    static const double shown_delay = [] {
+        const char* v = std::getenv("LD_MP_DELAY");
+        const double ms = v ? std::atof(v) : 100.0;
+        return std::clamp(ms, 0.0, 400.0) / 1000.0;
+    }();
+    const double shown = now - latency - shown_delay;
     float tx = r.x, ty = r.y, tz = r.z;
-    if (p.prev.valid && p.cur_time > p.prev_time + 0.001) {
-        const double span = p.cur_time - p.prev_time;
-        double a = (shown - p.prev_time) / span;
-        const double ahead = age > 0.3 ? 1.0 : 1.35; // 4.4.13: sem pacote novo, nao extrapola (evita ir e voltar)
-        a = std::clamp(a, 0.0, ahead);
-        tx = static_cast<float>(p.prev.x + (r.x - p.prev.x) * a);
-        ty = static_cast<float>(p.prev.y + (r.y - p.prev.y) * a);
-        tz = static_cast<float>(p.prev.z + (r.z - p.prev.z) * a);
-    } else {
+    float face_x = r.fx, face_z = r.fz;
+    bool from_hist = false;
+    for (size_t i = 0; i + 1 < p.hist.size(); ++i) {
+        const double t0 = p.hist[i].first, t1 = p.hist[i + 1].first;
+        if (t1 <= t0 || shown > t1) continue;
+        const double a = std::clamp((shown - t0) / (t1 - t0), 0.0, 1.0);
+        const Remote& A = p.hist[i].second;
+        const Remote& B = p.hist[i + 1].second;
+        tx = static_cast<float>(A.x + (B.x - A.x) * a);
+        ty = static_cast<float>(A.y + (B.y - A.y) * a);
+        tz = static_cast<float>(A.z + (B.z - A.z) * a);
+        if ((A.fx != 0.0f || A.fz != 0.0f) && (B.fx != 0.0f || B.fz != 0.0f)) {
+            const float a0 = std::atan2(A.fx, A.fz), a1 = std::atan2(B.fx, B.fz);
+            float d = a1 - a0;
+            while (d > 3.14159265f) d -= 6.28318531f;
+            while (d < -3.14159265f) d += 6.28318531f;
+            const float ang = a0 + d * static_cast<float>(a);
+            face_x = std::sin(ang);
+            face_z = std::cos(ang);
+        }
+        from_hist = true;
+        break;
+    }
+    if (!from_hist && !p.hist.empty()) { // mais novo que o ultimo pacote: fica nele (espera, nao adivinha)
+        const Remote& last = p.hist.back().second;
+        tx = last.x;
+        ty = last.y;
+        tz = last.z;
+        if (last.fx != 0.0f || last.fz != 0.0f) {
+            face_x = last.fx;
+            face_z = last.fz;
+        }
+        from_hist = true;
+    }
+    if (!from_hist) {
         const float lead = static_cast<float>(std::clamp(age + latency, 0.0, 0.5));
         tx += vx * lead;
         tz += vz * lead;
@@ -1779,9 +1832,9 @@ void Steer(Puppet& p, double now, Drive* d) {
         if (r.gear > 3 && (mx != 0.0f || mz != 0.0f)) {
             tx_face = mx;
             tz_face = mz;
-        } else if (std::isfinite(r.fx) && std::isfinite(r.fz) && std::fabs(r.fx) + std::fabs(r.fz) > 0.01f) {
-            tx_face = r.fx;
-            tz_face = r.fz;
+        } else if (std::isfinite(face_x) && std::isfinite(face_z) && std::fabs(face_x) + std::fabs(face_z) > 0.01f) {
+            tx_face = face_x;
+            tz_face = face_z;
         } else {
             tx_face = (mx != 0.0f || mz != 0.0f) ? mx : 1.0f;
             tz_face = (mx != 0.0f || mz != 0.0f) ? mz : 0.0f;
@@ -2225,6 +2278,9 @@ void SendLocal(u64 p1, double now) {
     runtime::mp_net::SetLocalState(text);
 }
 
+// 4.4.17: atalho do painel (F4) para trocar o espaco da direcao: auto -> corpo -> mundo -> auto
+void CycleMoveMode() { SetMoveMode((g_move_mode.load() + 1) % 3); }
+
 void Log(const char* fmt, const std::string& a, const std::string& b) {
     std::printf(fmt, a.c_str(), b.c_str());
     std::printf("\n");
@@ -2334,9 +2390,27 @@ bool ResolveFunctions(bool again = false) {
 std::atomic<bool> g_hooks_wanted{false};
 bool g_hooks_installed = false;
 
+// 4.4.17: se sobrou personagem nosso num slot do portal (rodas antigas), descarrega: a roda de figuras volta a ficar
+// so com as SUAS figuras.
+void UnloadOurPortalSlots() {
+    if (PortalSlotsAllowed()) return;
+    for (auto it = g_our_slots.begin(); it != g_our_slots.end();) {
+        const int idx = SlotIndexOf(it->first);
+        if (idx < 0 || idx >= g_nslots) {
+            ++it;
+            continue;
+        }
+        if (kSlotStateFn) Call(kSlotStateFn, it->first, 3, 0); // 3 = descarrega
+        std::printf("[MP] soltei o slot do portal %s (para nao aparecer na roda de figuras)\n", it->second.c_str());
+        std::fflush(stdout);
+        it = g_our_slots.erase(it);
+    }
+}
+
 bool InstallHooks() {
     if (g_hooks_installed) return g_control && g_spawn && g_dtor;
     g_hooks_installed = true;
+    UnloadOurPortalSlots(); // 4.4.17
     g_control = reinterpret_cast<ControlFn>(Hook(g_control_fn ? g_control_fn : kControlFn, reinterpret_cast<const void*>(&ControlHook)));
     g_spawn = reinterpret_cast<SpawnFn>(Hook(kSpawnFn, reinterpret_cast<const void*>(&SpawnHook)));
     g_dtor = reinterpret_cast<DtorFn>(Hook(kRequestDtorFn, reinterpret_cast<const void*>(&RequestDtorHook)));
@@ -2634,6 +2708,28 @@ std::string g_push_target;         // 4.4.10: a fase pedida (para o log)
 std::mutex g_summary_mutex;
 std::string g_summary;
 
+int MoveMode() { return g_move_mode.load(); }
+
+std::string MoveModeName() {
+    switch (g_move_mode.load()) {
+    case 1: return "corpo";
+    case 2: return "mundo";
+    default: return "auto";
+    }
+}
+
+void SetMoveMode(int mode, bool broadcast) {
+    mode = std::clamp(mode, 0, 2);
+    g_move_mode.store(mode);
+    if (mode == 1) g_move_local.store(true);
+    if (mode == 2) g_move_local.store(false);
+    std::printf("[MP] direcao da caminhada: %s\n", MoveModeName().c_str());
+    std::fflush(stdout);
+    if (broadcast && g_enabled && runtime::mp_net::SelfId()) {
+        runtime::mp_net::SendEvent("V|mv|" + std::to_string(mode)); // vale para os dois lados
+    }
+}
+
 std::string DebugSummary() {
     std::lock_guard lock(g_summary_mutex);
     return g_summary;
@@ -2747,6 +2843,10 @@ void ApplyEvent(int from, const std::string& payload, double now) {
         f.push_back(payload.substr(pos, bar == std::string::npos ? std::string::npos : bar - pos));
         if (bar == std::string::npos) break;
         pos = bar + 1;
+    }
+    if (f.size() >= 3 && f[0] == "V") { // 4.4.17: ajuste da sala (ex.: espaco da direcao da caminhada)
+        if (f[1] == "mv") SetMoveMode(std::atoi(f[2].c_str()), false);
+        return;
     }
     if (f.size() >= 2 && f[0] == "L") { // 4.4.7: o outro jogador entrou numa missao/fase
         const std::string& key = f[1];
@@ -3110,6 +3210,8 @@ void Tick() {
             Remote r;
             if (ParseRemote(peer.state, &r)) {
                 main.prev = main.cur;
+                main.hist.push_back({peer.state_time, main.cur}); // 4.4.17: guarda para a interpolacao
+                while (main.hist.size() > 8) main.hist.pop_front();
                 main.prev_time = main.cur_time;
                 main.cur = r;
                 main.cur_time = peer.state_time;
@@ -3183,7 +3285,9 @@ void Tick() {
             // 4.4.13: sem boneco e o personagem ja esta carregado: entra na hora (as esperas de carga nao valem aqui).
             // Era isso que deixava "so o nome" por 2-3 s cada vez que o jogo desfazia o fantasma.
             if (!g_unsupported.count(Lower(p.cur.chr))) {
-                if (const u64 loaded = FindLoadedSlot(p.cur.chr); loaded && !SlotUsedByLocalPlayer(loaded)) {
+                if (const u64 loaded = FindLoadedSlot(p.cur.chr);
+                    loaded && !SlotUsedByLocalPlayer(loaded) &&
+                    (PortalSlotsAllowed() || SlotIndexOf(loaded) >= g_nslots)) { // 4.4.17: so slot de jogador
                     p.slot = loaded;
                     p.standin = false;
                     p.stage = Stage::kReady;
@@ -3226,11 +3330,12 @@ void Tick() {
                 // 4.4.16: SEMPRE no slot de jogador quando houver um livre: esses slots nao aparecem na roda de
                 // figuras, entao o jogador local nao consegue mais entrar no personagem do outro (era isso que
                 // derrubava o jogo). LD_MP_SLOT=portal volta ao comportamento antigo.
-                static const bool portal_always = [] {
-                    const char* v = std::getenv("LD_MP_SLOT");
-                    return v && std::strcmp(v, "portal") == 0;
-                }();
+                const bool portal_always = PortalSlotsAllowed();
                 const bool player_slot = !portal_always && (shares_local || UsePlayerSlot());
+                if (!portal_always && !player_slot) { // 4.4.17: sem slot de jogador livre, nem carrega (roda limpa)
+                    p.retry_time = now + 3.0;
+                    break;
+                }
                 std::memset(p.load_buffer, 0, sizeof(p.load_buffer));
                 At<s32>(reinterpret_cast<u64>(p.load_buffer) + 96) = player_slot ? 1 : 0; // tipo: 0 portal, 1 jogador
                 std::snprintf(p.load_name, sizeof(p.load_name), "%s", p.cur.chr.c_str());
