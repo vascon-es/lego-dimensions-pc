@@ -32,6 +32,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cctype>
 #include <cmath>
 #include <cstdlib>
 #include <deque>
@@ -3917,6 +3918,190 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     return DefWindowProcW(hwnd, msg, wp, lp);
 }
 
+// ---- 4.4.4: o Python portatil (tools\python) as vezes chega incompleto -------------------------------------------
+// Antivirus apagando python.exe / python311.dll, zip interrompido, update parcial: nesses casos o launcher caia no
+// "python" do PATH, e em quem tem um venv sem pyvenv.cfg aparecia "No pyvenv.cfg file". A conferencia e a reposicao
+// acontecem sozinhas no comeco, sem janela e sem aviso: o usuario nao precisa saber que elas existem.
+std::atomic<bool> g_pyfix_running{false};
+
+void PythonLog(const std::wstring& text) { // so um arquivo em build\logs: nada na tela
+    std::error_code ec;
+    fs::create_directories(g_root / L"build" / L"logs", ec);
+    std::ofstream out(g_root / L"build" / L"logs" / L"python.log", std::ios::app);
+    SYSTEMTIME st{};
+    GetLocalTime(&st);
+    char stamp[64];
+    std::snprintf(stamp, sizeof(stamp), "[%04d-%02d-%02d %02d:%02d:%02d] ", st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond);
+    out << stamp << std::string(text.begin(), text.end()) << "\n";
+}
+
+// O interpretador abre escondido e importa o que a preparacao usa? (0 = sim)
+bool PythonRuns(const fs::path& python) {
+    std::wstring command = Quote(python.wstring()) + L" -I -c \"import sys,os,json,zlib,hashlib,ctypes,shutil,struct,subprocess\"";
+    STARTUPINFOW si{sizeof(si)};
+    si.dwFlags = STARTF_USESHOWWINDOW;
+    si.wShowWindow = SW_HIDE;
+    PROCESS_INFORMATION pi{};
+    if (!CreateProcessW(nullptr, command.data(), nullptr, nullptr, FALSE, CREATE_NO_WINDOW, nullptr, g_root.c_str(), &si, &pi)) return false;
+    const DWORD wait = WaitForSingleObject(pi.hProcess, 25000);
+    DWORD code = 1;
+    if (wait == WAIT_TIMEOUT) TerminateProcess(pi.hProcess, 1);
+    else GetExitCodeProcess(pi.hProcess, &code);
+    CloseHandle(pi.hThread);
+    CloseHandle(pi.hProcess);
+    return wait == WAIT_OBJECT_0 && code == 0;
+}
+
+// python.exe + dlls + Lib/DLLs essenciais (e, se pedido, o interpretador abrindo)
+bool PythonComplete(bool run_interpreter) {
+    std::error_code ec;
+    const fs::path dir = g_root / L"tools" / L"python";
+    const fs::path exe = dir / L"python.exe";
+    if (!fs::is_regular_file(exe, ec) || fs::file_size(exe, ec) < 60000) return false;
+    for (const wchar_t* name : {L"pythonw.exe", L"python3.dll", L"vcruntime140.dll", L"vcruntime140_1.dll"}) {
+        const fs::path file = dir / name;
+        if (!fs::is_regular_file(file, ec) || fs::file_size(file, ec) < 9000) return false;
+    }
+    bool core = false; // python311.dll (ou o numero da versao que vier)
+    for (fs::directory_iterator it(dir, ec), end; !ec && it != end; it.increment(ec)) {
+        const std::wstring name = it->path().filename().wstring();
+        if (name.size() > 12 && name.compare(0, 7, L"python3") == 0 && name.compare(name.size() - 4, 4, L".dll") == 0) {
+            std::error_code size_ec;
+            if (fs::file_size(it->path(), size_ec) > 1000000) core = true;
+        }
+    }
+    if (!core) return false;
+    for (const wchar_t* rel : {L"Lib\\os.py", L"Lib\\json\\__init__.py", L"Lib\\encodings\\__init__.py", L"Lib\\ctypes\\__init__.py",
+                               L"Lib\\shutil.py", L"Lib\\struct.py", L"DLLs\\_socket.pyd", L"DLLs\\_ctypes.pyd", L"DLLs\\unicodedata.pyd",
+                               L"DLLs\\_ssl.pyd"}) {
+        if (!fs::is_regular_file(dir / rel, ec)) return false;
+    }
+    return !run_interpreter || PythonRuns(exe);
+}
+
+bool HttpGetToStream(const std::wstring& url, std::ostream* out, std::string* text) {
+    URL_COMPONENTS parts{sizeof(parts)};
+    wchar_t host[256]{};
+    wchar_t path[2048]{};
+    parts.lpszHostName = host;
+    parts.dwHostNameLength = 255;
+    parts.lpszUrlPath = path;
+    parts.dwUrlPathLength = 2047;
+    if (!WinHttpCrackUrl(url.c_str(), 0, 0, &parts)) return false;
+    HINTERNET session = WinHttpOpen(L"LegoDimensionsLauncher/1.0", WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY, WINHTTP_NO_PROXY_NAME,
+                                    WINHTTP_NO_PROXY_BYPASS, 0);
+    if (!session) {
+        session = WinHttpOpen(L"LegoDimensionsLauncher/1.0", WINHTTP_ACCESS_TYPE_DEFAULT_PROXY, WINHTTP_NO_PROXY_NAME,
+                             WINHTTP_NO_PROXY_BYPASS, 0);
+    }
+    if (!session) return false;
+    WinHttpSetTimeouts(session, 20000, 20000, 20000, 180000);
+    bool ok = false;
+    if (HINTERNET connect = WinHttpConnect(session, host, parts.nPort, 0)) {
+        if (HINTERNET request = WinHttpOpenRequest(connect, L"GET", path[0] ? path : L"/", nullptr, WINHTTP_NO_REFERER,
+                                                   WINHTTP_DEFAULT_ACCEPT_TYPES, parts.nScheme == INTERNET_SCHEME_HTTPS ? WINHTTP_FLAG_SECURE : 0)) {
+            if (WinHttpSendRequest(request, WINHTTP_NO_ADDITIONAL_HEADERS, 0, WINHTTP_NO_REQUEST_DATA, 0, 0, 0) &&
+                WinHttpReceiveResponse(request, nullptr)) {
+                std::vector<char> buffer(1 << 16);
+                DWORD available = 0;
+                ok = true;
+                while (WinHttpQueryDataAvailable(request, &available) && available > 0) {
+                    DWORD read = 0;
+                    if (!WinHttpReadData(request, buffer.data(), static_cast<DWORD>(buffer.size()), &read) || !read) break;
+                    if (out) out->write(buffer.data(), read);
+                    if (text) text->append(buffer.data(), read);
+                }
+                if (out && !out->good()) ok = false;
+            }
+            WinHttpCloseHandle(request);
+        }
+        WinHttpCloseHandle(connect);
+    }
+    WinHttpCloseHandle(session);
+    return ok;
+}
+
+std::wstring PortableZipUrl(const std::string& json) { // "browser_download_url" do zip portatil
+    const std::string key = "\"browser_download_url\":\"";
+    for (size_t at = json.find(key); at != std::string::npos; at = json.find(key, at + 1)) {
+        const size_t begin = at + key.size(), end = json.find('"', begin);
+        if (end == std::string::npos) break;
+        std::string url = json.substr(begin, end - begin);
+        std::string low = url;
+        for (char& c : low) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+        if (low.find(".zip") == std::string::npos) continue;
+        if (low.find("portable") == std::string::npos && low.find("portatil") == std::string::npos) continue;
+        return std::wstring(url.begin(), url.end());
+    }
+    return {};
+}
+
+int RunTar(const std::wstring& args) { // o mesmo tar.exe do Windows que o instalador usa
+    wchar_t system[MAX_PATH];
+    GetSystemDirectoryW(system, MAX_PATH);
+    std::wstring command = L"\"" + (fs::path(system) / L"tar.exe").wstring() + L"\" " + args;
+    STARTUPINFOW si{sizeof(si)};
+    si.dwFlags = STARTF_USESHOWWINDOW;
+    si.wShowWindow = SW_HIDE;
+    PROCESS_INFORMATION pi{};
+    if (!CreateProcessW(nullptr, command.data(), nullptr, nullptr, FALSE, CREATE_NO_WINDOW, nullptr, g_root.c_str(), &si, &pi)) return -1;
+    WaitForSingleObject(pi.hProcess, 300000);
+    DWORD code = 1;
+    GetExitCodeProcess(pi.hProcess, &code);
+    CloseHandle(pi.hThread);
+    CloseHandle(pi.hProcess);
+    return static_cast<int>(code);
+}
+
+// Baixa o zip portatil da ultima release e repoe so tools\python (nada do jogo, nada das configuracoes do usuario).
+void RepairPythonSilently() {
+    PythonLog(L"tools\\python incompleto: repondo pela ultima release");
+    std::string repo = "vascon-es/lego-dimensions-pc";
+    if (const char* custom = std::getenv("LD_REPO"); custom && *custom) repo = custom;
+    std::string json;
+    const std::wstring api = L"https://api.github.com/repos/" + std::wstring(repo.begin(), repo.end()) + L"/releases/latest";
+    if (!HttpGetToStream(api, nullptr, &json)) {
+        PythonLog(L"nao consegui falar com o GitHub");
+        return;
+    }
+    const std::wstring url = PortableZipUrl(json);
+    if (url.empty()) {
+        PythonLog(L"a ultima release nao tem o zip portatil");
+        return;
+    }
+    wchar_t temp[MAX_PATH];
+    GetTempPathW(MAX_PATH, temp);
+    const fs::path zip = fs::path(temp) / L"ldpc_python_fix.zip";
+    bool downloaded = false;
+    {
+        std::ofstream out(zip, std::ios::binary | std::ios::trunc);
+        downloaded = out && HttpGetToStream(url, &out, nullptr);
+        std::error_code size_ec;
+        downloaded = downloaded && fs::is_regular_file(zip, size_ec) && fs::file_size(zip, size_ec) > 50000000;
+    }
+    if (!downloaded) {
+        PythonLog(L"download do zip portatil falhou");
+        DeleteFileW(zip.c_str());
+        return;
+    }
+    PythonLog(L"zip baixado: extraindo tools\\python");
+    // o zip do pacote tem uma pasta na raiz ("LEGO Dimensions PC\"): tenta com e sem ela
+    if (RunTar(L"-xf " + Quote(zip.wstring()) + L" -C " + Quote(g_root.wstring()) + L" --strip-components 1 \"*/tools/python*\"") != 0 ||
+        !PythonComplete(false)) {
+        RunTar(L"-xf " + Quote(zip.wstring()) + L" -C " + Quote(g_root.wstring()) + L" \"tools/python*\"");
+    }
+    DeleteFileW(zip.c_str());
+    PythonLog(PythonComplete(false) ? L"tools\\python reposto" : L"tools\\python continua incompleto (rodar Atualizar)");
+}
+
+// Chamado uma vez no comeco, numa thread: ninguem ve nada. LD_NO_PYFIX desliga (teste).
+void EnsurePythonSilently() {
+    if (g_dev_tree || std::getenv("LD_NO_PYFIX")) return;
+    if (g_pyfix_running.exchange(true)) return;
+    if (!PythonComplete(true)) RepairPythonSilently();
+    g_pyfix_running = false;
+}
+
 } // namespace
 
 int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show) {
@@ -3974,6 +4159,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show) {
         const int result=Screenshots(screenshots);DestroyWindow(g_main);CoUninitialize();return result;
     }
     LoadSettings();
+    std::thread(EnsurePythonSilently).detach(); // 4.4.4: confere (e repoe, se faltar) o Python portatil, sem avisar
     WakeMpServer(); // 4.0: com o multiplayer ligado, acorda o servidor enquanto voce navega no launcher
     EnsureTrophyIcons(); // 3.0
     ShowWindow(g_main, show);

@@ -2139,8 +2139,10 @@ std::vector<NameTag> NameTags() {
 // 4.1.1: inicio de funcao (push rbp; mov rbp, rsp) no deslocamento ou 0x10 depois (outro dump do eboot); 0 = nenhum
 u64 FnAt(u64 offset) {
     static const u8 kPrologue[4] = {0x55, 0x48, 0x89, 0xe5};
-    for (u64 o : {offset, offset + 0x10}) {
-        if (std::memcmp(g_base + o, kPrologue, 4) == 0) return o;
+    // 4.4.4: no dump EUR (CUSA00935) as funcoes acima de 0x1577000 ficam 0x10 depois; outros dumps podem vir 0x20
+    // depois (ou 0x10 antes). Em vez de recusar o eboot, procura o comeco de verdade perto do endereco conhecido.
+    for (u64 o : {offset, offset + 0x10, offset + 0x20, offset - 0x10}) {
+        if (Readable(o, 4) && std::memcmp(g_base + o, kPrologue, 4) == 0) return o;
     }
     return 0;
 }
