@@ -235,6 +235,8 @@ struct Puppet {
     float last_px = 0, last_pz = 0, last_wx = 0, last_wz = 0; // 4.4.8: sonda da convencao da direcao
     float last_dist = 99.0f; // 4.4.8: distancia do quadro anterior (a sonda so vale sem correcao acontecendo)
     std::string dropped_for_local; // 4.4.14: (reservado) personagem que o jogador local tomou
+    bool slot_released = false;    // 4.4.18: ja soltou o slot depois de criar o boneco (para sair da roda)
+    double release_check = 0;      // 4.4.18: quando conferir se o boneco sobreviveu ao slot solto
     float face_ang = 0.0f;         // 4.4.16: cara suavizada (angulo)
     bool have_face = false;
     bool have_last = false;
@@ -251,8 +253,10 @@ std::map<int, Puppet> g_puppets; // so a thread principal mexe
 // 4.4.8: a direcao que o gancho de controle recebe e' do mundo ou do espaco do corpo? O jogo nao documenta, entao o
 // port descobre sozinho: se o fantasma anda perpendicular ao que foi mandado (de lado), troca a convencao. O
 // LD_MP_MOVE=world|local fixa uma delas para teste.
-std::atomic<bool> g_move_local{true};
-std::atomic<int> g_move_mode{0}; // 4.4.17: 0 = automatico, 1 = local (corpo), 2 = mundo
+std::atomic<bool> g_move_local{false};
+// 4.4.18: padrao = espaco do MUNDO. No modo "corpo" o jogo nao girava o personagem no chao (ele orienta o corpo pela
+// direcao da caminhada, que e' do mundo). O painel F4 troca na hora (auto / corpo / mundo).
+std::atomic<int> g_move_mode{2};
 std::atomic<int> g_vote_world{0}, g_vote_local{0}; // 4.4.11: votos da convencao da direcao (decide uma vez)
 std::atomic<int> g_move_probe_n{0};
 std::atomic<float> g_move_probe_dot{0.0f};
@@ -2407,6 +2411,11 @@ void UnloadOurPortalSlots() {
     }
 }
 
+// 4.4.18: depois que o boneco do amigo existe, solta o slot dele (estado 3). Assim o personagem NAO aparece mais na
+// roda de figuras - era por ali que o jogador local conseguia equipar o personagem do outro. O port confere se o
+// boneco sobrevive: se o jogo desfizer o personagem ao soltar o slot, ele nunca mais tenta (LD_MP_UNLOAD=0 desliga).
+std::atomic<int> g_slot_unload_ok{0}; // 0 = ainda nao testado, 1 = funciona, -1 = nao funciona
+
 bool InstallHooks() {
     if (g_hooks_installed) return g_control && g_spawn && g_dtor;
     g_hooks_installed = true;
@@ -3400,6 +3409,20 @@ void Tick() {
                 p.inst_name = At<u64>(inst + 0x10);
                 p.stage = Stage::kActive;
                 p.stage_time = now;
+                // 4.4.18: tira a figura da roda (o boneco continua vivo, so o slot e' que nao fica carregado)
+                if (!p.slot_released && p.slot && g_slot_unload_ok.load() >= 0 && kSlotStateFn) {
+                    static const bool unload_env = [] {
+                        const char* v = std::getenv("LD_MP_UNLOAD");
+                        return !(v && std::strcmp(v, "0") == 0);
+                    }();
+                    if (unload_env) {
+                        p.slot_released = true;
+                        p.release_check = now + 1.5;
+                        Call(kSlotStateFn, p.slot, 3, 0);
+                        std::printf("[MP] soltei o slot de %s: o personagem sai da roda de figuras\n", p.cur.chr.c_str());
+                        std::fflush(stdout);
+                    }
+                }
                 Teleport(inst, p.cur.x, p.cur.y, p.cur.z);
                 Log("[MP] %s apareceu como %s", p.name, LocalCharacter(inst));
                 // nome que o jogo nao conhece como figura (ex.: Wheatley): o descritor cai no personagem do spawner.
@@ -3420,6 +3443,21 @@ void Tick() {
             break;
         }
         case Stage::kActive: {
+            // 4.4.18: o slot foi solto de proposito: confere se o boneco sobreviveu a isso
+            if (p.slot_released && p.release_check && now > p.release_check) {
+                p.release_check = 0;
+                if (PuppetAlive(p)) {
+                    if (g_slot_unload_ok.load() != 1) {
+                        g_slot_unload_ok.store(1);
+                        std::printf("[MP] soltar o slot funciona: o boneco continua de pe e a figura sai da roda\n");
+                        std::fflush(stdout);
+                    }
+                } else {
+                    g_slot_unload_ok.store(-1);
+                    std::printf("[MP] soltar o slot desfaz o boneco: nao solto mais (a figura fica na roda)\n");
+                    std::fflush(stdout);
+                }
+            }
             // 4.4.14: o jogador local entrou no personagem que o fantasma usa (figura livre na roda): larga o fantasma
             // no mesmo quadro, sem chamar nada do jogo. Era isso que derrubava o jogo (as duas coisas usando a mesma
             // instancia/pedido).
@@ -3435,7 +3473,7 @@ void Tick() {
             // 4.4.12: o slot do fantasma deixou de ser nosso (o jogador pos um personagem nele ou removeu o dele):
             // solta o fantasma SEM chamar o destrutor do jogo - era isso que fazia o personagem do jogador sumir e
             // o jogo cair ao mexer no menu de figuras (Y).
-            if (p.slot) {
+            if (p.slot && !p.slot_released) {
                 int idx = -1;
                 for (int i = 0; i < g_nall; ++i) {
                     if (SlotAddress(i) == p.slot) {
@@ -3519,6 +3557,38 @@ void Tick() {
         }
         }
         } // 4.5.1: fim dos personagens da party deste amigo
+    }
+    // 4.4.18: sonda das opcoes de animacao/dano. Com LD_MP_ANIM=1 o port compara, a cada 250 ms, os campos do
+    // personagem do jogador 1 (inst+0x100..0x400) e mostra no log o que mudou - anotando o que voce faz na hora
+    // (andar, voar, socar, levar dano) da' para achar os campos de animacao e de dano.
+    if (std::getenv("LD_MP_ANIM") && p1) {
+        static u32 prev[0xc0];
+        static double last = 0;
+        static bool init = false;
+        if (now - last > 0.25 && Readable(p1 + 0x100, 4 * 0xc0)) {
+            last = now;
+            std::string line;
+            for (int i = 0; i < 0xc0; ++i) {
+                const u32 v = At<u32>(p1 + 0x100 + 4 * i);
+                if (!init || v == prev[i]) {
+                    prev[i] = v;
+                    continue;
+                }
+                if (line.size() < 1800) {
+                    char b[48];
+                    std::snprintf(b, sizeof(b), " %03x:%08x>%08x", 0x100 + 4 * i, prev[i], v);
+                    line += b;
+                }
+                prev[i] = v;
+            }
+            init = true;
+            if (!line.empty()) {
+                const u64 loc = Readable(p1 + 0x90, 8) ? At<u64>(p1 + 0x90) : 0;
+                std::printf("[ANIM] marcha %d cara %.2f %.2f%s\n", loc && Readable(loc + 0x238, 4) ? At<s32>(loc + 0x238) : -1,
+                            At<float>(p1 + 0x170), At<float>(p1 + 0x178), line.c_str());
+                std::fflush(stdout);
+            }
+        }
     }
     { // 4.4.9: resumo para o painel F9 (MULTIPLAYER): posicao do amigo x posicao do fantasma, marcha e atraso
         std::string line = "MP: ";
