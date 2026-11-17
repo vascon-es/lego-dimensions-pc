@@ -233,8 +233,7 @@ struct Puppet {
     float move_dx = 0, move_dz = 0; // 4.4.8: deslocamento real entre os dois ultimos pacotes (diagnostico)
     float last_px = 0, last_pz = 0, last_wx = 0, last_wz = 0; // 4.4.8: sonda da convencao da direcao
     float last_dist = 99.0f; // 4.4.8: distancia do quadro anterior (a sonda so vale sem correcao acontecendo)
-    int gear_shown = 3;      // 4.4.13: marcha que esta sendo animada (evita piscar parado/correndo)
-    double gear_time = 0;
+    std::string dropped_for_local; // 4.4.14: (reservado) personagem que o jogador local tomou
     bool have_last = false;
     Remote cur, prev;
     double cur_time = 0, prev_time = 0;
@@ -1757,18 +1756,7 @@ void Steer(Puppet& p, double now, Drive* d) {
     // de caminhada e' refeito no quadro seguinte pelo Teleport.
     d->speed = 0.0f; // 0 = a rapidez da tabela da marcha (e' dela que sai a animacao)
     d->hold = false;
-    // 4.4.13: a marcha vinha trocando a cada pacote (parado/correndo/parado) e o passo "gaguejava". So aceita a
-    // marcha nova quando ela se mantem por 80 ms.
-    if (r.gear != p.gear_shown) {
-        if (!p.gear_time) p.gear_time = now;
-        if (now - p.gear_time > 0.08) {
-            p.gear_shown = r.gear;
-            p.gear_time = 0;
-        }
-    } else {
-        p.gear_time = 0;
-    }
-    d->gear = age < 3.0 ? p.gear_shown : 3;
+    d->gear = age < 3.0 ? r.gear : 3; // 4.4.14: volta a marcha direta do outro jogo (a histerese travava o passo)
     d->held = age < 1.0 ? (r.held & kSentButtons) : 0;
     {
         float fx = r.fx, fz = r.fz;
@@ -1778,7 +1766,7 @@ void Steer(Puppet& p, double now, Drive* d) {
             std::isfinite(r.fx) && std::isfinite(r.fz)) {
             const double span = p.cur_time - p.prev_time;
             double a = (shown - p.prev_time) / span;
-            a = std::clamp(a, 0.0, 1.0 + 0.35);
+            a = std::clamp(a, 0.0, 1.0); // 4.4.14: nunca passa do pacote atual (girar a mais parece erro)
             const float a0 = std::atan2(p.prev.fx, p.prev.fz), a1 = std::atan2(r.fx, r.fz);
             float d = a1 - a0;
             while (d > 3.14159265f) d -= 6.28318531f;
@@ -3296,6 +3284,18 @@ void Tick() {
             break;
         }
         case Stage::kActive: {
+            // 4.4.14: o jogador local entrou no personagem que o fantasma usa (figura livre na roda): larga o fantasma
+            // no mesmo quadro, sem chamar nada do jogo. Era isso que derrubava o jogo (as duas coisas usando a mesma
+            // instancia/pedido).
+            if (!p.cur.chr.empty() && LocalPlayerUses(Lower(p.cur.chr) + ".cd")) {
+                LiveDrop(p.request);
+                p.request = 0;
+                p.inst = p.inst_name = 0;
+                p.stage = Stage::kNone;
+                p.retry_time = now + 5.0;
+                Log("[MP] o jogador local pegou o personagem %s: soltando o fantasma de %s", p.cur.chr, p.name);
+                break;
+            }
             // 4.4.12: o slot do fantasma deixou de ser nosso (o jogador pos um personagem nele ou removeu o dele):
             // solta o fantasma SEM chamar o destrutor do jogo - era isso que fazia o personagem do jogador sumir e
             // o jogo cair ao mexer no menu de figuras (Y).
