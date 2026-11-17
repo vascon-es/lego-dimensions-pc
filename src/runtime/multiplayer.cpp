@@ -230,6 +230,10 @@ struct Puppet {
     int idx = 0;        // 4.5.1: 0 = personagem ativo do amigo, 1.. = os outros da party dele
     int clashes = 0; // 4.5: vezes que o pedido acabou preso na party do jogador local (Task 6)
     unsigned seq = 0;
+    float move_dx = 0, move_dz = 0; // 4.4.8: deslocamento real entre os dois ultimos pacotes (diagnostico)
+    float last_px = 0, last_pz = 0, last_wx = 0, last_wz = 0; // 4.4.8: sonda da convencao da direcao
+    float last_dist = 99.0f; // 4.4.8: distancia do quadro anterior (a sonda so vale sem correcao acontecendo)
+    bool have_last = false;
     Remote cur, prev;
     double cur_time = 0, prev_time = 0;
     alignas(16) u8 load_buffer[256] = {}; // descritor + saida do carregamento do slot (o jogo escreve aqui)
@@ -237,6 +241,13 @@ struct Puppet {
 };
 
 std::map<int, Puppet> g_puppets; // so a thread principal mexe
+
+// 4.4.8: a direcao que o gancho de controle recebe e' do mundo ou do espaco do corpo? O jogo nao documenta, entao o
+// port descobre sozinho: se o fantasma anda perpendicular ao que foi mandado (de lado), troca a convencao. O
+// LD_MP_MOVE=world|local fixa uma delas para teste.
+std::atomic<bool> g_move_local{true};
+std::atomic<int> g_move_probe_n{0};
+std::atomic<float> g_move_probe_dot{0.0f};
 
 // Pedidos dos fantasmas vivos. O destrutor do jogo pode rodar em outra thread: ele so zera a entrada (sem trava,
 // para nunca esperar a thread principal enquanto ela chama funcoes do jogo).
@@ -1628,6 +1639,8 @@ void Steer(Puppet& p, double now, Drive* d) {
     if (p.prev.valid && p.cur_time > p.prev_time + 0.001) {
         mx = r.x - p.prev.x;
         mz = r.z - p.prev.z;
+        p.move_dx = mx;
+        p.move_dz = mz;
         const float len = std::sqrt(mx * mx + mz * mz);
         if (len > 0.004f) { // andou o bastante para saber para onde (a posicao vem exata, sem ruido)
             mx /= len;
@@ -1672,6 +1685,30 @@ void Steer(Puppet& p, double now, Drive* d) {
         return;
     }
     const float px = At<float>(t + 0x90), py = At<float>(t + 0x94), pz = At<float>(t + 0x98);
+    // 4.4.8: o fantasma andou para onde foi mandado? Se andou de lado, a convencao esta trocada (calibra sozinho).
+    if (p.have_last) {
+        const float mvx = px - p.last_px, mvz = pz - p.last_pz;
+        const float mlen = std::sqrt(mvx * mvx + mvz * mvz);
+        const float wlen = std::sqrt(p.last_wx * p.last_wx + p.last_wz * p.last_wz);
+        if (mlen > 0.01f && wlen > 0.001f && p.cur.gear > 3 && age < 1.0 && p.last_dist < 0.5f) {
+            const float dot = (mvx * p.last_wx + mvz * p.last_wz) / (mlen * wlen);
+            const float sum = g_move_probe_dot.load(std::memory_order_relaxed) + dot;
+            g_move_probe_dot.store(sum, std::memory_order_relaxed);
+            const int cnt = g_move_probe_n.load(std::memory_order_relaxed) + 1;
+            g_move_probe_n.store(cnt, std::memory_order_relaxed);
+            if (cnt >= 20) {
+                const float mean = sum / static_cast<float>(cnt);
+                g_move_probe_n.store(0, std::memory_order_relaxed);
+                g_move_probe_dot.store(0.0f, std::memory_order_relaxed);
+                const bool flip = mean < 0.35f && std::getenv("LD_MP_MOVE") == nullptr; // anda de lado: troca
+                if (flip) g_move_local.store(!g_move_local.load(std::memory_order_relaxed), std::memory_order_relaxed);
+                std::printf("[MP] direcao do fantasma: %s%s (alinha %.2f)\n",
+                            flip ? "convencao trocada para " : "",
+                            g_move_local.load() ? "espaco do corpo" : "espaco do mundo", static_cast<double>(mean));
+                std::fflush(stdout);
+            }
+        }
+    }
     const float ex = tx - px, ez = tz - pz;
     const float dist = std::sqrt(ex * ex + ez * ez);
     // 4.5.1: teleporte so quando o fantasma esta realmente longe (entrou agora, trocou de area, caiu). Antes ele
@@ -1706,6 +1743,23 @@ void Steer(Puppet& p, double now, Drive* d) {
     d->dx = 0.0f; // parado: sem velocidade (a velocidade so vale para marcha > 3)
     d->dz = 0.0f;
     const bool stale = age > 3.0;
+    // 4.4.8: o gancho de controle espera a direcao no espaco DO CORPO (x = lado, z = frente): o jogo gira o corpo
+    // pela cara e anda para frente. Mandando o vetor do mundo, o boneco andava de lado quando o outro virava.
+    static const bool move_env = [] { // LD_MP_MOVE=world|local fixa a convencao (teste)
+        const char* v = std::getenv("LD_MP_MOVE");
+        if (!v) return false;
+        g_move_local = std::strcmp(v, "world") != 0;
+        return true;
+    }();
+    (void)move_env;
+    const auto to_body = [&](float& dx, float& dz) {
+        if (!g_move_local.load(std::memory_order_relaxed)) return;
+        const float fx = d->fx, fz = d->fz;    // cara ja normalizada
+        const float forward = dx * fx + dz * fz; // quanto do movimento e' para frente
+        const float side = dx * fz - dz * fx;    // e quanto e' para o lado
+        dx = side;
+        dz = forward;
+    };
     if (!stale && r.gear > 3 && (mx != 0.0f || mz != 0.0f)) {
         const float k = 0.8f * std::min(dist, 1.5f);
         float dx = mx + (dist > 0.001f ? ex / dist * k : 0), dz = mz + (dist > 0.001f ? ez / dist * k : 0);
@@ -1715,8 +1769,6 @@ void Steer(Puppet& p, double now, Drive* d) {
             dz /= n;
         }
         d->gear = r.gear;
-        d->dx = dx; // loc+0x80: so a velocidade (pode divergir da cara: andar de lado e' normal)
-        d->dz = dz;
         // atras do ponto (na direcao do movimento): um pouco mais rapido ate encostar; na frente: um pouco mais devagar
         const float base = TableSpeed(p.inst, r.gear);
         if (base > 0.0f) {
@@ -1725,16 +1777,35 @@ void Steer(Puppet& p, double now, Drive* d) {
             const float boost = dist > 3.0f ? 3.0f : 1.9f;
             d->speed = std::clamp(base + 3.0f * along, base * 0.5f, base * boost);
         }
+        to_body(dx, dz); // mundo -> corpo (por ultimo: vale para a direcao e para a correcao juntas)
+        d->dx = dx;      // loc+0x80: so a velocidade
+        d->dz = dz;
     } else if (r.gear > 3 && mx == 0.0f && mz == 0.0f && dist < 0.6f) {
         d->gear = 3; // girando no lugar: nao anda, so a cara (r.fx/r.fz) muda
     } else if (dist > 0.12f) { // parado la e o fantasma longe: vai ate o lugar (devagar quando perto)
         d->gear = 6;
         const float base = TableSpeed(p.inst, 6);
         if (base > 0.0f) d->speed = std::clamp(dist * 4.0f, 0.3f, base * (dist > 3.0f ? 3.0f : 1.0f));
-        d->dx = ex / dist;
-        d->dz = ez / dist;
+        float dx = ex / dist, dz = ez / dist;
+        to_body(dx, dz);
+        d->dx = dx;
+        d->dz = dz;
     } else {
         d->gear = 3;
+    }
+    p.last_px = px;
+    p.last_pz = pz;
+    p.last_dist = dist;
+    p.have_last = true;
+    { // direcao no mundo equivalente ao que foi mandado (para a sonda do proximo quadro)
+        float wx = d->dx, wz = d->dz;
+        if (g_move_local.load(std::memory_order_relaxed)) {
+            const float fx = d->fx, fz = d->fz; // corpo -> mundo: frente na cara, lado na perpendicular
+            wx = d->dz * fx + d->dx * fz;
+            wz = d->dz * fz - d->dx * fx;
+        }
+        p.last_wx = wx;
+        p.last_wz = wz;
     }
     // preso (outro personagem, parede): em vez de teleportar (aquilo parecia lag), desvia de lado ate passar
     if (std::hypot(px - p.still_x, pz - p.still_z) > 0.05f || d->gear <= 3 || dist < 0.6f) {
@@ -1966,7 +2037,13 @@ void UpdateLevelKey() {
         std::fflush(stdout);
         // 4.4.7: quem entrou na missao/fase avisa na hora: o outro jogo pede a mesma carga no mesmo instante em vez
         // de esperar a estabilidade do seguidor (era isso que deixava o convidado preso no tubo).
-        if (g_enabled && !key.empty() && runtime::mp_net::SelfId()) runtime::mp_net::SendEvent("L|" + key);
+        // 4.4.8: so fases jogaveis. Antes o aviso levava junto "Loading_Screen_Default"/"Titles" e o outro jogo
+        // entrava numa tela de carregamento que nao era missao nenhuma.
+        const std::string low = Lower(key);
+        const bool playable = low.find("loadingscreen") == std::string::npos &&
+                              low.find("loading_screen") == std::string::npos && low.find("titles") == std::string::npos &&
+                              low.find("startup") == std::string::npos && low.find("slideways") == std::string::npos && low != "-";
+        if (g_enabled && playable && runtime::mp_net::SelfId()) runtime::mp_net::SendEvent("L|" + key);
     }
 }
 
@@ -2548,6 +2625,8 @@ struct PendingEvent {
 std::vector<PendingEvent> g_pending_events; // esperando a varredura achar o objeto
 
 // Fase 80: aplica os avisos dos outros jogadores ("b|area|nome|ordem" = quebrou um objeto explodivel)
+double g_push_request_time = -100; // 4.4.8: quando este jogo pediu a fase do outro por aviso ("L|")
+
 void ApplyEvent(int from, const std::string& payload, double now) {
     std::vector<std::string> f;
     size_t pos = 0;
@@ -2582,6 +2661,7 @@ void ApplyEvent(int from, const std::string& payload, double now) {
             g_owner_level_time = now;
         }
         Call(kGotoLevelFn, reinterpret_cast<u64>(g_base) + kLevelLoader, static_cast<u64>(id), 0, 0);
+        g_push_request_time = now; // 4.4.8: para sair do tubo se a carga nao terminar
         return;
     }
     if (f.size() < 4 || (f[0] != "b" && f[0] != "k" && f[0] != "o" && f[0] != "m" && f[0] != "r" && f[0] != "c" &&
@@ -2838,6 +2918,29 @@ void Tick() {
         std::fflush(stdout);
         return;
     }
+    // 4.4.8: tubo infinito. Pedimos a fase do outro e ficamos presos numa tela de carregamento: depois de 30 s
+    // volta para o Hub para nao travar o jogo de vez (o id do Hub e' resolvido AQUI - USA e EUR numeram diferente,
+    // nunca usar o numero que veio do outro jogo).
+    if (g_push_request_time > 0 && now - g_push_request_time > 30.0) {
+        g_push_request_time = -100;
+        const std::string low = Lower(g_level_key);
+        const bool loading = low.empty() || low == "-" || low.find("loading") != std::string::npos ||
+                             low.find("titles") != std::string::npos;
+        if (loading) {
+            const int hub = LevelIdForKey("Hub#0");
+            if (hub >= 0) {
+                std::printf("[MP] preso no carregamento da fase do outro: voltando para o Hub (id %d)\n", hub);
+                std::fflush(stdout);
+                g_level_gate_id = static_cast<u64>(hub);
+                g_level_gate_time = now;
+                g_level_request_time = now;
+                Call(kGotoLevelFn, reinterpret_cast<u64>(g_base) + kLevelLoader, static_cast<u64>(hub), 0, 0);
+            } else {
+                std::printf("[MP] preso no carregamento e sem o numero do Hub: saindo para o menu\n");
+                std::fflush(stdout);
+            }
+        }
+    }
     FollowOwner(now);
     Drive old[kMaxPuppets];
     const int old_count = g_drive_count;
@@ -2892,8 +2995,9 @@ void Tick() {
         if (!p.cur.region.empty() && p.cur.region != "?" && p.cur.region != LocalRegion()) {
             static std::set<std::string> warned;
             if (warned.insert(p.cur.region).second) {
-                Log("[MP] %s usa outra versao do jogo (%s x %s): as fases vao pelo pacote, mas os numeros delas mudam",
-                    p.name + " " + p.cur.region + " | " + LocalRegion());
+                std::printf("[MP] %s usa outra versao do jogo (%s x %s): as fases vao pelo pacote, mas os numeros mudam\n",
+                            p.name.c_str(), p.cur.region.c_str(), LocalRegion().c_str());
+                std::fflush(stdout);
             }
         }
         if (idx == 0 && !here) {
@@ -3131,9 +3235,13 @@ void Tick() {
         for (auto& [id, p] : g_puppets) {
             if (p.stage != Stage::kActive) continue;
             const u64 t = Transform(p.inst);
-            std::printf("[MP]   %s: remoto (%.2f %.2f %.2f) marcha %d ha %.1fs | fantasma (%.2f %.2f %.2f)\n", p.name.c_str(), p.cur.x,
+            // 4.4.8: diagnostico do movimento - "vetor" e' o loc+0x80/0x88 que o jogo do outro manda, "delta" e' o
+            // deslocamento real entre dois pacotes e "cara" e' inst+0x170/0x178. Angulo vetor x delta ~0 = vetor do
+            // mundo; ~90 graus = vetor local ao corpo.
+            std::printf("[MP]   %s: remoto (%.2f %.2f %.2f) marcha %d ha %.1fs | fantasma (%.2f %.2f %.2f) | vetor (%.2f %.2f) "
+                        "delta (%.2f %.2f) cara (%.2f %.2f)\n", p.name.c_str(), p.cur.x,
                         p.cur.y, p.cur.z, p.cur.gear, now - p.cur_time, t ? At<float>(t + 0x90) : 0.f, t ? At<float>(t + 0x94) : 0.f,
-                        t ? At<float>(t + 0x98) : 0.f);
+                        t ? At<float>(t + 0x98) : 0.f, p.cur.dx, p.cur.dz, p.move_dx, p.move_dz, p.cur.fx, p.cur.fz);
         }
         std::fflush(stdout);
     }
