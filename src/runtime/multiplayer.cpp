@@ -234,6 +234,8 @@ struct Puppet {
     float last_px = 0, last_pz = 0, last_wx = 0, last_wz = 0; // 4.4.8: sonda da convencao da direcao
     float last_dist = 99.0f; // 4.4.8: distancia do quadro anterior (a sonda so vale sem correcao acontecendo)
     std::string dropped_for_local; // 4.4.14: (reservado) personagem que o jogador local tomou
+    float face_ang = 0.0f;         // 4.4.16: cara suavizada (angulo)
+    bool have_face = false;
     bool have_last = false;
     Remote cur, prev;
     double cur_time = 0, prev_time = 0;
@@ -390,6 +392,17 @@ HLE_SYSV_ABI u64 ControlHook(u64 inst, float dt) {
         }
     }
     if (d) { // botoes antes: o pulo/ataque e lido dentro do controle
+        // 4.4.16: alem do estado bruto em inst+0x4f8, escreve no controle do personagem (inst+0x3a0) quando ele existe:
+        // era por ali que o jogo lia o "soco" (o pulo funcionava pelo caminho antigo, o soco no chao nao).
+        if (const u64 ctrl = Readable(inst + 0x3a0, 8) ? At<u64>(inst + 0x3a0) : 0; ctrl && Readable(ctrl + 0x18, 0x18)) {
+            const u32 pressed = d->held & ~d->prev, released = d->prev & ~d->held;
+            At<u32>(ctrl + 0x18) = d->held;
+            At<u32>(ctrl + 0x1c) = d->prev;
+            At<u32>(ctrl + 0x20) = pressed;
+            At<u32>(ctrl + 0x24) = d->held;
+            At<u32>(ctrl + 0x28) = pressed;
+            At<u32>(ctrl + 0x2c) = released;
+        }
         At<u32>(inst + 0x4f8 + 0xc) = d->held;
         At<u32>(inst + 0x4f8 + 0x10) = d->held & ~d->prev;
         At<u32>(inst + 0x4f8 + 0x14) = d->prev & ~d->held;
@@ -1759,31 +1772,32 @@ void Steer(Puppet& p, double now, Drive* d) {
     d->gear = age < 3.0 ? r.gear : 3; // 4.4.14: volta a marcha direta do outro jogo (a histerese travava o passo)
     d->held = age < 1.0 ? (r.held & kSentButtons) : 0;
     {
-        float fx = r.fx, fz = r.fz;
-        // 4.4.13: a cara tambem e' interpolada entre os dois pacotes (menor arco), como a posicao. Antes ela saltava
-        // a cada pacote e o boneco ficava "piscando" de lado quando o outro girava.
-        if (p.prev.valid && (p.prev.fx != 0.0f || p.prev.fz != 0.0f) && p.cur_time > p.prev_time + 0.001 &&
-            std::isfinite(r.fx) && std::isfinite(r.fz)) {
-            const double span = p.cur_time - p.prev_time;
-            double a = (shown - p.prev_time) / span;
-            a = std::clamp(a, 0.0, 1.0); // 4.4.14: nunca passa do pacote atual (girar a mais parece erro)
-            const float a0 = std::atan2(p.prev.fx, p.prev.fz), a1 = std::atan2(r.fx, r.fz);
-            float d = a1 - a0;
-            while (d > 3.14159265f) d -= 6.28318531f;
-            while (d < -3.14159265f) d += 6.28318531f;
-            const float ang = a0 + d * static_cast<float>(a);
-            fx = std::sin(ang);
-            fz = std::cos(ang);
-        }
-        const float n = std::sqrt(fx * fx + fz * fz);
-        if (!std::isfinite(n) || n < 0.01f) { // sem rumo no pacote: a cara segue o deslocamento
-            const float ax = (mx != 0.0f || mz != 0.0f) ? mx : 1.0f, az = (mx != 0.0f || mz != 0.0f) ? mz : 0.0f;
-            d->fx = ax;
-            d->fz = az;
+        // 4.4.16: a cara vira no COMECO do passo e continua podendo virar durante ele: andando, ela e' a direcao do
+        // deslocamento (e' o que o jogo do outro faz - o corpo sempre encara para onde anda); parado, e' a cara do
+        // pacote. Antes eu so usava a cara do pacote, que parecia so "acertar" depois de terminar de andar.
+        float tx_face = 0.0f, tz_face = 0.0f;
+        if (r.gear > 3 && (mx != 0.0f || mz != 0.0f)) {
+            tx_face = mx;
+            tz_face = mz;
+        } else if (std::isfinite(r.fx) && std::isfinite(r.fz) && std::fabs(r.fx) + std::fabs(r.fz) > 0.01f) {
+            tx_face = r.fx;
+            tz_face = r.fz;
         } else {
-            d->fx = fx / n;
-            d->fz = fz / n;
+            tx_face = (mx != 0.0f || mz != 0.0f) ? mx : 1.0f;
+            tz_face = (mx != 0.0f || mz != 0.0f) ? mz : 0.0f;
         }
+        float tgt = std::atan2(tx_face, tz_face);
+        if (!p.have_face) {
+            p.face_ang = tgt;
+            p.have_face = true;
+        }
+        float diff = tgt - p.face_ang;
+        while (diff > 3.14159265f) diff -= 6.28318531f;
+        while (diff < -3.14159265f) diff += 6.28318531f;
+        const float step = 0.55f; // rad por quadro: vira rapido no comeco do passo, sem girar de uma vez
+        p.face_ang += std::clamp(diff, -step, step);
+        d->fx = std::sin(p.face_ang);
+        d->fz = std::cos(p.face_ang);
     }
     { // 4.4.12: o passo anda SEMPRE para frente, na direcao da cara. A posicao ja vem pronta do outro jogo (o
         // Teleport acima poe o boneco no lugar certo); aqui so a ANIMACAO importa. Antes eu mandava a direcao real do
@@ -3209,7 +3223,14 @@ void Tick() {
                 p.wait_since = 0;
                 // 4.5: personagem igual ao do jogador local (o mesmo Batman nos dois): o slot TEM de ser um "Player Load
                 // Slot" proprio, nunca o do portal/party do jogador (duas instancias isoladas, sem colisao de ponteiro)
-                const bool player_slot = shares_local || UsePlayerSlot(); // primeiro os de jogador (nao disputam com as figuras)
+                // 4.4.16: SEMPRE no slot de jogador quando houver um livre: esses slots nao aparecem na roda de
+                // figuras, entao o jogador local nao consegue mais entrar no personagem do outro (era isso que
+                // derrubava o jogo). LD_MP_SLOT=portal volta ao comportamento antigo.
+                static const bool portal_always = [] {
+                    const char* v = std::getenv("LD_MP_SLOT");
+                    return v && std::strcmp(v, "portal") == 0;
+                }();
+                const bool player_slot = !portal_always && (shares_local || UsePlayerSlot());
                 std::memset(p.load_buffer, 0, sizeof(p.load_buffer));
                 At<s32>(reinterpret_cast<u64>(p.load_buffer) + 96) = player_slot ? 1 : 0; // tipo: 0 portal, 1 jogador
                 std::snprintf(p.load_name, sizeof(p.load_name), "%s", p.cur.chr.c_str());
