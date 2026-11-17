@@ -906,9 +906,15 @@ HLE_SYSV_ABI u64 BlowUpHook(u64 ctx, u64 who, u64 a, u64 b, u64 c, u64 d, u64 st
             const std::vector<u64> same = GadgetsNamed(name);
             const auto it = std::find(same.begin(), same.end(), ctx);
             const int order = it == same.end() ? 0 : static_cast<int>(it - same.begin());
-            Announce("b|" + CurrentArea() + "|" + name + "|" + std::to_string(order));
-            std::printf("[MP] quebrei %s (#%d): avisando a sala\n", name.c_str(), order);
-            std::fflush(stdout);
+            static std::map<u64, double> announced; // 4.4.7: o gancho roda varias vezes no mesmo objeto
+            const double now = runtime::mp_net::Now();
+            auto seen = announced.find(ctx);
+            if (seen == announced.end() || now - seen->second > 3.0) {
+                announced[ctx] = now;
+                Announce("b|" + CurrentArea() + "|" + name + "|" + std::to_string(order));
+                std::printf("[MP] quebrei %s (#%d): avisando a sala\n", name.c_str(), order);
+                std::fflush(stdout);
+            }
         }
     }
     return g_blowup(ctx, who, a, b, c, d, st0, st1);
@@ -1540,8 +1546,10 @@ void Despawn(Puppet& p) {
             if (next) At<u64>(next + 8) = prev;
             else At<u64>(list + 8) = prev;
             At<s32>(list + 0x10) = At<s32>(list + 0x10) - 1;
-            GameFree(node);
+            // 4.4.7: primeiro o destrutor do jogo desfaz o personagem, depois solto o no da lista. Na ordem inversa o
+            // destrutor mexia num no ja liberado e o jogo caia depois ("call [rax+0x88]" com rax=0).
             Call(kRequestDeleteFn, request); // passa pelo gancho do destrutor (ja zerado acima)
+            GameFree(node);
             return;
         }
         node = At<u64>(node);
@@ -1613,18 +1621,46 @@ void Steer(Puppet& p, double now, Drive* d) {
     const double age = now - p.cur_time;
     // Onde o amigo esta AGORA: a posicao recebida + a velocidade dele (marcha e direcao que ele mandou, a mesma conta
     // do jogo) x o tempo desde que ele mandou = idade do pacote + metade da nossa ida e volta + metade da dele.
+    // 4.4.7: a direcao do fantasma vem do DESLOCAMENTO real entre dois pacotes. O vetor que o jogo guarda em
+    // loc+0x80/0x88 e local ao corpo (x = lado, z = frente): interpretado como mundo, o fantasma andava de lado
+    // sempre que o outro jogador girava.
+    float mx = 0.0f, mz = 0.0f;
+    if (p.prev.valid && p.cur_time > p.prev_time + 0.001) {
+        mx = r.x - p.prev.x;
+        mz = r.z - p.prev.z;
+        const float len = std::sqrt(mx * mx + mz * mz);
+        if (len > 0.004f) { // andou o bastante para saber para onde (a posicao vem exata, sem ruido)
+            mx /= len;
+            mz /= len;
+        } else {
+            mx = mz = 0.0f;
+        }
+    }
     float vx = 0, vz = 0;
-    if (r.gear > 3) {
-        const float n = std::sqrt(r.dx * r.dx + r.dz * r.dz);
+    if (r.gear > 3 && (mx != 0.0f || mz != 0.0f)) {
         const float speed = TableSpeed(p.inst, r.gear);
-        if (n > 0.01f && speed > 0.0f) {
-            vx = r.dx / n * speed;
-            vz = r.dz / n * speed;
+        if (speed > 0.0f) {
+            vx = mx * speed;
+            vz = mz * speed;
         }
     }
     const double latency = runtime::mp_net::LatencySeconds(p.peer, r.rtt_ms); // Fase 82: direto (P2P) ou pelo servidor
-    const float lead = static_cast<float>(std::clamp(age + latency, 0.0, 0.5));
-    const float tx = r.x + vx * lead, tz = r.z + vz * lead;
+    // 4.4.7: mostra o outro onde ele REALMENTE estava quando o pacote saiu (agora - metade da ida e volta) e caminha
+    // entre o pacote anterior e o atual. Antes era so "pacote + velocidade x atraso": a posicao pulava a cada pacote.
+    const double shown = now - latency;
+    float tx = r.x, ty = r.y, tz = r.z;
+    if (p.prev.valid && p.cur_time > p.prev_time + 0.001) {
+        const double span = p.cur_time - p.prev_time;
+        double a = (shown - p.prev_time) / span;
+        a = std::clamp(a, 0.0, 1.0 + 0.35); // no maximo um terco de pacote para a frente
+        tx = static_cast<float>(p.prev.x + (r.x - p.prev.x) * a);
+        ty = static_cast<float>(p.prev.y + (r.y - p.prev.y) * a);
+        tz = static_cast<float>(p.prev.z + (r.z - p.prev.z) * a);
+    } else {
+        const float lead = static_cast<float>(std::clamp(age + latency, 0.0, 0.5));
+        tx += vx * lead;
+        tz += vz * lead;
+    }
     const u64 t = Transform(p.inst);
     if (!t || !Readable(t + 0x90, 12)) { // sem matriz de posicao: nada a dirigir neste quadro (nada velho no Drive)
         d->inst = 0;
@@ -1640,13 +1676,13 @@ void Steer(Puppet& p, double now, Drive* d) {
     const float dist = std::sqrt(ex * ex + ez * ez);
     // 4.5.1: teleporte so quando o fantasma esta realmente longe (entrou agora, trocou de area, caiu). Antes ele
     // pulava a cada 4 m e o outro parecia estar com a conexao ruim.
-    if (dist > 20.0f || std::fabs(r.y - py) > 8.0f) {
-        Teleport(p.inst, r.x, r.y, r.z);
+    if (dist > 20.0f || std::fabs(ty - py) > 8.0f) {
+        Teleport(p.inst, tx, ty, tz);
     } else if (dist > 1.2f) {
         // 4.5.1: a posicao de quem joga manda: corrige a deriva aos poucos (sem pulo) - antes o fantasma chegava a
         // ficar 2-3 m atras e os golpes do outro nao encostavam em ninguem.
-        const float blend = dist > 6.0f ? 0.35f : 0.12f;
-        Teleport(p.inst, px + ex * blend, py + (r.y - py) * blend, pz + ez * blend);
+        const float blend = dist > 6.0f ? 0.5f : (dist > 2.0f ? 0.3f : 0.15f);
+        Teleport(p.inst, px + ex * blend, py + (ty - py) * blend, pz + ez * blend);
     }
     d->inst = p.inst;
     d->speed = 0.0f;
@@ -1670,9 +1706,9 @@ void Steer(Puppet& p, double now, Drive* d) {
     d->dx = 0.0f; // parado: sem velocidade (a velocidade so vale para marcha > 3)
     d->dz = 0.0f;
     const bool stale = age > 3.0;
-    if (!stale && r.gear > 3) {
+    if (!stale && r.gear > 3 && (mx != 0.0f || mz != 0.0f)) {
         const float k = 0.8f * std::min(dist, 1.5f);
-        float dx = r.dx + (dist > 0.001f ? ex / dist * k : 0), dz = r.dz + (dist > 0.001f ? ez / dist * k : 0);
+        float dx = mx + (dist > 0.001f ? ex / dist * k : 0), dz = mz + (dist > 0.001f ? ez / dist * k : 0);
         const float n = std::sqrt(dx * dx + dz * dz);
         if (n > 0.001f) {
             dx /= n;
@@ -1689,6 +1725,8 @@ void Steer(Puppet& p, double now, Drive* d) {
             const float boost = dist > 3.0f ? 3.0f : 1.9f;
             d->speed = std::clamp(base + 3.0f * along, base * 0.5f, base * boost);
         }
+    } else if (r.gear > 3 && mx == 0.0f && mz == 0.0f && dist < 0.6f) {
+        d->gear = 3; // girando no lugar: nao anda, so a cara (r.fx/r.fz) muda
     } else if (dist > 0.12f) { // parado la e o fantasma longe: vai ate o lugar (devagar quando perto)
         d->gear = 6;
         const float base = TableSpeed(p.inst, 6);
@@ -1926,6 +1964,9 @@ void UpdateLevelKey() {
         g_level_key = key;
         std::printf("[MP] fase atual: %s (%d)\n", key.empty() ? "-" : key.c_str(), obj ? At<s16>(obj + 0x80) : -1);
         std::fflush(stdout);
+        // 4.4.7: quem entrou na missao/fase avisa na hora: o outro jogo pede a mesma carga no mesmo instante em vez
+        // de esperar a estabilidade do seguidor (era isso que deixava o convidado preso no tubo).
+        if (g_enabled && !key.empty() && runtime::mp_net::SelfId()) runtime::mp_net::SendEvent("L|" + key);
     }
 }
 
@@ -2516,6 +2557,33 @@ void ApplyEvent(int from, const std::string& payload, double now) {
         if (bar == std::string::npos) break;
         pos = bar + 1;
     }
+    if (f.size() >= 2 && f[0] == "L") { // 4.4.7: o outro jogador entrou numa missao/fase
+        const std::string& key = f[1];
+        if (key.empty() || key == g_level_key || g_level_key.empty()) return;
+        const int id = LevelIdForKey(key);
+        if (id < 0) {
+            std::printf("[MP] o outro entrou na fase %s e este jogo nao achou o numero dela\n", key.c_str());
+            std::fflush(stdout);
+            return;
+        }
+        std::printf("[MP] seguindo na hora: fase %s (id %d)\n", key.c_str(), id);
+        std::fflush(stdout);
+        for (auto& [pid, p] : g_puppets) {
+            if (p.stage == Stage::kSpawning || p.stage == Stage::kActive) Despawn(p);
+            p.stage = Stage::kNone;
+        }
+        g_drive_count = 0;
+        g_level_request_time = now;
+        g_level_gate_id = static_cast<u64>(id);
+        g_level_gate_time = now;
+        {
+            const size_t hash = key.rfind('#');
+            g_owner_level_path = hash == std::string::npos ? key : key.substr(0, hash);
+            g_owner_level_time = now;
+        }
+        Call(kGotoLevelFn, reinterpret_cast<u64>(g_base) + kLevelLoader, static_cast<u64>(id), 0, 0);
+        return;
+    }
     if (f.size() < 4 || (f[0] != "b" && f[0] != "k" && f[0] != "o" && f[0] != "m" && f[0] != "r" && f[0] != "c" &&
                          f[0] != "q"))
         return;
@@ -2706,7 +2774,7 @@ void Tick() {
         if ((p.stage == Stage::kSpawning || p.stage == Stage::kActive) && !LiveHas(p.request)) {
             p.request = p.inst = p.inst_name = 0;
             p.stage = Stage::kNone;
-            p.retry_time = now + 1.0;
+            p.retry_time = now + 2.5; // 4.4.7: menos pisca-pisca (o jogo as vezes desfaz e refaz o personagem)
         }
     }
     if (epoch != g_seen_epoch) { // troca de area: tira os fantasmas que ainda existirem
@@ -2871,6 +2939,17 @@ void Tick() {
             } else if (CanLoad() && SomeoneLoading()) {
                 // o jogo carrega um personagem por vez: espera a vez (enquanto isso so o nome aparece)
                 if (!p.wait_since) p.wait_since = now;
+            } else if (LocalPlayerUses(Lower(p.cur.chr) + ".cd") && !FreePlayerSlot()) {
+                // 4.4.7: o outro jogo esta com o MESMO personagem e nao ha slot de jogador livre: entra com um
+                // personagem ja carregado (nome dele em cima) - antes ficava so o nome e o boneco ia e voltava.
+                if (u64 slot = StandInSlot()) {
+                    p.slot = slot;
+                    p.standin = true;
+                    p.stage = Stage::kReady;
+                } else {
+                    p.retry_time = now + 3.0;
+                }
+                break;
             } else if (const bool shares_local = LocalPlayerUses(Lower(p.cur.chr) + ".cd");
                        CanLoad() && now - p.load_fail_time > 15.0 && now - g_last_unload > 8.0 &&
                        (!shares_local || FreePlayerSlot())) { // carrega num slot livre
@@ -2972,10 +3051,16 @@ void Tick() {
             const u64 local_party = p1 && Readable(p1 + 0x3a0, 8) ? At<u64>(p1 + 0x3a0) : 0;
             if (local_party && Readable(p.inst + 0x3a0, 8) && At<u64>(p.inst + 0x3a0) == local_party) {
                 Despawn(p);
-                if (++p.clashes >= 3) { // ja tentou 3 vezes: fica so o nome (nao entra em laco de spawn)
-                    g_unsupported.insert(Lower(p.cur.chr));
-                    Log("[MP] %s continua preso na party do jogador local: so o nome de %s aparece", p.cur.chr, p.name);
-                    p.retry_time = now + 30.0;
+                if (++p.clashes >= 3) { // ja tentou 3 vezes: entra como substituto, sem nome solto
+                    if (u64 slot = StandInSlot()) {
+                        p.slot = slot;
+                        p.standin = true;
+                        p.stage = Stage::kReady;
+                        p.retry_time = 0;
+                        Log("[MP] %s fica como substituto (party do jogador local): %s", p.cur.chr, p.name);
+                    } else {
+                        p.retry_time = now + 10.0;
+                    }
                 } else {
                     Log("[MP] %s ficou com a party do jogador local: desfazendo o fantasma", p.name);
                     p.retry_time = now + 2.0;
@@ -2984,7 +3069,18 @@ void Tick() {
                 break;
             }
             // o amigo trocou de personagem: refaz o fantasma (se o novo ja esta carregado ou cabe num slot)
-            if (Lower(LocalCharacter(p.inst)) != Lower(p.cur.chr) && now - p.stage_time > (p.standin ? 4.0 : 1.0) &&
+            if (p.standin && now - p.stage_time > 8.0) { // 4.4.7: substituto vira o personagem certo quando sobrar slot
+                const u64 real = FindLoadedSlot(p.cur.chr);
+                if (real && !SlotUsedByLocalPlayer(real) && !g_unsupported.count(Lower(p.cur.chr))) {
+                    Log("[MP] %s volta ao personagem certo (%s)", p.name, p.cur.chr.c_str());
+                    p.standin = false;
+                    p.slot = real;
+                    Despawn(p);
+                    p.retry_time = 0;
+                    break;
+                }
+            }
+            if (!p.standin && Lower(LocalCharacter(p.inst)) != Lower(p.cur.chr) && now - p.stage_time > 1.0 &&
                 !g_unsupported.count(Lower(p.cur.chr)) &&
                 (FindLoadedSlot(p.cur.chr) || (!SomeoneLoading() && now - p.load_fail_time > 15.0 && (CanLoad() || RecycleSlot())))) {
                 Despawn(p);
