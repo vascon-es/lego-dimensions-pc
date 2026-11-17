@@ -246,6 +246,7 @@ std::map<int, Puppet> g_puppets; // so a thread principal mexe
 // port descobre sozinho: se o fantasma anda perpendicular ao que foi mandado (de lado), troca a convencao. O
 // LD_MP_MOVE=world|local fixa uma delas para teste.
 std::atomic<bool> g_move_local{true};
+std::atomic<int> g_vote_world{0}, g_vote_local{0}; // 4.4.11: votos da convencao da direcao (decide uma vez)
 std::atomic<int> g_move_probe_n{0};
 std::atomic<float> g_move_probe_dot{0.0f};
 
@@ -1418,13 +1419,8 @@ u64 StandInSlot() {
     }
     // 4.5: antes o substituto caia no slot do personagem do jogador local - o mesmo problema da party compartilhada
     // (Task 6). Sem um personagem NOSSO livre, so o nome flutuando aparece ate sobrar um slot.
-    for (int i = 0; i < g_nall; ++i) { // 4.4.10: qualquer slot carregado que nao seja dos jogadores locais
-        const u64 slot = SlotAddress(i);
-        if (!slot || SlotState(i) != 1) continue;
-        const std::string name = SlotName(i);
-        if (name.empty() || LocalPlayerUses(name)) continue;
-        return slot;
-    }
+    // 4.4.11: NAO usa slot de personagem alheio (era assim que o amigo aparecia vestido de outro personagem que ele
+    // nem tinha equipado). Sem um personagem NOSSO livre, so o nome flutuando aparece.
     return 0;
 }
 
@@ -1640,6 +1636,32 @@ float TableSpeed(u64 inst, int gear) {
     return std::isfinite(v) && v > 0.05f && v < 20.0f ? v : 0.0f;
 }
 
+// 4.4.11: descobre em que espaco o jogo do outro guarda a direcao da caminhada (loc+0x80/0x88), comparando esse
+// vetor com o DESLOCAMENTO REAL entre dois pacotes. Uma vez decidido, nao muda mais (era a troca em tempo real que
+// fazia o boneco ficar alternando entre andar para frente e para o lado).
+void VoteDirection(const Remote& r, float wx, float wz, float fx, float fz) {
+    static bool decided = false;
+    if (decided || std::getenv("LD_MP_MOVE") != nullptr) return;
+    const float wxlen = std::sqrt(wx * wx + wz * wz);
+    const float rlen = std::sqrt(r.dx * r.dx + r.dz * r.dz);
+    if (wxlen < 0.03f || rlen < 0.01f) return;
+    const float ux = wx / wxlen, uz = wz / wxlen;
+    // o mesmo deslocamento escrito no espaco do corpo (x = lado, z = frente)
+    const float bx = ux * fz - uz * fx, bz = ux * fx + uz * fz;
+    const float cx = r.dx / rlen, cz = r.dz / rlen;
+    const float cw = cx * ux + cz * uz;                       // parecido com o mundo?
+    const float cb = cx * bx + cz * bz;                       // parecido com o espaco do corpo?
+    if (cw > cb) ++g_vote_world;
+    else ++g_vote_local;
+    if (g_vote_world + g_vote_local < 60) return;
+    decided = true;
+    g_move_local = g_vote_local > g_vote_world;
+    std::printf("[MP] direcao da caminhada do outro jogo: %s (mundo %.2f x corpo %.2f)\n",
+                g_move_local.load() ? "espaco do corpo" : "espaco do mundo",
+                g_vote_world.load() / 60.0, g_vote_local.load() / 60.0);
+    std::fflush(stdout);
+}
+
 // Calcula a marcha/direcao do fantasma para este quadro (aplicada pelo gancho de controle).
 void Steer(Puppet& p, double now, Drive* d) {
     const Remote& r = p.cur;
@@ -1737,42 +1759,16 @@ void Steer(Puppet& p, double now, Drive* d) {
             d->fz = fz / n;
         }
     }
-    { // direcao: do fantasma para o alvo (no mundo) e convertida para o espaco do corpo (autocalibrada)
-        float wdx = ex, wdz = ez;
-        const float wlen = std::sqrt(wdx * wdx + wdz * wdz);
-        if (wlen > 0.001f) {
-            wdx /= wlen;
-            wdz /= wlen;
-        } else { // parado: usa o deslocamento do pacote (serve para girar o passo) ou a cara
-            wdx = (mx != 0.0f || mz != 0.0f) ? mx : d->fx;
-            wdz = (mx != 0.0f || mz != 0.0f) ? mz : d->fz;
-        }
+    { // 4.4.11: a direcao do PASSO vem do deslocamento real do amigo entre dois pacotes (mx, mz), nao da diferenca
+        // entre o fantasma e o alvo: com a diferenca, cada correcao de posicao girava a direcao e o boneco ficava
+        // alternando entre andar de frente e de lado. Parado, ele caminha "para frente" (na cara dele).
+        VoteDirection(r, mx, mz, d->fx, d->fz); // calibra o espaco uma vez
+        float wdx = (mx != 0.0f || mz != 0.0f) ? mx : d->fx;
+        float wdz = (mx != 0.0f || mz != 0.0f) ? mz : d->fz;
         float dx = wdx, dz = wdz;
         to_body(dx, dz);
         d->dx = dx;
         d->dz = dz;
-    }
-    // 4.4.10: calibra a convencao da direcao - se o fantasma anda perpendicular ao que foi mandado, ela esta trocada
-    if (p.have_last) {
-        const float mvx = px - p.last_px, mvz = pz - p.last_pz;
-        const float mlen = std::sqrt(mvx * mvx + mvz * mvz);
-        const float wlen = std::sqrt(p.last_wx * p.last_wx + p.last_wz * p.last_wz);
-        if (p.last_dist < 0.5f && mlen > 0.01f && wlen > 0.001f && r.gear > 3 && age < 1.0) {
-            const float dot = (mvx * p.last_wx + mvz * p.last_wz) / (mlen * wlen);
-            g_move_probe_dot.store(g_move_probe_dot.load() + dot, std::memory_order_relaxed);
-            const int cnt = g_move_probe_n.load() + 1;
-            g_move_probe_n.store(cnt, std::memory_order_relaxed);
-            if (cnt >= 20) {
-                const float mean = g_move_probe_dot.load() / static_cast<float>(cnt);
-                g_move_probe_n.store(0);
-                g_move_probe_dot.store(0.0f);
-                const bool flip = mean < 0.35f && std::getenv("LD_MP_MOVE") == nullptr;
-                if (flip) g_move_local.store(!g_move_local.load());
-                std::printf("[MP] direcao do fantasma: %s%s (alinha %.2f)\n", flip ? "convencao trocada para " : "",
-                            g_move_local.load() ? "espaco do corpo" : "espaco do mundo", static_cast<double>(mean));
-                std::fflush(stdout);
-            }
-        }
     }
     p.last_px = px;
     p.last_pz = pz;
@@ -2580,6 +2576,7 @@ struct PendingEvent {
 std::vector<PendingEvent> g_pending_events; // esperando a varredura achar o objeto
 
 // Fase 80: aplica os avisos dos outros jogadores ("b|area|nome|ordem" = quebrou um objeto explodivel)
+bool g_was_loading = false;        // 4.4.11: a fase atual e' tela de carregamento (os fantasmas ja foram desfeitos)
 double g_push_request_time = -100; // 4.4.8: quando este jogo pediu a fase do outro por aviso ("L|")
 bool g_push_retried = false;       // 4.4.10: ja pediu a mesma fase uma segunda vez
 int g_push_target_id = -1;         // 4.4.10: numero da fase pedida, resolvido AQUI (USA/EUR numeram diferente)
@@ -2706,6 +2703,11 @@ void ApplyEvent(int from, const std::string& payload, double now) {
     if (f.size() >= 2 && f[0] == "L") { // 4.4.7: o outro jogador entrou numa missao/fase
         const std::string& key = f[1];
         if (key.empty() || key == g_level_key || g_level_key.empty()) return;
+        if (now - g_level_request_time < 25.0) { // 4.4.11: ja estamos carregando uma fase (pedido duplo = tela branca)
+            std::printf("[MP] aviso da fase %s ignorado: este jogo ja esta trocando de fase\n", key.c_str());
+            std::fflush(stdout);
+            return;
+        }
         const int id = LevelIdForKey(key);
         if (id < 0) {
             std::printf("[MP] o outro entrou na fase %s e este jogo nao achou o numero dela\n", key.c_str());
@@ -2909,6 +2911,22 @@ void Tick() {
     }
     UpdateSlotCounts();
     UpdateLevelKey();
+    // 4.4.11: numa troca de fase o mundo esta sendo desmontado: nao escreve em personagem nenhum (era daqui que
+    // vinham travadas, tela branca e crash ao entrar em missao).
+    const bool loading_now = Lower(g_level_key).find("loading") != std::string::npos || g_level_key == "-" || g_level_key.empty();
+    if (loading_now) {
+        if (!g_was_loading) { // entrou agora: desfaz os fantasmas uma vez
+            g_was_loading = true;
+            for (auto& [pid, p] : g_puppets) {
+                if (p.stage == Stage::kSpawning || p.stage == Stage::kActive) Despawn(p);
+                p.stage = Stage::kNone;
+                p.request = p.inst = p.inst_name = 0;
+            }
+            g_drive_count = 0;
+        }
+        return;
+    }
+    g_was_loading = false;
     SendLocal(p1, now);
 
     std::string area;
