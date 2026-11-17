@@ -283,6 +283,7 @@ struct Drive {
     float dx, dz, fx, fz;
     u32 held, prev;
     bool hold = false; // 4.4.9: espelho puro - rapidez 0 e a posicao vem do Teleport (nada de IA andando sozinha)
+    u64 name = 0;      // 4.4.10: inst+0x10 do fantasma (se mudou, o personagem morreu/trocou: nao mexer)
 };
 
 // nomes em cima dos fantasmas (o overlay le de outra thread)
@@ -357,6 +358,9 @@ HLE_SYSV_ABI u64 ControlHook(u64 inst, float dt) {
         }
     }
     if (d) ++g_hook_driven;
+    // 4.4.10: o personagem pode ter sido desfeito/trocado (troca de figura com Y, portal). Se a instancia nao e'
+    // mais a nossa, nao escreve nada nela - era assim que o jogo caia ao trocar de personagem.
+    if (d && (!Readable(inst + 0x10, 8) || (d->name && At<u64>(inst + 0x10) != d->name))) d = nullptr;
     if (d && PlayerMode()) {
         if (FakeController* fc = FakeControllerFor(inst)) {
             const bool moving = d->gear > 3;
@@ -1414,6 +1418,13 @@ u64 StandInSlot() {
     }
     // 4.5: antes o substituto caia no slot do personagem do jogador local - o mesmo problema da party compartilhada
     // (Task 6). Sem um personagem NOSSO livre, so o nome flutuando aparece ate sobrar um slot.
+    for (int i = 0; i < g_nall; ++i) { // 4.4.10: qualquer slot carregado que nao seja dos jogadores locais
+        const u64 slot = SlotAddress(i);
+        if (!slot || SlotState(i) != 1) continue;
+        const std::string name = SlotName(i);
+        if (name.empty() || LocalPlayerUses(name)) continue;
+        return slot;
+    }
     return 0;
 }
 
@@ -1694,10 +1705,24 @@ void Steer(Puppet& p, double now, Drive* d) {
     // nada de teleporte so quando longe: antes a IA do fantasma andava sozinha e parava em posicao errada (no mesmo
     // mundo, com os dois jogadores parados, os bonecos saiam andando). Agora a matriz de posicao e' escrita do alvo
     // interpolado em todo quadro e o motor nao move (hold): as posicoes batem sempre com as do outro jogo.
+    // 4.4.10: mundo -> espaco do corpo (o gancho espera x = lado, z = frente). LD_MP_MOVE=world|local fixa; sem a
+    // variavel a convencao e' calibrada sozinha (ver a sonda na linha de status).
+    const auto to_body = [&](float& dx, float& dz) {
+        if (!g_move_local.load(std::memory_order_relaxed)) return;
+        const float fx = d->fx, fz = d->fz;
+        const float forward = dx * fx + dz * fz;
+        const float side = dx * fz - dz * fx;
+        dx = side;
+        dz = forward;
+    };
     Teleport(p.inst, tx, ty, tz);
     d->inst = p.inst;
-    d->speed = 0.0f;
-    d->hold = true;
+    d->name = p.inst_name;
+    // 4.4.10: a posicao continua sendo escrita aqui todo quadro (espelho), mas com rapidez e direcao de verdade: sem
+    // isso o animador nao tem velocidade e toca a animacao de PARADO enquanto o boneco desliza. O erro de um quadro
+    // de caminhada e' refeito no quadro seguinte pelo Teleport.
+    d->speed = 0.0f; // 0 = a rapidez da tabela da marcha (e' dela que sai a animacao)
+    d->hold = false;
     d->gear = age < 3.0 ? r.gear : 3;
     d->held = age < 1.0 ? (r.held & kSentButtons) : 0;
     {
@@ -1712,11 +1737,54 @@ void Steer(Puppet& p, double now, Drive* d) {
             d->fz = fz / n;
         }
     }
-    d->dx = 0.0f;
-    d->dz = 0.0f;
+    { // direcao: do fantasma para o alvo (no mundo) e convertida para o espaco do corpo (autocalibrada)
+        float wdx = ex, wdz = ez;
+        const float wlen = std::sqrt(wdx * wdx + wdz * wdz);
+        if (wlen > 0.001f) {
+            wdx /= wlen;
+            wdz /= wlen;
+        } else { // parado: usa o deslocamento do pacote (serve para girar o passo) ou a cara
+            wdx = (mx != 0.0f || mz != 0.0f) ? mx : d->fx;
+            wdz = (mx != 0.0f || mz != 0.0f) ? mz : d->fz;
+        }
+        float dx = wdx, dz = wdz;
+        to_body(dx, dz);
+        d->dx = dx;
+        d->dz = dz;
+    }
+    // 4.4.10: calibra a convencao da direcao - se o fantasma anda perpendicular ao que foi mandado, ela esta trocada
+    if (p.have_last) {
+        const float mvx = px - p.last_px, mvz = pz - p.last_pz;
+        const float mlen = std::sqrt(mvx * mvx + mvz * mvz);
+        const float wlen = std::sqrt(p.last_wx * p.last_wx + p.last_wz * p.last_wz);
+        if (p.last_dist < 0.5f && mlen > 0.01f && wlen > 0.001f && r.gear > 3 && age < 1.0) {
+            const float dot = (mvx * p.last_wx + mvz * p.last_wz) / (mlen * wlen);
+            g_move_probe_dot.store(g_move_probe_dot.load() + dot, std::memory_order_relaxed);
+            const int cnt = g_move_probe_n.load() + 1;
+            g_move_probe_n.store(cnt, std::memory_order_relaxed);
+            if (cnt >= 20) {
+                const float mean = g_move_probe_dot.load() / static_cast<float>(cnt);
+                g_move_probe_n.store(0);
+                g_move_probe_dot.store(0.0f);
+                const bool flip = mean < 0.35f && std::getenv("LD_MP_MOVE") == nullptr;
+                if (flip) g_move_local.store(!g_move_local.load());
+                std::printf("[MP] direcao do fantasma: %s%s (alinha %.2f)\n", flip ? "convencao trocada para " : "",
+                            g_move_local.load() ? "espaco do corpo" : "espaco do mundo", static_cast<double>(mean));
+                std::fflush(stdout);
+            }
+        }
+    }
     p.last_px = px;
     p.last_pz = pz;
     p.last_dist = dist;
+    p.last_wx = d->dx;
+    p.last_wz = d->dz;
+    if (g_move_local.load(std::memory_order_relaxed)) { // corpo -> mundo (para comparar no proximo quadro)
+        const float fx = d->fx, fz = d->fz;
+        const float w = d->dz;
+        p.last_wx = d->dz * fx + d->dx * fz;
+        p.last_wz = w * fz - d->dx * fx;
+    }
     p.have_last = true;
 }
 
@@ -2513,6 +2581,9 @@ std::vector<PendingEvent> g_pending_events; // esperando a varredura achar o obj
 
 // Fase 80: aplica os avisos dos outros jogadores ("b|area|nome|ordem" = quebrou um objeto explodivel)
 double g_push_request_time = -100; // 4.4.8: quando este jogo pediu a fase do outro por aviso ("L|")
+bool g_push_retried = false;       // 4.4.10: ja pediu a mesma fase uma segunda vez
+int g_push_target_id = -1;         // 4.4.10: numero da fase pedida, resolvido AQUI (USA/EUR numeram diferente)
+std::string g_push_target;         // 4.4.10: a fase pedida (para o log)
 
 // 4.4.9: estado do multiplayer para o painel F9 (linha viva, atualizada ~2x por segundo na thread principal).
 std::mutex g_summary_mutex;
@@ -2658,6 +2729,9 @@ void ApplyEvent(int from, const std::string& payload, double now) {
         }
         Call(kGotoLevelFn, reinterpret_cast<u64>(g_base) + kLevelLoader, static_cast<u64>(id), 0, 0);
         g_push_request_time = now; // 4.4.8: para sair do tubo se a carga nao terminar
+        g_push_retried = false;
+        g_push_target_id = id;
+        g_push_target = key;
         return;
     }
     if (f.size() < 4 || (f[0] != "b" && f[0] != "k" && f[0] != "o" && f[0] != "m" && f[0] != "r" && f[0] != "c" &&
@@ -2917,8 +2991,23 @@ void Tick() {
     // 4.4.8: tubo infinito. Pedimos a fase do outro e ficamos presos numa tela de carregamento: depois de 30 s
     // volta para o Hub para nao travar o jogo de vez (o id do Hub e' resolvido AQUI - USA e EUR numeram diferente,
     // nunca usar o numero que veio do outro jogo).
+    if (g_push_request_time > 0 && now - g_push_request_time > 20.0 && !g_push_retried) {
+        g_push_retried = true; // 4.4.10: primeiro tenta a mesma fase de novo (o pedido pode ter se perdido na carga)
+        const std::string low = Lower(g_level_key);
+        const bool loading = low.empty() || low == "-" || low.find("loading") != std::string::npos;
+        if (loading && g_push_target_id >= 0) {
+            std::printf("[MP] ainda carregando: pedindo a fase %s (id %d) de novo\n", g_push_target.c_str(), g_push_target_id);
+            std::fflush(stdout);
+            g_level_gate_id = static_cast<u64>(g_push_target_id);
+            g_level_gate_time = now;
+            g_level_request_time = now;
+            Call(kGotoLevelFn, reinterpret_cast<u64>(g_base) + kLevelLoader, static_cast<u64>(g_push_target_id), 0, 0);
+            g_push_request_time = now;
+        }
+    }
     if (g_push_request_time > 0 && now - g_push_request_time > 30.0) {
         g_push_request_time = -100;
+        g_push_retried = false;
         const std::string low = Lower(g_level_key);
         const bool loading = low.empty() || low == "-" || low.find("loading") != std::string::npos ||
                              low.find("titles") != std::string::npos;
@@ -3152,7 +3241,7 @@ void Tick() {
             const u64 local_party = p1 && Readable(p1 + 0x3a0, 8) ? At<u64>(p1 + 0x3a0) : 0;
             if (local_party && Readable(p.inst + 0x3a0, 8) && At<u64>(p.inst + 0x3a0) == local_party) {
                 Despawn(p);
-                if (++p.clashes >= 3) { // ja tentou 3 vezes: entra como substituto, sem nome solto
+                if (++p.clashes >= 1) { // 4.4.10: na primeira vez ja entra como substituto (antes eram 3 tentativas)
                     if (u64 slot = StandInSlot()) {
                         p.slot = slot;
                         p.standin = true;
@@ -3191,6 +3280,7 @@ void Tick() {
             if (now - p.stage_time > 1.5 && g_drive_count < kMaxPuppets) { // deixa a chegada pelo portal terminar
                 Drive& d = g_drive[g_drive_count];
                 d.hold = false; // 4.4.9: zera antes do Steer (a struct e' reaproveitada de quadros anteriores)
+                d.name = 0;
                 d.speed = 0.0f;
                 d.dx = d.dz = 0.0f;
                 u32 prev = 0;
