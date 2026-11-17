@@ -1010,8 +1010,7 @@ void MpActivate(bool kick = false) {
         return;
     case kMpOptMove: // 4.4.17: auto -> corpo -> mundo; o valor vai para a sala (os dois lados mudam juntos)
         runtime::multiplayer::SetMoveMode((runtime::multiplayer::MoveMode() + 1) % 3);
-        log::Tagged("MP", "walk direction: " + runtime::multiplayer::MoveModeName());
-        Redraw();
+        log::Tagged("MP", "walk direction: %s", runtime::multiplayer::MoveModeName().c_str());
         return;
     case kMpOptInvite:
         MpCopyInvite();
