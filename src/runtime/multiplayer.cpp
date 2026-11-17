@@ -1551,8 +1551,13 @@ bool Spawn(Puppet& p) {
 }
 
 // Solta o no do pedido da lista do spawner, libera o no e apaga o pedido (o jogo desfaz o personagem).
+bool PuppetAlive(const Puppet& p);
+
 void Despawn(Puppet& p) {
     const u64 request = p.request, spawner = p.spawner;
+    // 4.4.12: se o personagem ja foi desfeito pelo jogo (troca de figura, portal, fim de fase), o pedido pode ter
+    // sido reaproveitado por outra carga: nao chama o destrutor dele (derrubava o personagem do jogador / caia).
+    const bool alive = p.inst && PuppetAlive(p);
     if (p.slot) g_slot_used[p.slot] = runtime::mp_net::Now();
     p.request = p.inst = p.inst_name = 0;
     p.stage = Stage::kNone;
@@ -1569,6 +1574,10 @@ void Despawn(Puppet& p) {
             At<s32>(list + 0x10) = At<s32>(list + 0x10) - 1;
             // 4.4.7: primeiro o destrutor do jogo desfaz o personagem, depois solto o no da lista. Na ordem inversa o
             // destrutor mexia num no ja liberado e o jogo caia depois ("call [rax+0x88]" com rax=0).
+            if (!alive) { // 4.4.12: personagem ja desfeito: so tira o no da lista (nao ha o que desfazer)
+                GameFree(node);
+                return;
+            }
             Call(kRequestDeleteFn, request); // passa pelo gancho do destrutor (ja zerado acima)
             GameFree(node);
             return;
@@ -1759,14 +1768,12 @@ void Steer(Puppet& p, double now, Drive* d) {
             d->fz = fz / n;
         }
     }
-    { // 4.4.11: a direcao do PASSO vem do deslocamento real do amigo entre dois pacotes (mx, mz), nao da diferenca
-        // entre o fantasma e o alvo: com a diferenca, cada correcao de posicao girava a direcao e o boneco ficava
-        // alternando entre andar de frente e de lado. Parado, ele caminha "para frente" (na cara dele).
-        VoteDirection(r, mx, mz, d->fx, d->fz); // calibra o espaco uma vez
-        float wdx = (mx != 0.0f || mz != 0.0f) ? mx : d->fx;
-        float wdz = (mx != 0.0f || mz != 0.0f) ? mz : d->fz;
-        float dx = wdx, dz = wdz;
-        to_body(dx, dz);
+    { // 4.4.12: o passo anda SEMPRE para frente, na direcao da cara. A posicao ja vem pronta do outro jogo (o
+        // Teleport acima poe o boneco no lugar certo); aqui so a ANIMACAO importa. Antes eu mandava a direcao real do
+        // movimento - quando ela era perpendicular a cara o jogo animava de lado, e o boneco deslizava de lado.
+        VoteDirection(r, mx, mz, d->fx, d->fz); // calibra o espaco uma vez (mundo x corpo)
+        float dx = d->fx, dz = d->fz;
+        to_body(dx, dz); // no espaco do corpo vira (0, 1): frente pura
         d->dx = dx;
         d->dz = dz;
     }
@@ -3249,6 +3256,29 @@ void Tick() {
             break;
         }
         case Stage::kActive: {
+            // 4.4.12: o slot do fantasma deixou de ser nosso (o jogador pos um personagem nele ou removeu o dele):
+            // solta o fantasma SEM chamar o destrutor do jogo - era isso que fazia o personagem do jogador sumir e
+            // o jogo cair ao mexer no menu de figuras (Y).
+            if (p.slot) {
+                int idx = -1;
+                for (int i = 0; i < g_nall; ++i) {
+                    if (SlotAddress(i) == p.slot) {
+                        idx = i;
+                        break;
+                    }
+                }
+                const std::string name = idx >= 0 ? SlotName(idx) : std::string();
+                if (idx < 0 || SlotState(idx) != 1 || name.empty() || LocalPlayerUses(name)) {
+                    LiveDrop(p.request);
+                    p.request = 0;
+                    p.inst = p.inst_name = 0;
+                    p.stage = Stage::kNone;
+                    p.load_fail_time = 0;
+                    p.retry_time = now + 3.0;
+                    Log("[MP] slot do fantasma de %s mudou de dono: soltando o boneco", p.name);
+                    break;
+                }
+            }
             if (!PuppetAlive(p)) {
                 p.stage = Stage::kNone;
                 p.request = p.inst = 0;
