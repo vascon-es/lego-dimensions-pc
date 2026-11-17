@@ -1081,9 +1081,70 @@ enum InGameMpId {
     kInGameMpCancel = 1002,
     kInGameMpNewRoom = 1003,
     kInGameMpSaved = 1004, // Fase 83: redes salvas
+    kInGameMpLeave = 1005, // 4.4.5: sair da rede pelo F3
     kInGameMpEdit = 1100
 };
 static HWND s_mp_saved = nullptr;
+static HWND s_mp_status = nullptr; // 4.4.5: linha de estado (fora da rede / na rede / motivo da falha)
+static bool s_mp_status_bad = false;
+
+static std::wstring Widen(const std::string& s) { // UTF-8 -> UTF-16 (aviso/erro do multiplayer)
+    if (s.empty()) return {};
+    const int size = MultiByteToWideChar(CP_UTF8, 0, s.data(), static_cast<int>(s.size()), nullptr, 0);
+    std::wstring out(size, L'\0');
+    MultiByteToWideChar(CP_UTF8, 0, s.data(), static_cast<int>(s.size()), out.data(), size);
+    return out;
+}
+
+// 4.4.5: o que a janela mostra em cima (antes ela nao dizia nada e o painel F4 so dizia "fora da rede")
+static std::wstring MpDialogStatus(bool pt, bool* bad) {
+    *bad = false;
+    if (runtime::multiplayer::Leaving()) {
+        *bad = true;
+        return pt ? L"SAINDO DA REDE..." : L"LEAVING THE NETWORK...";
+    }
+    if (!runtime::multiplayer::Enabled()) {
+        const std::string error = runtime::multiplayer::LastError();
+        if (!error.empty()) {
+            *bad = true;
+            return (pt ? L"NAO CONECTOU: " : L"COULD NOT CONNECT: ") + Widen(error);
+        }
+        return pt ? L"FORA DA REDE - crie uma rede nova abaixo ou entre com um codigo"
+                  : L"OFFLINE - create a new network below or join with a code";
+    }
+    const std::string room = runtime::mp_net::RoomCode();
+    std::wstring text = (pt ? L"NA REDE " : L"IN NETWORK ") + Widen(room);
+    if (runtime::mp_net::SelfId() && runtime::mp_net::OwnerId() == runtime::mp_net::SelfId()) text += pt ? L" - VOCE E O DONO" : L" - YOU ARE THE OWNER";
+    if (runtime::mp_net::RoomLocked()) text += pt ? L" (TRANCADA)" : L" (LOCKED)";
+    return text;
+}
+
+// Teclas dentro dos campos: Esc cancela, Enter entra, Tab anda (sem isso o dialogo nao responde a teclado nenhum).
+static LRESULT CALLBACK InGameMpChildProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
+    if (msg == WM_KEYDOWN) {
+        if (wp == VK_ESCAPE) {
+            PostMessageW(s_mp_dialog, WM_COMMAND, MAKEWPARAM(kInGameMpCancel, BN_CLICKED), 0);
+            return 0;
+        }
+        if (wp == VK_RETURN) {
+            PostMessageW(s_mp_dialog, WM_COMMAND, MAKEWPARAM(kInGameMpSave, BN_CLICKED), 0);
+            return 0;
+        }
+        if (wp == VK_TAB) {
+            const bool back = (GetKeyState(VK_SHIFT) & 0x8000) != 0;
+            if (HWND next = GetNextDlgTabItem(s_mp_dialog, hwnd, back)) SetFocus(next);
+            return 0;
+        }
+    }
+    const auto original = reinterpret_cast<WNDPROC>(GetPropW(hwnd, L"mp_orig_proc"));
+    return CallWindowProcW(original, hwnd, msg, wp, lp);
+}
+
+static void MpCatchKeys(HWND control) {
+    if (!control) return;
+    const auto original = reinterpret_cast<WNDPROC>(SetWindowLongPtrW(control, GWLP_WNDPROC, reinterpret_cast<LONG_PTR>(InGameMpChildProc)));
+    SetPropW(control, L"mp_orig_proc", reinterpret_cast<HANDLE>(original));
+}
 
 // Fase 83: redes salvas (como a lista de redes do Radmin): mp_rede1..8 = "CODIGO<tab>SENHA" no launcher.ini
 struct SavedNetwork {
@@ -1142,7 +1203,13 @@ static LRESULT CALLBACK InGameMpProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) 
     case WM_CTLCOLORSTATIC: {
         HDC dc = reinterpret_cast<HDC>(wp);
         SetBkMode(dc, TRANSPARENT);
-        SetTextColor(dc, RGB(225, 230, 240));
+        const HWND control = reinterpret_cast<HWND>(lp);
+        if (control == s_mp_status) { // 4.4.5: estado em cor (vermelho = falhou, ciano = na rede, cinza = fora)
+            SetTextColor(dc, s_mp_status_bad ? RGB(255, 120, 110)
+                                             : (runtime::multiplayer::Enabled() ? RGB(120, 220, 255) : RGB(150, 158, 172)));
+        } else {
+            SetTextColor(dc, RGB(225, 230, 240));
+        }
         return reinterpret_cast<LRESULT>(s_mp_bg_brush);
     }
     case WM_CTLCOLOREDIT: {
@@ -1155,14 +1222,18 @@ static LRESULT CALLBACK InGameMpProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) 
         return reinterpret_cast<LRESULT>(s_mp_bg_brush);
     }
     case WM_COMMAND: {
-        const int id = LOWORD(wp);
-        if (id == kInGameMpSaved && HIWORD(wp) == CBN_SELCHANGE) { // escolheu uma rede salva
+        const int id = LOWORD(wp);        if (id == kInGameMpSaved && HIWORD(wp) == CBN_SELCHANGE) { // escolheu uma rede salva
             const int sel = static_cast<int>(SendMessageW(s_mp_saved, CB_GETCURSEL, 0, 0)) - 1; // item 0 = "escolha..."
             const std::vector<SavedNetwork> list = LoadSavedNetworks();
             if (sel >= 0 && sel < static_cast<int>(list.size())) {
                 SetWindowTextW(s_mp_edits[1], list[sel].code.c_str());
                 SetWindowTextW(s_mp_edits[3], list[sel].pass.c_str());
             }
+            return 0;
+        }
+        if (id == kInGameMpLeave) { // 4.4.5: sair da rede pelo proprio F3
+            runtime::multiplayer::Disconnect();
+            DestroyWindow(hwnd);
             return 0;
         }
         if (id == kInGameMpNewRoom) {
@@ -1197,7 +1268,15 @@ static LRESULT CALLBACK InGameMpProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) 
             const std::string s_name = Narrow(name);
             const std::string s_pass = Narrow(pass);
 
-            runtime::multiplayer::Connect(s_server, s_room, s_name, s_pass);
+            if (!runtime::multiplayer::Connect(s_server, s_room, s_name, s_pass)) {
+                // 4.4.5: nao fecha a janela em silencio: mostra o motivo (antes o F4 so dizia "fora da rede")
+                bool bad = false;
+                SetWindowTextW(s_mp_status, MpDialogStatus(lang::Pt(), &bad).c_str());
+                s_mp_status_bad = true;
+                InvalidateRect(s_mp_status, nullptr, TRUE);
+                MessageBeep(MB_ICONWARNING);
+                return 0;
+            }
             DestroyWindow(hwnd);
 
             if (!g_mp_panel_open.load()) {
@@ -1208,12 +1287,23 @@ static LRESULT CALLBACK InGameMpProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) 
         }
         return 0;
     }
+    case WM_KEYDOWN: // 4.4.5: Esc fecha, Enter entra (antes o dialogo nao respondia a teclado)
+        if (wp == VK_ESCAPE) {
+            DestroyWindow(hwnd);
+            return 0;
+        }
+        if (wp == VK_RETURN) {
+            SendMessageW(hwnd, WM_COMMAND, MAKEWPARAM(kInGameMpSave, BN_CLICKED), 0);
+            return 0;
+        }
+        return 0;
     case WM_CLOSE:
         DestroyWindow(hwnd);
         return 0;
     case WM_DESTROY:
         s_mp_dialog = nullptr;
         s_mp_saved = nullptr;
+        s_mp_status = nullptr;
         if (HWND game = static_cast<HWND>(WindowHandle())) {
             SetForegroundWindow(game);
             SetFocus(game);
@@ -1254,8 +1344,8 @@ void OpenMpRoomDialog(bool new_network) {
                                     OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH, L"Segoe UI");
     }
 
-    const int dlg_w = 460;
-    const int dlg_h = 500; // Fase 83: + redes salvas
+    const int dlg_w = 520;
+    const int dlg_h = 500; // 4.4.5: linha de estado + botao de sair
     HWND parent = static_cast<HWND>(WindowHandle());
     RECT prc{100, 100, 100 + dlg_w, 100 + dlg_h};
     if (parent) GetWindowRect(parent, &prc);
@@ -1294,14 +1384,22 @@ void OpenMpRoomDialog(bool new_network) {
     }
 
     HWND hTitle = CreateWindowExW(0, L"STATIC", new_network ? (pt ? L"CRIAR REDE NOVA" : L"CREATE A NEW NETWORK")
-                                                            : (pt ? L"SALA DO MULTIPLAYER (ONLINE)" : L"ONLINE MULTIPLAYER ROOM"),
-                                  WS_CHILD | WS_VISIBLE, 24, 16, 400, 24, s_mp_dialog, nullptr, nullptr, nullptr);
+                                                            : (pt ? L"MULTIPLAYER ONLINE (F3)" : L"ONLINE MULTIPLAYER (F3)"),
+                                  WS_CHILD | WS_VISIBLE, 24, 16, 470, 24, s_mp_dialog, nullptr, nullptr, nullptr);
     SendMessageW(hTitle, WM_SETFONT, reinterpret_cast<WPARAM>(s_mp_bold_font), TRUE);
 
+    // 4.4.5: estado na hora (fora da rede / na rede / motivo da falha) - antes isso nao aparecia aqui
+    bool status_bad = false;
+    const std::wstring status_text = MpDialogStatus(pt, &status_bad);
+    s_mp_status_bad = status_bad;
+    s_mp_status = CreateWindowExW(0, L"STATIC", status_text.c_str(), WS_CHILD | WS_VISIBLE | SS_ENDELLIPSIS, 24, 44, 470, 20,
+                                  s_mp_dialog, nullptr, nullptr, nullptr);
+    SendMessageW(s_mp_status, WM_SETFONT, reinterpret_cast<WPARAM>(s_mp_bold_font), TRUE);
+
     HWND hHint = CreateWindowExW(0, L"STATIC",
-                                 pt ? L"Quem usar o mesmo código e servidor joga junto (até 16).\nCada um no seu jogo; os outros aparecem como personagens."
-                                    : L"Everyone with the same code and server plays together (up to 16).\nEach in their own game; others show up as characters.",
-                                 WS_CHILD | WS_VISIBLE, 24, 42, 400, 36, s_mp_dialog, nullptr, nullptr, nullptr);
+                                 pt ? L"Quem usar o mesmo código (e servidor) joga junto, até 16 pessoas.\nCada um no seu jogo: os outros aparecem como personagens."
+                                    : L"Everyone with the same code (and server) plays together, up to 16.\nEach in their own game: others show up as characters.",
+                                 WS_CHILD | WS_VISIBLE, 24, 70, 470, 36, s_mp_dialog, nullptr, nullptr, nullptr);
     SendMessageW(hHint, WM_SETFONT, reinterpret_cast<WPARAM>(s_mp_font), TRUE);
 
     const wchar_t* labels[4] = {
@@ -1313,11 +1411,11 @@ void OpenMpRoomDialog(bool new_network) {
     const std::wstring values[4] = {server, room, name, pass};
 
     // Fase 83: redes salvas (as ultimas 8 em que entrou): escolher preenche codigo e senha
-    HWND lblSaved = CreateWindowExW(0, L"STATIC", pt ? L"REDES SALVAS:" : L"SAVED NETWORKS:", WS_CHILD | WS_VISIBLE, 24, 86, 400, 18,
+    HWND lblSaved = CreateWindowExW(0, L"STATIC", pt ? L"REDES SALVAS:" : L"SAVED NETWORKS:", WS_CHILD | WS_VISIBLE, 24, 112, 470, 18,
                                     s_mp_dialog, nullptr, nullptr, nullptr);
     SendMessageW(lblSaved, WM_SETFONT, reinterpret_cast<WPARAM>(s_mp_font), TRUE);
     s_mp_saved = CreateWindowExW(0, L"COMBOBOX", L"", WS_CHILD | WS_VISIBLE | WS_TABSTOP | CBS_DROPDOWNLIST | WS_VSCROLL,
-                                 24, 106, 400, 200, s_mp_dialog,
+                                 24, 132, 470, 200, s_mp_dialog,
                                  reinterpret_cast<HMENU>(static_cast<INT_PTR>(kInGameMpSaved)), nullptr, nullptr);
     SendMessageW(s_mp_saved, WM_SETFONT, reinterpret_cast<WPARAM>(s_mp_font), TRUE);
     const std::vector<SavedNetwork> saved = LoadSavedNetworks();
@@ -1336,12 +1434,12 @@ void OpenMpRoomDialog(bool new_network) {
     SendMessageW(s_mp_saved, CB_SETCURSEL, 0, 0);
 
     for (int i = 0; i < 4; ++i) {
-        const int row_y = 146 + i * 58;
-        HWND lbl = CreateWindowExW(0, L"STATIC", labels[i], WS_CHILD | WS_VISIBLE, 24, row_y, 400, 18,
+        const int row_y = 172 + i * 56;
+        HWND lbl = CreateWindowExW(0, L"STATIC", labels[i], WS_CHILD | WS_VISIBLE, 24, row_y, 470, 18,
                                    s_mp_dialog, nullptr, nullptr, nullptr);
         SendMessageW(lbl, WM_SETFONT, reinterpret_cast<WPARAM>(s_mp_font), TRUE);
 
-        const int edit_w = (i == 1) ? 260 : 400;
+        const int edit_w = (i == 1) ? 320 : 470;
         DWORD style = WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_AUTOHSCROLL;
         if (i == 3) style |= ES_PASSWORD;
         s_mp_edits[i] = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", values[i].c_str(), style,
@@ -1349,26 +1447,39 @@ void OpenMpRoomDialog(bool new_network) {
                                         reinterpret_cast<HMENU>(static_cast<INT_PTR>(kInGameMpEdit + i)), nullptr, nullptr);
         SendMessageW(s_mp_edits[i], WM_SETFONT, reinterpret_cast<WPARAM>(s_mp_font), TRUE);
         SendMessageW(s_mp_edits[i], EM_LIMITTEXT, i == 0 ? 200 : (i == 1 ? 12 : (i == 3 ? 32 : 16)), 0);
+        MpCatchKeys(s_mp_edits[i]); // 4.4.5: Esc / Enter / Tab dentro dos campos
     }
+    MpCatchKeys(s_mp_saved);
 
     HWND btnNew = CreateWindowExW(0, L"BUTTON", pt ? L"Nova sala" : L"New room",
                                   WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON,
-                                  294, 146 + 1 * 58 + 20, 130, 24, s_mp_dialog,
+                                  364, 172 + 1 * 56 + 20, 130, 24, s_mp_dialog,
                                   reinterpret_cast<HMENU>(static_cast<INT_PTR>(kInGameMpNewRoom)), nullptr, nullptr);
     SendMessageW(btnNew, WM_SETFONT, reinterpret_cast<WPARAM>(s_mp_font), TRUE);
+    MpCatchKeys(btnNew);
+
+    if (runtime::multiplayer::Enabled()) { // 4.4.5: sair da rede sem passar pelo painel
+        HWND btnLeave = CreateWindowExW(0, L"BUTTON", pt ? L"Sair da rede" : L"Leave the network",
+                                        WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON, 24, 388, 168, 28, s_mp_dialog,
+                                        reinterpret_cast<HMENU>(static_cast<INT_PTR>(kInGameMpLeave)), nullptr, nullptr);
+        SendMessageW(btnLeave, WM_SETFONT, reinterpret_cast<WPARAM>(s_mp_font), TRUE);
+        MpCatchKeys(btnLeave);
+    }
 
     HWND btnCancel = CreateWindowExW(0, L"BUTTON", pt ? L"Cancelar (Esc)" : L"Cancel (Esc)",
                                      WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON,
-                                     24, 400, 150, 36, s_mp_dialog,
+                                     24, 432, 180, 36, s_mp_dialog,
                                      reinterpret_cast<HMENU>(static_cast<INT_PTR>(kInGameMpCancel)), nullptr, nullptr);
     SendMessageW(btnCancel, WM_SETFONT, reinterpret_cast<WPARAM>(s_mp_font), TRUE);
+    MpCatchKeys(btnCancel);
 
     HWND btnSave = CreateWindowExW(0, L"BUTTON", new_network ? (pt ? L"Criar e Entrar" : L"Create and Join")
                                                              : (pt ? L"Entrar na Sala" : L"Join Room"),
                                    WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_DEFPUSHBUTTON,
-                                   244, 400, 180, 36, s_mp_dialog,
+                                   274, 432, 220, 36, s_mp_dialog,
                                    reinterpret_cast<HMENU>(static_cast<INT_PTR>(kInGameMpSave)), nullptr, nullptr);
     SendMessageW(btnSave, WM_SETFONT, reinterpret_cast<WPARAM>(s_mp_bold_font), TRUE);
+    MpCatchKeys(btnSave);
 
     SetForegroundWindow(s_mp_dialog);
     SetFocus(s_mp_edits[new_network ? 3 : (room.empty() ? 1 : 0)]);

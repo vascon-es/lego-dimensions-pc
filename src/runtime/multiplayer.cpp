@@ -80,6 +80,9 @@ Config g_config;
 bool g_enabled = false;
 u8* g_base = nullptr;
 DWORD g_main_tid = 0;
+// 4.4.5: o motivo da ultima falha de conexao (a janela do F3 mostra isso em vez de so "fora da rede").
+std::string g_last_error;
+u64 g_control_fn = 0; // kControlFn resolvido (o dump pode vir com a tabela deslocada)
 
 template <typename T>
 T& At(u64 address) {
@@ -2137,34 +2140,68 @@ std::vector<NameTag> NameTags() {
 }
 
 // 4.1.1: inicio de funcao (push rbp; mov rbp, rsp) no deslocamento ou 0x10 depois (outro dump do eboot); 0 = nenhum
+// 4.4.5: o dump pode vir com a tabela inteira deslocada (no USA as funcoes altas ja ficam +0x10). Em vez de exigir
+// o endereco exato, procura o comeco de verdade numa janela de +-0x30 e usa o que achar.
 u64 FnAt(u64 offset) {
     static const u8 kPrologue[4] = {0x55, 0x48, 0x89, 0xe5};
-    // 4.4.4: no dump USA (CUSA00935) as funcoes acima de 0x1577000 ficam 0x10 depois; outros dumps podem vir 0x20
-    // depois (ou 0x10 antes). Em vez de recusar o eboot, procura o comeco de verdade perto do endereco conhecido.
-    for (u64 o : {offset, offset + 0x10, offset + 0x20, offset - 0x10}) {
+    for (long long shift : {0ll, 0x10ll, 0x20ll, 0x30ll, -0x10ll, -0x20ll}) {
+        const long long at = static_cast<long long>(offset) + shift;
+        if (at < 0x10000) continue;
+        const u64 o = static_cast<u64>(at);
         if (Readable(o, 4) && std::memcmp(g_base + o, kPrologue, 4) == 0) return o;
     }
     return 0;
 }
 
-// confere as funcoes do eboot (so leitura): false = eboot desconhecido, o multiplayer fica desligado
-bool ResolveFunctions() {
+// confere as funcoes do eboot (so leitura). false = eboot desconhecido: o multiplayer nao liga, e o motivo fica
+// guardado (g_last_error) para a janela do F3 mostrar - antes so aparecia "fora da rede", sem pista nenhuma.
+// 4.4.5: `again` refaz a conferencia (o F3 chama assim quando o jogo ja esta aberto).
+void RememberError(const char* text) {
+    g_last_error = text;
+    std::printf("[MP] %s\n", text);
+    std::fflush(stdout);
+}
+
+bool ResolveFunctions(bool again = false) {
     static int s_ok = -1;
-    if (s_ok >= 0) return s_ok == 1;
+    if (s_ok == 1) return true;            // ja resolvido: nao mexe nos ponteiros de novo (eles ja foram ajustados)
+    if (s_ok == 0 && !again) return false; // ja falhou: so tenta de novo quando pedem (a janela do F3 pede)
     s_ok = 0;
-    if (!g_base || FnAt(kControlFn) != kControlFn) return false;
+    if (!g_base) {
+        RememberError("o eboot do jogo ainda nao esta carregado (o multiplayer liga dentro do jogo)");
+        return false;
+    }
+    const u64 control = FnAt(kControlFn);
+    if (!control) {
+        char text[200];
+        const u8* at = g_base + kControlFn;
+        std::snprintf(text, sizeof(text), "eboot+0x%llx nao reconhecido (bytes %02x %02x %02x %02x): dump diferente do port",
+                      static_cast<unsigned long long>(kControlFn), at[0], at[1], at[2], at[3]);
+        RememberError(text);
+        return false;
+    }
+    g_control_fn = control;
     for (u64* f : {&kSpawnFn, &kRequestDtorFn, &kRequestDeleteFn, &kSlotLoadFn, &kListPushFn, &kSlotStateFn, &kLevelSetupFn,
                    &kDescFn, &kAllocFn, &kFreeFn, &kFireEventFn, &kKillObjectFn, &kBlowUpFn, &kTriggerObstacleFn,
                    &kGotoLevelFn, &kLevelByIdFn, &kLevelValidFn, &kMsRequestFn, &kReformTriggerFn, &kBuildStartFn,
                    &kBuildUpdateFn}) { // (eboot+a0a770 nao tem prologo: fica fixo, antes da parte deslocada)
         const u64 o = FnAt(*f);
         if (!o) {
-            std::printf("[MP] eboot+0x%llx: funcao nao reconhecida, multiplayer desligado\n", static_cast<unsigned long long>(*f));
+            char text[200];
+            const u8* at = g_base + *f;
+            std::snprintf(text, sizeof(text), "eboot+0x%llx nao reconhecido (bytes %02x %02x %02x %02x): multiplayer desligado",
+                          static_cast<unsigned long long>(*f), at[0], at[1], at[2], at[3]);
+            RememberError(text);
             return false;
         }
         *f = o;
     }
-    if (kSpawnFn != 0x158c2c0) std::printf("[MP] eboot com as funcoes deslocadas: enderecos ajustados\n");
+    if (kSpawnFn != 0x158c2c0 || control != kControlFn) {
+        std::printf("[MP] eboot com as funcoes deslocadas em %+lld bytes: enderecos ajustados\n",
+                    static_cast<long long>(kSpawnFn) - static_cast<long long>(0x158c2c0));
+        std::fflush(stdout);
+    }
+    g_last_error.clear();
     s_ok = 1;
     return true;
 }
@@ -2177,7 +2214,7 @@ bool g_hooks_installed = false;
 bool InstallHooks() {
     if (g_hooks_installed) return g_control && g_spawn && g_dtor;
     g_hooks_installed = true;
-    g_control = reinterpret_cast<ControlFn>(Hook(kControlFn, reinterpret_cast<const void*>(&ControlHook)));
+    g_control = reinterpret_cast<ControlFn>(Hook(g_control_fn ? g_control_fn : kControlFn, reinterpret_cast<const void*>(&ControlHook)));
     g_spawn = reinterpret_cast<SpawnFn>(Hook(kSpawnFn, reinterpret_cast<const void*>(&SpawnHook)));
     g_dtor = reinterpret_cast<DtorFn>(Hook(kRequestDtorFn, reinterpret_cast<const void*>(&RequestDtorHook)));
     if (const char* env = std::getenv("LD_MP_SLOTS")) g_extra_slots = std::clamp(std::atoi(env) - 7, 0, 1);
@@ -2255,23 +2292,32 @@ bool Connect(const std::string& server, const std::string& room, const std::stri
     g_config.password = password;
     g_enabled = false;
     runtime::mp_net::Stop();
-    if (server.empty() || room.empty()) return false;
-    if (!ResolveFunctions() || (g_hooks_installed && !(g_control && g_spawn && g_dtor))) {
-        std::printf("[MP] eboot diferente: nao e possivel conectar\n");
+    if (server.empty() || room.empty()) {
+        RememberError(server.empty() ? "endereco do servidor vazio (use wss://...)" : "codigo da sala vazio");
+        return false;
+    }
+    if (!g_hooks_installed) {
+        if (!ResolveFunctions(true)) return false; // g_last_error ja diz qual funcao do eboot nao foi reconhecida
+    } else if (!(g_control && g_spawn && g_dtor)) {
+        RememberError("os ganchos do eboot nao entraram (veja o log do jogo)");
         return false;
     }
     if (!g_hooks_installed) g_hooks_wanted = true; // o Tick instala na thread do jogo
     g_enabled = true;
     if (!runtime::mp_net::Start(g_config.server, g_config.room, g_config.name, g_config.password)) {
-        std::printf("[MP] endereco do servidor invalido: %s\n", g_config.server.c_str());
+        RememberError("endereco do servidor invalido (use wss://...) ou codigo da sala vazio");
         g_enabled = false;
         return false;
     }
+    g_last_error.clear();
     std::printf("[MP] multiplayer online conectado: sala %s, servidor %s\n", g_config.room.c_str(), g_config.server.c_str());
     return true;
 }
 
 bool InWorld() { return g_enabled && g_in_world; }
+
+// 4.4.5: texto do ultimo erro de conexao (a janela do F3 mostra isso em vez de so "fora da rede").
+std::string LastError() { return g_last_error; }
 void SetFollowOwner(bool on) { g_follow_owner = on; }
 bool FollowOwnerEnabled() { return g_follow_owner; }
 
