@@ -63,7 +63,16 @@ u64 kLevelSetupFn = 0x1577ba0; // prepara a memoria dos slots ao carregar a fase
 
 constexpr u32 kCross = 0x40004000, kSquare = 0x10008000; // mascara de botoes do jogo
 constexpr u32 kSentButtons = kCross | kSquare;           // pulo e ataque
-constexpr int kMaxPuppets = 15;
+constexpr int kMaxPuppets = 24;   // 4.5.1: cada amigo pode aparecer com mais de um personagem (a party dele)
+constexpr int kPuppetStride = 16; // chave no mapa dos fantasmas: id do amigo * 16 + indice do personagem
+// 4.5.1: quantos personagens de cada amigo aparecem ao mesmo tempo. Com 2 pessoas na sala: 6 de cada (sobra sempre
+// um personagem do outro para voce ver); com 3: 5 de cada; com mais: o que couber em 12 dividido pelas pessoas.
+int PartyCap(size_t peers) {
+    const int people = std::max<int>(2, static_cast<int>(peers) + 1);
+    if (people <= 2) return 6;
+    if (people == 3) return 5;
+    return std::max(2, 12 / people);
+}
 
 const char kAllocTag[] = "MPGHOST";
 
@@ -193,6 +202,8 @@ struct Remote {
     bool ingame = false;
     int rtt_ms = 0; // latencia dele ate o servidor
     std::string level; // 4.1.1: fase atual ("LevelPack\...\Nome#ordem"); vazio = versao antiga / nao sabe
+    std::string region; // 4.5.1: CUSA01176 (USA) ou CUSA00935 (EUR): as fases sao mapeadas pelo pacote, mas o aviso ajuda
+    std::vector<std::string> party; // 4.5.1: os outros personagens equipados dele (o ativo e o `chr`)
 };
 
 enum class Stage { kNone, kLoading, kReady, kSpawning, kActive };
@@ -212,6 +223,8 @@ struct Puppet {
     float distance = 0;  // ate o nosso jogador 1 (quem esta mais perto ganha os slots)
     float still_x = 0, still_z = 0; // ultimo lugar onde o fantasma andou (para ver se ficou preso)
     double still_time = 0;
+    int stuck_side = 0; // 4.5.1: para que lado ele desvia quando fica preso (sem teleporte)
+    int idx = 0;        // 4.5.1: 0 = personagem ativo do amigo, 1.. = os outros da party dele
     int clashes = 0; // 4.5: vezes que o pedido acabou preso na party do jogador local (Task 6)
     unsigned seq = 0;
     Remote cur, prev;
@@ -1552,6 +1565,15 @@ bool ParseRemote(const std::string& text, Remote* r) {
     r->ingame = f[11] == "1";
     r->rtt_ms = f.size() > 12 ? std::clamp(std::atoi(f[12].c_str()), 0, 2000) : 0;
     r->level = f.size() > 13 ? f[13] : std::string();
+    r->region = f.size() > 14 ? f[14] : std::string();
+    r->party.clear();
+    if (f.size() > 15) { // 4.5.1: "nome;nome;nome" (os outros personagens equipados dele)
+        std::stringstream party(f[15]);
+        std::string one;
+        while (std::getline(party, one, ';') && r->party.size() < 6) {
+            if (!one.empty() && one != "-" && one.size() < 48) r->party.push_back(one);
+        }
+    }
     r->valid = std::isfinite(r->x) && std::isfinite(r->y) && std::isfinite(r->z);
     return r->valid;
 }
@@ -1613,8 +1635,15 @@ void Steer(Puppet& p, double now, Drive* d) {
     const float px = At<float>(t + 0x90), py = At<float>(t + 0x94), pz = At<float>(t + 0x98);
     const float ex = tx - px, ez = tz - pz;
     const float dist = std::sqrt(ex * ex + ez * ez);
-    if (dist > 4.0f || std::fabs(r.y - py) > 4.0f) {
-        Teleport(p.inst, r.x, r.y, r.z); // muito longe (entrou agora, caiu, atalho): pula para la
+    // 4.5.1: teleporte so quando o fantasma esta realmente longe (entrou agora, trocou de area, caiu). Antes ele
+    // pulava a cada 4 m e o outro parecia estar com a conexao ruim.
+    if (dist > 20.0f || std::fabs(r.y - py) > 8.0f) {
+        Teleport(p.inst, r.x, r.y, r.z);
+    } else if (dist > 1.2f) {
+        // 4.5.1: a posicao de quem joga manda: corrige a deriva aos poucos (sem pulo) - antes o fantasma chegava a
+        // ficar 2-3 m atras e os golpes do outro nao encostavam em ninguem.
+        const float blend = dist > 6.0f ? 0.35f : 0.12f;
+        Teleport(p.inst, px + ex * blend, py + (r.y - py) * blend, pz + ez * blend);
     }
     d->inst = p.inst;
     d->speed = 0.0f;
@@ -1653,25 +1682,42 @@ void Steer(Puppet& p, double now, Drive* d) {
         const float base = TableSpeed(p.inst, r.gear);
         if (base > 0.0f) {
             const float along = ex * dx + ez * dz;
-            d->speed = std::clamp(base + 3.0f * along, base * 0.5f, base * 1.6f);
+            // 4.5.1: alcanca o amigo andando, nao pulando: ate 3x a velocidade dele quando o erro e grande
+            const float boost = dist > 3.0f ? 3.0f : 1.9f;
+            d->speed = std::clamp(base + 3.0f * along, base * 0.5f, base * boost);
         }
     } else if (dist > 0.12f) { // parado la e o fantasma longe: vai ate o lugar (devagar quando perto)
         d->gear = 6;
         const float base = TableSpeed(p.inst, 6);
-        if (base > 0.0f) d->speed = std::clamp(dist * 4.0f, 0.3f, base);
+        if (base > 0.0f) d->speed = std::clamp(dist * 4.0f, 0.3f, base * (dist > 3.0f ? 3.0f : 1.0f));
         d->dx = ex / dist;
         d->dz = ez / dist;
     } else {
         d->gear = 3;
     }
-    // preso (outro personagem, parede): tentando andar ha 1 s sem sair do lugar -> vai direto para o ponto
+    // preso (outro personagem, parede): em vez de teleportar (aquilo parecia lag), desvia de lado ate passar
     if (std::hypot(px - p.still_x, pz - p.still_z) > 0.05f || d->gear <= 3 || dist < 0.6f) {
         p.still_x = px;
         p.still_z = pz;
         p.still_time = now;
-    } else if (now - p.still_time > 1.0) {
-        Teleport(p.inst, r.x, r.y, r.z);
-        p.still_time = now;
+        p.stuck_side = 0;
+    } else if (now - p.still_time > 0.8 && dist > 0.6f) {
+        // gira a direcao em ~65 graus para um lado (troca de lado a cada 1.2 s) e segue tentando
+        static const float kCos = 0.42f, kSin = 0.91f;
+        const float side = p.stuck_side % 2 ? 1.0f : -1.0f;
+        const float sx = d->dx * kCos - d->dz * kSin * side, sz = d->dx * kSin * side + d->dz * kCos;
+        const float n = std::sqrt(sx * sx + sz * sz);
+        if (n > 0.001f) {
+            d->dx = sx / n;
+            d->dz = sz / n;
+            d->gear = std::max(d->gear, 6);
+            const float base = TableSpeed(p.inst, d->gear);
+            if (base > 0.0f) d->speed = base;
+        }
+        if (now - p.still_time > 2.0) {
+            p.still_time = now;
+            ++p.stuck_side;
+        }
     }
 }
 
@@ -1736,6 +1782,11 @@ bool DlcContentInstalled() {
 
 u64 g_level_gate_id = ~0ull;        // fase do dono autorizada agora (pula o "mundo liberado" do save local)
 double g_level_gate_time = -100;    // quando foi autorizada
+// 4.5.1: as missoes (e as DLCs) mudam de numero com os pacotes instalados. O caminho do pacote da fase do dono fica
+// guardado durante a sessao: o convidado pode abrir o portal da missao pelo jogo dele (numero local) e o portao de
+// fases autoriza pelo caminho, nao pelo numero (era o que deixava o convidado preso no tubo para sempre).
+std::string g_owner_level_path;
+double g_owner_level_time = -100;
 bool g_level_index_building = false; // so a NOSSA lista de fases aceita as fases de DLC que o save local nao liberou
 SetupFn g_level_valid = nullptr;
 constexpr int kDlcLevelBase = 2600; // ate aqui as fases do jogo base; as das DLCs vem depois deste buraco
@@ -1751,15 +1802,25 @@ HLE_SYSV_ABI u64 LevelValidHook(u64 id, u64 a, u64 b, u64 c, u64 d, u64 e) {
     if (!g_enabled || !runtime::mp_net::SelfId()) return result; // fora de uma sala: nada muda
     static thread_local bool inside = false; // o proprio jogo pode consultar de novo na busca pelo numero
     if (inside) return result;
-    const bool authorized = id == g_level_gate_id && runtime::mp_net::Now() - g_level_gate_time < 60.0;
+    bool authorized = id == g_level_gate_id && runtime::mp_net::Now() - g_level_gate_time < 60.0;
+    u64 obj = 0;
+    if (!authorized && !g_owner_level_path.empty() && runtime::mp_net::Now() - g_owner_level_time < 900.0) {
+        // 4.5.1: o dono esta numa missao: o numero pedido aqui e o desta copia do jogo, mas o pacote e o mesmo.
+        inside = true;
+        obj = Call(kLevelByIdFn, id);
+        inside = false;
+        authorized = obj && LevelPath(obj) == g_owner_level_path;
+        if (authorized) Log("[MP] fase %s liberada pelo pacote da missao do dono", std::to_string(id));
+    }
     if (!authorized && !g_level_index_building) return result;
     const bool from_dlc = id >= static_cast<u64>(kDlcLevelBase);
     if (!from_dlc && !authorized) return result;                  // o jogo base fica como o jogo respondeu
     if (from_dlc && !DlcContentInstalled()) return result;        // DLC: so com o pacote instalado
-    u64 obj = 0;
-    inside = true;
-    obj = Call(kLevelByIdFn, id);
-    inside = false;
+    if (!obj) {
+        inside = true;
+        obj = Call(kLevelByIdFn, id);
+        inside = false;
+    }
     if (!obj || LevelPath(obj).empty()) return result; // a fase nao existe neste jogo
     static u64 last_logged = ~0ull;
     if (authorized && last_logged != id) {
@@ -1771,7 +1832,10 @@ HLE_SYSV_ABI u64 LevelValidHook(u64 id, u64 a, u64 b, u64 c, u64 d, u64 e) {
 
 // As listas de fases das DLCs sao lidas depois da tela de carregamento: uma fase que nao esta no indice refaz o
 // indice (no maximo a cada 10 s).
-void BuildLevelIndex(bool again = false) {
+// 4.5.1: `deep` tambem entra na lista das fases que o jogo nao reconhece agora (as missoes so respondem "existe"
+// com a missao ativa naquele jogo): e assim que o convidado acha a fase da missao que o dono esta jogando. So roda
+// quando o caminho do dono nao esta na lista normal, e o ponteiro e conferido antes de ler (Readable em LevelPath).
+void BuildLevelIndex(bool again = false, bool deep = false) {
     const double now = runtime::mp_net::Now();
     if (g_level_index_time > -100 && !(again && now - g_level_index_time > 10.0)) return;
     g_level_index_time = now;
@@ -1779,7 +1843,8 @@ void BuildLevelIndex(bool again = false) {
     int found = 0;
     g_level_index_building = true; // as fases de DLC instaladas entram na NOSSA lista mesmo sem o save liberar
     for (int id = 0; id < 8192; ++id) { // as das DLCs ficam depois de um buraco grande (~2600)
-        if (!(Call(kLevelValidFn, static_cast<u64>(id)) & 0xff)) continue;
+        const bool gated = !(Call(kLevelValidFn, static_cast<u64>(id)) & 0xff);
+        if (gated && !deep && (id < kDlcLevelBase || !DlcContentInstalled())) continue;
         const u64 obj = Call(kLevelByIdFn, static_cast<u64>(id));
         const std::string path = LevelPath(obj);
         if (path.empty()) continue;
@@ -1810,6 +1875,10 @@ std::string LevelKey(u64 obj) {
         BuildLevelIndex(true);
         key = LevelKeyIn(path, id);
     }
+    if (key.empty() && !g_owner_level_path.empty() && g_owner_level_path == path) { // 4.5.1: missao/DLC
+        BuildLevelIndex(true, true);
+        key = LevelKeyIn(path, id);
+    }
     return key;
 }
 
@@ -1828,6 +1897,15 @@ int LevelIdForKey(const std::string& key) {
     if (id < 0) {
         BuildLevelIndex(true);
         id = LevelIdIn(key);
+    }
+    if (id < 0) { // 4.5.1: fase de missao (o jogo so a reconhece com a missao ativa): procura no indice profundo
+        const std::string path = key.substr(0, key.rfind('#'));
+        BuildLevelIndex(true, true);
+        id = LevelIdIn(key);
+        if (id < 0 && !path.empty()) {
+            const auto it = g_level_index.find(path);
+            if (it != g_level_index.end() && !it->second.empty()) id = it->second.front();
+        }
     }
     return id;
 }
@@ -1886,9 +1964,10 @@ void FollowOwner(double now) {
     const bool off = !g_follow_owner || std::getenv("LD_MP_NOFOLLOW") != nullptr;
     static std::string owner_key, failed_key, pending_key;
     static double owner_since = 0, cooldown = 0, failed_until = 0, pending_time = 0;
+    static int pending_tries = 0;
     const int owner = runtime::mp_net::OwnerId(), self = runtime::mp_net::SelfId();
     if (off || !owner || !self || owner == self) return;
-    const auto it = g_puppets.find(owner);
+    const auto it = g_puppets.find(owner * kPuppetStride); // o personagem ativo do dono
     if (it == g_puppets.end()) return;
     const Remote& r = it->second.cur;
     if (!r.valid || !r.ingame || now - it->second.cur_time > 3.0 || r.level.empty()) return;
@@ -1899,12 +1978,27 @@ void FollowOwner(double now) {
     if (!pending_key.empty()) { // pediu a troca: deu certo?
         if (g_level_key == pending_key) {
             pending_key.clear();
+            pending_tries = 0;
             g_level_gate_id = ~0ull; // a fase do dono ja e a nossa: o portao volta ao normal
         } else if (now - pending_time > 25.0) {
+            if (pending_tries < 1 && !r.level.empty()) { // 4.5.1: o jogo pode ter engolido o pedido (missao): pede de novo
+                pending_tries = 1;
+                pending_time = now;
+                g_level_gate_time = now;
+                g_owner_level_time = now;
+                const int again = LevelIdForKey(r.level);
+                if (again >= 0) {
+                    g_level_gate_id = static_cast<u64>(again);
+                    Log("[MP] a fase %s do dono ainda nao carregou: pedindo de novo", r.level);
+                    Call(kGotoLevelFn, reinterpret_cast<u64>(g_base) + kLevelLoader, static_cast<u64>(again), 0, 0);
+                    return;
+                }
+            }
             Log("[MP] nao consegui ir para a fase %s do dono da sala (tento de novo em 60 s)", pending_key);
             failed_key = pending_key;
             failed_until = now + 60.0;
             pending_key.clear();
+            pending_tries = 0;
             g_level_gate_id = ~0ull;
         }
         return;
@@ -1919,11 +2013,21 @@ void FollowOwner(double now) {
         if (now - g_area_time < 4.0) return; // ainda carregando a area (mundo estavel)
     }
     if (r.level == failed_key && now < failed_until) return;
+    // 4.5.1: guarda o pacote da fase do dono (o portao de fases autoriza a missao pelo caminho, nao pelo numero)
+    {
+        const size_t hash = r.level.rfind('#');
+        g_owner_level_path = hash == std::string::npos ? r.level : r.level.substr(0, hash);
+        g_owner_level_time = now;
+    }
     const int id = LevelIdForKey(r.level);
     if (id < 0) {
-        Log("[MP] o dono da sala esta na fase %s, que este jogo nao tem (DLC?)", r.level);
+        static std::string logged;
+        if (logged != r.level) { // 4.5.1: a lista pode ganhar a fase depois (missao que o jogo so reconhece ativa)
+            logged = r.level;
+            Log("[MP] o dono da sala esta na fase %s, que este jogo ainda nao achou (tentando de novo)", r.level);
+        }
         failed_key = r.level;
-        failed_until = now + 60.0;
+        failed_until = now + 8.0;
         return;
     }
     Log("[MP] seguindo o dono da sala %s: indo para a fase %s", it->second.name, r.level);
@@ -1942,7 +2046,30 @@ void FollowOwner(double now) {
     Call(kGotoLevelFn, reinterpret_cast<u64>(g_base) + kLevelLoader, static_cast<u64>(id), 0, 0);
     pending_key = r.level;
     pending_time = now;
+    pending_tries = 0;
     cooldown = now + 8.0;
+}
+
+// 4.5.1: USA (CUSA01176) x EUR (CUSA00935). As fases das duas versoes tem numeros diferentes, por isso a sala troca
+// o caminho do pacote (LevelKey) e nunca o numero. O id da versao vai no estado para avisar quando sao diferentes.
+std::string LocalRegion() {
+    static const std::string id = game_region::TitleId(hle::fs::App0());
+    return id.empty() ? std::string("?") : id;
+}
+
+// 4.5.1: os outros personagens equipados deste jogador (os slots de jogador do portal, menos o que esta em uso agora).
+// Vao no estado para os outros verem a party inteira, nao so o personagem ativo.
+std::vector<std::string> LocalPartyNames(const std::string& active) {
+    std::vector<std::string> out;
+    for (int i = g_nslots; i < g_nall && out.size() < 6; ++i) {
+        if (SlotState(i) != 1) continue;
+        std::string name = SlotName(i);
+        if (name.size() > 3 && name.compare(name.size() - 3, 3, ".cd") == 0) name.resize(name.size() - 3);
+        if (name.empty() || Lower(name) == Lower(active)) continue;
+        if (g_our_slots.count(SlotAddress(i))) continue; // slot que NOS carregamos para um fantasma
+        out.push_back(name);
+    }
+    return out;
 }
 
 void SendLocal(u64 p1, double now) {
@@ -1951,7 +2078,7 @@ void SendLocal(u64 p1, double now) {
         std::lock_guard lock(g_area_mutex);
         area = g_area;
     }
-    char text[448];
+    char text[768];
     const u64 t0 = p1 ? Transform(p1) : 0;
     const u64 t = t0 && Readable(t0 + 0x90, 12) ? t0 : 0;
     const u64 loc0 = p1 && Readable(p1 + 0x90, 8) ? At<u64>(p1 + 0x90) : 0;
@@ -1975,10 +2102,16 @@ void SendLocal(u64 p1, double now) {
     } else if (now - g_held_latch_time > 0.08) {
         g_held_latch = 0;
     }
-    std::snprintf(text, sizeof(text), "%s|%s|%.3f|%.3f|%.3f|%d|%.3f|%.3f|%.3f|%.3f|%x|1|%d|%s", area.c_str(),
+    std::string party_list; // 4.5.1: "nome;nome;nome" dos outros personagens equipados
+    for (const std::string& one : LocalPartyNames(LocalCharacter(p1))) {
+        if (!party_list.empty()) party_list += ';';
+        party_list += one;
+    }
+    std::snprintf(text, sizeof(text), "%s|%s|%.3f|%.3f|%.3f|%d|%.3f|%.3f|%.3f|%.3f|%x|1|%d|%s|%s|%s", area.c_str(),
                   LocalCharacter(p1).c_str(), At<float>(t + 0x90), At<float>(t + 0x94), At<float>(t + 0x98),
                   At<s32>(loc + 0x238), At<float>(loc + 0x80), At<float>(loc + 0x88), At<float>(p1 + 0x170),
-                  At<float>(p1 + 0x178), held | g_held_latch, runtime::mp_net::RttMs(), g_level_key.c_str());
+                  At<float>(p1 + 0x178), held | g_held_latch, runtime::mp_net::RttMs(), g_level_key.c_str(), LocalRegion().c_str(),
+                  party_list.c_str());
     runtime::mp_net::SetLocalState(text);
 }
 
@@ -2369,7 +2502,7 @@ void ApplyEvent(int from, const std::string& payload, double now) {
         LogAreaEvent(payload);
         if (At<s32>(b + 0x24c) == 4) return; // ja montado aqui
         u64 who = At<u64>(reinterpret_cast<u64>(g_base) + kPlayerTable);
-        const auto pit = g_puppets.find(from);
+        const auto pit = g_puppets.find(from * kPuppetStride);
         if (pit != g_puppets.end() && pit->second.stage == Stage::kActive && pit->second.inst) who = pit->second.inst;
         const u64 first = At<u64>(b + 0x200);
         if (!who || !first) return;
@@ -2433,7 +2566,7 @@ void ApplyEvent(int from, const std::string& payload, double now) {
         const size_t order = static_cast<size_t>(std::max(0, std::atoi(f[3].c_str())));
         const u64 victim = same[std::min(order, same.size() - 1)];
         u64 who = At<u64>(reinterpret_cast<u64>(g_base) + kPlayerTable);
-        const auto it = g_puppets.find(from);
+        const auto it = g_puppets.find(from * kPuppetStride);
         if (it != g_puppets.end() && it->second.stage == Stage::kActive && it->second.inst) who = it->second.inst;
         g_applying = true;
         Call8(kKillObjectFn, victim, 3, who, 0, 0, 0, 0, 0);
@@ -2453,7 +2586,7 @@ void ApplyEvent(int from, const std::string& payload, double now) {
     const u64 ctx = same[std::min(order, same.size() - 1)];
     if (f[0] == "o") { // acionou um obstaculo (alavanca, coisa de usar...)
         u64 user = At<u64>(reinterpret_cast<u64>(g_base) + kPlayerTable);
-        const auto pit = g_puppets.find(from);
+        const auto pit = g_puppets.find(from * kPuppetStride);
         if (pit != g_puppets.end() && pit->second.stage == Stage::kActive && pit->second.inst) user = pit->second.inst;
         if (!user) return;
         g_applying = true;
@@ -2468,7 +2601,7 @@ void ApplyEvent(int from, const std::string& payload, double now) {
     if (At<u8>(ctx + 0x260)) return; // ja quebrado aqui tambem
     // quem quebrou: o fantasma dele (se esta aparecendo), senao o nosso jogador (o jogo precisa de alguem)
     u64 who = At<u64>(reinterpret_cast<u64>(g_base) + kPlayerTable);
-    const auto it = g_puppets.find(from);
+    const auto it = g_puppets.find(from * kPuppetStride);
     if (it != g_puppets.end() && it->second.stage == Stage::kActive && it->second.inst) who = it->second.inst;
     if (!who) return;
     g_applying = true;
@@ -2563,7 +2696,7 @@ void Tick() {
     // pares atuais da sala
     const auto peers = runtime::mp_net::Peers();
     for (auto it = g_puppets.begin(); it != g_puppets.end();) {
-        const bool present = std::any_of(peers.begin(), peers.end(), [&](const auto& q) { return q.id == it->first; });
+        const bool present = std::any_of(peers.begin(), peers.end(), [&](const auto& q) { return q.id == it->second.peer; });
         if (!present) {
             if (it->second.stage == Stage::kSpawning || it->second.stage == Stage::kActive) Despawn(it->second);
             it = g_puppets.erase(it);
@@ -2587,32 +2720,65 @@ void Tick() {
     const int old_count = g_drive_count;
     std::copy(g_drive, g_drive + old_count, old);
     g_drive_count = 0;
+    const int party_cap = PartyCap(peers.size());
     for (const auto& peer : peers) {
-        if (g_puppets.size() >= kMaxPuppets && !g_puppets.count(peer.id)) continue;
-        Puppet& p = g_puppets[peer.id];
-        p.peer = peer.id;
-        p.name = peer.name;
-        if (peer.seq != p.seq && !peer.state.empty()) {
+        const int base_key = peer.id * kPuppetStride;
+        if (g_puppets.size() >= kMaxPuppets && !g_puppets.count(base_key)) continue;
+        Puppet& main = g_puppets[base_key];
+        main.peer = peer.id;
+        main.name = peer.name;
+        main.idx = 0;
+        if (peer.seq != main.seq && !peer.state.empty()) {
             Remote r;
             if (ParseRemote(peer.state, &r)) {
-                p.prev = p.cur;
-                p.prev_time = p.cur_time;
-                p.cur = r;
-                p.cur_time = peer.state_time;
+                main.prev = main.cur;
+                main.prev_time = main.cur_time;
+                main.cur = r;
+                main.cur_time = peer.state_time;
             }
-            p.seq = peer.seq;
+            main.seq = peer.seq;
         }
-        const bool want = settled && p.cur.valid && p.cur.ingame && p.cur.area == area && now - p.cur_time < 6.0 &&
+        // 4.5.1: alem do personagem ativo, a party dele (os outros equipados) aparece do lado dele. O limite por pessoa
+        // depende de quantas pessoas estao na sala (PartyCap): 2 pessoas = 6 cada, 3 = 5 cada...
+        const int cap = std::min<int>(party_cap, 1 + static_cast<int>(main.cur.party.size()));
+        for (int idx = 0; idx < cap; ++idx) {
+            if (idx && !(main.cur.valid && main.cur.ingame)) continue;
+            const int key = base_key + idx;
+            if (idx && g_puppets.size() >= kMaxPuppets && !g_puppets.count(key)) continue;
+            Puppet& p = idx == 0 ? main : g_puppets[key];
+            p.peer = peer.id;
+            p.name = peer.name;
+            p.idx = idx;
+            if (idx) { // o estado e o do amigo; so mudam o personagem e o lugar (em volta dele, sem empilhar)
+                p.cur = main.cur;
+                p.cur.chr = main.cur.party[idx - 1];
+                const double angle = 2.4 * idx;
+                p.cur.x = main.cur.x + static_cast<float>(std::cos(angle)) * 0.55f;
+                p.cur.z = main.cur.z + static_cast<float>(std::sin(angle)) * 0.55f;
+                p.cur_time = main.cur_time;
+                p.seq = main.seq;
+            }
+        // 4.5.1: sumia ao se afastar porque a area muda de nome nas zonas do mundo (a fase e a mesma: as posicoes sao
+        // do mesmo mundo). Mesma fase = mesmo mundo. E a tolerancia do estado subiu para 10 s (engasgo do outro jogo).
+        const bool same_world = p.cur.area == area || (!p.cur.level.empty() && p.cur.level == g_level_key);
+        const bool want = settled && p.cur.valid && p.cur.ingame && same_world && now - p.cur_time < 10.0 &&
                           p.cur.chr != "-" && !p.cur.chr.empty();
         p.want = want;
         // 4.2: chegou na nossa area ha 6 s (a lista de objetos dele ja esta pronta): o dono reenvia o que ja mudou aqui
-        const bool here = settled && p.cur.valid && p.cur.ingame && p.cur.area == area && now - p.cur_time < 6.0;
-        if (!here) {
+        const bool here = settled && p.cur.valid && p.cur.ingame && same_world && now - p.cur_time < 10.0;
+        if (!p.cur.region.empty() && p.cur.region != "?" && p.cur.region != LocalRegion()) {
+            static std::set<std::string> warned;
+            if (warned.insert(p.cur.region).second) {
+                Log("[MP] %s usa outra versao do jogo (%s x %s): as fases vao pelo pacote, mas os numeros delas mudam",
+                    p.name + " " + p.cur.region + " | " + LocalRegion());
+            }
+        }
+        if (idx == 0 && !here) {
             p.same_area_since = 0;
             p.replayed = false;
-        } else if (!p.same_area_since) {
+        } else if (idx == 0 && !p.same_area_since) {
             p.same_area_since = now;
-        } else if (!p.replayed && now - p.same_area_since > 6.0) {
+        } else if (idx == 0 && !p.replayed && now - p.same_area_since > 6.0) {
             p.replayed = true;
             const int self = runtime::mp_net::SelfId(), owner = runtime::mp_net::OwnerId();
             if (self && (owner == self || !owner) && g_log_area == area && !g_area_log.empty()) {
@@ -2783,6 +2949,7 @@ void Tick() {
             break;
         }
         }
+        } // 4.5.1: fim dos personagens da party deste amigo
     }
     {
         std::vector<NameTag> tags;
