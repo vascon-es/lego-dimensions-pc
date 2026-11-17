@@ -2142,13 +2142,16 @@ std::vector<NameTag> NameTags() {
 // 4.1.1: inicio de funcao (push rbp; mov rbp, rsp) no deslocamento ou 0x10 depois (outro dump do eboot); 0 = nenhum
 // 4.4.5: o dump pode vir com a tabela inteira deslocada (no USA as funcoes altas ja ficam +0x10). Em vez de exigir
 // o endereco exato, procura o comeco de verdade numa janela de +-0x30 e usa o que achar.
+// 4.4.6: o `Readable` precisa do endereco ABSOLUTO (g_base + offset) - passando so o offset ele sempre dava falso e
+// nenhuma funcao era reconhecida (era o "eboot+0xd70730 nao reconhecido (bytes 55 48 89 e5)").
 u64 FnAt(u64 offset) {
     static const u8 kPrologue[4] = {0x55, 0x48, 0x89, 0xe5};
+    const u64 base = reinterpret_cast<u64>(g_base);
     for (long long shift : {0ll, 0x10ll, 0x20ll, 0x30ll, -0x10ll, -0x20ll}) {
         const long long at = static_cast<long long>(offset) + shift;
         if (at < 0x10000) continue;
         const u64 o = static_cast<u64>(at);
-        if (Readable(o, 4) && std::memcmp(g_base + o, kPrologue, 4) == 0) return o;
+        if (Readable(base + o, 4) && std::memcmp(g_base + o, kPrologue, 4) == 0) return o;
     }
     return 0;
 }
@@ -2162,6 +2165,17 @@ void RememberError(const char* text) {
     std::fflush(stdout);
 }
 
+// Detalhe do eboot vai para o log; na janela fica so um aviso curto (o texto longo nao cabe e nao ajuda em jogo).
+void ReportEbootFailure(u64 offset) {
+    char detail[220];
+    const u8* at = g_base + offset;
+    std::snprintf(detail, sizeof(detail), "eboot+0x%llx nao reconhecido (bytes %02x %02x %02x %02x)",
+                  static_cast<unsigned long long>(offset), at[0], at[1], at[2], at[3]);
+    std::printf("[MP] %s: multiplayer desligado\n", detail);
+    std::fflush(stdout);
+    RememberError("eboot do jogo nao reconhecido por este build - veja o log (build/sessao_*.log)");
+}
+
 bool ResolveFunctions(bool again = false) {
     static int s_ok = -1;
     if (s_ok == 1) return true;            // ja resolvido: nao mexe nos ponteiros de novo (eles ja foram ajustados)
@@ -2173,11 +2187,7 @@ bool ResolveFunctions(bool again = false) {
     }
     const u64 control = FnAt(kControlFn);
     if (!control) {
-        char text[200];
-        const u8* at = g_base + kControlFn;
-        std::snprintf(text, sizeof(text), "eboot+0x%llx nao reconhecido (bytes %02x %02x %02x %02x): dump diferente do port",
-                      static_cast<unsigned long long>(kControlFn), at[0], at[1], at[2], at[3]);
-        RememberError(text);
+        ReportEbootFailure(kControlFn);
         return false;
     }
     g_control_fn = control;
@@ -2187,11 +2197,7 @@ bool ResolveFunctions(bool again = false) {
                    &kBuildUpdateFn}) { // (eboot+a0a770 nao tem prologo: fica fixo, antes da parte deslocada)
         const u64 o = FnAt(*f);
         if (!o) {
-            char text[200];
-            const u8* at = g_base + *f;
-            std::snprintf(text, sizeof(text), "eboot+0x%llx nao reconhecido (bytes %02x %02x %02x %02x): multiplayer desligado",
-                          static_cast<unsigned long long>(*f), at[0], at[1], at[2], at[3]);
-            RememberError(text);
+            ReportEbootFailure(*f);
             return false;
         }
         *f = o;
@@ -2318,6 +2324,7 @@ bool InWorld() { return g_enabled && g_in_world; }
 
 // 4.4.5: texto do ultimo erro de conexao (a janela do F3 mostra isso em vez de so "fora da rede").
 std::string LastError() { return g_last_error; }
+void ClearLastError() { g_last_error.clear(); } // 4.4.6: abrir o F3 comeca uma tentativa nova (sem erro velho na tela)
 void SetFollowOwner(bool on) { g_follow_owner = on; }
 bool FollowOwnerEnabled() { return g_follow_owner; }
 

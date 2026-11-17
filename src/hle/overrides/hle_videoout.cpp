@@ -1347,16 +1347,22 @@ void OpenMpRoomDialog(bool new_network) {
     const int dlg_w = 520;
     const int dlg_h = 500; // 4.4.5: linha de estado + botao de sair
     HWND parent = static_cast<HWND>(WindowHandle());
-    RECT prc{100, 100, 100 + dlg_w, 100 + dlg_h};
+    // 4.4.6: 520x500 e a AREA CLIENTE. Antes o tamanho era do quadro inteiro e a barra de titulo/bordas comia
+    // ~35 px: os botoes de baixo ficavam cortados e nao dava para clicar em "Criar e Entrar".
+    const DWORD dlg_style = WS_POPUP | WS_CAPTION | WS_SYSMENU | WS_CLIPCHILDREN | WS_VISIBLE;
+    const DWORD dlg_ex = WS_EX_DLGMODALFRAME | WS_EX_TOPMOST;
+    RECT frame{0, 0, dlg_w, dlg_h};
+    AdjustWindowRectEx(&frame, dlg_style, FALSE, dlg_ex);
+    const int win_w = frame.right - frame.left, win_h = frame.bottom - frame.top;
+    RECT prc{100, 100, 100 + win_w, 100 + win_h};
     if (parent) GetWindowRect(parent, &prc);
-    const int x = prc.left + ((prc.right - prc.left) - dlg_w) / 2;
-    const int y = prc.top + ((prc.bottom - prc.top) - dlg_h) / 2;
+    const int x = prc.left + ((prc.right - prc.left) - win_w) / 2 - frame.left;
+    const int y = prc.top + ((prc.bottom - prc.top) - win_h) / 2 - frame.top;
 
     const bool pt = lang::Pt();
-    s_mp_dialog = CreateWindowExW(WS_EX_DLGMODALFRAME | WS_EX_TOPMOST, L"LegoDimensionsInGameMpDialog",
+    s_mp_dialog = CreateWindowExW(dlg_ex, L"LegoDimensionsInGameMpDialog",
                                   pt ? L"Sala do Multiplayer (F3)" : L"Multiplayer Room (F3)",
-                                  WS_POPUP | WS_CAPTION | WS_SYSMENU | WS_CLIPCHILDREN | WS_VISIBLE,
-                                  x, y, dlg_w, dlg_h, parent, nullptr, GetModuleHandleW(nullptr), nullptr);
+                                  dlg_style, x, y, win_w, win_h, parent, nullptr, GetModuleHandleW(nullptr), nullptr);
 
     BOOL dark = TRUE;
     DwmSetWindowAttribute(s_mp_dialog, 20, &dark, sizeof(dark));
@@ -1389,6 +1395,7 @@ void OpenMpRoomDialog(bool new_network) {
     SendMessageW(hTitle, WM_SETFONT, reinterpret_cast<WPARAM>(s_mp_bold_font), TRUE);
 
     // 4.4.5: estado na hora (fora da rede / na rede / motivo da falha) - antes isso nao aparecia aqui
+    if (!runtime::multiplayer::Enabled()) runtime::multiplayer::ClearLastError(); // 4.4.6: erro velho nao fica na tela
     bool status_bad = false;
     const std::wstring status_text = MpDialogStatus(pt, &status_bad);
     s_mp_status_bad = status_bad;
