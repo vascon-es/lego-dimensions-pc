@@ -233,6 +233,8 @@ struct Puppet {
     float move_dx = 0, move_dz = 0; // 4.4.8: deslocamento real entre os dois ultimos pacotes (diagnostico)
     float last_px = 0, last_pz = 0, last_wx = 0, last_wz = 0; // 4.4.8: sonda da convencao da direcao
     float last_dist = 99.0f; // 4.4.8: distancia do quadro anterior (a sonda so vale sem correcao acontecendo)
+    int gear_shown = 3;      // 4.4.13: marcha que esta sendo animada (evita piscar parado/correndo)
+    double gear_time = 0;
     bool have_last = false;
     Remote cur, prev;
     double cur_time = 0, prev_time = 0;
@@ -1710,7 +1712,8 @@ void Steer(Puppet& p, double now, Drive* d) {
     if (p.prev.valid && p.cur_time > p.prev_time + 0.001) {
         const double span = p.cur_time - p.prev_time;
         double a = (shown - p.prev_time) / span;
-        a = std::clamp(a, 0.0, 1.0 + 0.35); // no maximo um terco de pacote para a frente
+        const double ahead = age > 0.3 ? 1.0 : 1.35; // 4.4.13: sem pacote novo, nao extrapola (evita ir e voltar)
+        a = std::clamp(a, 0.0, ahead);
         tx = static_cast<float>(p.prev.x + (r.x - p.prev.x) * a);
         ty = static_cast<float>(p.prev.y + (r.y - p.prev.y) * a);
         tz = static_cast<float>(p.prev.z + (r.z - p.prev.z) * a);
@@ -1754,10 +1757,36 @@ void Steer(Puppet& p, double now, Drive* d) {
     // de caminhada e' refeito no quadro seguinte pelo Teleport.
     d->speed = 0.0f; // 0 = a rapidez da tabela da marcha (e' dela que sai a animacao)
     d->hold = false;
-    d->gear = age < 3.0 ? r.gear : 3;
+    // 4.4.13: a marcha vinha trocando a cada pacote (parado/correndo/parado) e o passo "gaguejava". So aceita a
+    // marcha nova quando ela se mantem por 80 ms.
+    if (r.gear != p.gear_shown) {
+        if (!p.gear_time) p.gear_time = now;
+        if (now - p.gear_time > 0.08) {
+            p.gear_shown = r.gear;
+            p.gear_time = 0;
+        }
+    } else {
+        p.gear_time = 0;
+    }
+    d->gear = age < 3.0 ? p.gear_shown : 3;
     d->held = age < 1.0 ? (r.held & kSentButtons) : 0;
     {
-        const float fx = r.fx, fz = r.fz;
+        float fx = r.fx, fz = r.fz;
+        // 4.4.13: a cara tambem e' interpolada entre os dois pacotes (menor arco), como a posicao. Antes ela saltava
+        // a cada pacote e o boneco ficava "piscando" de lado quando o outro girava.
+        if (p.prev.valid && (p.prev.fx != 0.0f || p.prev.fz != 0.0f) && p.cur_time > p.prev_time + 0.001 &&
+            std::isfinite(r.fx) && std::isfinite(r.fz)) {
+            const double span = p.cur_time - p.prev_time;
+            double a = (shown - p.prev_time) / span;
+            a = std::clamp(a, 0.0, 1.0 + 0.35);
+            const float a0 = std::atan2(p.prev.fx, p.prev.fz), a1 = std::atan2(r.fx, r.fz);
+            float d = a1 - a0;
+            while (d > 3.14159265f) d -= 6.28318531f;
+            while (d < -3.14159265f) d += 6.28318531f;
+            const float ang = a0 + d * static_cast<float>(a);
+            fx = std::sin(ang);
+            fz = std::cos(ang);
+        }
         const float n = std::sqrt(fx * fx + fz * fz);
         if (!std::isfinite(n) || n < 0.01f) { // sem rumo no pacote: a cara segue o deslocamento
             const float ax = (mx != 0.0f || mz != 0.0f) ? mx : 1.0f, az = (mx != 0.0f || mz != 0.0f) ? mz : 0.0f;
@@ -3139,6 +3168,17 @@ void Tick() {
         case Stage::kNone:
             if (now < p.retry_time || now - g_last_spawn < 0.5) break;
             p.retry_time = now + 1.0;
+            // 4.4.13: sem boneco e o personagem ja esta carregado: entra na hora (as esperas de carga nao valem aqui).
+            // Era isso que deixava "so o nome" por 2-3 s cada vez que o jogo desfazia o fantasma.
+            if (!g_unsupported.count(Lower(p.cur.chr))) {
+                if (const u64 loaded = FindLoadedSlot(p.cur.chr); loaded && !SlotUsedByLocalPlayer(loaded)) {
+                    p.slot = loaded;
+                    p.standin = false;
+                    p.stage = Stage::kReady;
+                    p.retry_time = 0;
+                    break;
+                }
+            }
             if (g_unsupported.count(Lower(p.cur.chr))) { // personagem que nao e figura: aparece com um substituto
                 if (u64 slot = StandInSlot()) {
                     p.slot = slot;
