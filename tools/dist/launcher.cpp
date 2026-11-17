@@ -33,6 +33,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cctype>
+#include <chrono>
 #include <cmath>
 #include <cstdlib>
 #include <deque>
@@ -4098,7 +4099,19 @@ void RepairPythonSilently() {
 void EnsurePythonSilently() {
     if (g_dev_tree || std::getenv("LD_NO_PYFIX")) return;
     if (g_pyfix_running.exchange(true)) return;
-    if (!PythonComplete(true)) RepairPythonSilently();
+    if (!PythonComplete(true)) {
+        // uma tentativa por dia: se a pasta for somente leitura (ou o download falhar), nao baixa 190 MB a cada abertura
+        const fs::path marker = g_root / L"build" / L"python.repair";
+        std::error_code ec;
+        const auto last = fs::last_write_time(marker, ec);
+        if (!ec && fs::file_time_type::clock::now() - last < std::chrono::hours(24)) {
+            g_pyfix_running = false;
+            return;
+        }
+        fs::create_directories(marker.parent_path(), ec);
+        std::ofstream(marker, std::ios::trunc) << "reparo do tools\\python\n";
+        RepairPythonSilently();
+    }
     g_pyfix_running = false;
 }
 
