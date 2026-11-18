@@ -340,7 +340,13 @@ struct FakeController {
 };
 std::map<u64, FakeController> g_fake_ctrl;
 bool PlayerMode() {
-    static const bool on = std::getenv("LD_MP_PLAYERMODE") != nullptr;
+    // 4.4.22: LIGADO por padrao. E' o unico caminho em que o fantasma tem um controle de jogador de verdade - sem ele o
+    // jogo le os botoes de um controle que nao existe e o soco nunca acontece. LD_MP_PLAYERMODE=0 desliga (se der
+    // problema na troca de figura).
+    static const bool on = [] {
+        const char* v = std::getenv("LD_MP_PLAYERMODE");
+        return !(v && v[0] == '0' && v[1] == 0);
+    }();
     return on;
 }
 u64 GameAlloc(u64 size);
@@ -387,6 +393,12 @@ HLE_SYSV_ABI u64 ControlHook(u64 inst, float dt) {
             At<u32>(fc->ctrl + 0x24) = d->held;
             At<u32>(fc->ctrl + 0x28) = pressed;
             At<u32>(fc->ctrl + 0x2c) = released;
+            // 4.4.22: o estado bruto do controle tambem (e' por ele que o jogo le o aperto de quadro em quadro)
+            if (Readable(inst + 0x4f8, 0x18)) {
+                At<u32>(inst + 0x4f8 + 0xc) = d->held;
+                At<u32>(inst + 0x4f8 + 0x10) = pressed;
+                At<u32>(inst + 0x4f8 + 0x14) = released;
+            }
             d->prev = d->held;
             const bool walk = moving && !d->hold;
             At<float>(fc->ctrl + 0x54) = walk ? 1.4f : 0.0f;
@@ -1445,6 +1457,10 @@ bool ReclaimForCloser(const Puppet& wanting, double now) {
 // um personagem que ja esta carregado: primeiro um que NOS carregamos (nunca e descarregado com fantasma em cima), senao
 // o do proprio jogador. O nome em cima continua sendo o dele; quando sobra um slot, vira o personagem certo.
 u64 StandInSlot() {
+    // 4.4.22: SUBSTITUTO DESLIGADO. Era ele que enchia a fase de personagens que nao estao na mesa: um fantasma sem
+    // slot pegava um boneco nosso ja carregado - muitas vezes o carro do amigo ou a figura de outro fantasma - e ele
+    // ficava plantado no chao. Sem slot, o amigo aparece so com o nome flutuante ate sobrar um.
+    return 0;
     for (int i = 0; i < g_nall; ++i) {
         const u64 slot = SlotAddress(i);
         if (!slot) continue;
@@ -1736,8 +1752,7 @@ void Steer(Puppet& p, double now, Drive* d) {
     if (p.prev.valid && p.cur_time > p.prev_time + 0.001) {
         const double span = p.cur_time - p.prev_time;
         double a = (shown - p.prev_time) / span;
-        const double ahead = age > 0.3 ? 1.0 : 1.35; // 4.4.13: sem pacote novo, nao extrapola (evita ir e voltar)
-        a = std::clamp(a, 0.0, ahead);
+        a = std::clamp(a, 0.0, 1.0 + 0.35); // no maximo um terco de pacote para a frente
         tx = static_cast<float>(p.prev.x + (r.x - p.prev.x) * a);
         ty = static_cast<float>(p.prev.y + (r.y - p.prev.y) * a);
         tz = static_cast<float>(p.prev.z + (r.z - p.prev.z) * a);
@@ -1754,9 +1769,6 @@ void Steer(Puppet& p, double now, Drive* d) {
         d->dx = d->dz = 0.0f;
         d->fx = d->fz = 0.0f;
         d->held = d->prev = 0;
-        d->punching = false;
-        p.prev_held = 0;
-        p.punch_until = 0;
         return;
     }
     const float px = At<float>(t + 0x90), py = At<float>(t + 0x94), pz = At<float>(t + 0x98);
@@ -1784,46 +1796,20 @@ void Steer(Puppet& p, double now, Drive* d) {
     // de caminhada e' refeito no quadro seguinte pelo Teleport.
     d->speed = 0.0f; // 0 = a rapidez da tabela da marcha (e' dela que sai a animacao)
     d->hold = false;
-    // 4.4.13: a marcha vinha trocando a cada pacote (parado/correndo/parado) e o passo "gaguejava". So aceita a
-    // marcha nova quando ela se mantem por 80 ms.
-    if (now >= p.punch_until && r.gear != p.gear_shown) {
-        if (!p.gear_time) p.gear_time = now;
-        if (now - p.gear_time > 0.08) {
-            p.gear_shown = r.gear;
-            p.gear_time = 0;
-        }
-    } else {
-        p.gear_time = 0;
-    }
-    d->gear = age < 3.0 ? p.gear_shown : 3;
+    d->gear = age < 3.0 ? r.gear : 3;
     d->held = age < 1.0 ? (r.held & kSentButtons) : 0;
-    // 4.4.21: o soco do outro jogo. Enquanto a janela durar, o gancho NAO forca marcha/rapidez/direcao: era isso que
-    // cancelava a animacao do soco no quadro seguinte (o personagem voltava para "andando" antes de bater).
+    // 4.4.22: soco do outro jogo. O gancho forca a caminhada todo quadro e isso matava a animacao do soco no quadro
+    // seguinte; durante a janela do soco o motor manda na animacao (a posicao continua vindo do espelho).
     if (const u32 pressed = d->held & ~p.prev_held; pressed & kSquare) {
         p.punch_until = now + 0.7;
-        std::printf("[MP] soco do outro jogo (%s)\n", p.name.c_str());
+        std::printf("[MP] soco do outro jogo (%s) botao %x\n", p.name.c_str(), pressed);
         std::fflush(stdout);
     }
     p.prev_held = d->held;
-    d->punching = now < p.punch_until;   // 4.4.21: o gancho nao forca a caminhada nesta janela
-    if (d->punching) d->gear = 3;        // parado: o motor toca o soco
+    d->punching = now < p.punch_until;
+    if (d->punching) d->gear = 3; // parado: o motor toca o soco
     {
-        float fx = r.fx, fz = r.fz;
-        // 4.4.13: a cara tambem e' interpolada entre os dois pacotes (menor arco), como a posicao. Antes ela saltava
-        // a cada pacote e o boneco ficava "piscando" de lado quando o outro girava.
-        if (p.prev.valid && (p.prev.fx != 0.0f || p.prev.fz != 0.0f) && p.cur_time > p.prev_time + 0.001 &&
-            std::isfinite(r.fx) && std::isfinite(r.fz)) {
-            const double span = p.cur_time - p.prev_time;
-            double a = (shown - p.prev_time) / span;
-            a = std::clamp(a, 0.0, 1.0 + 0.35);
-            const float a0 = std::atan2(p.prev.fx, p.prev.fz), a1 = std::atan2(r.fx, r.fz);
-            float d = a1 - a0;
-            while (d > 3.14159265f) d -= 6.28318531f;
-            while (d < -3.14159265f) d += 6.28318531f;
-            const float ang = a0 + d * static_cast<float>(a);
-            fx = std::sin(ang);
-            fz = std::cos(ang);
-        }
+        const float fx = r.fx, fz = r.fz;
         const float n = std::sqrt(fx * fx + fz * fz);
         if (!std::isfinite(n) || n < 0.01f) { // sem rumo no pacote: a cara segue o deslocamento
             const float ax = (mx != 0.0f || mz != 0.0f) ? mx : 1.0f, az = (mx != 0.0f || mz != 0.0f) ? mz : 0.0f;
