@@ -63,6 +63,9 @@ u64 kSlotStateFn = 0x157cdd0; // (slot, estado, 0): 0 = cancela pedido / esvazia
 u64 kLevelSetupFn = 0x1577ba0; // prepara a memoria dos slots ao carregar a fase (rdi = config, +0x233)
 u64 kPlayerBrainCtorFn = 0xebfef0; // 4.4.23: PlayerBrain(brain, owner) isolado para o fantasma atacar/pular/voar
 u64 kSetActionFn = 0xd6ea10;       // 4.4.23: Character::SetAction(inst, ctx_id, param, flags, sub)
+u64 kStartMeleeFn = 0x12214f0;     // 4.4.24: FightingComponent::StartMeleeAttack(fight, bind, 0x30, 0) - soco/combo real
+u64 kCanSwapFn = 0x11aa030;        // 4.4.24: CanSwapToCharacter - impede o Triangulo de tentar entrar em fantasma
+u64 kPartySwitchFn = 0x14b4e30;    // 4.4.24: PlayerParty::SwitchControlledCharacter - blinda fc->ctrl e fantasmas
 u64 g_context_registry_ptr = 0;    // 4.4.23: deslocamento de g_ContextRegistry (resolvido via RIP em kSetActionFn+0xc1)
 u64 g_main_camera_ptr = 0;         // 4.4.23: deslocamento da camera ativa (resolvido via RIP em fn_getcam)
 
@@ -78,13 +81,16 @@ constexpr u32 NuHash(const char* s) {
     return h;
 }
 constexpr u32 kCtxDefault     = NuHash("Default");
+constexpr u32 kCtxJumping     = NuHash("Jumping");
+constexpr u32 kCtxFalling     = NuHash("Falling");
+constexpr u32 kCtxLandSlam    = NuHash("LandSlam");
 constexpr u32 kCtxFighting    = NuHash("Fighting");
 constexpr u32 kCtxConeAttack  = NuHash("ConeAttack");
 constexpr u32 kCtxSpecialMove = NuHash("SpecialMove");
 constexpr u32 kCtxFlying      = NuHash("Flying");
 constexpr u32 kCtxGliding     = NuHash("Gliding");
 
-constexpr u32 kCross = 0x40004000, kSquare = 0x10008000; // mascara de botoes do jogo
+constexpr u32 kCross = 0x40004000, kSquare = 0x10008000, kCircle = 0x20002000; // mascara de botoes do jogo
 // 4.4.21: os quatro botoes de face (nas duas metades da palavra). Antes so cruz e quadrado eram copiados e o soco
 // dependia de um bit que pode nao ser o mesmo em toda figura; agora o que o outro apertar chega inteiro.
 constexpr u32 kSentButtons = 0xf000f000;
@@ -265,6 +271,12 @@ struct Puppet {
     double fly_pulse_start = -100; // 4.4.23: pulso duplo de X para entrar em voo quando o outro jogo esta em Flying
     double fly_cooldown = -100;
     u32 prev_held = 0;
+    u32 last_remote_ctx = 0;       // 4.4.24: ultimo ActionContext visto do outro jogo (bordas de pulo/soco/especial)
+    bool pending_melee = false;    // 4.4.24: bordas latentes consumidas no ControlHook (nunca se perdem entre Ticks)
+    bool pending_special = false;
+    bool pending_jump = false;
+    bool pending_slam = false;
+    double jump_until = 0;         // 4.4.24: janela minima do pulo antes de espelhar pouso em Default
     float face_ang = 0.0f;         // 4.4.16: cara suavizada (angulo)
     bool have_face = false;
     bool have_last = false;
@@ -288,9 +300,10 @@ bool MoveSpaceLocal() {
     return local;
 }
 
-// Pedidos dos fantasmas vivos. O destrutor do jogo pode rodar em outra thread: ele so zera a entrada (sem trava,
-// para nunca esperar a thread principal enquanto ela chama funcoes do jogo).
+// Pedidos e instancias dos fantasmas vivos (atomicos para ganchos que podem rodar na NuBgProc sem trava).
 std::atomic<u64> g_live[32];
+std::atomic<u64> g_live_insts[32];
+std::atomic<u64> g_fake_ctrls[32];
 
 void LiveAdd(u64 request) {
     for (auto& e : g_live) {
@@ -309,7 +322,38 @@ bool LiveDrop(u64 request) {
 
 bool LiveHas(u64 request) {
     for (auto& e : g_live) {
-        if (request && e.load() == request) return true;
+        if (request && e.load(std::memory_order_relaxed) == request) return true;
+    }
+    return false;
+}
+
+void LiveInstAdd(u64 inst) {
+    if (!inst) return;
+    for (auto& e : g_live_insts) {
+        if (e.load(std::memory_order_relaxed) == inst) return;
+    }
+    for (auto& e : g_live_insts) {
+        u64 expected = 0;
+        if (e.compare_exchange_strong(expected, inst)) return;
+    }
+}
+
+void LiveInstDrop(u64 inst) {
+    if (!inst) return;
+    for (auto& e : g_live_insts) {
+        u64 expected = inst;
+        e.compare_exchange_strong(expected, 0);
+    }
+}
+
+void LiveInstClear() {
+    for (auto& e : g_live_insts) e.store(0, std::memory_order_relaxed);
+}
+
+bool IsPuppetFast(u64 inst) {
+    if (!inst) return false;
+    for (const auto& e : g_live_insts) {
+        if (e.load(std::memory_order_relaxed) == inst) return true;
     }
     return false;
 }
@@ -317,6 +361,7 @@ bool LiveHas(u64 request) {
 // O que o gancho de controle aplica (so thread principal, montado no Tick).
 struct Drive {
     u64 inst;
+    Puppet* puppet = nullptr;
     int slot_key = 0;
     int gear;
     float speed; // 0 = a da tabela da marcha
@@ -325,6 +370,7 @@ struct Drive {
     u32 ctx_hash = 0;
     bool hold = false; // 4.4.9: espelho puro - rapidez 0 e a posicao vem do Teleport (nada de IA andando sozinha)
     bool punching = false; // 4.4.21: o outro jogo socou - o motor toca a animacao, o gancho nao forca a marcha
+    bool jump_active = false;
     u64 name = 0;      // 4.4.10: inst+0x10 do fantasma (se mudou, o personagem morreu/trocou: nao mexer)
 };
 
@@ -412,10 +458,21 @@ u64 GameAlloc(u64 size);
 
 bool IsOurFakeCtrl(u64 ctrl) {
     if (!ctrl) return false;
-    for (const auto& [k, fc] : g_fake_ctrl) {
-        if (fc.ctrl == ctrl) return true;
+    for (const auto& e : g_fake_ctrls) {
+        if (e.load(std::memory_order_relaxed) == ctrl) return true;
     }
     return false;
+}
+
+void RememberFakeCtrl(u64 ctrl) {
+    if (!ctrl) return;
+    for (auto& e : g_fake_ctrls) {
+        if (e.load(std::memory_order_relaxed) == ctrl) return;
+    }
+    for (auto& e : g_fake_ctrls) {
+        u64 expected = 0;
+        if (e.compare_exchange_strong(expected, ctrl)) return;
+    }
 }
 
 FakeController* FakeControllerFor(int slot_key, u64 inst) {
@@ -471,6 +528,7 @@ FakeController* FakeControllerFor(int slot_key, u64 inst) {
     At<u8>(c + 0x21a) = 0;
     At<u64>(c + 0x228) = c;
     At<u64>(c + 0x230) = 0;
+    RememberFakeCtrl(c);
     std::printf("[MP] fantasma %llx ganhou PlayerParty %llx + PlayerBrain %llx + holder %llx\n",
                 static_cast<unsigned long long>(inst), static_cast<unsigned long long>(c),
                 static_cast<unsigned long long>(brain), static_cast<unsigned long long>(h));
@@ -478,9 +536,9 @@ FakeController* FakeControllerFor(int slot_key, u64 inst) {
     return &(g_fake_ctrl[slot_key] = FakeController{c, h, owner, brain, inst});
 }
 
-// 4.4.23: eboot+0xd718ce..0xd71c02 transforma o analogico (holder+0x5a/0x5b) pela base ortonormal da camera ativa
-// (R_up = (cx, cz) de cam+0x90, R_right = (-cz, cx)) e curva de deadzone 42.5 + 85*m. A inversa exata elimina 100%
-// da interferencia do angulo da camera do jogador 1 na caminhada/voo do fantasma.
+// 4.4.24: eboot+0xd718ce..0xd71c02 usa cam+0x90 (+Z_cam = TRAS da camera), nega para Forward = (-cx, -cz) em 0xd719ca
+// e monta Right = (+cz, -cx) em 0xd71b87. A inversa exata (sx = ux*cz - uz*cx, sy = -ux*cx - uz*cz) casa bit a bit
+// tanto PadInput+0xb0..0xb8 quanto o angulo binario em PadInput+0x94 (que soma +0x8000 = 180 graus em 0xd7182f).
 void WriteCameraStick(u64 holder, int gear, float dx, float dz, bool active) {
     u8 bx = 0x80, by = 0x80;
     if (active && gear > 3 && std::isfinite(dx) && std::isfinite(dz)) {
@@ -500,8 +558,8 @@ void WriteCameraStick(u64 holder, int gear, float dx, float dz, bool active) {
                     }
                 }
             }
-            const float sx_u = -ux * cz + uz * cx;
-            const float sy_u =  ux * cx + uz * cz;
+            const float sx_u =  ux * cz - uz * cx;
+            const float sy_u = -ux * cx - uz * cz;
             const float m = gear == 4 ? 0.35f : (gear == 5 ? 0.65f : 1.0f);
             const float rad = 42.5f + 85.0f * m;
             bx = static_cast<u8>(std::clamp(static_cast<int>(std::lround(127.5f + rad * sx_u)), 1, 254));
@@ -510,6 +568,24 @@ void WriteCameraStick(u64 holder, int gear, float dx, float dz, bool active) {
     }
     At<u8>(holder + 0x5a) = bx;
     At<u8>(holder + 0x5b) = by;
+}
+
+SetupFn g_can_swap = nullptr;
+SetupFn g_party_switch = nullptr;
+
+// 4.4.24: ao apertar Triangulo para trocar entre os SEUS personagens, eboot+0x11aa030 varre os personagens do mundo;
+// retornando 0 para qualquer fantasma, o jogo troca limpo apenas entre as figuras do jogador local (sem crash).
+HLE_SYSV_ABI u64 CanSwapHook(u64 a, u64 from_chr, u64 to_chr, u64 d, u64 e, u64 f) {
+    if (g_enabled && IsPuppetFast(to_chr)) return 0;
+    return g_can_swap(a, from_chr, to_chr, d, e, f);
+}
+
+// 4.4.24: blinda PlayerParty::SwitchControlledCharacter (eboot+0x14b4e30) contra tocar em fc->ctrl (evita o crash em
+// eboot+0x14b77db ao desfazer nos de lista) ou capturar fantasmas na party do jogador local (~Character / roda).
+HLE_SYSV_ABI u64 PartySwitchHook(u64 party, u64 world, u64 chr_370, u64 a, u64 b, u64 c) {
+    if (IsOurFakeCtrl(party)) return 0;
+    if (g_enabled && chr_370 > 0x370 && IsPuppetFast(chr_370 - 0x370)) return 0;
+    return g_party_switch(party, world, chr_370, a, b, c);
 }
 
 HLE_SYSV_ABI u64 ControlHook(u64 inst, float dt) {
@@ -525,48 +601,124 @@ HLE_SYSV_ABI u64 ControlHook(u64 inst, float dt) {
     // 4.4.10: o personagem pode ter sido desfeito/trocado (troca de figura com Y, portal). Se a instancia nao e'
     // mais a nossa, nao escreve nada nela - era assim que o jogo caia ao trocar de personagem.
     if (d && (!Readable(inst + 0x10, 0x500) || (d->name && At<u64>(inst + 0x10) != d->name))) d = nullptr;
+
+    bool want_melee = false, want_special = false, want_jump = false, want_slam = false;
+    u32 held = d ? d->held : 0, prev_btn = d ? d->prev : 0;
+    if (d && d->puppet && d->puppet->inst == inst) {
+        if (d->puppet->pending_melee)   { want_melee = true;   d->puppet->pending_melee = false;   held |= kSquare; prev_btn &= ~kSquare; }
+        if (d->puppet->pending_special) { want_special = true; d->puppet->pending_special = false; held |= kCircle; prev_btn &= ~kCircle; }
+        if (d->puppet->pending_jump)    { want_jump = true;    d->puppet->pending_jump = false;    held |= kCross;  prev_btn &= ~kCross; }
+        if (d->puppet->pending_slam)    { want_slam = true;    d->puppet->pending_slam = false; }
+    }
+    const u32 pressed = held & ~prev_btn, released = prev_btn & ~held;
+    if (pressed & kSquare) want_melee = true;
+    if (pressed & kCircle) want_special = true;
+    if (pressed & kCross)  want_jump = true;
+
+    const u32 ctx_before = d ? ActiveContextHash(inst) : 0;
+    FakeController* active_fc = nullptr;
     bool used_player_ctrl = false;
     if (d && g_player_mode.load()) {
         if (FakeController* fc = FakeControllerFor(d->slot_key, inst)) {
             used_player_ctrl = true;
+            active_fc = fc;
             At<u64>(inst + 0x3a0) = fc->ctrl;
-            const u32 pressed = d->held & ~d->prev, released = d->prev & ~d->held;
-            At<u32>(fc->holder + 0x00) = d->held;
-            At<u32>(fc->holder + 0x04) = d->prev;
+            At<u32>(fc->holder + 0x00) = held;
+            At<u32>(fc->holder + 0x04) = prev_btn;
             At<u32>(fc->holder + 0x08) = pressed;
             At<u32>(fc->holder + 0x0c) = released;
-            At<u32>(fc->ctrl + 0x24) = d->held;
-            At<u32>(fc->ctrl + 0x28) = pressed;
-            At<u32>(fc->ctrl + 0x2c) = released;
+            // 4.4.24: BrainModule::PollButtons (eboot+0xec3230 via owner->vt[0x7d8] = ctrl+0x18) le 3 triplas de botoes:
+            // +0x24..0x2c (indice 0), +0x30..0x38 (indice 1 = gamepad INPG!), e +0x3c..0x44 (indice 2).
+            for (u64 off : {0x24ull, 0x30ull, 0x3cull}) {
+                At<u32>(fc->ctrl + off + 0) = held;
+                At<u32>(fc->ctrl + off + 4) = pressed;
+                At<u32>(fc->ctrl + off + 8) = released;
+            }
             if (Readable(inst + 0x4f8, 0x18)) {
-                At<u32>(inst + 0x4f8 + 0xc) = d->held;
+                At<u32>(inst + 0x4f8 + 0xc) = held;
                 At<u32>(inst + 0x4f8 + 0x10) = pressed;
                 At<u32>(inst + 0x4f8 + 0x14) = released;
             }
-            d->prev = d->held;
-            const bool walk = d->gear > 3 && !d->hold && !d->punching;
-            WriteCameraStick(fc->holder, d->gear, d->dx, d->dz, walk);
+            d->prev = held;
+            // 4.4.24: destrava o ping-pong PreUpdate/PostUpdate (byte [brain+0x117] bits 0x08/0x10) e liga bit 0x01
+            At<u8>(fc->brain + 0x117) = static_cast<u8>((At<u8>(fc->brain + 0x117) & ~0x18u) | 0x01u);
+            const bool airborne_move = (ctx_before == kCtxFlying || ctx_before == kCtxGliding ||
+                                        ctx_before == kCtxJumping || ctx_before == kCtxFalling) &&
+                                       (d->gear > 3 || std::hypot(d->dx, d->dz) > 0.05f);
+            const int stick_gear = airborne_move ? std::max(d->gear, 5) : d->gear;
+            const bool walk = (stick_gear > 3) && !d->hold && !d->punching;
+            WriteCameraStick(fc->holder, stick_gear, d->dx, d->dz, walk);
             At<u8>(inst + 0x399) = 1;
         }
     }
     if (d && !used_player_ctrl) {
         if (Readable(inst + 0x3a0, 8) && IsOurFakeCtrl(At<u64>(inst + 0x3a0))) At<u64>(inst + 0x3a0) = 0;
-        const u32 pressed = d->held & ~d->prev, released = d->prev & ~d->held;
         if (Readable(inst + 0x4f8, 0x18)) {
-            At<u32>(inst + 0x4f8 + 0xc) = d->held;
+            At<u32>(inst + 0x4f8 + 0xc) = held;
             At<u32>(inst + 0x4f8 + 0x10) = pressed;
             At<u32>(inst + 0x4f8 + 0x14) = released;
         }
-        d->prev = d->held;
-        At<u8>(inst + 0x399) = 1; // so durante o g_control: fora dele trava o andar e faz ~Character roubar figuras
+        d->prev = held;
+        At<u8>(inst + 0x399) = 1;
     }
     const u64 result = g_control(inst, dt);
     if (!d) return result;
-    // 4.4.23: sempre zera inst+0x399 logo apos g_control (eboot+0xd6ab80 no ~Character rouba figuras ociosas se +0x399!=0)
-    At<u8>(inst + 0x399) = 0;
+
+    // 4.4.24: fecha o ciclo PostUpdate do PlayerBrain (vtable[0x80] = eboot+0xec1220) para o proximo quadro funcionar.
+    if (active_fc && active_fc->brain && Readable(active_fc->brain, 8)) {
+        const u64 vt = At<u64>(active_fc->brain);
+        if (vt && Readable(vt + 0x80, 8)) {
+            if (const u64 post_fn = At<u64>(vt + 0x80)) {
+                reinterpret_cast<ControlFn>(post_fn)(active_fc->brain, dt);
+            }
+        }
+    }
+
     u32 local_ctx = ActiveContextHash(inst);
-    // 4.4.23: se o outro jogo ja pousou (Default) e o fantasma continuava em voo/planar, pousa na hora
-    if (d->ctx_hash == kCtxDefault && (local_ctx == kCtxFlying || local_ctx == kCtxGliding) && kSetActionFn) {
+    // 4.4.24: disparo direto no motor enquanto inst+0x399==1:
+    //  - Soco e combo de 3 golpes: FightingComponent::StartMeleeAttack (eboot+0x12214f0 em [inst+0x798])
+    //  - Especial (bola): SetAction("SpecialMove") (eboot+0x123811e)
+    //  - Pulo (X): SetAction("Jumping", param=0) (eboot+0xda2230 / 0xd9db70)
+    //  - Golpe aereo (quadrado no ar / LandSlam): StartMeleeAttack ou SetAction("LandSlam")
+    if (want_melee && kStartMeleeFn && !(ctx_before != kCtxFighting && local_ctx == kCtxFighting)) {
+        const u64 fight = Readable(inst + 0x798, 8) ? At<u64>(inst + 0x798) : 0;
+        if (fight && Readable(fight, 0x140)) {
+            alignas(16) u64 dummy_bind[4] = {};
+            Call(kStartMeleeFn, fight, reinterpret_cast<u64>(dummy_bind), 0x30, 0);
+            local_ctx = ActiveContextHash(inst);
+        }
+    }
+    if (want_slam && (local_ctx == kCtxJumping || local_ctx == kCtxFalling) && kSetActionFn) {
+        const s32 slam_id = ContextIdByHash(kCtxLandSlam);
+        if (slam_id >= 0) {
+            Call(kSetActionFn, inst, static_cast<u64>(slam_id), 0, 0, 0xffffffffu);
+            local_ctx = ActiveContextHash(inst);
+        }
+    }
+    if (want_special && local_ctx == kCtxDefault && kSetActionFn) {
+        const s32 spec_id = ContextIdByHash(kCtxSpecialMove);
+        if (spec_id >= 0) {
+            Call(kSetActionFn, inst, static_cast<u64>(spec_id), 0, 0, 0xffffffffu);
+            local_ctx = ActiveContextHash(inst);
+        }
+    }
+    if (want_jump && local_ctx == kCtxDefault && kSetActionFn) {
+        const s32 jump_id = ContextIdByHash(kCtxJumping);
+        if (jump_id >= 0) {
+            Call(kSetActionFn, inst, static_cast<u64>(jump_id), 0, 0, 0xffffffffu);
+            local_ctx = ActiveContextHash(inst);
+        }
+    }
+
+    // 4.4.24: desanexa inst+0x399 e inst+0x3a0 fora do ControlHook (evita rumble/LED em 0x199fd4e, HUD em 0x19a0250 e ~Character).
+    At<u8>(inst + 0x399) = 0;
+    if (Readable(inst + 0x3a0, 8) && IsOurFakeCtrl(At<u64>(inst + 0x3a0))) At<u64>(inst + 0x3a0) = 0;
+
+    // 4.4.23/4.4.24: se o outro jogo ja pousou (Default) e o fantasma continuava em voo/planar/queda (ex.: Teleport em rampa), pousa na hora
+    if (d->ctx_hash == kCtxDefault &&
+        (local_ctx == kCtxFlying || local_ctx == kCtxGliding || local_ctx == kCtxFalling ||
+         (local_ctx == kCtxJumping && !d->jump_active)) &&
+        kSetActionFn) {
         const s32 def_id = ContextIdByHash(kCtxDefault);
         if (def_id >= 0) {
             Call(kSetActionFn, inst, static_cast<u64>(def_id), 0, 0, 0xffffffffu);
@@ -576,7 +728,9 @@ HLE_SYSV_ABI u64 ControlHook(u64 inst, float dt) {
     const bool in_action = d->punching || (local_ctx != 0 && local_ctx != kCtxDefault);
     const u64 loc = Readable(inst + 0x90, 8) ? At<u64>(inst + 0x90) : 0;
     if (in_action) {
-        if (d->punching && loc && Readable(loc + 0x70, 4)) At<u32>(loc + 0x70) = 0;
+        if ((d->punching || local_ctx == kCtxFighting || local_ctx == kCtxConeAttack) && loc && Readable(loc + 0x70, 4)) {
+            At<u32>(loc + 0x70) = 0;
+        }
     } else if (loc && Readable(loc + 0x70, 0x1d0)) {
         if (d->hold) At<float>(loc + 0x70) = 0.0f;
         else if (d->speed > 0.0f) At<float>(loc + 0x70) = d->speed;
@@ -1259,9 +1413,12 @@ HLE_SYSV_ABI u64 RequestDtorHook(u64 request, u64 a, u64 b, u64 c, u64 d, u64 e)
     if (IsOurRequest(request) && Readable(request + 0x40, 8)) {
         const u64 comp = At<u64>(request + 0x40);
         const u64 inst = comp && Readable(comp + 0x20, 8) ? At<u64>(comp + 0x20) : 0;
-        if (inst && Readable(inst + 0x399, 0x10) && !IsLocalPlayer(inst)) {
-            At<u8>(inst + 0x399) = 0;
-            if (IsOurFakeCtrl(At<u64>(inst + 0x3a0))) At<u64>(inst + 0x3a0) = 0;
+        if (inst) {
+            LiveInstDrop(inst);
+            if (Readable(inst + 0x399, 0x10) && !IsLocalPlayer(inst)) {
+                At<u8>(inst + 0x399) = 0;
+                if (IsOurFakeCtrl(At<u64>(inst + 0x3a0))) At<u64>(inst + 0x3a0) = 0;
+            }
         }
     }
     LiveDrop(request); // o jogo desfez um fantasma (a figura do spawner saiu, a fase acabou...): o Tick ve e recria
@@ -1766,6 +1923,10 @@ bool PuppetAlive(const Puppet& p);
 
 void Despawn(Puppet& p) {
     const u64 request = p.request, spawner = p.spawner, inst = p.inst;
+    struct DropInstOnExit {
+        u64 i;
+        ~DropInstOnExit() { LiveInstDrop(i); }
+    } drop_guard{inst};
     // 4.4.12: se o personagem ja foi desfeito pelo jogo (troca de figura, portal, fim de fase), o pedido pode ter
     // sido reaproveitado por outra carga: nao chama o destrutor dele (derrubava o personagem do jogador / caia).
     const bool alive = inst && PuppetAlive(p);
@@ -1953,12 +2114,29 @@ void Steer(Puppet& p, double now, Drive* d) {
     d->hold = false;
     d->gear = age < 3.0 ? r.gear : 3;
     d->held = age < 1.0 ? (r.held & kSentButtons) : 0;
-    // 4.4.23: se um toque rapido de ataque aconteceu entre dois pacotes de 50 ms, o ctx_hash ("Fighting" / "ConeAttack"
-    // / "SpecialMove") garante uma borda limpa de aperto para o PlayerBrain disparar o golpe aqui tambem.
-    const bool remote_attack = r.ctx_hash == kCtxFighting || r.ctx_hash == kCtxConeAttack || r.ctx_hash == kCtxSpecialMove;
-    if (age < 0.5 && remote_attack && !(d->held & kSquare) && !(p.prev_held & kSquare) && now >= p.punch_until) {
-        d->held |= (r.ctx_hash == kCtxSpecialMove ? 0x20002000u : kSquare);
+    const u32 edge = d->held & ~p.prev_held;
+    const bool ctx_changed = age < 0.5 && r.ctx_hash != 0 && r.ctx_hash != p.last_remote_ctx;
+    p.last_remote_ctx = r.ctx_hash;
+
+    if ((edge & kSquare) || (ctx_changed && (r.ctx_hash == kCtxFighting || r.ctx_hash == kCtxConeAttack))) {
+        p.pending_melee = true;
+        p.punch_until = now + 0.35;
+        std::printf("[MP] soco do outro jogo (%s) botao %x ctx %x\n", p.name.c_str(), edge, r.ctx_hash);
+        std::fflush(stdout);
     }
+    if ((edge & kCircle) || (ctx_changed && r.ctx_hash == kCtxSpecialMove)) {
+        p.pending_special = true;
+        p.punch_until = now + 0.35;
+    }
+    if ((edge & kCross) || (ctx_changed && r.ctx_hash == kCtxJumping)) {
+        p.pending_jump = true;
+        p.jump_until = now + 0.45;
+    }
+    if (ctx_changed && r.ctx_hash == kCtxLandSlam) {
+        p.pending_slam = true;
+    }
+    d->jump_active = now < p.jump_until;
+
     // 4.4.23: quando o outro jogo ja entrou em voo ("Flying") e o fantasma ainda esta no chao/pulo, gera um pulso
     // duplo limpo de X para o FlightComponent iniciar o voo real com os parametros da figura.
     const u32 local_ctx = ActiveContextHash(p.inst);
@@ -1977,15 +2155,8 @@ void Steer(Puppet& p, double now, Drive* d) {
         else if (dt_fly < 0.22) d->held |= kCross;
         else p.fly_pulse_start = -100;
     }
-    // 4.4.22: soco do outro jogo. O gancho forca a caminhada todo quadro e isso matava a animacao do soco no quadro
-    // seguinte; durante a janela do soco o motor manda na animacao (a posicao continua vindo do espelho).
-    if (const u32 pressed = d->held & ~p.prev_held; pressed & kSquare) {
-        p.punch_until = now + 0.55;
-        std::printf("[MP] soco do outro jogo (%s) botao %x\n", p.name.c_str(), pressed);
-        std::fflush(stdout);
-    }
     p.prev_held = d->held;
-    d->punching = now < p.punch_until;
+    d->punching = now < p.punch_until || local_ctx == kCtxFighting || local_ctx == kCtxConeAttack;
     if (d->punching) d->gear = 3; // parado: o motor toca o soco
     {
         const float fx = r.fx, fz = r.fz;
@@ -1999,17 +2170,14 @@ void Steer(Puppet& p, double now, Drive* d) {
             d->fz = fz / n;
         }
     }
-    { // 4.4.23: direcao no espaco do MUNDO (eboot+0xd72248): prioriza o vetor de velocidade real enviado pelo outro
-        // jogo (loc+0x80/0x88), caindo para o deslocamento ou a cara. Assim andar reto e andar mirando funcionam sem
-        // puxar para +Z nem girar de lado com a camera do jogador 1.
+    { // 4.4.24: no chao/voo, caminha na direcao suave da cara (d->fx, d->fz), como na 4.4.22, evitando ruido residual
+        // de loc+0x80/0x88 ao parar/partir; so usa r.dx/r.dz quando o outro esta andando de fato e desviando da cara
+        // (ex.: mirando de lado).
         float dx = d->fx, dz = d->fz;
         const float vlen = std::hypot(r.dx, r.dz);
-        if (std::isfinite(vlen) && vlen > 0.05f) {
+        if (r.gear > 3 && (mx != 0.0f || mz != 0.0f) && std::isfinite(vlen) && vlen > 0.1f) {
             dx = r.dx / vlen;
             dz = r.dz / vlen;
-        } else if (mx != 0.0f || mz != 0.0f) {
-            dx = mx;
-            dz = mz;
         }
         to_body(dx, dz);
         d->dx = dx;
@@ -2557,7 +2725,7 @@ bool ResolveFunctions(bool again = false) {
     }
     g_control_fn = control;
     for (u64* f : {&kSpawnFn, &kRequestDtorFn, &kRequestDeleteFn, &kSlotLoadFn, &kListPushFn, &kSlotStateFn, &kLevelSetupFn,
-                   &kPlayerBrainCtorFn, &kSetActionFn,
+                   &kPlayerBrainCtorFn, &kSetActionFn, &kStartMeleeFn, &kCanSwapFn, &kPartySwitchFn,
                    &kDescFn, &kAllocFn, &kFreeFn, &kFireEventFn, &kKillObjectFn, &kBlowUpFn, &kTriggerObstacleFn,
                    &kGotoLevelFn, &kLevelByIdFn, &kLevelValidFn, &kMsRequestFn, &kReformTriggerFn, &kBuildStartFn,
                    &kBuildUpdateFn}) { // (eboot+a0a770 nao tem prologo: fica fixo, antes da parte deslocada)
@@ -2652,6 +2820,8 @@ bool InstallHooks() {
     // passa pelo portao do save quando o pacote (DLC) esta instalado (LevelValid)
     if (!g_fire_event) g_fire_event = reinterpret_cast<SetupFn>(Hook(kFireEventFn, reinterpret_cast<const void*>(&FireEventHook)));
     if (!g_level_valid) g_level_valid = reinterpret_cast<SetupFn>(Hook(kLevelValidFn, reinterpret_cast<const void*>(&LevelValidHook)));
+    if (!g_can_swap) g_can_swap = reinterpret_cast<SetupFn>(Hook(kCanSwapFn, reinterpret_cast<const void*>(&CanSwapHook)));
+    if (!g_party_switch) g_party_switch = reinterpret_cast<SetupFn>(Hook(kPartySwitchFn, reinterpret_cast<const void*>(&PartySwitchHook)));
 
     if (!g_control || !g_spawn || !g_dtor) {
         std::printf("[MP] eboot diferente: multiplayer desligado\n");
@@ -3270,6 +3440,7 @@ void Tick() {
                 p.stage = Stage::kNone;
                 p.request = p.inst = p.inst_name = 0;
             }
+            LiveInstClear();
             g_drive_count = 0;
         }
         return;
@@ -3288,6 +3459,7 @@ void Tick() {
     // fantasmas que o jogo desfez sozinho
     for (auto& [id, p] : g_puppets) {
         if ((p.stage == Stage::kSpawning || p.stage == Stage::kActive) && !LiveHas(p.request)) {
+            LiveInstDrop(p.inst);
             p.request = p.inst = p.inst_name = 0;
             p.stage = Stage::kNone;
             p.retry_time = now + 2.5; // 4.4.7: menos pisca-pisca (o jogo as vezes desfaz e refaz o personagem)
@@ -3594,6 +3766,7 @@ void Tick() {
             if (inst && Readable(inst + 0x10, 0x500)) {
                 p.inst = inst;
                 p.inst_name = At<u64>(inst + 0x10);
+                LiveInstAdd(inst);
                 p.stage = Stage::kActive;
                 p.stage_time = now;
                 // 4.4.23: com flag = 0 no Spawn, o fantasma nunca entra na party nem na roda de figuras. O slot
@@ -3619,6 +3792,7 @@ void Tick() {
         }
         case Stage::kActive: {
             if (IsLocalPlayer(p.inst)) {
+                LiveInstDrop(p.inst);
                 LiveDrop(p.request);
                 p.request = p.inst = p.inst_name = 0;
                 p.stage = Stage::kNone;
@@ -3637,10 +3811,12 @@ void Tick() {
                 }
             }
             if (!PuppetAlive(p)) {
+                LiveInstDrop(p.inst);
                 p.stage = Stage::kNone;
                 p.request = p.inst = 0;
                 break;
             }
+            LiveInstAdd(p.inst);
             // 4.5: o pedido acabou preso na party do jogador local (inst+0x3a0 igual): desfaz agora para nao derrubar o
             // jogo na troca de figura e volta com um slot independente
             const u64 local_party = p1 && Readable(p1 + 0x3a0, 8) ? At<u64>(p1 + 0x3a0) : 0;
@@ -3672,8 +3848,10 @@ void Tick() {
             }
             if (now - p.stage_time > 1.5 && g_drive_count < kMaxPuppets) { // deixa a chegada pelo portal terminar
                 Drive& d = g_drive[g_drive_count];
+                d.puppet = &p;
                 d.slot_key = key;
                 d.hold = false; // 4.4.9: zera antes do Steer (a struct e' reaproveitada de quadros anteriores)
+                d.jump_active = false;
                 d.name = 0;
                 d.ctx_hash = 0;
                 d.speed = 0.0f;
