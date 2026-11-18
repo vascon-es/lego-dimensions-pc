@@ -845,14 +845,15 @@ enum MpOption {
     kMpOptInvite = -5,
     kMpOptLeave = -6,
     kMpOptChat = -7,
+    kMpOptPlayerMode = -8,
     kMpLeftBase = -100,
 };
 
 bool MpIsOption(int id) { return id <= 0 && id > kMpLeftBase; }
-bool MpIsToggle(int id) { return id == kMpOptLock || id == kMpOptFollow || id == kMpOptP2P; }
+bool MpIsToggle(int id) { return id == kMpOptLock || id == kMpOptFollow || id == kMpOptP2P || id == kMpOptPlayerMode; }
 
 
-void MpLoadOptions() { // 4.1.1 / Fase 82: opcoes guardadas no launcher.ini
+void MpLoadOptions() { // 4.1.1 / Fase 82 / 4.4.23: opcoes guardadas no launcher.ini
     static bool loaded = false;
     if (loaded) return;
     loaded = true;
@@ -860,6 +861,9 @@ void MpLoadOptions() { // 4.1.1 / Fase 82: opcoes guardadas no launcher.ini
     if (!ini.empty()) {
         runtime::multiplayer::SetFollowOwner(GetPrivateProfileIntW(L"launcher", L"mp_seguir", 1, ini.wstring().c_str()) != 0);
         runtime::mp_net::SetP2P(GetPrivateProfileIntW(L"launcher", L"mp_p2p", 1, ini.wstring().c_str()) != 0);
+        if (!std::getenv("LD_MP_PLAYERMODE")) {
+            runtime::multiplayer::SetPlayerMode(GetPrivateProfileIntW(L"launcher", L"mp_playermode", 1, ini.wstring().c_str()) != 0);
+        }
     }
 }
 
@@ -889,6 +893,7 @@ std::vector<MpRow> MpRows() {
     }
     rows.push_back({kMpOptP2P, pt ? "CONEXAO DIRETA (P2P)" : "DIRECT CONNECTION (P2P)", false});
     rows.push_back({kMpOptFollow, pt ? "SEGUIR O DONO (CAMPANHA JUNTO)" : "FOLLOW THE OWNER (CAMPAIGN)", false});
+    rows.push_back({kMpOptPlayerMode, pt ? "CONTROLE DE JOGADOR (PLAYERMODE)" : "PLAYER CONTROL (PLAYERMODE)", false});
     if (online && MpIsOwner()) rows.push_back({kMpOptLock, pt ? "TRANCAR A REDE" : "LOCK THE NETWORK", false});
     rows.push_back({kMpOptCreate, pt ? "CRIAR REDE NOVA" : "CREATE A NEW NETWORK", false});
     rows.push_back({kMpOptJoin, pt ? "ENTRAR EM UMA REDE (F3)" : "JOIN A NETWORK (F3)", false});
@@ -903,6 +908,12 @@ void MpToggleFollow() {
     const bool next = !runtime::multiplayer::FollowOwnerEnabled();
     runtime::multiplayer::SetFollowOwner(next);
     WriteLauncherIni(L"mp_seguir", next ? L"1" : L"0");
+}
+
+void MpTogglePlayerMode() { // 4.4.23
+    const bool next = !runtime::multiplayer::PlayerModeEnabled();
+    runtime::multiplayer::SetPlayerMode(next);
+    WriteLauncherIni(L"mp_playermode", next ? L"1" : L"0");
 }
 
 void MpToggleP2P() { // Fase 82
@@ -994,6 +1005,9 @@ void MpActivate(bool kick = false) {
         return;
     case kMpOptFollow:
         MpToggleFollow();
+        return;
+    case kMpOptPlayerMode:
+        MpTogglePlayerMode();
         return;
     case kMpOptP2P:
         MpToggleP2P();
@@ -4080,6 +4094,8 @@ void QueueStatsOverlay() {
                 value = runtime::mp_net::RoomLocked() ? (pt ? "< SIM >" : "< ON >") : (pt ? "< NAO >" : "< OFF >");
             } else if (r.id == kMpOptFollow) {
                 value = runtime::multiplayer::FollowOwnerEnabled() ? (pt ? "< SIM >" : "< ON >") : (pt ? "< NAO >" : "< OFF >");
+            } else if (r.id == kMpOptPlayerMode) {
+                value = runtime::multiplayer::PlayerModeEnabled() ? (pt ? "< SIM >" : "< ON >") : (pt ? "< NAO >" : "< OFF >");
             } else if (r.id == kMpOptP2P) {
                 value = net.p2p_on ? (pt ? "< SIM >" : "< ON >") : (pt ? "< NAO >" : "< OFF >");
             } else if (r.id == kMpOptLeave && g_mp_leave_armed && now - g_mp_leave_time < std::chrono::seconds(4)) {

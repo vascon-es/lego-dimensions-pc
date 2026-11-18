@@ -61,6 +61,28 @@ int g_nslots = 7, g_nall = 11; // atualizados a cada Tick (a lista do portal cre
 constexpr int kKeepFreeSlots = 1; // nunca ocupar o ultimo slot livre do portal: o jogador pode por uma figura nova
 u64 kSlotStateFn = 0x157cdd0; // (slot, estado, 0): 0 = cancela pedido / esvazia, 3 = descarrega (o jogo leva a 0)
 u64 kLevelSetupFn = 0x1577ba0; // prepara a memoria dos slots ao carregar a fase (rdi = config, +0x233)
+u64 kPlayerBrainCtorFn = 0xebfef0; // 4.4.23: PlayerBrain(brain, owner) isolado para o fantasma atacar/pular/voar
+u64 kSetActionFn = 0xd6ea10;       // 4.4.23: Character::SetAction(inst, ctx_id, param, flags, sub)
+u64 g_context_registry_ptr = 0;    // 4.4.23: deslocamento de g_ContextRegistry (resolvido via RIP em kSetActionFn+0xc1)
+u64 g_main_camera_ptr = 0;         // 4.4.23: deslocamento da camera ativa (resolvido via RIP em fn_getcam)
+
+// 4.4.23: hash FNV-1 em maiusculas usado pelo ContextRegistry do motor (eboot+0x4a4390). Identico em USA e EUR.
+constexpr u32 NuHash(const char* s) {
+    u32 h = 0x811c9dc5u;
+    if (!s) return h;
+    for (; *s; ++s) {
+        const int c = static_cast<signed char>(*s);
+        const int u = (c >= 'a' && c <= 'z') ? (c - 0x20) : c;
+        h = (h * 0x1000193u) ^ static_cast<u32>(u);
+    }
+    return h;
+}
+constexpr u32 kCtxDefault     = NuHash("Default");
+constexpr u32 kCtxFighting    = NuHash("Fighting");
+constexpr u32 kCtxConeAttack  = NuHash("ConeAttack");
+constexpr u32 kCtxSpecialMove = NuHash("SpecialMove");
+constexpr u32 kCtxFlying      = NuHash("Flying");
+constexpr u32 kCtxGliding     = NuHash("Gliding");
 
 constexpr u32 kCross = 0x40004000, kSquare = 0x10008000; // mascara de botoes do jogo
 // 4.4.21: os quatro botoes de face (nas duas metades da palavra). Antes so cruz e quadrado eram copiados e o soco
@@ -210,6 +232,7 @@ struct Remote {
     std::string level; // 4.1.1: fase atual ("LevelPack\...\Nome#ordem"); vazio = versao antiga / nao sabe
     std::string region; // 4.5.1: CUSA01176 (EUR) ou CUSA00935 (USA): as fases sao mapeadas pelo pacote, mas o aviso ajuda
     std::vector<std::string> party; // 4.5.1: os outros personagens equipados dele (o ativo e o `chr`)
+    u32 ctx_hash = 0; // 4.4.23: hash do ActionContext ativo no outro jogo ("Default", "Fighting", "Flying"...)
 };
 
 enum class Stage { kNone, kLoading, kReady, kSpawning, kActive };
@@ -231,17 +254,16 @@ struct Puppet {
     double still_time = 0;
     int stuck_side = 0; // 4.5.1: para que lado ele desvia quando fica preso (sem teleporte)
     int idx = 0;        // 4.5.1: 0 = personagem ativo do amigo, 1.. = os outros da party dele
-    int clashes = 0; // 4.5: vezes que o pedido acabou preso na party do jogador local (Task 6)
     unsigned seq = 0;
     float move_dx = 0, move_dz = 0; // 4.4.8: deslocamento real entre os dois ultimos pacotes (diagnostico)
     float last_px = 0, last_pz = 0, last_wx = 0, last_wz = 0; // 4.4.8: sonda da convencao da direcao
     float last_dist = 99.0f; // 4.4.8: distancia do quadro anterior (a sonda so vale sem correcao acontecendo)
     std::string dropped_for_local; // 4.4.14: (reservado) personagem que o jogador local tomou
-    bool slot_released = false;    // 4.4.18: ja soltou o slot depois de criar o boneco (para sair da roda)
-    double release_check = 0;      // 4.4.18: quando conferir se o boneco sobreviveu ao slot solto
     int gear_shown = 3;            // 4.4.13/4.4.21: marcha mostrada (so troca depois de 80 ms estavel)
     double gear_time = 0;          // 4.4.13: desde quando a marcha nova esta pedindo para entrar
     double punch_until = 0;        // 4.4.21: ate quando o motor toca o soco do outro jogo (sem forcar a marcha)
+    double fly_pulse_start = -100; // 4.4.23: pulso duplo de X para entrar em voo quando o outro jogo esta em Flying
+    double fly_cooldown = -100;
     u32 prev_held = 0;
     float face_ang = 0.0f;         // 4.4.16: cara suavizada (angulo)
     bool have_face = false;
@@ -256,11 +278,15 @@ struct Puppet {
 
 std::map<int, Puppet> g_puppets; // so a thread principal mexe
 
-// 4.4.8: a direcao que o gancho de controle recebe e' do mundo ou do espaco do corpo? O jogo nao documenta, entao o
-// port descobre sozinho: se o fantasma anda perpendicular ao que foi mandado (de lado), troca a convencao. O
-// LD_MP_MOVE=world|local fixa uma delas para teste.
-// 4.4.20: espaco FIXO do corpo - o mesmo da 4.4.12, que foi o que andou melhor. Sem votacao e sem opcao no painel.
-constexpr bool g_move_local = true;
+// 4.4.23: eboot+0xd72248..0xd722f3 prova que loc+0x80/0x88 e' espaco do MUNDO (passado direto ao atan2f como
+// inst+0x170/0x178). So muda para corpo se LD_MP_MOVE=local for pedido explicitamente para teste.
+bool MoveSpaceLocal() {
+    static const bool local = [] {
+        const char* v = std::getenv("LD_MP_MOVE");
+        return v && std::strcmp(v, "local") == 0;
+    }();
+    return local;
+}
 
 // Pedidos dos fantasmas vivos. O destrutor do jogo pode rodar em outra thread: ele so zera a entrada (sem trava,
 // para nunca esperar a thread principal enquanto ela chama funcoes do jogo).
@@ -291,10 +317,12 @@ bool LiveHas(u64 request) {
 // O que o gancho de controle aplica (so thread principal, montado no Tick).
 struct Drive {
     u64 inst;
+    int slot_key = 0;
     int gear;
     float speed; // 0 = a da tabela da marcha
     float dx, dz, fx, fz;
     u32 held, prev;
+    u32 ctx_hash = 0;
     bool hold = false; // 4.4.9: espelho puro - rapidez 0 e a posicao vem do Teleport (nada de IA andando sozinha)
     bool punching = false; // 4.4.21: o outro jogo socou - o motor toca a animacao, o gancho nao forca a marcha
     u64 name = 0;      // 4.4.10: inst+0x10 do fantasma (se mudou, o personagem morreu/trocou: nao mexer)
@@ -328,46 +356,160 @@ bool SomeoneLoading() {
     return false;
 }
 
+// 4.4.23: consulta e busca no ContextRegistry (eboot+0xa3d4d0 / 0xa3d5c0) para saber o ActionContext atual
+// (inst+0x38, ou inst+0x450 se inst+0x38 == inst+0x454) pelo hash FNV-1 do nome ("Default", "Fighting", "Flying"...).
+s32 ActiveContextId(u64 inst) {
+    if (!inst || !Readable(inst + 0x38, 4) || !Readable(inst + 0x450, 8)) return -1;
+    s32 ctx = At<s32>(inst + 0x38);
+    if (ctx == At<s32>(inst + 0x454)) ctx = At<s32>(inst + 0x450);
+    return ctx;
+}
+
+u32 ActiveContextHash(u64 inst) {
+    if (!g_context_registry_ptr) return 0;
+    const u64 reg_addr = reinterpret_cast<u64>(g_base) + g_context_registry_ptr;
+    if (!Readable(reg_addr, 8)) return 0;
+    const u64 reg = At<u64>(reg_addr);
+    if (!reg || !Readable(reg + 0x10b0, 4)) return 0;
+    const s32 ctx = ActiveContextId(inst);
+    const s32 count = At<s32>(reg + 0x10b0);
+    if (ctx < 0 || ctx >= count || count > 1024 || !Readable(reg + 0xb0 + static_cast<u64>(ctx) * 8, 8)) return 0;
+    const u64 factory = At<u64>(reg + 0xb0 + static_cast<u64>(ctx) * 8);
+    return factory && Readable(factory + 0x34, 4) ? At<u32>(factory + 0x34) : 0;
+}
+
+s32 ContextIdByHash(u32 want_hash) {
+    if (!want_hash || !g_context_registry_ptr) return -1;
+    const u64 reg_addr = reinterpret_cast<u64>(g_base) + g_context_registry_ptr;
+    if (!Readable(reg_addr, 8)) return -1;
+    const u64 reg = At<u64>(reg_addr);
+    if (!reg || !Readable(reg + 0x10b0, 4)) return -1;
+    const s32 count = std::min<s32>(At<s32>(reg + 0x10b0), 1024);
+    for (s32 i = 0; i < count; ++i) {
+        if (!Readable(reg + 0xb0 + static_cast<u64>(i) * 8, 8)) break;
+        const u64 factory = At<u64>(reg + 0xb0 + static_cast<u64>(i) * 8);
+        if (factory && Readable(factory + 0x34, 4) && At<u32>(factory + 0x34) == want_hash) return i;
+    }
+    return -1;
+}
+
 // ---- ganchos ----------------------------------------------------------------------------------------------------
 std::atomic<u64> g_hook_calls{0}, g_hook_other_thread{0}, g_hook_driven{0};
 
-// Fase 80 (teste, LD_MP_PLAYERMODE): o fantasma vira um "jogador" de verdade. O jogo so deixa personagens de jogador
-// quebrar objetos, montar etc. (inst+0x399 = 1 e um controle em inst+0x3a0). Cada fantasma ganha uma copia do controle
-// do jogador 1 (+0x18 = suporte de botoes, +0x54 forca do analogico, +0x58/+0x5c direcao, +0xf8 = inst+0x370), que
-// a gente preenche com o que veio da rede. O sistema de controles do jogo nao conhece a copia (nao a sobrescreve).
+// 4.4.23: PlayerParty (0x280 bytes) + PartyOwnerHandle (0x28) + PlayerBrain (0x118, eboot+0xebfef0) + holder (0x100)
+// totalmente isolados por fantasma (reaproveitados por slot_key, sem entrar na lista global de reset eboot+0x199f990 e
+// sem compartilhar ponteiros com o jogador 1). Assim o PlayerBrain dispara soco, combo, pulo e voo no fantasma sem
+// nunca ler o controle fisico do jogador 1 nem interferir na party local.
 struct FakeController {
-    u64 ctrl = 0, holder = 0;
+    u64 ctrl = 0, holder = 0, owner = 0, brain = 0, bound_inst = 0;
 };
-std::map<u64, FakeController> g_fake_ctrl;
-bool PlayerMode() {
-    // 4.4.22: LIGADO por padrao. E' o unico caminho em que o fantasma tem um controle de jogador de verdade - sem ele o
-    // jogo le os botoes de um controle que nao existe e o soco nunca acontece. LD_MP_PLAYERMODE=0 desliga (se der
-    // problema na troca de figura).
-    static const bool on = [] {
-        const char* v = std::getenv("LD_MP_PLAYERMODE");
-        return !(v && v[0] == '0' && v[1] == 0);
-    }();
-    return on;
-}
+std::map<int, FakeController> g_fake_ctrl;
+std::atomic<bool> g_player_mode{[] {
+    const char* v = std::getenv("LD_MP_PLAYERMODE");
+    return !(v && v[0] == '0' && v[1] == 0);
+}()};
 u64 GameAlloc(u64 size);
 
-FakeController* FakeControllerFor(u64 inst) {
-    auto it = g_fake_ctrl.find(inst);
-    if (it != g_fake_ctrl.end()) return &it->second;
+bool IsOurFakeCtrl(u64 ctrl) {
+    if (!ctrl) return false;
+    for (const auto& [k, fc] : g_fake_ctrl) {
+        if (fc.ctrl == ctrl) return true;
+    }
+    return false;
+}
+
+FakeController* FakeControllerFor(int slot_key, u64 inst) {
+    auto it = g_fake_ctrl.find(slot_key);
+    if (it != g_fake_ctrl.end() && it->second.ctrl && it->second.holder && it->second.owner && it->second.brain) {
+        FakeController& fc = it->second;
+        if (fc.bound_inst != inst) {
+            fc.bound_inst = inst;
+            At<u64>(fc.brain + 0xf8) = 0;
+            At<u64>(fc.brain + 0x100) = 0;
+            At<u16>(fc.brain + 0x114) = 0xffff;
+            At<u8>(fc.brain + 0x116) = 0;
+        }
+        At<u64>(fc.ctrl + 0x18) = fc.holder;
+        At<u64>(fc.ctrl + 0xd0) = fc.owner;
+        At<u64>(fc.ctrl + 0xd8) = fc.brain;
+        At<u64>(fc.ctrl + 0xf8) = inst + 0x370;
+        At<u8>(fc.ctrl + 0x218) = 1;
+        At<u64>(fc.holder + 0x80) = 0;
+        return &fc;
+    }
     const u64 p1 = At<u64>(reinterpret_cast<u64>(g_base) + kPlayerTable);
     const u64 src = p1 && Readable(p1 + 0x3a0, 8) ? At<u64>(p1 + 0x3a0) : 0;
-    if (!src || !Readable(src, 0x200)) return nullptr;
+    if (!src || !Readable(src, 0x280) || !kPlayerBrainCtorFn) return nullptr;
     const u64 src_holder = At<u64>(src + 0x18);
-    // o estado bruto do controle (+0x18) tem listas internas: o fantasma aponta para o do jogador 1 (so leitura)
-    const u64 c = GameAlloc(0x200), h = src_holder;
-    if (!c || !h) return nullptr;
-    std::memcpy(reinterpret_cast<void*>(c), reinterpret_cast<const void*>(src), 0x200);
+    const u64 src_owner = At<u64>(src + 0xd0);
+    if (!src_holder || !Readable(src_holder, 0x80) || !src_owner || !Readable(src_owner, 0x28)) return nullptr;
+    const u64 c = GameAlloc(0x2c0), h = GameAlloc(0x100), owner = GameAlloc(0x30), brain = GameAlloc(0x140);
+    if (!c || !h || !owner || !brain) return nullptr;
+    std::memset(reinterpret_cast<void*>(c), 0, 0x2c0);
+    std::memset(reinterpret_cast<void*>(h), 0, 0x100);
+    std::memset(reinterpret_cast<void*>(owner), 0, 0x30);
+    std::memset(reinterpret_cast<void*>(brain), 0, 0x140);
+    std::memcpy(reinterpret_cast<void*>(c), reinterpret_cast<const void*>(src), 0x280);
+    std::memcpy(reinterpret_cast<void*>(h), reinterpret_cast<const void*>(src_holder), 0x80);
+    std::memcpy(reinterpret_cast<void*>(owner), reinterpret_cast<const void*>(src_owner), 0x28);
+    At<u64>(owner + 0x08) = 0;
+    At<u64>(owner + 0x10) = 0;
+    At<u64>(owner + 0x18) = 0;
+    At<u64>(owner + 0x20) = c;
+    Call(kPlayerBrainCtorFn, brain, owner);
+    if (!At<u64>(brain)) return nullptr;
+    std::memset(reinterpret_cast<void*>(h), 0, 0x20);
+    std::memset(reinterpret_cast<void*>(h + 0x58), 0x80, 8);
+    At<u64>(h + 0x80) = 0; // sem controle fisico em +0x80: eboot+0xd710a2 nao sobrescreve botoes nem analogico
+    At<u64>(c + 0x18) = h;
+    At<u64>(c + 0xd0) = owner;
+    At<u64>(c + 0xd8) = brain;
+    std::memset(reinterpret_cast<void*>(c + 0xf8), 0, 0xc0);
     At<u64>(c + 0xf8) = inst + 0x370;
-    std::printf("[MP] fantasma %llx virou jogador: controle %llx (copia de %llx), botoes %llx\n",
+    At<u64>(c + 0x1f8) = 0;
+    At<u8>(c + 0x218) = 1;
+    At<u8>(c + 0x21a) = 0;
+    At<u64>(c + 0x228) = c;
+    At<u64>(c + 0x230) = 0;
+    std::printf("[MP] fantasma %llx ganhou PlayerParty %llx + PlayerBrain %llx + holder %llx\n",
                 static_cast<unsigned long long>(inst), static_cast<unsigned long long>(c),
-                static_cast<unsigned long long>(src), static_cast<unsigned long long>(h));
+                static_cast<unsigned long long>(brain), static_cast<unsigned long long>(h));
     std::fflush(stdout);
-    return &(g_fake_ctrl[inst] = FakeController{c, h});
+    return &(g_fake_ctrl[slot_key] = FakeController{c, h, owner, brain, inst});
+}
+
+// 4.4.23: eboot+0xd718ce..0xd71c02 transforma o analogico (holder+0x5a/0x5b) pela base ortonormal da camera ativa
+// (R_up = (cx, cz) de cam+0x90, R_right = (-cz, cx)) e curva de deadzone 42.5 + 85*m. A inversa exata elimina 100%
+// da interferencia do angulo da camera do jogador 1 na caminhada/voo do fantasma.
+void WriteCameraStick(u64 holder, int gear, float dx, float dz, bool active) {
+    u8 bx = 0x80, by = 0x80;
+    if (active && gear > 3 && std::isfinite(dx) && std::isfinite(dz)) {
+        const float dlen = std::hypot(dx, dz);
+        if (dlen > 0.01f) {
+            const float ux = dx / dlen, uz = dz / dlen;
+            float cx = 0.0f, cz = 1.0f;
+            if (g_main_camera_ptr) {
+                const u64 cam_ptr_addr = reinterpret_cast<u64>(g_base) + g_main_camera_ptr;
+                const u64 cam = Readable(cam_ptr_addr, 8) ? At<u64>(cam_ptr_addr) : 0;
+                if (cam && Readable(cam + 0x90, 12)) {
+                    const float fx = At<float>(cam + 0x90), fz = At<float>(cam + 0x98);
+                    const float flen = std::hypot(fx, fz);
+                    if (std::isfinite(flen) && flen > 0.01f) {
+                        cx = fx / flen;
+                        cz = fz / flen;
+                    }
+                }
+            }
+            const float sx_u = -ux * cz + uz * cx;
+            const float sy_u =  ux * cx + uz * cz;
+            const float m = gear == 4 ? 0.35f : (gear == 5 ? 0.65f : 1.0f);
+            const float rad = 42.5f + 85.0f * m;
+            bx = static_cast<u8>(std::clamp(static_cast<int>(std::lround(127.5f + rad * sx_u)), 1, 254));
+            by = static_cast<u8>(std::clamp(static_cast<int>(std::lround(127.5f - rad * sy_u)), 1, 254));
+        }
+    }
+    At<u8>(holder + 0x5a) = bx;
+    At<u8>(holder + 0x5b) = by;
 }
 
 HLE_SYSV_ABI u64 ControlHook(u64 inst, float dt) {
@@ -382,84 +524,73 @@ HLE_SYSV_ABI u64 ControlHook(u64 inst, float dt) {
     if (d) ++g_hook_driven;
     // 4.4.10: o personagem pode ter sido desfeito/trocado (troca de figura com Y, portal). Se a instancia nao e'
     // mais a nossa, nao escreve nada nela - era assim que o jogo caia ao trocar de personagem.
-    if (d && (!Readable(inst + 0x10, 8) || (d->name && At<u64>(inst + 0x10) != d->name))) d = nullptr;
-    if (d && PlayerMode()) {
-        if (FakeController* fc = FakeControllerFor(inst)) {
-            const bool moving = d->gear > 3;
+    if (d && (!Readable(inst + 0x10, 0x500) || (d->name && At<u64>(inst + 0x10) != d->name))) d = nullptr;
+    bool used_player_ctrl = false;
+    if (d && g_player_mode.load()) {
+        if (FakeController* fc = FakeControllerFor(d->slot_key, inst)) {
+            used_player_ctrl = true;
             At<u64>(inst + 0x3a0) = fc->ctrl;
-            // botoes: no controle (+0x24 segurados, +0x28 apertados agora, +0x2c soltos agora) e no estado bruto do
-            // controle (+0x18 -> +0 atual, +4 anterior, +8 apertados, +0xc soltos), como o do jogador 1
             const u32 pressed = d->held & ~d->prev, released = d->prev & ~d->held;
+            At<u32>(fc->holder + 0x00) = d->held;
+            At<u32>(fc->holder + 0x04) = d->prev;
+            At<u32>(fc->holder + 0x08) = pressed;
+            At<u32>(fc->holder + 0x0c) = released;
             At<u32>(fc->ctrl + 0x24) = d->held;
             At<u32>(fc->ctrl + 0x28) = pressed;
             At<u32>(fc->ctrl + 0x2c) = released;
-            // 4.4.22: o estado bruto do controle tambem (e' por ele que o jogo le o aperto de quadro em quadro)
             if (Readable(inst + 0x4f8, 0x18)) {
                 At<u32>(inst + 0x4f8 + 0xc) = d->held;
                 At<u32>(inst + 0x4f8 + 0x10) = pressed;
                 At<u32>(inst + 0x4f8 + 0x14) = released;
             }
             d->prev = d->held;
-            const bool walk = moving && !d->hold;
-            At<float>(fc->ctrl + 0x54) = walk ? 1.4f : 0.0f;
-            At<float>(fc->ctrl + 0x58) = walk ? d->dx : 0.0f;
-            At<float>(fc->ctrl + 0x5c) = walk ? d->dz : 0.0f;
+            const bool walk = d->gear > 3 && !d->hold && !d->punching;
+            WriteCameraStick(fc->holder, d->gear, d->dx, d->dz, walk);
             At<u8>(inst + 0x399) = 1;
-            const u64 result = g_control(inst, dt);
-            // 4.5: o analogico alimenta so a caminhada; a cara continua sendo a do outro jogo (sem isto o motor vira
-            // o personagem na direcao do analógico e o fantasma "anda de lado")
-            if (std::isfinite(d->fx) && std::isfinite(d->fz) && std::fabs(d->fx) + std::fabs(d->fz) > 0.01f) {
-                At<float>(inst + 0x170) = d->fx;
-                At<float>(inst + 0x178) = d->fz;
-            }
-            return result;
         }
     }
-    if (d) { // botoes antes: o pulo/ataque e lido dentro do controle
-        // 4.4.16: alem do estado bruto em inst+0x4f8, escreve no controle do personagem (inst+0x3a0) quando ele existe:
-        // era por ali que o jogo lia o "soco" (o pulo funcionava pelo caminho antigo, o soco no chao nao).
-        if (const u64 ctrl = Readable(inst + 0x3a0, 8) ? At<u64>(inst + 0x3a0) : 0; ctrl && Readable(ctrl + 0x18, 0x18)) {
-            const u32 pressed = d->held & ~d->prev, released = d->prev & ~d->held;
-            At<u32>(ctrl + 0x18) = d->held;
-            At<u32>(ctrl + 0x1c) = d->prev;
-            At<u32>(ctrl + 0x20) = pressed;
-            At<u32>(ctrl + 0x24) = d->held;
-            At<u32>(ctrl + 0x28) = pressed;
-            At<u32>(ctrl + 0x2c) = released;
+    if (d && !used_player_ctrl) {
+        if (Readable(inst + 0x3a0, 8) && IsOurFakeCtrl(At<u64>(inst + 0x3a0))) At<u64>(inst + 0x3a0) = 0;
+        const u32 pressed = d->held & ~d->prev, released = d->prev & ~d->held;
+        if (Readable(inst + 0x4f8, 0x18)) {
+            At<u32>(inst + 0x4f8 + 0xc) = d->held;
+            At<u32>(inst + 0x4f8 + 0x10) = pressed;
+            At<u32>(inst + 0x4f8 + 0x14) = released;
         }
-        At<u32>(inst + 0x4f8 + 0xc) = d->held;
-        At<u32>(inst + 0x4f8 + 0x10) = d->held & ~d->prev;
-        At<u32>(inst + 0x4f8 + 0x14) = d->prev & ~d->held;
         d->prev = d->held;
-        At<u8>(inst + 0x399) = 1; // sem isto o quadrado nao ataca (so durante o controle: fora dele trava o andar)
+        At<u8>(inst + 0x399) = 1; // so durante o g_control: fora dele trava o andar e faz ~Character roubar figuras
     }
     const u64 result = g_control(inst, dt);
-    if (d && d->punching) { // 4.4.21: durante o soco o motor manda na animacao (so a posicao vem do espelho)
-        At<u8>(inst + 0x399) = 0;
-        const u64 loc = At<u64>(inst + 0x90);
-        if (loc && Readable(loc + 0x70, 4)) At<u32>(loc + 0x70) = 0; // nao anda enquanto soca
-        return result;
+    if (!d) return result;
+    // 4.4.23: sempre zera inst+0x399 logo apos g_control (eboot+0xd6ab80 no ~Character rouba figuras ociosas se +0x399!=0)
+    At<u8>(inst + 0x399) = 0;
+    u32 local_ctx = ActiveContextHash(inst);
+    // 4.4.23: se o outro jogo ja pousou (Default) e o fantasma continuava em voo/planar, pousa na hora
+    if (d->ctx_hash == kCtxDefault && (local_ctx == kCtxFlying || local_ctx == kCtxGliding) && kSetActionFn) {
+        const s32 def_id = ContextIdByHash(kCtxDefault);
+        if (def_id >= 0) {
+            Call(kSetActionFn, inst, static_cast<u64>(def_id), 0, 0, 0xffffffffu);
+            local_ctx = kCtxDefault;
+        }
     }
-    if (d) { // marcha e direcao depois: o controle (IA) acabou de definir as dele
-        At<u8>(inst + 0x399) = 0;
-        const u64 loc = At<u64>(inst + 0x90);
-        if (loc) {
-            if (d->hold) At<float>(loc + 0x70) = 0.0f; // 4.4.9: parado de verdade (a posicao vem do espelho)
-            else if (d->speed > 0.0f) At<float>(loc + 0x70) = d->speed; // rapidez propria (alcanca o ponto recebido)
-            else At<u32>(loc + 0x70) = 0xff7fffffu; // rapidez = tabela da marcha
-            At<s32>(loc + 0x238) = d->gear;
-            if (d->gear > 3 && std::isfinite(d->dx) && std::isfinite(d->dz)) {
-                At<float>(loc + 0x80) = d->dx; // loc+0x80: SO a velocidade (direcao da caminhada)
-                At<float>(loc + 0x84) = 0.0f;
-                At<float>(loc + 0x88) = d->dz;
-            }
+    const bool in_action = d->punching || (local_ctx != 0 && local_ctx != kCtxDefault);
+    const u64 loc = Readable(inst + 0x90, 8) ? At<u64>(inst + 0x90) : 0;
+    if (in_action) {
+        if (d->punching && loc && Readable(loc + 0x70, 4)) At<u32>(loc + 0x70) = 0;
+    } else if (loc && Readable(loc + 0x70, 0x1d0)) {
+        if (d->hold) At<float>(loc + 0x70) = 0.0f;
+        else if (d->speed > 0.0f) At<float>(loc + 0x70) = d->speed;
+        else At<u32>(loc + 0x70) = 0xff7fffffu; // rapidez = tabela da marcha
+        At<s32>(loc + 0x238) = d->gear;
+        if (d->gear > 3 && std::isfinite(d->dx) && std::isfinite(d->dz)) {
+            At<float>(loc + 0x80) = d->dx; // espaco do mundo (eboot+0xd72248)
+            At<float>(loc + 0x84) = 0.0f;
+            At<float>(loc + 0x88) = d->dz;
         }
-        // 4.5: inst+0x170 e SO o rumo do corpo (a cara), que vem do outro jogo. A correcao de posicao vive em
-        // loc+0x80 - se ela for escrita aqui tambem, o fantasma anda de lado/gira ao corrigir a deriva lateral.
-        if (std::isfinite(d->fx) && std::isfinite(d->fz) && std::fabs(d->fx) + std::fabs(d->fz) > 0.01f) {
-            At<float>(inst + 0x170) = d->fx;
-            At<float>(inst + 0x178) = d->fz;
-        }
+    }
+    if (std::isfinite(d->fx) && std::isfinite(d->fz) && std::fabs(d->fx) + std::fabs(d->fz) > 0.01f) {
+        At<float>(inst + 0x170) = d->fx;
+        At<float>(inst + 0x178) = d->fz;
     }
     return result;
 }
@@ -1125,6 +1256,14 @@ HLE_SYSV_ABI u64 TriggerObstacleHook(u64 unused, u64 ctx, u64 who, u64 a, u64 b,
 }
 
 HLE_SYSV_ABI u64 RequestDtorHook(u64 request, u64 a, u64 b, u64 c, u64 d, u64 e) {
+    if (IsOurRequest(request) && Readable(request + 0x40, 8)) {
+        const u64 comp = At<u64>(request + 0x40);
+        const u64 inst = comp && Readable(comp + 0x20, 8) ? At<u64>(comp + 0x20) : 0;
+        if (inst && Readable(inst + 0x399, 0x10) && !IsLocalPlayer(inst)) {
+            At<u8>(inst + 0x399) = 0;
+            if (IsOurFakeCtrl(At<u64>(inst + 0x3a0))) At<u64>(inst + 0x3a0) = 0;
+        }
+    }
     LiveDrop(request); // o jogo desfez um fantasma (a figura do spawner saiu, a fase acabou...): o Tick ve e recria
     return g_dtor(request, a, b, c, d, e);
 }
@@ -1168,10 +1307,13 @@ bool LocalPlayerUses(const std::string& slot_name);
 // o fantasma: o motor liga o pedido ao mesmo personagem da party (inst+0x3a0), um dos dois some e a troca de figura
 // derruba o jogo. Se for o mesmo personagem que o jogador local usa, esta funcao devolve 0 e o Tick carrega o
 // personagem num "Player Load Slot" proprio (duas instancias isoladas).
+bool PortalSlotsAllowed();
+
 u64 FindLoadedSlot(const std::string& chr) {
     const std::string want = Lower(chr) + ".cd";
     u64 ours = 0;
     for (int i = 0; i < g_nall; ++i) {
+        if (!PortalSlotsAllowed() && i < g_nslots) continue; // 4.4.23: nunca usa slot do portal da mesa (so Player Load Slot)
         if (SlotState(i) != 1) continue;
         const std::string name = SlotName(i);
         if (name != want) continue;
@@ -1268,14 +1410,6 @@ bool OursFamily(const std::string& slot_name) { // da mesma familia de algum per
     return false;
 }
 
-bool LocalFamily(const std::string& slot_name) {
-    const std::string fam = Family(slot_name);
-    for (int j = 0; j < g_nall; ++j) {
-        if (SlotState(j) == 1 && !Ours(SlotName(j)) && Family(SlotName(j)) == fam) return true;
-    }
-    return false;
-}
-
 // A carga de um slot corre em segundo plano (NuBgProc, trabalho em slot+0x88) e continua mesmo depois de o pedido ser
 // solto (estado 2). Esvaziar o slot com a carga em andamento derrubava a NuBgProc (eboot+add9a0): era sempre no meio
 // da carga de uma variante que um fantasma pediu (Homer bravo, o proximo Doctor, o chi do Laval). Como o jogo
@@ -1285,16 +1419,18 @@ bool SlotJobDone(u64 slot) {
     return At<u64>(slot + 0x88 + 0x18) == 0; // trabalho em andamento (eboot+d193b0)
 }
 
+bool SlotUsedByLocalPlayer(u64 slot);
+
 void SlotMaintenance(double now) {
     for (int i = 0; i < g_nall; ++i) {
         const u64 slot = SlotAddress(i);
         const std::string name = SlotName(i);
         const bool loading_for_us = std::any_of(g_puppets.begin(), g_puppets.end(),
                                                 [&](const auto& e) { return e.second.stage == Stage::kLoading && e.second.slot == slot; });
-        // pedidos de variantes dos nossos personagens, ou que nenhuma figura do jogador explica (ex.: o proximo Doctor
-        // que o fantasma de um Doctor pede ao aparecer)
-        const bool cancelable = Ours(name) || !LocalFamily(name);
-        if (SlotState(i) != 2 || loading_for_us || !cancelable || LocalPlayerUses(name) || PuppetUses(slot)) {
+        // 4.4.23: NUNCA descarrega slots que o proprio jogador local pediu (carros ti_*, figuras recem-colocadas na
+        // mesa). So cancela reservas presas que vieram de personagens nossos (g_our_slots, Ours ou OursFamily).
+        const bool cancelable = g_our_slots.count(slot) != 0 || Ours(name) || OursFamily(name);
+        if (SlotState(i) != 2 || loading_for_us || !cancelable || SlotUsedByLocalPlayer(slot) || PuppetUses(slot)) {
             g_stuck_since[i] = 0;
             continue;
         }
@@ -1357,7 +1493,7 @@ bool RecycleSlot() {
             if (player != (pass == 0)) continue; // primeiro os de jogador
             const u64 slot = SlotAddress(i);
             const std::string name = SlotName(i);
-            if (SlotState(i) != 1 || !Ours(name) || !Settled(slot) || LocalPlayerUses(name)) continue;
+            if (SlotState(i) != 1 || (!g_our_slots.count(slot) && !Ours(name)) || !Settled(slot) || SlotUsedByLocalPlayer(slot)) continue;
             Log("[MP] liberando o slot de %s", name);
             Unload(slot);
             return true;
@@ -1384,7 +1520,7 @@ void ReclaimReserve(double now) {
     for (int i = 0; i < g_nslots; ++i) {
         const u64 slot = SlotAddress(i);
         const std::string name = SlotName(i);
-        if (SlotState(i) != 1 || !Ours(name) || LocalPlayerUses(name)) continue;
+        if (SlotState(i) != 1 || !Ours(name) || SlotUsedByLocalPlayer(slot)) continue;
         if (pass == 0 && !Settled(slot)) continue;
         if (pass == 1) { // em uso: tira os fantasmas agora; o slot e descarregado (passo 0) quando assentar
             for (auto& [id, p] : g_puppets) {
@@ -1416,7 +1552,7 @@ bool ReclaimForCloser(const Puppet& wanting, double now) {
     for (int i = 0; i < g_nall; ++i) {
         const u64 slot = SlotAddress(i);
         const std::string name = SlotName(i);
-        if (SlotState(i) != 1 || !Ours(name) || LocalPlayerUses(name)) continue;
+        if (SlotState(i) != 1 || (!g_our_slots.count(slot) && !Ours(name)) || SlotUsedByLocalPlayer(slot)) continue;
         float nearest = 1e9f;
         bool used = false;
         bool recent = false;
@@ -1497,6 +1633,12 @@ bool SlotUsedByLocalPlayer(u64 slot) {
     for (int i = 0; i < g_nall; ++i) {
         if (SlotAddress(i) != slot) continue;
         const std::string name = SlotName(i);
+        // 4.4.23: um Player Load Slot (i >= g_nslots) carregado por NOS (g_our_slots) e' dedicado ao fantasma, mesmo
+        // quando os dois jogadores usam o mesmo personagem (ex.: dois Batmans independentes).
+        if (i >= g_nslots) {
+            const auto it = g_our_slots.find(slot);
+            if (it != g_our_slots.end() && name == it->second + ".cd") return false;
+        }
         return !name.empty() && LocalPlayerUses(name);
     }
     return false;
@@ -1610,7 +1752,9 @@ bool Spawn(Puppet& p) {
     std::fflush(stdout);
     g_spawning = true;
     g_spawning_flag_for_load = true;
-    g_spawn(spawner, request, 1, 0, 0, 0);
+    // 4.4.23: flag = 0 (3o argumento edx em eboot+0x158c952): cria o personagem normalmente mas PULA 100% do registro
+    // Party::AddCharacter (0x14b4e30). O fantasma nunca entra na party local nem na roda de figuras (triangulo/Y).
+    g_spawn(spawner, request, 0, 0, 0, 0);
     g_spawning_flag_for_load = false;
     g_spawning = false;
     At<u64>(spawner + 0x1f0) = original_slot;
@@ -1621,10 +1765,14 @@ bool Spawn(Puppet& p) {
 bool PuppetAlive(const Puppet& p);
 
 void Despawn(Puppet& p) {
-    const u64 request = p.request, spawner = p.spawner;
+    const u64 request = p.request, spawner = p.spawner, inst = p.inst;
     // 4.4.12: se o personagem ja foi desfeito pelo jogo (troca de figura, portal, fim de fase), o pedido pode ter
     // sido reaproveitado por outra carga: nao chama o destrutor dele (derrubava o personagem do jogador / caia).
-    const bool alive = p.inst && PuppetAlive(p);
+    const bool alive = inst && PuppetAlive(p);
+    if (alive && !IsLocalPlayer(inst) && Readable(inst + 0x399, 0x10)) {
+        At<u8>(inst + 0x399) = 0;
+        if (IsOurFakeCtrl(At<u64>(inst + 0x3a0))) At<u64>(inst + 0x3a0) = 0;
+    }
     if (p.slot) g_slot_used[p.slot] = runtime::mp_net::Now();
     p.request = p.inst = p.inst_name = 0;
     p.stage = Stage::kNone;
@@ -1653,6 +1801,11 @@ void Despawn(Puppet& p) {
     }
 }
 
+bool IsVehicleName(const std::string& s) {
+    const std::string low = Lower(s);
+    return low.rfind("ti_", 0) == 0;
+}
+
 bool ParseRemote(const std::string& text, Remote* r) {
     std::vector<std::string> f;
     std::stringstream ss(text);
@@ -1679,9 +1832,10 @@ bool ParseRemote(const std::string& text, Remote* r) {
         std::stringstream party(f[15]);
         std::string one;
         while (std::getline(party, one, ';') && r->party.size() < 6) {
-            if (!one.empty() && one != "-" && one.size() < 48) r->party.push_back(one);
+            if (!one.empty() && one != "-" && one.size() < 48 && !IsVehicleName(one)) r->party.push_back(one);
         }
     }
+    r->ctx_hash = f.size() > 16 ? static_cast<u32>(std::strtoul(f[16].c_str(), nullptr, 16)) : 0;
     r->valid = std::isfinite(r->x) && std::isfinite(r->y) && std::isfinite(r->z);
     return r->valid;
 }
@@ -1781,7 +1935,7 @@ void Steer(Puppet& p, double now, Drive* d) {
     // 4.4.10: mundo -> espaco do corpo (o gancho espera x = lado, z = frente). LD_MP_MOVE=world|local fixa; sem a
     // variavel a convencao e' calibrada sozinha (ver a sonda na linha de status).
     const auto to_body = [&](float& dx, float& dz) {
-        if (!g_move_local) return;
+        if (!MoveSpaceLocal()) return;
         const float fx = d->fx, fz = d->fz;
         const float forward = dx * fx + dz * fz;
         const float side = dx * fz - dz * fx;
@@ -1791,6 +1945,7 @@ void Steer(Puppet& p, double now, Drive* d) {
     Teleport(p.inst, tx, ty, tz);
     d->inst = p.inst;
     d->name = p.inst_name;
+    d->ctx_hash = r.ctx_hash;
     // 4.4.10: a posicao continua sendo escrita aqui todo quadro (espelho), mas com rapidez e direcao de verdade: sem
     // isso o animador nao tem velocidade e toca a animacao de PARADO enquanto o boneco desliza. O erro de um quadro
     // de caminhada e' refeito no quadro seguinte pelo Teleport.
@@ -1798,10 +1953,34 @@ void Steer(Puppet& p, double now, Drive* d) {
     d->hold = false;
     d->gear = age < 3.0 ? r.gear : 3;
     d->held = age < 1.0 ? (r.held & kSentButtons) : 0;
+    // 4.4.23: se um toque rapido de ataque aconteceu entre dois pacotes de 50 ms, o ctx_hash ("Fighting" / "ConeAttack"
+    // / "SpecialMove") garante uma borda limpa de aperto para o PlayerBrain disparar o golpe aqui tambem.
+    const bool remote_attack = r.ctx_hash == kCtxFighting || r.ctx_hash == kCtxConeAttack || r.ctx_hash == kCtxSpecialMove;
+    if (age < 0.5 && remote_attack && !(d->held & kSquare) && !(p.prev_held & kSquare) && now >= p.punch_until) {
+        d->held |= (r.ctx_hash == kCtxSpecialMove ? 0x20002000u : kSquare);
+    }
+    // 4.4.23: quando o outro jogo ja entrou em voo ("Flying") e o fantasma ainda esta no chao/pulo, gera um pulso
+    // duplo limpo de X para o FlightComponent iniciar o voo real com os parametros da figura.
+    const u32 local_ctx = ActiveContextHash(p.inst);
+    if (age < 1.0 && r.ctx_hash == kCtxFlying && local_ctx != kCtxFlying) {
+        if (p.fly_pulse_start < 0 && now >= p.fly_cooldown) {
+            p.fly_pulse_start = now;
+            p.fly_cooldown = now + 1.2;
+        }
+    } else if (local_ctx == kCtxFlying || r.ctx_hash != kCtxFlying) {
+        p.fly_pulse_start = -100;
+    }
+    if (p.fly_pulse_start > 0) {
+        const double dt_fly = now - p.fly_pulse_start;
+        if (dt_fly < 0.06) d->held |= kCross;
+        else if (dt_fly < 0.13) d->held &= ~kCross;
+        else if (dt_fly < 0.22) d->held |= kCross;
+        else p.fly_pulse_start = -100;
+    }
     // 4.4.22: soco do outro jogo. O gancho forca a caminhada todo quadro e isso matava a animacao do soco no quadro
     // seguinte; durante a janela do soco o motor manda na animacao (a posicao continua vindo do espelho).
     if (const u32 pressed = d->held & ~p.prev_held; pressed & kSquare) {
-        p.punch_until = now + 0.7;
+        p.punch_until = now + 0.55;
         std::printf("[MP] soco do outro jogo (%s) botao %x\n", p.name.c_str(), pressed);
         std::fflush(stdout);
     }
@@ -1820,11 +1999,19 @@ void Steer(Puppet& p, double now, Drive* d) {
             d->fz = fz / n;
         }
     }
-    { // 4.4.12: o passo anda SEMPRE para frente, na direcao da cara. A posicao ja vem pronta do outro jogo (o
-        // Teleport acima poe o boneco no lugar certo); aqui so a ANIMACAO importa. Antes eu mandava a direcao real do
-        // movimento - quando ela era perpendicular a cara o jogo animava de lado, e o boneco deslizava de lado.
+    { // 4.4.23: direcao no espaco do MUNDO (eboot+0xd72248): prioriza o vetor de velocidade real enviado pelo outro
+        // jogo (loc+0x80/0x88), caindo para o deslocamento ou a cara. Assim andar reto e andar mirando funcionam sem
+        // puxar para +Z nem girar de lado com a camera do jogador 1.
         float dx = d->fx, dz = d->fz;
-        to_body(dx, dz); // no espaco do corpo vira (0, 1): frente pura
+        const float vlen = std::hypot(r.dx, r.dz);
+        if (std::isfinite(vlen) && vlen > 0.05f) {
+            dx = r.dx / vlen;
+            dz = r.dz / vlen;
+        } else if (mx != 0.0f || mz != 0.0f) {
+            dx = mx;
+            dz = mz;
+        }
+        to_body(dx, dz);
         d->dx = dx;
         d->dz = dz;
     }
@@ -1833,7 +2020,7 @@ void Steer(Puppet& p, double now, Drive* d) {
     p.last_dist = dist;
     p.last_wx = d->dx;
     p.last_wz = d->dz;
-    if (g_move_local) { // corpo -> mundo (para comparar no proximo quadro)
+    if (MoveSpaceLocal()) { // corpo -> mundo (para comparar no proximo quadro)
         const float fx = d->fx, fz = d->fz;
         const float w = d->dz;
         p.last_wx = d->dz * fx + d->dx * fz;
@@ -2195,7 +2382,7 @@ std::vector<std::string> LocalPartyNames(const std::string& active) {
         if (SlotState(i) != 1) continue;
         std::string name = SlotName(i);
         if (name.size() > 3 && name.compare(name.size() - 3, 3, ".cd") == 0) name.resize(name.size() - 3);
-        if (name.empty() || Lower(name) == Lower(active)) continue;
+        if (name.empty() || IsVehicleName(name) || Lower(name) == Lower(active)) continue;
         if (g_our_slots.count(SlotAddress(i))) continue; // slot que NOS carregamos para um fantasma
         out.push_back(name);
     }
@@ -2221,6 +2408,20 @@ void SendLocal(u64 p1, double now) {
     }
     g_in_world = true;
     g_seen_world = true; // 4.5: ja jogou num mundo (o seguidor de fase so age depois disto)
+    // 4.4.23: quando o jogador local esta dirigindo um veiculo ("ti_batmobile_1"...), extrai o motorista em p1+0xcc8
+    // (ou mantem a ultima figura valida) para nao mandar "ti_..." como personagem e nao plantar um carro travado la.
+    static std::string s_last_figure;
+    std::string sent_chr = LocalCharacter(p1);
+    if (IsVehicleName(sent_chr)) {
+        const u64 linked = Readable(p1 + 0xcc8, 8) ? At<u64>(p1 + 0xcc8) : 0;
+        if (linked && Readable(linked, 0x500) && At<u64>(linked) == reinterpret_cast<u64>(g_base) + kCharacterVtable) {
+            const std::string rider = LocalCharacter(linked);
+            if (!rider.empty() && !IsVehicleName(rider)) sent_chr = rider;
+        }
+        if (IsVehicleName(sent_chr)) sent_chr = s_last_figure.empty() ? std::string("-") : s_last_figure;
+    } else if (!sent_chr.empty()) {
+        s_last_figure = sent_chr;
+    }
     // 4.4.21: os botoes vem de varias fontes porque o jogo nao guarda o soco num lugar so: o controle do personagem
     // (party+0x24 segurados, +0x28 apertados agora) e o estado bruto apontado por party+0x18 (+0 atual / +4 anterior
     // / +8 apertados / +0xc soltos). Antes so uma delas era lida e o soco nunca chegava no outro lado.
@@ -2239,12 +2440,15 @@ void SendLocal(u64 p1, double now) {
     }
     held &= kSentButtons;
     g_last_held.store(held);
-    if (held != g_held_sent) { // 4.4.21: o soco so aparece aqui se o botao for lido; o log diz de onde ele vem
+    static const bool log_btn = std::getenv("LD_MP_DEBUG") != nullptr || std::getenv("LD_MP_ANIM") != nullptr;
+    if (held != g_held_sent) {
         g_held_sent = held;
-        std::printf("[MP] botoes do jogador local: %x\n", held);
-        std::fflush(stdout);
+        if (log_btn) {
+            std::printf("[MP] botoes do jogador local: %x\n", held);
+            std::fflush(stdout);
+        }
     }
-    {   // sonda: so quando muda (para caber no log), com as palavras cruas para eu ver de onde vem o soco
+    if (log_btn) {
         static u32 shown = 0xffffffffu;
         const u32 now_bits = held | raw[0] | (raw[2] << 8);
         if (now_bits != shown) {
@@ -2266,15 +2470,16 @@ void SendLocal(u64 p1, double now) {
         g_held_latch = 0;
     }
     std::string party_list; // 4.5.1: "nome;nome;nome" dos outros personagens equipados
-    for (const std::string& one : LocalPartyNames(LocalCharacter(p1))) {
+    for (const std::string& one : LocalPartyNames(sent_chr)) {
         if (!party_list.empty()) party_list += ';';
         party_list += one;
     }
-    std::snprintf(text, sizeof(text), "%s|%s|%.3f|%.3f|%.3f|%d|%.3f|%.3f|%.3f|%.3f|%x|1|%d|%s|%s|%s", area.c_str(),
-                  LocalCharacter(p1).c_str(), At<float>(t + 0x90), At<float>(t + 0x94), At<float>(t + 0x98),
+    const u32 ctx_hash = ActiveContextHash(p1);
+    std::snprintf(text, sizeof(text), "%s|%s|%.3f|%.3f|%.3f|%d|%.3f|%.3f|%.3f|%.3f|%x|1|%d|%s|%s|%s|%x", area.c_str(),
+                  sent_chr.c_str(), At<float>(t + 0x90), At<float>(t + 0x94), At<float>(t + 0x98),
                   At<s32>(loc + 0x238), At<float>(loc + 0x80), At<float>(loc + 0x88), At<float>(p1 + 0x170),
                   At<float>(p1 + 0x178), held | g_held_latch, runtime::mp_net::RttMs(), g_level_key.c_str(), LocalRegion().c_str(),
-                  party_list.c_str());
+                  party_list.c_str(), ctx_hash);
     runtime::mp_net::SetLocalState(text);
 }
 
@@ -2352,6 +2557,7 @@ bool ResolveFunctions(bool again = false) {
     }
     g_control_fn = control;
     for (u64* f : {&kSpawnFn, &kRequestDtorFn, &kRequestDeleteFn, &kSlotLoadFn, &kListPushFn, &kSlotStateFn, &kLevelSetupFn,
+                   &kPlayerBrainCtorFn, &kSetActionFn,
                    &kDescFn, &kAllocFn, &kFreeFn, &kFireEventFn, &kKillObjectFn, &kBlowUpFn, &kTriggerObstacleFn,
                    &kGotoLevelFn, &kLevelByIdFn, &kLevelValidFn, &kMsRequestFn, &kReformTriggerFn, &kBuildStartFn,
                    &kBuildUpdateFn}) { // (eboot+a0a770 nao tem prologo: fica fixo, antes da parte deslocada)
@@ -2362,6 +2568,25 @@ bool ResolveFunctions(bool again = false) {
         }
         *f = o;
     }
+    // 4.4.23: resolve g_ContextRegistry (RIP-relativo em kSetActionFn+0xc1) e g_main_camera_ptr (via call fn_getcam em
+    // g_control_fn + 0x117a -> primeiro lea rax, [rip+disp32]) de forma 100% independente de USA x EUR.
+    {
+        const u64 base = reinterpret_cast<u64>(g_base);
+        const u64 lea_reg = kSetActionFn + 0xc1;
+        if (Readable(base + lea_reg, 7) && g_base[lea_reg] == 0x48 && g_base[lea_reg + 1] == 0x8d && g_base[lea_reg + 2] == 0x05) {
+            const s64 disp = At<s32>(base + lea_reg + 3);
+            g_context_registry_ptr = static_cast<u64>(static_cast<s64>(lea_reg + 7) + disp);
+        }
+        const u64 call_getcam = g_control_fn + (0xd718aa - 0xd70730);
+        if (Readable(base + call_getcam, 5) && g_base[call_getcam] == 0xe8) {
+            const s64 call_disp = At<s32>(base + call_getcam + 1);
+            const u64 fn_getcam = static_cast<u64>(static_cast<s64>(call_getcam + 5) + call_disp);
+            if (Readable(base + fn_getcam, 7) && g_base[fn_getcam] == 0x48 && g_base[fn_getcam + 1] == 0x8d && g_base[fn_getcam + 2] == 0x05) {
+                const s64 cam_disp = At<s32>(base + fn_getcam + 3);
+                g_main_camera_ptr = static_cast<u64>(static_cast<s64>(fn_getcam + 7) + cam_disp);
+            }
+        }
+    }
     if (kSpawnFn != 0x158c2c0 || control != kControlFn) {
         std::printf("[MP] eboot com as funcoes deslocadas em %+lld bytes: enderecos ajustados\n",
                     static_cast<long long>(kSpawnFn) - static_cast<long long>(0x158c2c0));
@@ -2370,11 +2595,13 @@ bool ResolveFunctions(bool again = false) {
     // 4.4.15: mostra no log quais opcoes de teste estao ligadas (aparece na aba MULTIPLAYER do F9)
     {
         std::string opts = "MP ligado";
-        if (const char* v = std::getenv("LD_MP_PLAYERMODE")) opts += std::string(" | PLAYERMODE=1");
+        opts += g_player_mode.load() ? " | PLAYERMODE=1" : " | PLAYERMODE=0";
         if (const char* v = std::getenv("LD_MP_MOVE")) opts += std::string(" | MOVE=") + v;
         if (std::getenv("LD_MP_DEBUG")) opts += " | DEBUG=1";
         if (std::getenv("LD_MP_EVENTS")) opts += " | EVENTS=1";
-        std::printf("[MP] opcoes: %s\n", opts.c_str());
+        std::printf("[MP] opcoes: %s | ctx_reg=0x%llx cam=0x%llx\n", opts.c_str(),
+                    static_cast<unsigned long long>(g_context_registry_ptr),
+                    static_cast<unsigned long long>(g_main_camera_ptr));
         std::fflush(stdout);
     }
     g_last_error.clear();
@@ -2403,11 +2630,6 @@ void UnloadOurPortalSlots() {
         it = g_our_slots.erase(it);
     }
 }
-
-// 4.4.18: depois que o boneco do amigo existe, solta o slot dele (estado 3). Assim o personagem NAO aparece mais na
-// roda de figuras - era por ali que o jogador local conseguia equipar o personagem do outro. O port confere se o
-// boneco sobrevive: se o jogo desfizer o personagem ao soltar o slot, ele nunca mais tenta (LD_MP_UNLOAD=0 desliga).
-std::atomic<int> g_slot_unload_ok{0}; // 0 = ainda nao testado, 1 = funciona, -1 = nao funciona
 
 bool InstallHooks() {
     if (g_hooks_installed) return g_control && g_spawn && g_dtor;
@@ -2520,6 +2742,8 @@ std::string LastError() { return g_last_error; }
 void ClearLastError() { g_last_error.clear(); } // 4.4.6: abrir o F3 comeca uma tentativa nova (sem erro velho na tela)
 void SetFollowOwner(bool on) { g_follow_owner = on; }
 bool FollowOwnerEnabled() { return g_follow_owner; }
+void SetPlayerMode(bool on) { g_player_mode = on; }
+bool PlayerModeEnabled() { return g_player_mode; }
 
 void OnArea(const std::string& area) {
     if (!g_enabled) return;
@@ -3218,7 +3442,7 @@ void Tick() {
         // do mesmo mundo). Mesma fase = mesmo mundo. E a tolerancia do estado subiu para 10 s (engasgo do outro jogo).
         const bool same_world = p.cur.area == area || (!p.cur.level.empty() && p.cur.level == g_level_key);
         const bool want = settled && p.cur.valid && p.cur.ingame && same_world && now - p.cur_time < 10.0 &&
-                          p.cur.chr != "-" && !p.cur.chr.empty();
+                          p.cur.chr != "-" && !p.cur.chr.empty() && !IsVehicleName(p.cur.chr);
         p.want = want;
         // 4.2: chegou na nossa area ha 6 s (a lista de objetos dele ja esta pronta): o dono reenvia o que ja mudou aqui
         const bool here = settled && p.cur.valid && p.cur.ingame && same_world && now - p.cur_time < 10.0;
@@ -3279,11 +3503,7 @@ void Tick() {
                 }
                 break;
             }
-            if (u64 slot = FindLoadedSlot(p.cur.chr)) {
-                p.slot = slot;
-                p.standin = false;
-                p.stage = Stage::kReady;
-            } else if (CanLoad() && SomeoneLoading()) {
+            if (CanLoad() && SomeoneLoading()) {
                 // o jogo carrega um personagem por vez: espera a vez (enquanto isso so o nome aparece)
                 if (!p.wait_since) p.wait_since = now;
             } else if (LocalPlayerUses(Lower(p.cur.chr) + ".cd") && !FreePlayerSlot()) {
@@ -3376,20 +3596,8 @@ void Tick() {
                 p.inst_name = At<u64>(inst + 0x10);
                 p.stage = Stage::kActive;
                 p.stage_time = now;
-                // 4.4.18: tira a figura da roda (o boneco continua vivo, so o slot e' que nao fica carregado)
-                if (!p.slot_released && p.slot && g_slot_unload_ok.load() >= 0 && kSlotStateFn) {
-                    static const bool unload_env = [] {
-                        const char* v = std::getenv("LD_MP_UNLOAD");
-                        return !(v && std::strcmp(v, "0") == 0);
-                    }();
-                    if (unload_env) {
-                        p.slot_released = true;
-                        p.release_check = now + 1.5;
-                        Call(kSlotStateFn, p.slot, 3, 0);
-                        std::printf("[MP] soltei o slot de %s: o personagem sai da roda de figuras\n", p.cur.chr.c_str());
-                        std::fflush(stdout);
-                    }
-                }
+                // 4.4.23: com flag = 0 no Spawn, o fantasma nunca entra na party nem na roda de figuras. O slot
+                // (Player Load Slot dedicado) permanece carregado (estado 1) para os assets do boneco nunca sumirem.
                 Teleport(inst, p.cur.x, p.cur.y, p.cur.z);
                 Log("[MP] %s apareceu como %s", p.name, LocalCharacter(inst));
                 // nome que o jogo nao conhece como figura (ex.: Wheatley): o descritor cai no personagem do spawner.
@@ -3410,53 +3618,21 @@ void Tick() {
             break;
         }
         case Stage::kActive: {
-            // 4.4.18: o slot foi solto de proposito: confere se o boneco sobreviveu a isso
-            if (p.slot_released && p.release_check && now > p.release_check) {
-                p.release_check = 0;
-                if (PuppetAlive(p)) {
-                    if (g_slot_unload_ok.load() != 1) {
-                        g_slot_unload_ok.store(1);
-                        std::printf("[MP] soltar o slot funciona: o boneco continua de pe e a figura sai da roda\n");
-                        std::fflush(stdout);
-                    }
-                } else {
-                    g_slot_unload_ok.store(-1);
-                    std::printf("[MP] soltar o slot desfaz o boneco: nao solto mais (a figura fica na roda)\n");
-                    std::fflush(stdout);
-                }
-            }
-            // 4.4.14: o jogador local entrou no personagem que o fantasma usa (figura livre na roda): larga o fantasma
-            // no mesmo quadro, sem chamar nada do jogo. Era isso que derrubava o jogo (as duas coisas usando a mesma
-            // instancia/pedido).
-            if (!p.cur.chr.empty() && LocalPlayerUses(Lower(p.cur.chr) + ".cd")) {
+            if (IsLocalPlayer(p.inst)) {
                 LiveDrop(p.request);
-                p.request = 0;
-                p.inst = p.inst_name = 0;
+                p.request = p.inst = p.inst_name = 0;
                 p.stage = Stage::kNone;
-                p.retry_time = now + 5.0;
-                Log("[MP] o jogador local pegou o personagem %s: soltando o fantasma de %s", p.cur.chr, p.name);
+                p.retry_time = now + 3.0;
                 break;
             }
-            // 4.4.12: o slot do fantasma deixou de ser nosso (o jogador pos um personagem nele ou removeu o dele):
-            // solta o fantasma SEM chamar o destrutor do jogo - era isso que fazia o personagem do jogador sumir e
-            // o jogo cair ao mexer no menu de figuras (Y).
-            if (p.slot && !p.slot_released) {
-                int idx = -1;
-                for (int i = 0; i < g_nall; ++i) {
-                    if (SlotAddress(i) == p.slot) {
-                        idx = i;
-                        break;
-                    }
-                }
-                const std::string name = idx >= 0 ? SlotName(idx) : std::string();
-                if (idx < 0 || SlotState(idx) != 1 || name.empty() || LocalPlayerUses(name)) {
-                    LiveDrop(p.request);
-                    p.request = 0;
-                    p.inst = p.inst_name = 0;
-                    p.stage = Stage::kNone;
+            if (p.slot) {
+                const int sidx = SlotIndexOf(p.slot);
+                const std::string name = sidx >= 0 ? SlotName(sidx) : std::string();
+                if (sidx < 0 || SlotState(sidx) != 1 || name.empty() || SlotUsedByLocalPlayer(p.slot)) {
+                    Log("[MP] slot do fantasma de %s mudou de estado/dono: desfazendo o boneco", p.name);
+                    Despawn(p);
                     p.load_fail_time = 0;
-                    p.retry_time = now + 3.0;
-                    Log("[MP] slot do fantasma de %s mudou de dono: soltando o boneco", p.name);
+                    p.retry_time = now + 2.0;
                     break;
                 }
             }
@@ -3470,21 +3646,9 @@ void Tick() {
             const u64 local_party = p1 && Readable(p1 + 0x3a0, 8) ? At<u64>(p1 + 0x3a0) : 0;
             if (local_party && Readable(p.inst + 0x3a0, 8) && At<u64>(p.inst + 0x3a0) == local_party) {
                 Despawn(p);
-                if (++p.clashes >= 1) { // 4.4.10: na primeira vez ja entra como substituto (antes eram 3 tentativas)
-                    if (u64 slot = StandInSlot()) {
-                        p.slot = slot;
-                        p.standin = true;
-                        p.stage = Stage::kReady;
-                        p.retry_time = 0;
-                        Log("[MP] %s fica como substituto (party do jogador local): %s", p.cur.chr, p.name);
-                    } else {
-                        p.retry_time = now + 10.0;
-                    }
-                } else {
-                    Log("[MP] %s ficou com a party do jogador local: desfazendo o fantasma", p.name);
-                    p.retry_time = now + 2.0;
-                    p.load_fail_time = 0;
-                }
+                Log("[MP] %s ficou com a party do jogador local: desfazendo o fantasma", p.name);
+                p.retry_time = now + 2.0;
+                p.load_fail_time = 0;
                 break;
             }
             // o amigo trocou de personagem: refaz o fantasma (se o novo ja esta carregado ou cabe num slot)
@@ -3508,8 +3672,10 @@ void Tick() {
             }
             if (now - p.stage_time > 1.5 && g_drive_count < kMaxPuppets) { // deixa a chegada pelo portal terminar
                 Drive& d = g_drive[g_drive_count];
+                d.slot_key = key;
                 d.hold = false; // 4.4.9: zera antes do Steer (a struct e' reaproveitada de quadros anteriores)
                 d.name = 0;
+                d.ctx_hash = 0;
                 d.speed = 0.0f;
                 d.dx = d.dz = 0.0f;
                 u32 prev = 0;
@@ -3525,10 +3691,9 @@ void Tick() {
         }
         } // 4.5.1: fim dos personagens da party deste amigo
     }
-    // 4.4.18: sonda das opcoes de animacao/dano. Com LD_MP_ANIM=1 o port compara, a cada 250 ms, os campos do
-    // personagem do jogador 1 (inst+0x100..0x400) e mostra no log o que mudou - anotando o que voce faz na hora
-    // (andar, voar, socar, levar dano) da' para achar os campos de animacao e de dano.
-    if (p1) { // 4.4.20: sonda sempre ligada, 2 linhas por segundo, so o que muda (vai para o log da sessao)
+    // 4.4.18 / 4.4.23: sonda das opcoes de animacao/dano apenas com LD_MP_ANIM=1 (evita logs de dezenas de MB por sessao).
+    static const bool log_anim_probe = std::getenv("LD_MP_ANIM") != nullptr;
+    if (log_anim_probe && p1) {
         // 4.4.21: janela inst+0x000..0x800 (a animacao nao estava em 0x100..0x400) e rajada de 1 s quando um botao
         // muda, para o soco aparecer no log com o campo que ele mexe.
         static u32 prev[0x200];

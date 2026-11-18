@@ -40,4 +40,8 @@ std::string DebugSummary();
 void SetFollowOwner(bool on);
 bool FollowOwnerEnabled();
 
+// 4.4.23: controle real de jogador nos fantasmas (soco, pulo, voo e quebra de objetos; padrao: ligado)
+void SetPlayerMode(bool on);
+bool PlayerModeEnabled();
+
 } // namespace runtime::multiplayer
