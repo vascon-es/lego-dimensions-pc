@@ -253,10 +253,11 @@ std::map<int, Puppet> g_puppets; // so a thread principal mexe
 // 4.4.8: a direcao que o gancho de controle recebe e' do mundo ou do espaco do corpo? O jogo nao documenta, entao o
 // port descobre sozinho: se o fantasma anda perpendicular ao que foi mandado (de lado), troca a convencao. O
 // LD_MP_MOVE=world|local fixa uma delas para teste.
-std::atomic<bool> g_move_local{false};
-// 4.4.18: padrao = espaco do MUNDO. No modo "corpo" o jogo nao girava o personagem no chao (ele orienta o corpo pela
-// direcao da caminhada, que e' do mundo). O painel F4 troca na hora (auto / corpo / mundo).
-std::atomic<int> g_move_mode{2};
+std::atomic<bool> g_move_local{true};
+// 4.4.19: padrao = espaco do CORPO (foi o que andou melhor nos testes). A direcao que vai para o motor e' o
+// deslocamento real do outro jogador convertido para esse espaco - estavel e sem realimentacao. O painel F4 troca na
+// hora e manda para a sala (auto / corpo / mundo).
+std::atomic<int> g_move_mode{1};
 std::atomic<int> g_vote_world{0}, g_vote_local{0}; // 4.4.11: votos da convencao da direcao (decide uma vez)
 std::atomic<int> g_move_probe_n{0};
 std::atomic<float> g_move_probe_dot{0.0f};
@@ -1086,9 +1087,11 @@ HLE_SYSV_ABI u64 MsRequestHook(u64 obj, u64 state, u64 param, u64 force, u64 imm
 }
 
 HLE_SYSV_ABI u64 TriggerObstacleHook(u64 unused, u64 ctx, u64 who, u64 a, u64 b, u64 c) {
-    if (!g_applying && g_enabled && ValidGadget(ctx) && IsLocalPlayer(who)) {
+    // 4.4.19: vale para QUALQUER objeto com nome (alavanca, valvula, botao), nao so os de "obstaculo": era por isso
+    // que algumas interacoes nao apareciam no outro jogo.
+    if (!g_applying && g_enabled && ctx && Readable(ctx, 8) && IsLocalPlayer(who)) {
         const std::string name = GadgetName(ctx);
-        if (!name.empty()) {
+        if (name.size() >= 3) { // 4.4.19: nome de verdade (evita lixo de objeto que nao e' interativo)
             const std::vector<u64> same = GadgetsNamed(name);
             const auto it = std::find(same.begin(), same.end(), ctx);
             const int order = it == same.end() ? 0 : static_cast<int>(it - same.begin());
@@ -1856,12 +1859,16 @@ void Steer(Puppet& p, double now, Drive* d) {
         d->fx = std::sin(p.face_ang);
         d->fz = std::cos(p.face_ang);
     }
-    { // 4.4.12: o passo anda SEMPRE para frente, na direcao da cara. A posicao ja vem pronta do outro jogo (o
-        // Teleport acima poe o boneco no lugar certo); aqui so a ANIMACAO importa. Antes eu mandava a direcao real do
-        // movimento - quando ela era perpendicular a cara o jogo animava de lado, e o boneco deslizava de lado.
-        VoteDirection(r, mx, mz, d->fx, d->fz); // calibra o espaco uma vez (mundo x corpo)
+    { // 4.4.19: a direcao do passo e' o DESLOCAMENTO do outro jogador (mx, mz), convertido para o espaco escolhido
+        // (F4). E' estavel: nao depende da correcao de posicao, entao nao fica alternando. Parado, anda "para frente"
+        // na cara dele.
+        VoteDirection(r, mx, mz, d->fx, d->fz); // calibra o espaco uma vez (so no modo automatico)
         float dx = d->fx, dz = d->fz;
-        to_body(dx, dz); // no espaco do corpo vira (0, 1): frente pura
+        if (mx != 0.0f || mz != 0.0f) {
+            dx = mx;
+            dz = mz;
+        }
+        to_body(dx, dz);
         d->dx = dx;
         d->dz = dz;
     }
