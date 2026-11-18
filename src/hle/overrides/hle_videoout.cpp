@@ -845,18 +845,12 @@ enum MpOption {
     kMpOptInvite = -5,
     kMpOptLeave = -6,
     kMpOptChat = -7,
-    kMpOptMove = -8, // 4.4.17: espaco da direcao da caminhada (auto / corpo / mundo), vale para a sala toda
     kMpLeftBase = -100,
 };
 
 bool MpIsOption(int id) { return id <= 0 && id > kMpLeftBase; }
 bool MpIsToggle(int id) { return id == kMpOptLock || id == kMpOptFollow || id == kMpOptP2P; }
 
-// 4.4.17: texto da linha da direcao, com o valor atual (auto / corpo / mundo)
-std::string MpMoveLabel() {
-    const std::string cur = runtime::multiplayer::MoveModeName();
-    return lang::Pt() ? ("DIRECAO DO PASSO: " + cur) : ("WALK DIRECTION: " + cur);
-}
 
 void MpLoadOptions() { // 4.1.1 / Fase 82: opcoes guardadas no launcher.ini
     static bool loaded = false;
@@ -895,7 +889,6 @@ std::vector<MpRow> MpRows() {
     }
     rows.push_back({kMpOptP2P, pt ? "CONEXAO DIRETA (P2P)" : "DIRECT CONNECTION (P2P)", false});
     rows.push_back({kMpOptFollow, pt ? "SEGUIR O DONO (CAMPANHA JUNTO)" : "FOLLOW THE OWNER (CAMPAIGN)", false});
-    rows.push_back({kMpOptMove, MpMoveLabel(), false}); // 4.4.17
     if (online && MpIsOwner()) rows.push_back({kMpOptLock, pt ? "TRANCAR A REDE" : "LOCK THE NETWORK", false});
     rows.push_back({kMpOptCreate, pt ? "CRIAR REDE NOVA" : "CREATE A NEW NETWORK", false});
     rows.push_back({kMpOptJoin, pt ? "ENTRAR EM UMA REDE (F3)" : "JOIN A NETWORK (F3)", false});
@@ -1007,10 +1000,6 @@ void MpActivate(bool kick = false) {
         return;
     case kMpOptChat:
         MpStartChat();
-        return;
-    case kMpOptMove: // 4.4.17: auto -> corpo -> mundo; o valor vai para a sala (os dois lados mudam juntos)
-        runtime::multiplayer::SetMoveMode((runtime::multiplayer::MoveMode() + 1) % 3);
-        log::Tagged("MP", "walk direction: %s", runtime::multiplayer::MoveModeName().c_str());
         return;
     case kMpOptInvite:
         MpCopyInvite();
