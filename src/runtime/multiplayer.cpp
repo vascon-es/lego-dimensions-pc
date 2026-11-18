@@ -239,6 +239,8 @@ struct Puppet {
     std::string dropped_for_local; // 4.4.14: (reservado) personagem que o jogador local tomou
     bool slot_released = false;    // 4.4.18: ja soltou o slot depois de criar o boneco (para sair da roda)
     double release_check = 0;      // 4.4.18: quando conferir se o boneco sobreviveu ao slot solto
+    int gear_shown = 3;            // 4.4.13/4.4.21: marcha mostrada (so troca depois de 80 ms estavel)
+    double gear_time = 0;          // 4.4.13: desde quando a marcha nova esta pedindo para entrar
     double punch_until = 0;        // 4.4.21: ate quando o motor toca o soco do outro jogo (sem forcar a marcha)
     u32 prev_held = 0;
     float face_ang = 0.0f;         // 4.4.16: cara suavizada (angulo)
@@ -2253,17 +2255,15 @@ void SendLocal(u64 p1, double now) {
     g_last_held.store(held);
     if (held != g_held_sent) { // 4.4.21: o soco so aparece aqui se o botao for lido; o log diz de onde ele vem
         g_held_sent = held;
-        std::printf("[MP] botoes do jogador local: %x
-", held);
+        std::printf("[MP] botoes do jogador local: %x\n", held);
         std::fflush(stdout);
     }
     {   // sonda: so quando muda (para caber no log), com as palavras cruas para eu ver de onde vem o soco
         static u32 shown = 0xffffffffu;
-        const u32 now_bits = held | (raw[0] & 0xffffff) << 0;
+        const u32 now_bits = held | raw[0] | (raw[2] << 8);
         if (now_bits != shown) {
             shown = now_bits;
-            std::printf("[BTN] %x | controle: %x %x %x %x | bruto: %x %x %x %x
-", held,
+            std::printf("[BTN] %x | controle: %x %x %x %x | bruto: %x %x %x %x\n", held,
                         party && Readable(party + 0x18, 0x18) ? At<u32>(party + 0x1c) : 0,
                         party && Readable(party + 0x18, 0x18) ? At<u32>(party + 0x20) : 0,
                         party && Readable(party + 0x18, 0x18) ? At<u32>(party + 0x24) : 0,
