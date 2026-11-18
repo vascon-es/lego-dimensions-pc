@@ -63,7 +63,9 @@ u64 kSlotStateFn = 0x157cdd0; // (slot, estado, 0): 0 = cancela pedido / esvazia
 u64 kLevelSetupFn = 0x1577ba0; // prepara a memoria dos slots ao carregar a fase (rdi = config, +0x233)
 
 constexpr u32 kCross = 0x40004000, kSquare = 0x10008000; // mascara de botoes do jogo
-constexpr u32 kSentButtons = kCross | kSquare;           // pulo e ataque
+// 4.4.21: os quatro botoes de face (nas duas metades da palavra). Antes so cruz e quadrado eram copiados e o soco
+// dependia de um bit que pode nao ser o mesmo em toda figura; agora o que o outro apertar chega inteiro.
+constexpr u32 kSentButtons = 0xf000f000;
 constexpr int kMaxPuppets = 24;   // 4.5.1: cada amigo pode aparecer com mais de um personagem (a party dele)
 constexpr int kPuppetStride = 16; // chave no mapa dos fantasmas: id do amigo * 16 + indice do personagem
 // 4.5.1: quantos personagens de cada amigo aparecem ao mesmo tempo. Com 2 pessoas na sala: 6 de cada (sobra sempre
@@ -237,6 +239,8 @@ struct Puppet {
     std::string dropped_for_local; // 4.4.14: (reservado) personagem que o jogador local tomou
     bool slot_released = false;    // 4.4.18: ja soltou o slot depois de criar o boneco (para sair da roda)
     double release_check = 0;      // 4.4.18: quando conferir se o boneco sobreviveu ao slot solto
+    double punch_until = 0;        // 4.4.21: ate quando o motor toca o soco do outro jogo (sem forcar a marcha)
+    u32 prev_held = 0;
     float face_ang = 0.0f;         // 4.4.16: cara suavizada (angulo)
     bool have_face = false;
     bool have_last = false;
@@ -290,6 +294,7 @@ struct Drive {
     float dx, dz, fx, fz;
     u32 held, prev;
     bool hold = false; // 4.4.9: espelho puro - rapidez 0 e a posicao vem do Teleport (nada de IA andando sozinha)
+    bool punching = false; // 4.4.21: o outro jogo socou - o motor toca a animacao, o gancho nao forca a marcha
     u64 name = 0;      // 4.4.10: inst+0x10 do fantasma (se mudou, o personagem morreu/trocou: nao mexer)
 };
 
@@ -303,6 +308,8 @@ int g_drive_count = 0;
 double g_last_spawn = 0;
 u32 g_held_latch = 0;
 double g_held_latch_time = 0;
+std::atomic<u32> g_last_held{0};
+u32 g_held_sent = 0; // 4.4.21: ultimo botao enviado (a sonda usa para dar a rajada no soco)
 unsigned g_seen_epoch = 0;
 double g_last_log = 0;
 
@@ -413,6 +420,12 @@ HLE_SYSV_ABI u64 ControlHook(u64 inst, float dt) {
         At<u8>(inst + 0x399) = 1; // sem isto o quadrado nao ataca (so durante o controle: fora dele trava o andar)
     }
     const u64 result = g_control(inst, dt);
+    if (d && d->punching) { // 4.4.21: durante o soco o motor manda na animacao (so a posicao vem do espelho)
+        At<u8>(inst + 0x399) = 0;
+        const u64 loc = At<u64>(inst + 0x90);
+        if (loc && Readable(loc + 0x70, 4)) At<u32>(loc + 0x70) = 0; // nao anda enquanto soca
+        return result;
+    }
     if (d) { // marcha e direcao depois: o controle (IA) acabou de definir as dele
         At<u8>(inst + 0x399) = 0;
         const u64 loc = At<u64>(inst + 0x90);
@@ -1714,51 +1727,19 @@ void Steer(Puppet& p, double now, Drive* d) {
         }
     }
     const double latency = runtime::mp_net::LatencySeconds(p.peer, r.rtt_ms); // Fase 82: direto (P2P) ou pelo servidor
-    // 4.4.17: desenha ~100 ms atras (LD_MP_DELAY em ms) e interpola entre os DOIS estados que cercam esse instante.
-    // Antes so existiam "o pacote anterior e o atual": com qualquer atraso maior que o intervalo dos pacotes a posicao
-    // pulava (mini-flicks). Um decimo de segundo de atraso extra e' invisivel e deixa o movimento liso.
-    static const double shown_delay = [] {
-        const char* v = std::getenv("LD_MP_DELAY");
-        const double ms = v ? std::atof(v) : 100.0;
-        return std::clamp(ms, 0.0, 400.0) / 1000.0;
-    }();
-    const double shown = now - latency - shown_delay;
+    // 4.4.7: mostra o outro onde ele REALMENTE estava quando o pacote saiu (agora - metade da ida e volta) e caminha
+    // entre o pacote anterior e o atual. Antes era so "pacote + velocidade x atraso": a posicao pulava a cada pacote.
+    const double shown = now - latency;
     float tx = r.x, ty = r.y, tz = r.z;
-    float face_x = r.fx, face_z = r.fz;
-    bool from_hist = false;
-    for (size_t i = 0; i + 1 < p.hist.size(); ++i) {
-        const double t0 = p.hist[i].first, t1 = p.hist[i + 1].first;
-        if (t1 <= t0 || shown > t1) continue;
-        const double a = std::clamp((shown - t0) / (t1 - t0), 0.0, 1.0);
-        const Remote& A = p.hist[i].second;
-        const Remote& B = p.hist[i + 1].second;
-        tx = static_cast<float>(A.x + (B.x - A.x) * a);
-        ty = static_cast<float>(A.y + (B.y - A.y) * a);
-        tz = static_cast<float>(A.z + (B.z - A.z) * a);
-        if ((A.fx != 0.0f || A.fz != 0.0f) && (B.fx != 0.0f || B.fz != 0.0f)) {
-            const float a0 = std::atan2(A.fx, A.fz), a1 = std::atan2(B.fx, B.fz);
-            float d = a1 - a0;
-            while (d > 3.14159265f) d -= 6.28318531f;
-            while (d < -3.14159265f) d += 6.28318531f;
-            const float ang = a0 + d * static_cast<float>(a);
-            face_x = std::sin(ang);
-            face_z = std::cos(ang);
-        }
-        from_hist = true;
-        break;
-    }
-    if (!from_hist && !p.hist.empty()) { // mais novo que o ultimo pacote: fica nele (espera, nao adivinha)
-        const Remote& last = p.hist.back().second;
-        tx = last.x;
-        ty = last.y;
-        tz = last.z;
-        if (last.fx != 0.0f || last.fz != 0.0f) {
-            face_x = last.fx;
-            face_z = last.fz;
-        }
-        from_hist = true;
-    }
-    if (!from_hist) {
+    if (p.prev.valid && p.cur_time > p.prev_time + 0.001) {
+        const double span = p.cur_time - p.prev_time;
+        double a = (shown - p.prev_time) / span;
+        const double ahead = age > 0.3 ? 1.0 : 1.35; // 4.4.13: sem pacote novo, nao extrapola (evita ir e voltar)
+        a = std::clamp(a, 0.0, ahead);
+        tx = static_cast<float>(p.prev.x + (r.x - p.prev.x) * a);
+        ty = static_cast<float>(p.prev.y + (r.y - p.prev.y) * a);
+        tz = static_cast<float>(p.prev.z + (r.z - p.prev.z) * a);
+    } else {
         const float lead = static_cast<float>(std::clamp(age + latency, 0.0, 0.5));
         tx += vx * lead;
         tz += vz * lead;
@@ -1771,6 +1752,9 @@ void Steer(Puppet& p, double now, Drive* d) {
         d->dx = d->dz = 0.0f;
         d->fx = d->fz = 0.0f;
         d->held = d->prev = 0;
+        d->punching = false;
+        p.prev_held = 0;
+        p.punch_until = 0;
         return;
     }
     const float px = At<float>(t + 0x90), py = At<float>(t + 0x94), pz = At<float>(t + 0x98);
@@ -1798,23 +1782,61 @@ void Steer(Puppet& p, double now, Drive* d) {
     // de caminhada e' refeito no quadro seguinte pelo Teleport.
     d->speed = 0.0f; // 0 = a rapidez da tabela da marcha (e' dela que sai a animacao)
     d->hold = false;
-    d->gear = age < 3.0 ? r.gear : 3; // 4.4.14: volta a marcha direta do outro jogo (a histerese travava o passo)
+    // 4.4.13: a marcha vinha trocando a cada pacote (parado/correndo/parado) e o passo "gaguejava". So aceita a
+    // marcha nova quando ela se mantem por 80 ms.
+    if (now >= p.punch_until && r.gear != p.gear_shown) {
+        if (!p.gear_time) p.gear_time = now;
+        if (now - p.gear_time > 0.08) {
+            p.gear_shown = r.gear;
+            p.gear_time = 0;
+        }
+    } else {
+        p.gear_time = 0;
+    }
+    d->gear = age < 3.0 ? p.gear_shown : 3;
     d->held = age < 1.0 ? (r.held & kSentButtons) : 0;
+    // 4.4.21: o soco do outro jogo. Enquanto a janela durar, o gancho NAO forca marcha/rapidez/direcao: era isso que
+    // cancelava a animacao do soco no quadro seguinte (o personagem voltava para "andando" antes de bater).
+    if (const u32 pressed = d->held & ~p.prev_held; pressed & kSquare) {
+        p.punch_until = now + 0.7;
+        std::printf("[MP] soco do outro jogo (%s)\n", p.name.c_str());
+        std::fflush(stdout);
+    }
+    p.prev_held = d->held;
+    d->punching = now < p.punch_until;   // 4.4.21: o gancho nao forca a caminhada nesta janela
+    if (d->punching) d->gear = 3;        // parado: o motor toca o soco
     {
-        // 4.4.20: cara direto do pacote (como na 4.4.12).
-        if (std::isfinite(face_x) && std::isfinite(face_z) && std::fabs(face_x) + std::fabs(face_z) > 0.01f) {
-            const float nrm = std::sqrt(face_x * face_x + face_z * face_z);
-            d->fx = face_x / nrm;
-            d->fz = face_z / nrm;
-        } else { // sem rumo no pacote: a cara segue o deslocamento
+        float fx = r.fx, fz = r.fz;
+        // 4.4.13: a cara tambem e' interpolada entre os dois pacotes (menor arco), como a posicao. Antes ela saltava
+        // a cada pacote e o boneco ficava "piscando" de lado quando o outro girava.
+        if (p.prev.valid && (p.prev.fx != 0.0f || p.prev.fz != 0.0f) && p.cur_time > p.prev_time + 0.001 &&
+            std::isfinite(r.fx) && std::isfinite(r.fz)) {
+            const double span = p.cur_time - p.prev_time;
+            double a = (shown - p.prev_time) / span;
+            a = std::clamp(a, 0.0, 1.0 + 0.35);
+            const float a0 = std::atan2(p.prev.fx, p.prev.fz), a1 = std::atan2(r.fx, r.fz);
+            float d = a1 - a0;
+            while (d > 3.14159265f) d -= 6.28318531f;
+            while (d < -3.14159265f) d += 6.28318531f;
+            const float ang = a0 + d * static_cast<float>(a);
+            fx = std::sin(ang);
+            fz = std::cos(ang);
+        }
+        const float n = std::sqrt(fx * fx + fz * fz);
+        if (!std::isfinite(n) || n < 0.01f) { // sem rumo no pacote: a cara segue o deslocamento
             const float ax = (mx != 0.0f || mz != 0.0f) ? mx : 1.0f, az = (mx != 0.0f || mz != 0.0f) ? mz : 0.0f;
             d->fx = ax;
             d->fz = az;
+        } else {
+            d->fx = fx / n;
+            d->fz = fz / n;
         }
     }
-    { // 4.4.20: o passo anda sempre "para frente", na direcao da cara (como na 4.4.12). A posicao ja vem do espelho.
+    { // 4.4.12: o passo anda SEMPRE para frente, na direcao da cara. A posicao ja vem pronta do outro jogo (o
+        // Teleport acima poe o boneco no lugar certo); aqui so a ANIMACAO importa. Antes eu mandava a direcao real do
+        // movimento - quando ela era perpendicular a cara o jogo animava de lado, e o boneco deslizava de lado.
         float dx = d->fx, dz = d->fz;
-        to_body(dx, dz); // no espaco do corpo vira (0, 1)
+        to_body(dx, dz); // no espaco do corpo vira (0, 1): frente pura
         d->dx = dx;
         d->dz = dz;
     }
@@ -2211,10 +2233,45 @@ void SendLocal(u64 p1, double now) {
     }
     g_in_world = true;
     g_seen_world = true; // 4.5: ja jogou num mundo (o seguidor de fase so age depois disto)
-    u32 held = 0;
+    // 4.4.21: os botoes vem de varias fontes porque o jogo nao guarda o soco num lugar so: o controle do personagem
+    // (party+0x24 segurados, +0x28 apertados agora) e o estado bruto apontado por party+0x18 (+0 atual / +4 anterior
+    // / +8 apertados / +0xc soltos). Antes so uma delas era lida e o soco nunca chegava no outro lado.
+    u32 held = 0, raw[4] = {0, 0, 0, 0};
     const u64 party = At<u64>(p1 + 0x3a0);
-    if (party && Readable(party + 0x18, 0x10)) held = At<u32>(party + 0x18 + 0xc);
+    if (party && Readable(party + 0x18, 0x18)) {
+        held |= At<u32>(party + 0x24);
+        held |= At<u32>(party + 0x28);
+        held |= At<u32>(party + 0x1c);
+        if (const u64 holder = At<u64>(party + 0x18); holder && Readable(holder, 0x10)) {
+            for (int k = 0; k < 4; ++k) {
+                raw[k] = At<u32>(holder + 4 * k);
+                held |= raw[k];
+            }
+        }
+    }
     held &= kSentButtons;
+    g_last_held.store(held);
+    if (held != g_held_sent) { // 4.4.21: o soco so aparece aqui se o botao for lido; o log diz de onde ele vem
+        g_held_sent = held;
+        std::printf("[MP] botoes do jogador local: %x
+", held);
+        std::fflush(stdout);
+    }
+    {   // sonda: so quando muda (para caber no log), com as palavras cruas para eu ver de onde vem o soco
+        static u32 shown = 0xffffffffu;
+        const u32 now_bits = held | (raw[0] & 0xffffff) << 0;
+        if (now_bits != shown) {
+            shown = now_bits;
+            std::printf("[BTN] %x | controle: %x %x %x %x | bruto: %x %x %x %x
+", held,
+                        party && Readable(party + 0x18, 0x18) ? At<u32>(party + 0x1c) : 0,
+                        party && Readable(party + 0x18, 0x18) ? At<u32>(party + 0x20) : 0,
+                        party && Readable(party + 0x18, 0x18) ? At<u32>(party + 0x24) : 0,
+                        party && Readable(party + 0x18, 0x18) ? At<u32>(party + 0x28) : 0,
+                        raw[0], raw[1], raw[2], raw[3]);
+            std::fflush(stdout);
+        }
+    }
     // um toque curto (1-2 quadros) tem de sobreviver ate o proximo envio (~50 ms)
     if (held) {
         g_held_latch |= held;
@@ -3486,21 +3543,30 @@ void Tick() {
     // personagem do jogador 1 (inst+0x100..0x400) e mostra no log o que mudou - anotando o que voce faz na hora
     // (andar, voar, socar, levar dano) da' para achar os campos de animacao e de dano.
     if (p1) { // 4.4.20: sonda sempre ligada, 2 linhas por segundo, so o que muda (vai para o log da sessao)
-        static u32 prev[0xc0];
-        static double last = 0;
+        // 4.4.21: janela inst+0x000..0x800 (a animacao nao estava em 0x100..0x400) e rajada de 1 s quando um botao
+        // muda, para o soco aparecer no log com o campo que ele mexe.
+        static u32 prev[0x200];
+        static double last = 0, burst = 0;
         static bool init = false;
-        if (now - last > 0.5 && Readable(p1 + 0x100, 4 * 0xc0)) {
+        static u32 last_btn = 0xffffffffu;
+        const u32 btn = g_last_held.load();
+        if (btn != last_btn) {
+            last_btn = btn;
+            burst = now + 1.0;
+        }
+        const bool fast = now < burst;
+        if ((fast ? now - last > 0.16 : now - last > 0.5) && Readable(p1, 4 * 0x200)) {
             last = now;
             std::string line;
-            for (int i = 0; i < 0xc0; ++i) {
-                const u32 v = At<u32>(p1 + 0x100 + 4 * i);
+            for (int i = 0; i < 0x200; ++i) {
+                const u32 v = At<u32>(p1 + 4 * i);
                 if (!init || v == prev[i]) {
                     prev[i] = v;
                     continue;
                 }
-                if (line.size() < 1800) {
+                if (line.size() < 2200) {
                     char b[48];
-                    std::snprintf(b, sizeof(b), " %03x:%08x>%08x", 0x100 + 4 * i, prev[i], v);
+                    std::snprintf(b, sizeof(b), " %03x:%08x>%08x", 4 * i, prev[i], v);
                     line += b;
                 }
                 prev[i] = v;
