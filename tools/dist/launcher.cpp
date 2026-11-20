@@ -3080,22 +3080,11 @@ void Paint(Gdiplus::Graphics& g, int width, int height) {
         g.FillPolygon(&dark, tri, 3);
         LegoText(g, ui::T(L"JOGAR", L"PLAY"), play.X + S(60), ty - S(17), 34.0f, kTintWhite);
         g_spots.push_back({play, kHotPlay});
-        // 4.4.26: "JOGAR MULTIPLAYER" logo abaixo do JOGAR: cria ou entra numa sala e ja abre o jogo junto.
-        float at = play_y + 60;
-        {
-            const bool mp_lit = (g_focus == kHotMpPlay || g_hover == kHotMpPlay) && Enabled(kHotMpPlay);
-            const Gdiplus::RectF bar = U(left, at, 270, 40);
-            if (mp_lit) {
-                Gdiplus::SolidBrush glow(Gdiplus::Color(90, 60, 150, 255));
-                g.FillRectangle(&glow, Gdiplus::RectF(bar.X - S(2), bar.Y - S(2), bar.Width + S(4), bar.Height + S(4)));
-            }
-            Gdiplus::SolidBrush mp_brush(Enabled(kHotMpPlay) ? ui::C(mp_lit ? RGB(90, 175, 255) : ui::kAccent)
-                                                             : Gdiplus::Color(255, 40, 70, 110));
-            g.FillRectangle(&mp_brush, bar);
-            LegoText(g, ui::T(L"MULTIPLAYER", L"MULTIPLAYER"), bar.X + S(20), bar.Y + S(7), 28.0f, kTintWhite);
-            g_spots.push_back({bar, kHotMpPlay});
-            at += 52;
-        }
+        // 4.4.27: "MULTIPLAYER" logo abaixo do JOGAR, no mesmo estilo dos itens de baixo (sem fundo, texto branco e
+        // amarelo so quando escolhido) e com um respiro maior depois da barra do JOGAR.
+        float at = play_y + 74;
+        menu_item(L"MULTIPLAYER", kHotMpPlay, at);
+        at += 48;
         menu_item(ui::T(L"PRÉ-COMPILAR SHADERS", L"PRECOMPILE SHADERS"), kHotShaders, at);
         at += 48;
         if (NeedsPrepare()) {
