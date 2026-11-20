@@ -281,8 +281,14 @@ void Configure(const std::filesystem::path& app0, const std::filesystem::path& w
     g_app0 = app0;
     g_writable_root = writable_root;
     // /savedataN nao e fixo: so existe entre sceSaveDataMount e sceSaveDataUmount.
+    // 4.4.25: /data e' o diretorio de dados do titulo. O jogo grava ali (o log mostrava "sceFiosDirectoryCreateSync
+    // /data/sce_coredumps -> NO MOUNT" e as escritas eram descartadas). Sem esse mount tudo que o jogo guarda fora de
+    // /savedataN (perfil, estado de tela, caches proprios) morria no fim da sessao - e o menu inicial voltava ao
+    // estado de "jogo novo". Agora persiste em <port>/assets/data, com leitura caindo em /app0/data quando o arquivo
+    // ainda nao existe (os dados originais do dump continuam visiveis).
     g_mounts = {
         {"/app0", app0, true},
+        {"/data", writable_root / "data", false},
         {"/temp0", writable_root / "temp0", false},
         {"/download0", writable_root / "download0", false},
     };
@@ -394,6 +400,19 @@ Resolved Resolve(const char* guest_path) {
         const auto mismatch = std::mismatch(base.begin(), base.end(), full.begin(), full.end());
         if (mismatch.first != base.end() && !mismatch.first->empty()) {
             return r;
+        }
+        // /data: leitura de arquivo que ainda nao foi gravado cai nos dados do dump (/app0/data)
+        if (m.prefix == "/data") {
+            std::error_code ec;
+            if (!std::filesystem::exists(full, ec)) {
+                const std::filesystem::path original = (g_app0 / "data" / rel).lexically_normal();
+                if (std::filesystem::exists(original, ec)) {
+                    r.host = original;
+                    r.mounted = true;
+                    r.read_only = true;
+                    return r;
+                }
+            }
         }
         r.host = full;
         r.mounted = true;

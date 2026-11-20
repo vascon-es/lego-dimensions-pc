@@ -63,6 +63,49 @@ using GuestThreadAttr = HostThreadAttr*;
 
 SRWLOCK g_lazy_lock = SRWLOCK_INIT; // protege a criacao preguicosa de mutex/cond estaticos
 
+// 4.4.25: leituras de memoria do jogo a partir de um handle. O jogo guarda o ponteiro do mutex dentro de structs
+// dele; se esse ponteiro estiver corrompido/solto (troca de personagem, cutscene, thread do audio) o magic check
+// lia memoria invalida e derrubava o processo - era o crash do Ngs2WatchThread em `cmp dword ptr [rdi], 0x4D545831`.
+// Estas duas funcoes nunca falham: devolvem false em vez de tocar no endereco.
+__declspec(noinline) bool ReadGuestPtr(const void* at, void** out) {
+    __try {
+        *out = *static_cast<void* const*>(at);
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
+__declspec(noinline) bool ReadGuestU32(const void* at, u32* out) {
+    __try {
+        *out = *static_cast<const u32*>(at);
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
+// Handle que nao e' nosso (ponteiro velho ou lixo): em vez de estourar ou travar o jogo, usa um mutex global. O
+// jogo acha que travou/destravou e segue.
+HostMutex* FallbackMutex() {
+    static HostMutex* m = [] {
+        auto* created = new HostMutex;
+        InitializeCriticalSection(&created->cs);
+        std::strncpy(created->name, "fallback", sizeof(created->name) - 1);
+        return created;
+    }();
+    return m;
+}
+
+void WarnBadHandle(const char* what, const void* value) {
+    static std::atomic<int> loud{0};
+    if (loud.fetch_add(1) < 8) {
+        std::printf("[SYNC] %s: handle invalido %p (o jogo guardou um ponteiro morto); usando o mutex interno\n", what,
+                    value);
+        std::fflush(stdout);
+    }
+}
+
 HostMutex* CreateMutex_(int type, const char* name) {
     auto* m = new HostMutex;
     m->type = type;
@@ -78,11 +121,16 @@ bool IsStatic(const void* handle) {
 }
 
 // Devolve o mutex do host, criando-o se o jogo usou um inicializador estatico.
-HostMutex* GetMutex(GuestMutex* guest) {
+HostMutex* GetMutex_(GuestMutex* guest) {
     if (!guest) {
         return nullptr;
     }
-    HostMutex* m = *guest;
+    void* raw = nullptr;
+    if (!ReadGuestPtr(guest, &raw)) {
+        WarnBadHandle("mutex", guest);
+        return FallbackMutex();
+    }
+    HostMutex* m = static_cast<HostMutex*>(raw);
     if (IsStatic(m)) {
         AcquireSRWLockExclusive(&g_lazy_lock);
         m = *guest;
@@ -93,14 +141,31 @@ HostMutex* GetMutex(GuestMutex* guest) {
         }
         ReleaseSRWLockExclusive(&g_lazy_lock);
     }
-    return m->magic == kMutexMagic ? m : nullptr;
+    u32 magic = 0;
+    if (!ReadGuestU32(m, &magic)) {
+        WarnBadHandle("mutex", m);
+        return FallbackMutex();
+    }
+    if (magic != kMutexMagic) {
+        WarnBadHandle("mutex", m); // ponteiro velho (destruido) ou de outro tipo
+        return FallbackMutex();
+    }
+    return m;
+}
+
+HostMutex* GetMutex(GuestMutex* guest) {
+    return GetMutex_(guest);
 }
 
 HostCond* GetCond(GuestCond* guest) {
     if (!guest) {
         return nullptr;
     }
-    HostCond* c = *guest;
+    void* raw = nullptr;
+    if (!ReadGuestPtr(guest, &raw)) {
+        return nullptr;
+    }
+    HostCond* c = static_cast<HostCond*>(raw);
     if (!c) {
         AcquireSRWLockExclusive(&g_lazy_lock);
         c = *guest;
@@ -111,7 +176,8 @@ HostCond* GetCond(GuestCond* guest) {
         }
         ReleaseSRWLockExclusive(&g_lazy_lock);
     }
-    return c->magic == kCondMagic ? c : nullptr;
+    u32 magic = 0;
+    return ReadGuestU32(c, &magic) && magic == kCondMagic ? c : nullptr;
 }
 
 // ---- mutexattr -------------------------------------------------------------
@@ -173,9 +239,11 @@ HLE_IMPL(int, scePthreadMutexDestroy, GuestMutex* mutex) {
     if (m->count) {
         return err::kEBUSY;
     }
+    // 4.4.25: o bloco NAO e' liberado. O jogo as vezes guarda o ponteiro do mutex em mais de um lugar e chama
+    // lock/unlock depois do destroy: com o bloco vivo o magic check da INVALID_HANDLE (ou cai no mutex interno) em
+    // vez de ler memoria do heap ja devolvida. Sao poucos bytes por mutex, o vazamento e' proposital.
     DeleteCriticalSection(&m->cs);
     m->magic = 0;
-    delete m;
     *mutex = nullptr;
     return err::OK;
 }

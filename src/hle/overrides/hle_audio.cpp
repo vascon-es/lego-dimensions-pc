@@ -246,17 +246,27 @@ HLE_IMPL(int, sceNgs2RackCreateWithAllocator, System* system, u32 rack_id, const
 }
 HLE_OVERRIDE(sceNgs2RackCreateWithAllocator);
 
+extern std::mutex g_voice_mutex; // definido mais abaixo (estado das vozes, compartilhado entre threads)
+
 HLE_IMPL(int, sceNgs2RackDestroy, Rack* rack, ContextBufferInfo* info) {
     HLE_TRACE("%p", static_cast<void*>(rack));
     if (!rack || rack->magic != kRackMagic) {
         return kNgs2ErrorInvalidHandle;
     }
+    // 4.4.25: NAO apaga nada. As vozes ficam em g_all_voices (mixagem e o relatorio do watchdog rodam em OUTRAS
+    // threads) e o rid de cada uma aponta para o rack: liberar a memoria daqui deixava ponteiros soltos no meio de
+    // uma cutscene - era o crash do Ngs2WatchThread (cmp dword ptr [rdi], ...) lendo memoria ja devolvida ao heap.
+    // O consumo e' minusculo (alguns KB por fase), entao o "vazamento" e' proposital.
     for (auto& [index, voice] : rack->voices) {
+        std::lock_guard lock(g_voice_mutex);
         voice->magic = 0;
-        delete voice;
+        voice->in_use = voice->playing = voice->paused = false;
+        voice->finished_dry = false;
+        voice->mix.clear();
+        voice->blocks.clear();
     }
-    rack->magic = 0;
-    delete rack;
+    rack->voices.clear();
+    rack->magic = 0; // tombstone: chamadas atrasadas ganham INVALID_HANDLE em vez de memoria liberada
     return err::OK;
 }
 HLE_OVERRIDE(sceNgs2RackDestroy);

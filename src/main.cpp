@@ -1392,8 +1392,22 @@ int main(int argc, char** argv) {
             unsigned width = 0, height = 0; // Fase 61: tamanho da janela, ex. 1920x1080
             if (std::sscanf(argv[++i], "%ux%u", &width, &height) == 2 && width && height) {
                 hle::videoout::SetWindowSize(width, height);
+                // 4.4.25: acima de 1080p o jogo desenha a camada 2D (menus, textos, HUD, telas de licenca) em escala
+                // 1:1 no alvo e ela estoura a tela - texto 2x maior e cortado. Agora o jogo desenha no maximo em
+                // 1920x1080 e a imagem e' ampliada para a janela (o upscaler ja fazia isso quando se usava
+                // LD_RENDER_1080). LD_RENDER_NATIVE=1 mantem o desenho na resolucao da janela.
+                u32 draw_w = width, draw_h = height;
+                if (!std::getenv("LD_RENDER_NATIVE") && (width > 1920 || height > 1080)) {
+                    const double fit = std::min(1920.0 / width, 1080.0 / height);
+                    draw_w = static_cast<u32>(width * fit);
+                    draw_h = static_cast<u32>(height * fit);
+                    std::printf("[RENDER] above 1080p: game drawn at %ux%u and upscaled to %ux%u "
+                                "(LD_RENDER_NATIVE=1 draws at the window size)\n",
+                                draw_w, draw_h, width, height);
+                    std::fflush(stdout);
+                }
                 if (!std::getenv("LD_RENDER_1080")) { // 1.9.1: desenha nessa resolucao (antes: 1920x1080 esticado)
-                    render::VulkanRenderer::Instance().SetRenderResolution(width, height);
+                    render::VulkanRenderer::Instance().SetRenderResolution(draw_w, draw_h);
                 }
             }
         } else if (!std::strcmp(argv[i], "--upscaler") && i + 1 < argc) { // 1.9.1: fsr1..4 | xess | off
