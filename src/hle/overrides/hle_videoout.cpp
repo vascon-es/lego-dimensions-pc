@@ -2438,6 +2438,16 @@ HLE_IMPL(int, sceVideoOutRegisterBuffers, int handle, int start_index, void* con
             g_buffers[start_index + i] = addresses[i];
         }
     }
+    // 4.4.26: uma linha com as tres resolucoes (o jogo pede 1080p; o port desenha num alvo escalado; a janela tem o
+    // tamanho dela). E o que identifica tela cortada / 2D em escala errada quando a janela e maior que 1080p.
+    if (result == 0 && attribute) {
+        u32 rw = 0, rh = 0;
+        render::VulkanRenderer::Instance().GetCurrentRenderResolution(&rw, &rh);
+        std::printf("[RENDER] guest buffers %ux%u | game drawn at %ux%u | window %ux%u | draw size %s\n",
+                    attribute->width, attribute->height, rw, rh, g_window_width.load(), g_window_height.load(),
+                    std::getenv("LD_RENDER_NATIVE") ? "window (LD_RENDER_NATIVE)" : "capped at 1080p");
+        std::fflush(stdout);
+    }
     HLE_TRACE("handle=%d start=%d buffers=%d %ux%u first=%p -> %d", handle, start_index, buffer_count,
               attribute ? attribute->width : 0, attribute ? attribute->height : 0,
               (addresses && buffer_count > 0) ? addresses[0] : nullptr, result);

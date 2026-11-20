@@ -1272,6 +1272,27 @@ std::wstring MpName() {
     return out.empty() ? std::wstring(L"Jogador") : out;
 }
 
+// 4.4.26: codigo da sala (8 de 32 simbolos = ~1 trilhao de combinacoes). Usado pelo dialogo de configuracao e pelo
+// "Jogar multiplayer".
+std::wstring NewRoomCode() {
+    static const wchar_t kChars[] = L"ABCDEFGHJKLMNPQRSTUVWXYZ23456789"; // sem 0/O e 1/I (faceis de confundir)
+    unsigned char random[8] = {};
+    if (BCryptGenRandom(nullptr, random, sizeof(random), BCRYPT_USE_SYSTEM_PREFERRED_RNG) != 0) { // nao deve falhar
+        LARGE_INTEGER t;
+        QueryPerformanceCounter(&t);
+        unsigned long long x = static_cast<unsigned long long>(t.QuadPart) ^ (GetTickCount64() << 21) ^ GetCurrentProcessId();
+        for (unsigned char& r : random) {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            r = static_cast<unsigned char>(x);
+        }
+    }
+    std::wstring code;
+    for (unsigned char r : random) code += kChars[r % 32];
+    return code;
+}
+
 std::wstring CleanRoom(std::wstring room) {
     std::wstring out;
     for (wchar_t c : room) {
@@ -1338,22 +1359,7 @@ LRESULT CALLBACK MpProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             g_mp_focus = HIWORD(wp) == EN_SETFOCUS ? reinterpret_cast<HWND>(lp) : nullptr;
             InvalidateRect(hwnd, nullptr, FALSE);
         } else if (LOWORD(wp) == kMpNewRoom) {
-            static const wchar_t kChars[] = L"ABCDEFGHJKLMNPQRSTUVWXYZ23456789"; // sem 0/O e 1/I (faceis de confundir)
-            std::wstring code;
-            unsigned char random[8] = {};
-            if (BCryptGenRandom(nullptr, random, sizeof(random), BCRYPT_USE_SYSTEM_PREFERRED_RNG) != 0) { // nao deve falhar
-                LARGE_INTEGER t;
-                QueryPerformanceCounter(&t);
-                unsigned long long x = static_cast<unsigned long long>(t.QuadPart) ^ (GetTickCount64() << 21) ^ GetCurrentProcessId();
-                for (unsigned char& r : random) {
-                    x ^= x << 13;
-                    x ^= x >> 7;
-                    x ^= x << 17;
-                    r = static_cast<unsigned char>(x);
-                }
-            }
-            for (unsigned char r : random) code += kChars[r % 32]; // 8 de 32 simbolos: ~1 trilhao de codigos
-            SetWindowTextW(g_mp_edits[1], code.c_str());
+            SetWindowTextW(g_mp_edits[1], NewRoomCode().c_str());
         } else if (LOWORD(wp) == kMpSave) {
             std::wstring server = GetText(g_mp_edits[0]);
             std::erase(server, L'"');
@@ -2576,7 +2582,8 @@ enum SettingsTab { kTabFiles, kTabDisplay, kTabGraphics, kTabGame, kTabTrophies,
 int g_tab = kTabFiles;
 
 enum Hot {
-    kHotNone, kHotClose, kHotMinimize, kHotPlay, kHotPrepare, kHotSettings, kHotMods, kHotTools, kHotQuit, kHotBack, kHotTabs,
+    kHotNone, kHotClose, kHotMinimize, kHotPlay, kHotMpPlay, kHotShaders, kHotPrepare, kHotSettings, kHotMods, kHotTools, kHotQuit,
+    kHotBack, kHotTabs,
     kHotTab0 = 20, kHotRow0 = 100, kHotLeft0 = 200, kHotRight0 = 300
 };
 struct Spot {
@@ -2611,6 +2618,8 @@ struct Row {
 std::wstring OnOff(bool on) { return on ? ui::T(L"Ligado", L"On") : ui::T(L"Desligado", L"Off"); }
 void OpenNamesDialog();
 void OpenMpDialog(); // 4.0
+void OpenMpPlayDialog(); // 4.4.26: "Jogar multiplayer" no menu
+void AskShaders();       // 4.4.26: pre-compilar shaders/pipelines
 std::vector<std::wstring> ReadPlayerNames();
 
 // As pastas de saves: assets\savedata0 (a do jogador, sempre) e as outras assets\savedata* com um Slot00 dentro
@@ -2878,6 +2887,8 @@ bool NeedsPrepare() { return !Prepared() || !AotReady(); }
 bool Enabled(int id) {
     if (g_busy) return id == kHotQuit || id == kHotClose || id == kHotMinimize;
     if (id == kHotPlay) return GameFolderOk();
+    if (id == kHotMpPlay) return GameFolderOk() && Prepared();
+    if (id == kHotShaders) return GameFolderOk() && Prepared();
     if (id == kHotPrepare) return GameFolderOk();
     return true;
 }
@@ -2887,6 +2898,8 @@ std::vector<int> FocusOrder() {
     std::vector<int> order;
     if (g_screen == Screen::kMain) {
         order.push_back(kHotPlay);
+        order.push_back(kHotMpPlay);
+        order.push_back(kHotShaders);
         if (NeedsPrepare()) order.push_back(kHotPrepare);
         order.insert(order.end(), {kHotSettings, kHotMods, kHotTools, kHotQuit});
     } else {
@@ -2953,7 +2966,8 @@ void PlainText(Gdiplus::Graphics& g, const std::wstring& text, Gdiplus::RectF bo
 Gdiplus::RectF U(float x, float y, float w, float h) { return Gdiplus::RectF(float(S(x)), float(S(y)), float(S(w)), float(S(h))); }
 
 bool BarItem(int id) {
-    return id == kHotPrepare || id == kHotSettings || id == kHotMods || id == kHotTools || id == kHotQuit || id == kHotBack || id == kHotTabs ||
+    return id == kHotMpPlay || id == kHotShaders || id == kHotPrepare || id == kHotSettings || id == kHotMods || id == kHotTools ||
+           id == kHotQuit || id == kHotBack || id == kHotTabs ||
            (id >= kHotRow0 && id < kHotLeft0);
 }
 
@@ -3066,7 +3080,24 @@ void Paint(Gdiplus::Graphics& g, int width, int height) {
         g.FillPolygon(&dark, tri, 3);
         LegoText(g, ui::T(L"JOGAR", L"PLAY"), play.X + S(60), ty - S(17), 34.0f, kTintWhite);
         g_spots.push_back({play, kHotPlay});
-        float at = play_y + 72;
+        // 4.4.26: "JOGAR MULTIPLAYER" logo abaixo do JOGAR: cria ou entra numa sala e ja abre o jogo junto.
+        float at = play_y + 60;
+        {
+            const bool mp_lit = (g_focus == kHotMpPlay || g_hover == kHotMpPlay) && Enabled(kHotMpPlay);
+            const Gdiplus::RectF bar = U(left, at, 270, 40);
+            if (mp_lit) {
+                Gdiplus::SolidBrush glow(Gdiplus::Color(90, 60, 150, 255));
+                g.FillRectangle(&glow, Gdiplus::RectF(bar.X - S(2), bar.Y - S(2), bar.Width + S(4), bar.Height + S(4)));
+            }
+            Gdiplus::SolidBrush mp_brush(Enabled(kHotMpPlay) ? ui::C(mp_lit ? RGB(90, 175, 255) : ui::kAccent)
+                                                             : Gdiplus::Color(255, 40, 70, 110));
+            g.FillRectangle(&mp_brush, bar);
+            LegoText(g, ui::T(L"MULTIPLAYER", L"MULTIPLAYER"), bar.X + S(20), bar.Y + S(7), 28.0f, kTintWhite);
+            g_spots.push_back({bar, kHotMpPlay});
+            at += 52;
+        }
+        menu_item(ui::T(L"PRÉ-COMPILAR SHADERS", L"PRECOMPILE SHADERS"), kHotShaders, at);
+        at += 48;
         if (NeedsPrepare()) {
             menu_item(ui::T(L"PREPARAR", L"PREPARE"), kHotPrepare, at);
             at += 48;
@@ -3214,6 +3245,163 @@ void AskPrepare() {
 }
 
 // Fase 77: so os pipelines no cache do driver de video (depois de atualizar o driver, ou para refazer as previstas)
+
+// ---- 4.4.26: "Jogar multiplayer" (menu principal) ------------------------------------------------
+// Abre um quadro com o apelido e o codigo da sala: "Criar sala" gera o codigo e ja abre o jogo, "Entrar" usa o
+// codigo digitado. O servidor e a senha continuam vindo das Configuracoes (Sala do multiplayer).
+HWND g_mp_play_window = nullptr;
+HWND g_mp_play_room = nullptr, g_mp_play_name = nullptr;
+constexpr int kMpPlayW = 460, kMpPlayH = 360;
+enum MpPlayId { kMpPlayJoin = 11, kMpPlayCreate = 12, kMpPlayCancel = 13, kMpPlayRoomEdit = 600, kMpPlayNameEdit = 601 };
+
+void StartMultiplayer(bool create_room) {
+    std::wstring code = CleanRoom(g_mp_play_room ? GetText(g_mp_play_room) : std::wstring());
+    if (create_room || code.empty()) {
+        code = NewRoomCode();
+    }
+    const std::wstring typed = g_mp_play_name ? GetText(g_mp_play_name) : std::wstring();
+    g_mp_room = code;
+    g_mp_name = typed;
+    g_opt_mp = true;
+    if (g_mp_server.empty()) {
+        g_mp_server = L"wss://lego-dimensions-mp-server.onrender.com";
+    }
+    SaveSettings();
+    if (g_mp_play_window) {
+        DestroyWindow(g_mp_play_window);
+    }
+    AllowSetForegroundWindow(ASFW_ANY); // o servidor do multiplayer pode estar dormindo: avisa antes de abrir o jogo
+    WakeMpServer();
+    AppendLog(ui::Pt() ? (L"Multiplayer online: sala " + code) : (L"Online multiplayer: room ") + code);
+    RunGame();
+}
+
+LRESULT CALLBACK MpPlayProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
+    switch (msg) {
+    case WM_PAINT: {
+        PAINTSTRUCT ps;
+        HDC target = BeginPaint(hwnd, &ps);
+        RECT client;
+        GetClientRect(hwnd, &client);
+        {
+            ui::Buffered buffer(target, client);
+            HBRUSH bg = CreateSolidBrush(ui::kBg);
+            FillRect(buffer.dc, &client, bg);
+            DeleteObject(bg);
+            Gdiplus::Graphics g(buffer.dc);
+            g.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
+            for (HWND edit : {g_mp_play_name, g_mp_play_room}) {
+                if (edit) ui::FieldBox(g, hwnd, edit, GetFocus() == edit);
+            }
+            g.Flush();
+            PlainText(g, ui::T(L"MULTIPLAYER", L"MULTIPLAYER"), U(38, 16, kMpPlayW - 76, 34), 22.0f, ui::kAccent);
+            PlainText(g, ui::T(L"Um cria a sala e passa o codigo; o outro entra com o mesmo codigo.",
+                               L"One creates the room and shares the code; the other joins with the same code."),
+                      U(38, 50, kMpPlayW - 76, 40), 12.5f, ui::kMuted);
+            PlainText(g, ui::T(L"APELIDO", L"NICKNAME"), U(38, 96, kMpPlayW - 76, 20), 12.0f, ui::kMuted);
+            PlainText(g, ui::T(L"CODIGO DA SALA", L"ROOM CODE"), U(38, 166, kMpPlayW - 76, 20), 12.0f, ui::kMuted);
+            PlainText(g, ui::T(L"deixe vazio para criar uma sala nova", L"leave empty to create a new room"),
+                      U(38, 236, kMpPlayW - 76, 20), 11.5f, ui::kMuted);
+        }
+        EndPaint(hwnd, &ps);
+        return 0;
+    }
+    case WM_CTLCOLOREDIT: {
+        HDC dc = reinterpret_cast<HDC>(wp);
+        SetBkColor(dc, ui::kBg);
+        SetTextColor(dc, ui::kText);
+        return reinterpret_cast<LRESULT>(g_bg_brush);
+    }
+    case WM_COMMAND:
+        if (HIWORD(wp) == BN_CLICKED) {
+            switch (LOWORD(wp)) {
+            case kMpPlayCreate: StartMultiplayer(true); return 0;
+            case kMpPlayJoin: StartMultiplayer(false); return 0;
+            case kMpPlayCancel: DestroyWindow(hwnd); return 0;
+            default: break;
+            }
+        } else if (HIWORD(wp) == EN_CHANGE) {
+            InvalidateRect(hwnd, nullptr, FALSE);
+        }
+        return 0;
+    case WM_CLOSE:
+        DestroyWindow(hwnd);
+        return 0;
+    case WM_DESTROY:
+        EnableWindow(g_main, TRUE);
+        SetForegroundWindow(g_main);
+        g_mp_play_window = nullptr;
+        g_mp_play_room = g_mp_play_name = nullptr;
+        Redraw();
+        return 0;
+    }
+    return DefWindowProcW(hwnd, msg, wp, lp);
+}
+
+void OpenMpPlayDialog() {
+    if (g_mp_play_window) {
+        SetForegroundWindow(g_mp_play_window);
+        return;
+    }
+    static bool registered = false;
+    if (!registered) {
+        WNDCLASSEXW wc{sizeof(wc)};
+        wc.lpfnWndProc = MpPlayProc;
+        wc.hInstance = GetModuleHandleW(nullptr);
+        wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+        wc.hbrBackground = g_bg_brush;
+        wc.hIcon = LoadIconW(wc.hInstance, MAKEINTRESOURCEW(1));
+        wc.lpszClassName = L"LegoDimensionsPcMpPlay";
+        RegisterClassExW(&wc);
+        registered = true;
+    }
+    const DWORD style = WS_POPUP | WS_CAPTION | WS_SYSMENU | WS_CLIPCHILDREN;
+    RECT size{0, 0, S(kMpPlayW), S(kMpPlayH)};
+    AdjustWindowRect(&size, style, FALSE);
+    RECT owner;
+    GetWindowRect(g_main, &owner);
+    const int w = size.right - size.left, h = size.bottom - size.top;
+    g_mp_play_window = CreateWindowExW(WS_EX_DLGMODALFRAME, L"LegoDimensionsPcMpPlay", ui::T(L"Jogar multiplayer", L"Play multiplayer"),
+                                       style, owner.left + ((owner.right - owner.left) - w) / 2,
+                                       owner.top + ((owner.bottom - owner.top) - h) / 2, w, h, g_main, nullptr,
+                                       GetModuleHandleW(nullptr), nullptr);
+    ui::DarkTitle(g_mp_play_window);
+    g_mp_play_name = ui::Edit(g_mp_play_window, S(38), S(118), S(kMpPlayW - 76), S(26), kMpPlayNameEdit, g_font);
+    SendMessageW(g_mp_play_name, EM_LIMITTEXT, 16, 0);
+    SetWindowTextW(g_mp_play_name, g_mp_name.empty() ? MpName().c_str() : g_mp_name.c_str());
+    g_mp_play_room = ui::Edit(g_mp_play_window, S(38), S(188), S(kMpPlayW - 76), S(26), kMpPlayRoomEdit, g_font);
+    SendMessageW(g_mp_play_room, EM_LIMITTEXT, 12, 0);
+    SetWindowTextW(g_mp_play_room, g_mp_room.c_str());
+    ui::Button(g_mp_play_window, ui::T(L"Entrar na sala", L"Join room"), ui::Style::kPrimary, S(38), S(kMpPlayH - 84), S(190), S(46),
+               kMpPlayJoin, g_button);
+    ui::Button(g_mp_play_window, ui::T(L"Criar sala", L"Create room"), ui::Style::kPrimary, S(kMpPlayW - 228), S(kMpPlayH - 84),
+               S(190), S(46), kMpPlayCreate, g_button);
+    ui::Button(g_mp_play_window, ui::T(L"Cancelar", L"Cancel"), ui::Style::kSecondary, S(kMpPlayW / 2 - 55), S(kMpPlayH - 30),
+               S(110), S(24), kMpPlayCancel, g_button);
+    EnableWindow(g_main, FALSE);
+    ShowWindow(g_mp_play_window, SW_SHOW);
+    SetFocus(g_mp_play_room);
+}
+
+// 4.4.26: pre-compilar tudo pela linha de comando do launcher (preparar.py --so-pipelines -> jogo --prewarm-only).
+void AskShaders() {
+    if (GameRunning()) {
+        MessageBoxW(g_main, ui::T(L"Feche o jogo antes.", L"Close the game first."), L"LEGO Dimensions PC",
+                    MB_OK | MB_ICONINFORMATION);
+        return;
+    }
+    if (MessageBoxW(g_main,
+                    ui::T(L"Criar agora todos os pipelines conhecidos no cache do driver de video?\n\n"
+                          L"Isso deixa o jogo sem engasgos de shader nas primeiras visitas a cada lugar. Leva alguns minutos e "
+                          L"o launcher mostra o progresso aqui.",
+                          L"Build every known pipeline into the GPU driver cache now?\n\n"
+                          L"That removes the shader hitches on the first visit to each place. It takes a few minutes and the "
+                          L"launcher shows the progress here."),
+                    L"LEGO Dimensions PC", MB_YESNO | MB_ICONQUESTION) == IDYES) {
+        RunPrepare(true);
+    }
+}
+
 void AskPipelines() {
     if (GameRunning()) {
         MessageBoxW(g_main, ui::T(L"Feche o jogo antes.", L"Close the game first."), L"LEGO Dimensions PC", MB_OK | MB_ICONINFORMATION);
@@ -3300,6 +3488,8 @@ void Activate(int id) {
     case kHotClose: case kHotQuit: PostMessageW(g_main, WM_CLOSE, 0, 0); break;
     case kHotMinimize: ShowWindow(g_main, SW_MINIMIZE); break;
     case kHotPlay: RunGame(); break;
+    case kHotMpPlay: OpenMpPlayDialog(); break;
+    case kHotShaders: AskShaders(); break;
     case kHotPrepare: AskPrepare(); break;
     case kHotSettings:
         g_screen = Screen::kSettings;
