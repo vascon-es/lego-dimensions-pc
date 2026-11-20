@@ -2390,6 +2390,15 @@ std::string g_level_key; // a fase atual deste jogo (atualizada no Tick)
 double g_level_request_time = -100; // quando este jogo pediu uma troca de fase (seguindo o dono)
 u64 g_level_obj = 0;
 
+// 4.4.31: "esta fase e' jogavel" (nao e' tela de carregamento, titulo, startup nem a cena do tubo). Usado tanto para
+// avisar os outros quanto para decidir se podemos seguir a fase de alguem.
+bool PlayableLevel(const std::string& key) {
+    const std::string low = Lower(key);
+    return !low.empty() && low != "-" && low.find("loadingscreen") == std::string::npos &&
+           low.find("loading_screen") == std::string::npos && low.find("titles") == std::string::npos &&
+           low.find("startup") == std::string::npos && low.find("slideways") == std::string::npos;
+}
+
 void UpdateLevelKey() {
     const u64 obj = CurrentLevelObj();
     if (obj == g_level_obj) return;
@@ -2403,10 +2412,7 @@ void UpdateLevelKey() {
         // de esperar a estabilidade do seguidor (era isso que deixava o convidado preso no tubo).
         // 4.4.8: so fases jogaveis. Antes o aviso levava junto "Loading_Screen_Default"/"Titles" e o outro jogo
         // entrava numa tela de carregamento que nao era missao nenhuma.
-        const std::string low = Lower(key);
-        const bool playable = low.find("loadingscreen") == std::string::npos &&
-                              low.find("loading_screen") == std::string::npos && low.find("titles") == std::string::npos &&
-                              low.find("startup") == std::string::npos && low.find("slideways") == std::string::npos && low != "-";
+        const bool playable = PlayableLevel(key);
         if (g_enabled && playable && runtime::mp_net::SelfId()) runtime::mp_net::SendEvent("L|" + key);
     }
 }
@@ -2495,7 +2501,7 @@ void FollowOwner(double now) {
     if (r.level == g_level_key || now < cooldown) return;
     // 4.4.30: o mesmo cuidado do aviso "L|": fora de uma fase (tela inicial, carregando o save, menu) este jogo
     // nunca e puxado para a fase do dono.
-    if (!(g_seen_world && g_in_world && !g_level_key.empty())) return;
+    if (!(g_seen_world && g_in_world && PlayableLevel(g_level_key))) return;
     // 4.5: na cena do tubo/queda nao ha mundo estavel para esperar: segue o dono no quadro seguinte
     const bool transition = LocalTransition();
     if (now - owner_since < (transition ? 0.25 : 2.0)) return;
@@ -3109,7 +3115,9 @@ std::string g_push_target;         // 4.4.10: a fase pedida (para o log)
 // 4.4.30: "este jogo ja esta numa fase de verdade" (saiu da tela inicial e tem um mundo estavel). O seguidor de fase
 // nunca pode puxar quem ainda esta no menu: isso forcava o carregamento sem o save e bagunçava a sessao inteira.
 bool ThisGameInLevel() {
-    return g_seen_world && g_in_world && !g_level_key.empty();
+    // 4.4.31: tela inicial, "Titles", tela de carregamento e a cena do tubo NAO contam como estar numa fase - era por
+    // aqui que o aviso ainda puxava o jogador no menu (o jogo informa "Titles#2" como fase atual).
+    return g_seen_world && g_in_world && PlayableLevel(g_level_key);
 }
 
 // Aviso de fase do outro jogador, aplicado na hora (o jogo troca de fase). So deve ser chamado com ThisGameInLevel().
@@ -3289,8 +3297,9 @@ void ApplyEvent(int from, const std::string& payload, double now) {
         if (!ThisGameInLevel()) {
             g_deferred_level = key;
             g_deferred_time = now;
-            std::printf("[MP] aviso da fase %s guardado: este jogo ainda nao esta numa fase (tela inicial/menu)\n",
-                        key.c_str());
+            std::printf("[MP] aviso da fase %s guardado: fase atual '%s', no mundo %d, ja jogou %d\n", key.c_str(),
+                        g_level_key.empty() ? "-" : g_level_key.c_str(), g_in_world.load() ? 1 : 0,
+                        g_seen_world.load() ? 1 : 0);
             std::fflush(stdout);
             return;
         }
