@@ -252,6 +252,7 @@ struct Puppet {
     double stage_time = 0, retry_time = 0, ready_time = 0, wait_since = 0, load_fail_time = -100;
     bool want = false;   // esta na mesma area e no jogo (aparece, ou so o nome enquanto nao ha slot)
     double want_since = 0; // desde quando quer aparecer
+    std::string spawn_level; // 4.4.32: fase em que este fantasma nasceu (se a fase mudou, o mundo dele nao existe mais)
     bool standin = false;  // 4.1.1: sem slot para o personagem dele: aparece com um personagem ja carregado
     double same_area_since = 0; // 4.2: desde quando esta na nossa area
     bool replayed = false;      // 4.2: o dono ja reenviou o registro da area para ele
@@ -304,6 +305,9 @@ bool MoveSpaceLocal() {
 std::atomic<u64> g_live[32];
 std::atomic<u64> g_live_insts[32];
 std::atomic<u64> g_fake_ctrls[32];
+
+// a fase atual deste jogo (atualizada no Tick). Declarada aqui em cima porque o Despawn precisa dela (4.4.32).
+std::string g_level_key;
 
 void LiveAdd(u64 request) {
     for (auto& e : g_live) {
@@ -1660,6 +1664,7 @@ bool RecycleSlot() {
 }
 
 void Despawn(struct Puppet& p);
+void ReleasePuppet(struct Puppet& p); // 4.4.32: solta o fantasma sem tocar no mundo do jogo
 bool SomeoneLoading();
 
 // O jogador pos figuras novas e o portal ficou sem slot livre: devolve um slot do portal que NOS carregamos (os
@@ -1903,6 +1908,7 @@ bool Spawn(Puppet& p) {
     At<u64>(spawner + 0x1f0) = p.slot;
     p.request = request;
     p.spawner = spawner;
+    p.spawn_level = g_level_key; // 4.4.32
     LiveAdd(request);
     std::printf("[MP] spawn: spawner %llx (slot %s) com slot %s%s\n", static_cast<unsigned long long>(spawner),
                 SlotLabel(original_slot), SlotLabel(p.slot), p.standin ? " (substituto)" : "");
@@ -1921,7 +1927,26 @@ bool Spawn(Puppet& p) {
 // Solta o no do pedido da lista do spawner, libera o no e apaga o pedido (o jogo desfaz o personagem).
 bool PuppetAlive(const Puppet& p);
 
+// 4.4.32: solta o fantasma SEM chamar nada do jogo. Serve para quando o mundo dele nao existe mais (fim de missao, troca
+// de fase) ou quando ja pedimos outra fase: aí o pedido/spawner/instancia sao memoria reaproveitada e chamar o destrutor
+// do jogo derrubava a partida inteira (foi o crash ao terminar uma missao e seguir para a proxima).
+void ReleasePuppet(Puppet& p) {
+    if (p.slot) g_slot_used[p.slot] = runtime::mp_net::Now();
+    LiveDrop(p.request);
+    LiveInstDrop(p.inst);
+    p.request = p.inst = p.inst_name = 0;
+    p.spawner = 0;
+    p.slot = 0;
+    p.stage = Stage::kNone;
+    p.spawn_level.clear();
+}
+
 void Despawn(Puppet& p) {
+    // 4.4.32: fantasma de outra fase (ou de um mundo ja desmontado): so solta, nunca mexe no jogo.
+    if (!p.spawn_level.empty() && p.spawn_level != g_level_key) {
+        ReleasePuppet(p);
+        return;
+    }
     const u64 request = p.request, spawner = p.spawner, inst = p.inst;
     struct DropInstOnExit {
         u64 i;
@@ -2386,7 +2411,6 @@ int LevelIdForKey(const std::string& key) {
     return id;
 }
 
-std::string g_level_key; // a fase atual deste jogo (atualizada no Tick)
 double g_level_request_time = -100; // quando este jogo pediu uma troca de fase (seguindo o dono)
 u64 g_level_obj = 0;
 
@@ -2529,11 +2553,8 @@ void FollowOwner(double now) {
     }
     Log("[MP] seguindo o dono da sala %s: indo para a fase %s", it->second.name, r.level);
     StopLocalFall(); // a queda/animacao do tubo para aqui: a fase vai ser desmontada agora
-    // os fantasmas saem antes (a fase vai ser desmontada)
-    for (auto& [pid, p] : g_puppets) {
-        if (p.stage == Stage::kSpawning || p.stage == Stage::kActive) Despawn(p);
-        p.stage = Stage::kNone;
-    }
+    // os fantasmas saem antes (a fase vai ser desmontada) - 4.4.32: sem chamar nada do jogo (o mundo esta de saida)
+    for (auto& [pid, p] : g_puppets) ReleasePuppet(p);
     g_drive_count = 0;
     g_level_request_time = now;
     // 4.5: a fase do dono fica autorizada durante a carga (o convidado pode nao ter o mundo liberado no save local;
@@ -3136,10 +3157,7 @@ void GoToLevelNow(const std::string& key, double now) {
     }
     std::printf("[MP] seguindo na hora: fase %s (id %d)\n", key.c_str(), id);
     std::fflush(stdout);
-    for (auto& [pid, p] : g_puppets) {
-        if (p.stage == Stage::kSpawning || p.stage == Stage::kActive) Despawn(p);
-        p.stage = Stage::kNone;
-    }
+    for (auto& [pid, p] : g_puppets) ReleasePuppet(p); // 4.4.32: o mundo vai ser desmontado agora
     g_drive_count = 0;
     g_level_request_time = now;
     g_level_gate_id = static_cast<u64>(id);
@@ -3481,17 +3499,32 @@ void Tick() {
     }
     UpdateSlotCounts();
     UpdateLevelKey();
+    // 4.4.32: a fase mudou (fim de missao -> proxima fase, volta ao hub, tela de carregamento): os fantasmas da fase
+    // antiga nao existem mais. Solta todos SEM tocar no jogo - era isso que derrubava o jogo de quem segue o outro
+    // jogador ao terminar uma missao (o destrutor do pedido mexia numa memoria ja liberada pela troca de fase).
+    {
+        static std::string last_level_here;
+        if (g_level_key != last_level_here) {
+            last_level_here = g_level_key;
+            for (auto& [id, p] : g_puppets) ReleasePuppet(p);
+            g_drive_count = 0;
+            if (PlayableLevel(g_level_key)) {
+                // chegamos numa fase de verdade: nao ha mais pedido pendente nem fase autorizada de antes (um portao
+                // velho autorizava o numero de outra fase depois do fim da missao)
+                g_level_gate_id = ~0ull;
+                g_push_request_time = -100;
+                g_push_retried = false;
+                g_push_target.clear();
+            }
+        }
+    }
     // 4.4.11: numa troca de fase o mundo esta sendo desmontado: nao escreve em personagem nenhum (era daqui que
     // vinham travadas, tela branca e crash ao entrar em missao).
     const bool loading_now = Lower(g_level_key).find("loading") != std::string::npos || g_level_key == "-" || g_level_key.empty();
     if (loading_now) {
         if (!g_was_loading) { // entrou agora: desfaz os fantasmas uma vez
             g_was_loading = true;
-            for (auto& [pid, p] : g_puppets) {
-                if (p.stage == Stage::kSpawning || p.stage == Stage::kActive) Despawn(p);
-                p.stage = Stage::kNone;
-                p.request = p.inst = p.inst_name = 0;
-            }
+            for (auto& [pid, p] : g_puppets) ReleasePuppet(p); // 4.4.32: o mundo ja foi desmontado
             LiveInstClear();
             g_drive_count = 0;
         }
