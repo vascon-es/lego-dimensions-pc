@@ -10,6 +10,13 @@ if(NOT WIN32 OR NOT CMAKE_SIZEOF_VOID_P EQUAL 8)
     message(FATAL_ERROR "Supported target: Windows x64")
 endif()
 
+# 4.4.25: o STL do MSVC 14.5x exige Clang 22+ e o clang-cl que vem com o Visual Studio e' mais antigo. A build do
+# GitHub Actions (runner windows-latest) atualizou o toolset e passou a falhar com "STL1000: Unexpected compiler
+# version". O codigo compila normalmente, entao o guarda do STL e' desligado para o clang-cl.
+if(CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
+    add_compile_definitions(_ALLOW_COMPILER_AND_STL_VERSION_MISMATCH)
+endif()
+
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
