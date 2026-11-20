@@ -3240,7 +3240,7 @@ void AskPrepare() {
 // codigo digitado. O servidor e a senha continuam vindo das Configuracoes (Sala do multiplayer).
 HWND g_mp_play_window = nullptr;
 HWND g_mp_play_room = nullptr, g_mp_play_name = nullptr;
-constexpr int kMpPlayW = 460, kMpPlayH = 360;
+constexpr int kMpPlayW = 470, kMpPlayH = 380;
 enum MpPlayId { kMpPlayJoin = 11, kMpPlayCreate = 12, kMpPlayCancel = 13, kMpPlayRoomEdit = 600, kMpPlayNameEdit = 601 };
 
 void StartMultiplayer(bool create_room) {
@@ -3284,9 +3284,9 @@ LRESULT CALLBACK MpPlayProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             }
             g.Flush();
             PlainText(g, ui::T(L"MULTIPLAYER", L"MULTIPLAYER"), U(38, 16, kMpPlayW - 76, 34), 22.0f, ui::kAccent);
-            PlainText(g, ui::T(L"Um cria a sala e passa o codigo; o outro entra com o mesmo codigo.",
+            PlainText(g, ui::T(L"Um cria a sala e passa o código; o outro entra com o mesmo código.",
                                L"One creates the room and shares the code; the other joins with the same code."),
-                      U(38, 50, kMpPlayW - 76, 40), 12.5f, ui::kMuted);
+                      U(38, 50, kMpPlayW - 76, 40), 12.5f, ui::kMuted, false, Gdiplus::StringAlignmentNear, true);
             PlainText(g, ui::T(L"APELIDO", L"NICKNAME"), U(38, 96, kMpPlayW - 76, 20), 12.0f, ui::kMuted);
             PlainText(g, ui::T(L"CODIGO DA SALA", L"ROOM CODE"), U(38, 166, kMpPlayW - 76, 20), 12.0f, ui::kMuted);
             PlainText(g, ui::T(L"deixe vazio para criar uma sala nova", L"leave empty to create a new room"),
@@ -3313,6 +3313,9 @@ LRESULT CALLBACK MpPlayProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             InvalidateRect(hwnd, nullptr, FALSE);
         }
         return 0;
+    case WM_DRAWITEM: // 4.4.28: os botoes sao desenhados por nos (BS_OWNERDRAW); sem isto ficavam brancos
+        ui::DrawButton(reinterpret_cast<const DRAWITEMSTRUCT*>(lp));
+        return TRUE;
     case WM_CLOSE:
         DestroyWindow(hwnd);
         return 0;
@@ -3361,12 +3364,12 @@ void OpenMpPlayDialog() {
     g_mp_play_room = ui::Edit(g_mp_play_window, S(38), S(188), S(kMpPlayW - 76), S(26), kMpPlayRoomEdit, g_font);
     SendMessageW(g_mp_play_room, EM_LIMITTEXT, 12, 0);
     SetWindowTextW(g_mp_play_room, g_mp_room.c_str());
-    ui::Button(g_mp_play_window, ui::T(L"Entrar na sala", L"Join room"), ui::Style::kPrimary, S(38), S(kMpPlayH - 84), S(190), S(46),
-               kMpPlayJoin, g_button);
-    ui::Button(g_mp_play_window, ui::T(L"Criar sala", L"Create room"), ui::Style::kPrimary, S(kMpPlayW - 228), S(kMpPlayH - 84),
-               S(190), S(46), kMpPlayCreate, g_button);
-    ui::Button(g_mp_play_window, ui::T(L"Cancelar", L"Cancel"), ui::Style::kSecondary, S(kMpPlayW / 2 - 55), S(kMpPlayH - 30),
-               S(110), S(24), kMpPlayCancel, g_button);
+    ui::Button(g_mp_play_window, ui::T(L"Entrar na sala", L"Join room"), ui::Style::kPrimary, S(38), S(kMpPlayH - 96), S(180),
+               S(44), kMpPlayJoin, g_button);
+    ui::Button(g_mp_play_window, ui::T(L"Criar sala", L"Create room"), ui::Style::kPrimary, S(kMpPlayW - 218), S(kMpPlayH - 96),
+               S(180), S(44), kMpPlayCreate, g_button);
+    ui::Button(g_mp_play_window, ui::T(L"Cancelar", L"Cancel"), ui::Style::kSecondary, S(kMpPlayW / 2 - 60), S(kMpPlayH - 40),
+               S(120), S(28), kMpPlayCancel, g_button);
     EnableWindow(g_main, FALSE);
     ShowWindow(g_mp_play_window, SW_SHOW);
     SetFocus(g_mp_play_room);
