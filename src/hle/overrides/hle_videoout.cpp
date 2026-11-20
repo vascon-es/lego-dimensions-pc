@@ -3525,9 +3525,18 @@ void QueueStatsOverlay() {
     }
     const bool show_chat = runtime::multiplayer::Enabled() && s_chat_seen && !g_mp_panel_open.load() &&
                            now - s_chat_since < std::chrono::seconds(8);
+    // 4.4.29: ao entrar no mundo com o multiplayer ligado (o launcher manda direto para a sala), avisa uma vez que o F4
+    // gerencia a sala e mostra o codigo. Fica 12 s e nao volta nesta sessao.
+    static std::chrono::steady_clock::time_point s_welcome_since{};
+    static bool s_welcome_done = false;
+    if (!s_welcome_done && runtime::multiplayer::Enabled() && runtime::multiplayer::InWorld()) {
+        s_welcome_done = true;
+        s_welcome_since = now;
+    }
+    const bool show_welcome = s_welcome_done && now - s_welcome_since < std::chrono::seconds(12);
     if (!g_stats_overlay.load() && !g_video_menu_open.load() && !g_image_menu_open.load() &&
         !g_achievements_overlay_open.load() && !g_logs_overlay_open.load() && !has_toast &&
-        tags.empty() && !g_mp_panel_open.load() && !g_mp_chat_typing && !show_refused && !show_chat) {
+        tags.empty() && !g_mp_panel_open.load() && !g_mp_chat_typing && !show_refused && !show_chat && !show_welcome) {
         return;
     }
     static std::vector<LoadingVertex> vertices;
@@ -3855,6 +3864,16 @@ void QueueStatsOverlay() {
         const float x = (client.right - w) * 0.5f, y = 40.0f * p;
         c.Pill(x - 6 * tp, y - 3 * tp, x + w + 6 * tp, y + 10 * tp, 0xCC000060);
         c.Write(mp_refused, x, y, tp, 0xFFFFFFFF);
+    }
+
+    if (show_welcome) { // 4.4.29: aviso de entrada (F4 gerencia a sala e mostra o codigo)
+        const float tp = p * 1.2f;
+        const std::string text = lang::Pt() ? "APERTE F4 PARA GERENCIAR A SALA E VER O CODIGO"
+                                            : "PRESS F4 TO MANAGE THE ROOM AND SEE YOUR CODE";
+        const float w = TextWidth(text, tp);
+        const float x = (client.right - w) * 0.5f, y = client.bottom - 90.0f * p / 2.0f;
+        c.Pill(x - 6 * tp, y - 3 * tp, x + w + 6 * tp, y + 10 * tp, 0xC0101820);
+        c.Write(text, x, y, tp, 0xFFFFFFFF);
     }
 
     if (show_chat) { // Fase 83: ultimas mensagens do chat, no canto de baixo a esquerda
