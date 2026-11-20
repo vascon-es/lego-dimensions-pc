@@ -2417,6 +2417,10 @@ std::atomic<bool> g_follow_owner{true};
 
 // 4.5: ele ja esteve num mundo alguma vez nesta sessao (nao puxa o jogador para a fase do dono estando no menu).
 std::atomic<bool> g_seen_world{false};
+// 4.4.30: aviso de fase recebido enquanto este jogo ainda estava na tela inicial/menu (aplicado depois, com o jogador
+// dentro do jogo). Antes ele era aplicado na hora e forcava o carregamento sem o save carregado.
+std::string g_deferred_level;
+double g_deferred_time = -100;
 
 // A cena do tubo do vorton tranca o controle: o mundo local fica sem jogador/area por varios segundos. Enquanto isso o
 // seguidor nao pode exigir estabilidade - era por isso que o convidado ficava preso caindo no tubo enquanto o dono ja
@@ -2489,7 +2493,9 @@ void FollowOwner(double now) {
         return;
     }
     if (r.level == g_level_key || now < cooldown) return;
-    if (!g_seen_world) return; // ainda no menu/front-end: nao puxa o jogador para a fase do dono
+    // 4.4.30: o mesmo cuidado do aviso "L|": fora de uma fase (tela inicial, carregando o save, menu) este jogo
+    // nunca e puxado para a fase do dono.
+    if (!(g_seen_world && g_in_world && !g_level_key.empty())) return;
     // 4.5: na cena do tubo/queda nao ha mundo estavel para esperar: segue o dono no quadro seguinte
     const bool transition = LocalTransition();
     if (now - owner_since < (transition ? 0.25 : 2.0)) return;
@@ -3100,6 +3106,62 @@ bool g_push_retried = false;       // 4.4.10: ja pediu a mesma fase uma segunda 
 int g_push_target_id = -1;         // 4.4.10: numero da fase pedida, resolvido AQUI (USA/EUR numeram diferente)
 std::string g_push_target;         // 4.4.10: a fase pedida (para o log)
 
+// 4.4.30: "este jogo ja esta numa fase de verdade" (saiu da tela inicial e tem um mundo estavel). O seguidor de fase
+// nunca pode puxar quem ainda esta no menu: isso forcava o carregamento sem o save e bagunçava a sessao inteira.
+bool ThisGameInLevel() {
+    return g_seen_world && g_in_world && !g_level_key.empty();
+}
+
+// Aviso de fase do outro jogador, aplicado na hora (o jogo troca de fase). So deve ser chamado com ThisGameInLevel().
+void GoToLevelNow(const std::string& key, double now) {
+    if (key.empty() || key == g_level_key) return;
+    if (now - g_level_request_time < 25.0) { // 4.4.11: ja estamos carregando uma fase (pedido duplo = tela branca)
+        std::printf("[MP] aviso da fase %s ignorado: este jogo ja esta trocando de fase\n", key.c_str());
+        std::fflush(stdout);
+        return;
+    }
+    const int id = LevelIdForKey(key);
+    if (id < 0) {
+        std::printf("[MP] o outro entrou na fase %s e este jogo nao achou o numero dela\n", key.c_str());
+        std::fflush(stdout);
+        return;
+    }
+    std::printf("[MP] seguindo na hora: fase %s (id %d)\n", key.c_str(), id);
+    std::fflush(stdout);
+    for (auto& [pid, p] : g_puppets) {
+        if (p.stage == Stage::kSpawning || p.stage == Stage::kActive) Despawn(p);
+        p.stage = Stage::kNone;
+    }
+    g_drive_count = 0;
+    g_level_request_time = now;
+    g_level_gate_id = static_cast<u64>(id);
+    g_level_gate_time = now;
+    {
+        const size_t hash = key.rfind('#');
+        g_owner_level_path = hash == std::string::npos ? key : key.substr(0, hash);
+        g_owner_level_time = now;
+    }
+    Call(kGotoLevelFn, reinterpret_cast<u64>(g_base) + kLevelLoader, static_cast<u64>(id), 0, 0);
+    g_push_request_time = now; // 4.4.8: para sair do tubo se a carga nao terminar
+    g_push_retried = false;
+    g_push_target_id = id;
+    g_push_target = key;
+    g_deferred_level.clear();
+}
+
+// Aviso guardado enquanto estavamos fora de uma fase: aplica assim que o jogador entra no jogo (e so entao).
+void ApplyDeferredLevel(double now) {
+    if (g_deferred_level.empty()) return;
+    if (now - g_deferred_time > 180.0) { // velho demais: o amigo ja foi para outro lugar
+        g_deferred_level.clear();
+        return;
+    }
+    if (!ThisGameInLevel()) return;
+    std::printf("[MP] entrando na fase %s que ficou guardada\n", g_deferred_level.c_str());
+    std::fflush(stdout);
+    GoToLevelNow(g_deferred_level, now);
+}
+
 // 4.4.9: estado do multiplayer para o painel F9 (linha viva, atualizada ~2x por segundo na thread principal).
 std::mutex g_summary_mutex;
 std::string g_summary;
@@ -3220,38 +3282,19 @@ void ApplyEvent(int from, const std::string& payload, double now) {
     }
     if (f.size() >= 2 && f[0] == "L") { // 4.4.7: o outro jogador entrou numa missao/fase
         const std::string& key = f[1];
-        if (key.empty() || key == g_level_key || g_level_key.empty()) return;
-        if (now - g_level_request_time < 25.0) { // 4.4.11: ja estamos carregando uma fase (pedido duplo = tela branca)
-            std::printf("[MP] aviso da fase %s ignorado: este jogo ja esta trocando de fase\n", key.c_str());
+        if (key.empty() || key == g_level_key) return;
+        // 4.4.30: so segue o outro se ESTE jogo ja esta dentro de uma fase. Antes, com o jogador ainda na tela inicial
+        // (carregando o save / menu), o aviso forcava o carregamento da fase do amigo: ele "entrava no jogo" sem
+        // carregar o save e o estado saia inconsistente - a sessao acabava voltando todo mundo para a primeira missao.
+        if (!ThisGameInLevel()) {
+            g_deferred_level = key;
+            g_deferred_time = now;
+            std::printf("[MP] aviso da fase %s guardado: este jogo ainda nao esta numa fase (tela inicial/menu)\n",
+                        key.c_str());
             std::fflush(stdout);
             return;
         }
-        const int id = LevelIdForKey(key);
-        if (id < 0) {
-            std::printf("[MP] o outro entrou na fase %s e este jogo nao achou o numero dela\n", key.c_str());
-            std::fflush(stdout);
-            return;
-        }
-        std::printf("[MP] seguindo na hora: fase %s (id %d)\n", key.c_str(), id);
-        std::fflush(stdout);
-        for (auto& [pid, p] : g_puppets) {
-            if (p.stage == Stage::kSpawning || p.stage == Stage::kActive) Despawn(p);
-            p.stage = Stage::kNone;
-        }
-        g_drive_count = 0;
-        g_level_request_time = now;
-        g_level_gate_id = static_cast<u64>(id);
-        g_level_gate_time = now;
-        {
-            const size_t hash = key.rfind('#');
-            g_owner_level_path = hash == std::string::npos ? key : key.substr(0, hash);
-            g_owner_level_time = now;
-        }
-        Call(kGotoLevelFn, reinterpret_cast<u64>(g_base) + kLevelLoader, static_cast<u64>(id), 0, 0);
-        g_push_request_time = now; // 4.4.8: para sair do tubo se a carga nao terminar
-        g_push_retried = false;
-        g_push_target_id = id;
-        g_push_target = key;
+        GoToLevelNow(key, now);
         return;
     }
     if (f.size() < 4 || (f[0] != "b" && f[0] != "k" && f[0] != "o" && f[0] != "m" && f[0] != "r" && f[0] != "c" &&
@@ -3565,6 +3608,7 @@ void Tick() {
         }
     }
     HandleChatCommands(now);
+    ApplyDeferredLevel(now); // 4.4.30: aviso de fase que chegou com o jogador ainda no menu
     FollowOwner(now);
     Drive old[kMaxPuppets];
     const int old_count = g_drive_count;
