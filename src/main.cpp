@@ -115,7 +115,7 @@ bool g_skip_cutscenes = false;
 runtime::multiplayer::Config g_mp_config; // Fase 79: --mp-server/--mp-room/--mp-name (caixa do launcher)
 bool g_keep_16x9 = false; // 1.9.1: --keep-16x9 = tela de outra proporcao com barras (sem corrigir a camera)
 
-bool PatchCutsceneSkip(const loader::ElfPieLoader& elf) {
+cutscene_patch::Result PatchCutsceneSkip(const loader::ElfPieLoader& elf) {
     std::vector<std::span<uint8_t>> code;
     for (const auto& segment : elf.segments()) {
         if ((segment.flags & 1) && segment.vaddr <= elf.image_size() && segment.filesz <= elf.image_size() - segment.vaddr)
@@ -1795,8 +1795,15 @@ int main(int argc, char** argv) {
     }
 
     if (g_skip_cutscenes) {
-        std::printf("Cutscenes : %s\n", PatchCutsceneSkip(elf) ? "all can be skipped (--skip-cutscenes)"
-                                                                       : "WARNING: different eboot, skip mod not applied");
+        // 4.4.33: diz tambem ONDE liberou (eboot+0x...) e quantas saidas antecipadas foram desarmadas, para o log
+        // mostrar o que aconteceu em cada versao do jogo (EUR/USA tem o mesmo codigo em enderecos diferentes).
+        const cutscene_patch::Result skip = PatchCutsceneSkip(elf);
+        if (skip.applied) {
+            std::printf("Cutscenes : all can be skipped (--skip-cutscenes, eboot+0x%llx, %d gates)\n",
+                        static_cast<unsigned long long>(skip.at), skip.gates);
+        } else {
+            std::printf("Cutscenes : WARNING: different eboot, skip mod not applied (pattern not found)\n");
+        }
     }
     if (!selftest) {
         hle::anomaly::Install(elf.base()); // Fase 67: carregador de mods Anomaly (connorh315), se houver pacotes de mod

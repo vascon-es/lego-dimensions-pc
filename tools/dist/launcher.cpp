@@ -3059,7 +3059,7 @@ void Paint(Gdiplus::Graphics& g, int width, int height) {
 
     if (!settings) {
         // JOGAR: barra amarela com o triangulo; brilha devagar quando escolhido
-        const float play_y = kBar + 186;
+        const float play_y = kBar + 170; // 4.4.33: subiu um pouco para a lista inteira caber (SAIR estava cortado)
         const bool lit = (g_focus == kHotPlay || g_hover == kHotPlay) && Enabled(kHotPlay);
         Gdiplus::RectF play = U(left, play_y, 270, 54);
         if (lit) {
@@ -3082,19 +3082,21 @@ void Paint(Gdiplus::Graphics& g, int width, int height) {
         g_spots.push_back({play, kHotPlay});
         // 4.4.27: "MULTIPLAYER" logo abaixo do JOGAR, no mesmo estilo dos itens de baixo (sem fundo, texto branco e
         // amarelo so quando escolhido) e com um respiro maior depois da barra do JOGAR.
+        // 4.4.33: espacamento de 44 (antes 48) para a lista caber na janela mesmo quando a linha PREPARAR aparece
+        constexpr float kItemGap = 44.0f;
         float at = play_y + 74;
         menu_item(L"MULTIPLAYER", kHotMpPlay, at);
-        at += 48;
+        at += kItemGap;
         menu_item(ui::T(L"PRÉ-COMPILAR SHADERS", L"PRECOMPILE SHADERS"), kHotShaders, at);
-        at += 48;
+        at += kItemGap;
         if (NeedsPrepare()) {
             menu_item(ui::T(L"PREPARAR", L"PREPARE"), kHotPrepare, at);
-            at += 48;
+            at += kItemGap;
         }
         menu_item(ui::T(L"CONFIGURAÇÕES", L"SETTINGS"), kHotSettings, at);
-        menu_item(L"MODS", kHotMods, at + 48);
-        menu_item(ui::T(L"FERRAMENTAS", L"TOOLS"), kHotTools, at + 96);
-        menu_item(ui::T(L"SAIR", L"QUIT"), kHotQuit, at + 144);
+        menu_item(L"MODS", kHotMods, at + kItemGap);
+        menu_item(ui::T(L"FERRAMENTAS", L"TOOLS"), kHotTools, at + 2 * kItemGap);
+        menu_item(ui::T(L"SAIR", L"QUIT"), kHotQuit, at + 3 * kItemGap);
 
         // painel a direita: situacao, o passo atual, progresso e as ultimas linhas do log
         const Gdiplus::RectF panel = U(560, kBar + 60, 372, 410);
@@ -3131,6 +3133,13 @@ void Paint(Gdiplus::Graphics& g, int width, int height) {
         float tx = left;
         const float ty = kBar + 128;
         static float underline_x = 0, underline_w = 0;
+        // 4.4.33: a faixa das abas entra na lista ANTES das abas: o teste de clique percorre de tras para frente, e
+        // antes a faixa (que cobre tudo e troca para a proxima aba) vencia qualquer clique numa aba especifica.
+        float strip_end = left;
+        for (int t = 0; t < kTabCount; ++t) {
+            strip_end += LegoTextWidth(g, TabName(t), 22.0f) / ui::g_scale + 34;
+        }
+        g_spots.push_back({U(left - 10, ty - 6, strip_end - left - 34 + 10, 34), kHotTabs});
         for (int t = 0; t < kTabCount; ++t) {
             const float w = LegoTextWidth(g, TabName(t), 22.0f) / ui::g_scale;
             const bool hot = g_hover == kHotTab0 + t;
@@ -3146,7 +3155,7 @@ void Paint(Gdiplus::Graphics& g, int width, int height) {
             g_spots.push_back({U(tx - 6, ty - 4, w + 12, 30), kHotTab0 + t});
             tx += w + 34;
         }
-        g_spots.push_back({U(left - 10, ty - 6, tx - left, 34), kHotTabs});
+        // (a faixa das abas agora entra antes delas - ver o inicio deste bloco)
         Gdiplus::SolidBrush underline(ui::C(ui::kAccent));
         g.FillRectangle(&underline, U(underline_x, ty + 27, underline_w, 2.5f));
         PlainText(g, g_pad_used ? L"LB / RB" : ui::T(L"← / →", L"← / →"), U(tx, ty + 4, 120, 20), 12.0f, ui::kMuted);
@@ -3872,6 +3881,20 @@ int SelfTest(const fs::path& report) {
         for (const auto& s : g_spots) {
             check(client.Contains(s.rect.X, s.rect.Y) && s.rect.GetRight() <= width + 0.5f && s.rect.GetBottom() <= height + 0.5f,
                   std::string("spot outside window: ") + name + " " + std::to_string(s.id));
+        }
+        // 4.4.33: clicar numa aba tem de abrir AQUELA aba (antes a faixa das abas vencia o clique e ia para a proxima)
+        if (screen == Screen::kSettings) {
+            for (int t = 0; t < int(kTabCount); ++t) {
+                const auto it = std::find_if(g_spots.begin(), g_spots.end(),
+                                             [&](const Spot& s) { return s.id == kHotTab0 + t; });
+                if (it == g_spots.end()) {
+                    check(false, std::string("tab not drawn: ") + name + " " + std::to_string(t));
+                    continue;
+                }
+                const int hit = HitTest(int(it->rect.X + it->rect.Width / 2), int(it->rect.Y + it->rect.Height / 2));
+                check(hit == kHotTab0 + t, std::string("clicking a tab jumps to the wrong one: ") + name + " " +
+                                              std::to_string(t) + " hit " + std::to_string(hit - kHotTab0));
+            }
         }
         const auto order = FocusOrder();
         for (int id : order) {

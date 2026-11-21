@@ -84,16 +84,33 @@ int main() {
             check(game_region::TitleId(game).empty() && game_region::FindPatch(game).empty());
         }
         constexpr std::array<uint8_t,8> signature{0x8A,0x83,0xE8,0,0,0,0x24,1};
-        std::array<uint8_t,32> bytes{};
-        std::array<std::span<uint8_t>,2> segments{std::span(bytes).first(16),std::span(bytes).subspan(16)};
+        std::array<uint8_t,64> bytes{};
+        std::array<std::span<uint8_t>,2> segments{std::span(bytes).first(32),std::span(bytes).subspan(32)};
         check(!cutscene_patch::Apply(segments));
+        // uma ocorrencia: libera a leitura e desarma as saidas antecipadas "je +4; xor eax,eax; jmp" da mesma funcao
+        constexpr std::array<uint8_t,5> gate{0x74,0x04,0x31,0xC0,0xEB};
+        std::copy(gate.begin(),gate.end(),bytes.begin()+8);
         std::copy(signature.begin(),signature.end(),bytes.begin()+24);
-        check(cutscene_patch::Apply(segments) && bytes[24]==0xB0 && bytes[25]==1);
+        {
+            const auto result=cutscene_patch::Apply(segments);
+            check(result && result.applied && result.gates==1 && result.at==24);
+            check(bytes[24]==0xB0 && bytes[25]==1 && bytes[10]==0xB0 && bytes[11]==1);
+        }
+        // duas ocorrencias: ambiguo, nao pode mexer em nada (nem nas saidas antecipadas)
         std::copy(signature.begin(),signature.end(),bytes.begin());
         std::copy(signature.begin(),signature.end(),bytes.begin()+24);
         const auto before=bytes; check(!cutscene_patch::Apply(segments) && bytes==before);
-        std::array<std::span<uint8_t>,1> short_segment{std::span(bytes).first(7)};
-        check(!cutscene_patch::Apply(short_segment) && bytes==before);
+        // variante sem o "and al,1": libera com 6 bytes e nao passa do fim do segmento
+        std::array<uint8_t,16> tiny{};
+        std::copy(bytes.begin(),bytes.begin()+6,tiny.begin());
+        std::array<std::span<uint8_t>,1> tiny_segment{std::span(tiny)};
+        check(cutscene_patch::Apply(tiny_segment) && tiny[0]==0xB0 && tiny[1]==1 && tiny[2]==0x90);
+        // padrao partido entre segmentos nao conta
+        std::array<uint8_t,7> split{};
+        std::copy(signature.begin(),signature.begin()+7,split.begin());
+        const auto split_before=split;
+        std::array<std::span<uint8_t>,2> split_segments{std::span(split).first(3),std::span(split).subspan(3)};
+        check(!cutscene_patch::Apply(split_segments) && split==split_before);
         std::filesystem::remove_all(root);
         std::cout<<"Region discovery and bounded cutscene patch checks passed\n";
         return 0;
