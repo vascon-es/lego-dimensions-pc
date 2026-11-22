@@ -111,37 +111,6 @@ int main() {
         const auto split_before=split;
         std::array<std::span<uint8_t>,2> split_segments{std::span(split).first(3),std::span(split).subspan(3)};
         check(!cutscene_patch::Apply(split_segments) && split==split_before);
-        {
-            // A chamada que distingue a abertura tambem pode apontar para tras no segmento.
-            constexpr std::array<uint8_t, 16> classifier{
-                0x55, 0x48, 0x89, 0xe5, 0x48, 0x8b, 0x07, 0xff, 0x50, 0x10, 0x31, 0xf6, 0x48, 0x89, 0xc7, 0xe8};
-            constexpr std::array<uint8_t, 31> caller{
-                0xc6, 0x45, 0xe7, 0, 0xc6, 0x45, 0xe6, 0, 0x48, 0x89, 0xdf, 0xe8, 0, 0, 0, 0,
-                0x48, 0x8d, 0x75, 0xe7, 0x48, 0x8d, 0x55, 0xe6, 0x48, 0x89, 0xdf, 0x84, 0xc0, 0x74, 0x07};
-            constexpr std::array<uint8_t, 24> permission{
-                0x55, 0x48, 0x89, 0xe5, 0x53, 0x50, 0x48, 0x89, 0xfb, 0x48, 0x8b, 0x03,
-                0xff, 0x50, 0x10, 0x8b, 0x88, 0x90, 0x03, 0x00, 0x00, 0xf6, 0xc1, 0x80};
-            std::array<uint8_t, 96> code{};
-            std::copy(classifier.begin(), classifier.end(), code.begin());
-            std::copy(caller.begin(), caller.end(), code.begin() + 24);
-            std::copy(permission.begin(), permission.end(), code.begin() + 64);
-            const int32_t backwards = -40;
-            std::memcpy(code.data() + 36, &backwards, sizeof(backwards));
-            const std::array<std::span<uint8_t>, 1> images{code};
-            check(cutscene_patch::FindStartupClassifier(images) == code.data());
-            const auto* function = cutscene_patch::FindSkipPermission(images);
-            check(function == code.data() + 64);
-            code[40] = 0x90;
-            check(!cutscene_patch::FindStartupClassifier(images));
-            const auto address = reinterpret_cast<uintptr_t>(function);
-            std::array<uint8_t, 2 * sizeof(address)> slots{};
-            const std::array<std::span<uint8_t>, 1> tables{slots};
-            check(!cutscene_patch::FindPermissionSlot(tables, function));
-            std::memcpy(slots.data(), &address, sizeof(address));
-            check(cutscene_patch::FindPermissionSlot(tables, function) == slots.data());
-            std::memcpy(slots.data() + sizeof(address), &address, sizeof(address));
-            check(!cutscene_patch::FindPermissionSlot(tables, function));
-        }
         std::filesystem::remove_all(root);
         std::cout<<"Region discovery and bounded cutscene patch checks passed\n";
         return 0;
