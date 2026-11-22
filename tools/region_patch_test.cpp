@@ -87,14 +87,20 @@ int main() {
         std::array<uint8_t,64> bytes{};
         std::array<std::span<uint8_t>,2> segments{std::span(bytes).first(32),std::span(bytes).subspan(32)};
         check(!cutscene_patch::Apply(segments));
-        // uma ocorrencia: libera a leitura e desarma as saidas antecipadas "je +4; xor eax,eax; jmp" da mesma funcao
-        constexpr std::array<uint8_t,5> gate{0x74,0x04,0x31,0xC0,0xEB};
-        std::copy(gate.begin(),gate.end(),bytes.begin()+8);
+        // uma ocorrencia: libera a leitura e desarma SO a saida "test eax,0x4000000; je; xor eax,eax" da mesma funcao
+        constexpr std::array<uint8_t,9> gate_a{0xA9,0x00,0x00,0x00,0x04,0x74,0x04,0x31,0xC0}; // obrigatoria
+        constexpr std::array<uint8_t,4> gate_b{0xA8,0x01,0x74,0x04};                             // menu/atracao
+        std::array<uint8_t,9> gate_b_tail{0x31,0xC0,0xEB,0x1D,0,0,0,0,0};
+        std::copy(gate_b.begin(),gate_b.end(),bytes.begin()+4);
+        std::copy(gate_b_tail.begin(),gate_b_tail.end(),bytes.begin()+8);
+        std::copy(gate_a.begin(),gate_a.end(),bytes.begin()+14);
         std::copy(signature.begin(),signature.end(),bytes.begin()+24);
         {
             const auto result=cutscene_patch::Apply(segments);
             check(result && result.applied && result.gates==1 && result.at==24);
-            check(bytes[24]==0xB0 && bytes[25]==1 && bytes[10]==0xB0 && bytes[11]==1);
+            check(bytes[24]==0xB0 && bytes[25]==1);
+            check(bytes[21]==0xB0 && bytes[22]==1);   // a saida 0x4000000 foi desarmada
+            check(bytes[8]==0x31 && bytes[9]==0xC0); // a do bit 0 continua "xor eax,eax"
         }
         // duas ocorrencias: ambiguo, nao pode mexer em nada (nem nas saidas antecipadas)
         std::copy(signature.begin(),signature.end(),bytes.begin());

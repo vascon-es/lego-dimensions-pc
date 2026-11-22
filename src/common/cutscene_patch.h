@@ -9,7 +9,7 @@ namespace cutscene_patch {
 // segments supplied by the loader. Missing/ambiguous matches leave all bytes
 // unchanged; a fixed 48 MiB scan could read unmapped/non-code regions.
 //
-// 4.4.38: nada de gancho em vtable nem de caso especial para a abertura: apenas o patch do proprio jogo, por bytes.
+// 4.4.39: nada de gancho em vtable nem de caso especial para a abertura: apenas o patch do proprio jogo, por bytes.
 // 4.4.33: o codigo e' o mesmo na versao EUR e na USA (a funcao e' achada pelo padrao de bytes, nunca por um endereco
 // fixo - o endereco muda de uma versao para a outra). Alem da leitura final ("cena ja vista / jogo 100%"), a funcao
 // tem saidas antecipadas do tipo "je +4; xor eax,eax; jmp", que devolvem "nao pode pular" por causa dos campos
@@ -61,8 +61,11 @@ inline Result Apply(std::span<const std::span<uint8_t>> segments) {
     std::memcpy(found, patched_bytes, patched_size);
     out.applied = true;
     out.at = at;
-    // saidas antecipadas da mesma funcao: "je +4; xor eax,eax; jmp ..." -> "je +4; mov al,1; jmp ..."
-    constexpr std::array<uint8_t, 5> gate{0x74, 0x04, 0x31, 0xC0, 0xEB};
+    // Saidas antecipadas da mesma funcao. So a que testa "test eax, 0x04000000" (cena que o jogo considera
+    // obrigatoria) e' desarmada: "je +4; xor eax,eax; jmp" -> "je +4; mov al,1; jmp".
+    // 4.4.39: a que testa o bit 0 do mesmo campo fica INTACTA - e ela que marca a cena de menu/atracao da tela
+    // inicial, e desarma-la fazia o jogo desenhar o aviso "Pular" por cima de "Player 1"/menu do titulo.
+    constexpr std::array<uint8_t, 7> gate{0xA9, 0x00, 0x00, 0x00, 0x04, 0x74, 0x04}; // test eax,0x4000000 / je +4
     constexpr size_t kWindow = 0x120; // a funcao inteira cabe com folga nessa janela antes da leitura liberada
     for (const auto code : segments) {
         uint8_t* begin = code.data();
@@ -70,10 +73,11 @@ inline Result Apply(std::span<const std::span<uint8_t>> segments) {
         if (found < begin || found >= end) continue;
         const size_t have = static_cast<size_t>(found - begin);
         const size_t from = have > kWindow ? have - kWindow : 0;
-        for (size_t offset = from; offset + gate.size() <= have; ++offset) {
+        for (size_t offset = from; offset + gate.size() + 2 <= have; ++offset) {
             if (std::memcmp(begin + offset, gate.data(), gate.size())) continue;
-            begin[offset + 2] = 0xB0; // mov al, 1 (antes: xor eax, eax)
-            begin[offset + 3] = 0x01;
+            if (begin[offset + 7] != 0x31 || begin[offset + 8] != 0xC0) continue; // xor eax,eax
+            begin[offset + 7] = 0xB0; // mov al, 1
+            begin[offset + 8] = 0x01;
             ++out.gates;
         }
     }
