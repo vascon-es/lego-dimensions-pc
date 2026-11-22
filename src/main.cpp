@@ -109,6 +109,7 @@ void StartPerfThread();
 namespace {
 
 bool g_skip_cutscenes = false;
+bool g_virtual_toypad_active = false;
 runtime::multiplayer::Config g_mp_config; // Fase 79: --mp-server/--mp-room/--mp-name (caixa do launcher)
 bool g_keep_16x9 = false; // 1.9.1: --keep-16x9 = tela de outra proporcao com barras (sem corrigir a camera)
 
@@ -119,12 +120,15 @@ CutscenePredicate g_native_startup_scene = nullptr;
 HLE_SYSV_ABI bool CutsceneSkipPermission(void* scene) {
     if (!g_native_skip_permission(scene)) return false;
     if (!g_native_startup_scene(scene)) return true;
+    // A cinematica do menu, que inclui a Warner, pode receber o pulo normal
+    // depois de o Toy Pad virtual completar o WAKE e o desafio do jogo.
+    if (!g_skip_cutscenes || (g_virtual_toypad_active && !hle::toypad::SessionReady())) return false;
     static std::atomic<bool> reported{false};
     if (!reported.exchange(true)) {
-        std::printf("[CUTSCENES] Loading_Screen_startup segue a transicao normal\n");
+        std::printf("[CUTSCENES] cinematica inicial liberada pelo menu de cutscenes\n");
         std::fflush(stdout);
     }
-    return false;
+    return true;
 }
 
 void ConfigureCutsceneSkip(const loader::ElfPieLoader& elf) {
@@ -150,7 +154,7 @@ void ConfigureCutsceneSkip(const loader::ElfPieLoader& elf) {
     const CutscenePredicate hook = &CutsceneSkipPermission;
     // O aviso e a leitura do botao passam pela mesma entrada virtual.
     std::memcpy(slot, &hook, sizeof(hook));
-    std::printf("Cutscenes : opening logos use the normal startup sequence\n");
+    std::printf("Cutscenes : startup cinematics follow the cutscene setting\n");
 
     if (!g_skip_cutscenes) return;
     const cutscene_patch::Result skip = cutscene_patch::Apply(code);
@@ -1764,6 +1768,7 @@ int main(int argc, char** argv) {
     if (toypad && !selftest && real_toypad && hle::UseRealToypad()) {
         std::printf("portal     : Physical Toy Pad (USB); --no-real-toypad uses virtual portal\n");
     } else if (toypad && !selftest) {
+        g_virtual_toypad_active = true;
         hle::StartPortalWatcher(portal_file);
         std::printf("portal     : %s  (reread every 500 ms)\n", hle::fs::PathText(portal_file).c_str());
         hle::StartToypadListener(toypad_port);
