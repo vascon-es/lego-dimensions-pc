@@ -15,6 +15,7 @@
 #include <Zydis/Zydis.h>
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cmath>
 #include <cstdio>
@@ -39,6 +40,7 @@ namespace runtime::multiplayer {
 void OnLocalKill(unsigned long long obj, unsigned long long killer); // Fase 80 (no fim do arquivo)
 void Announce(const std::string& payload); // 4.2: avisa a sala e guarda no registro da area (fora do namespace anonimo)
 namespace {
+std::string CurrentArea();
 
 // ---- enderecos do eboot (deslocamentos a partir da base) --------------------------------------------------------
 constexpr u64 kPlayerTable = 0x3163788;    // instancia do jogador 1 (+8 = jogador 2)
@@ -210,6 +212,7 @@ using ControlFn = u64(HLE_SYSV_ABI*)(u64, float);
 using SetupFn = u64(HLE_SYSV_ABI*)(u64, u64, u64, u64, u64, u64);
 SetupFn g_setup = nullptr;
 SetupFn g_slot_load = nullptr;
+SetupFn g_set_action = nullptr;
 using SpawnFn = u64(HLE_SYSV_ABI*)(u64, u64, u64, u64, u64, u64);
 using DtorFn = u64(HLE_SYSV_ABI*)(u64, u64, u64, u64, u64, u64);
 ControlFn g_control = nullptr;
@@ -234,7 +237,7 @@ std::vector<SpawnerSeen> g_spawners;
 std::atomic<bool> g_spawning{false}; // nos mesmos chamando o spawn
 
 struct LocalVehicle {
-    u64 inst, request, name_ptr, portal_slot;
+    u64 inst, request, identity, portal_slot;
     int slot;
     std::string model;
 };
@@ -243,15 +246,49 @@ std::vector<LocalVehicle> g_local_vehicles;
 bool ValidVehicleName(const std::string& name);
 std::string LocalCharacter(u64 inst);
 
-void RememberLocalVehicle(u64 inst, u64 request = 0, u64 portal_slot = 0) {
-    if (!inst || !Readable(inst, 0x1b8)) return;
-    const std::string model = LocalCharacter(inst);
+constexpr u64 kMechVehicleVtable = 0x2bfe200;
+constexpr u64 kMechVehicleRequestVtable = 0x2bfe540;
+u64 g_vehicle_registry = 0, g_vehicle_resource_fn = 0;
+
+bool IsMechVehicle(u64 inst) {
+    return inst && ReadPointer(inst) == reinterpret_cast<u64>(g_base) + kMechVehicleVtable;
+}
+
+u64 VehicleIdentity(u64 inst) {
+    return IsMechVehicle(inst) ? ReadPointer(inst + 0x48) : ReadPointer(inst + 0x10);
+}
+
+u64 EngineMethod(u64 object, u64 slot) {
+    const u64 table = ReadPointer(object);
+    const u64 base = reinterpret_cast<u64>(g_base);
+    if (table < base + 0x2300000 || table >= base + 0x3400000) return 0;
+    const u64 method = ReadPointer(table + slot);
+    return method >= base && method < base + 0x2300000 ? method - base : 0;
+}
+
+std::string VehicleModelLabel(std::string label) {
+    const size_t separator = label.find_last_of("/\\");
+    std::string model = Lower(separator == std::string::npos ? label : label.substr(separator + 1));
+    if (model.ends_with(".cd")) model.resize(model.size() - 3);
+    return ValidVehicleName(model) ? model : std::string{};
+}
+
+std::string PortalVehicleModel(u64 slot) {
+    if (!slot || !Readable(slot + 0xb8, 48)) return {};
+    const auto* label = reinterpret_cast<const char*>(slot + 0xb8);
+    return VehicleModelLabel(std::string(label, strnlen(label, 48)));
+}
+
+void RememberLocalVehicle(u64 inst, u64 request = 0, u64 portal_slot = 0, std::string model = {}) {
+    if (!inst) return;
+    const u64 identity = VehicleIdentity(inst);
+    if (!identity) return;
+    if (model.empty() && !IsMechVehicle(inst)) model = Lower(LocalCharacter(inst));
     if (!ValidVehicleName(model)) return;
     std::lock_guard lock(g_local_vehicle_mutex);
     for (auto& existing : g_local_vehicles) {
         if (existing.inst != inst) continue;
-        const u64 name_ptr = At<u64>(inst + 0x10);
-        if (existing.name_ptr != name_ptr) {
+        if (existing.identity != identity) {
             existing.request = 0;
             existing.portal_slot = 0;
         }
@@ -259,7 +296,7 @@ void RememberLocalVehicle(u64 inst, u64 request = 0, u64 portal_slot = 0) {
             existing.request = request;
             if (portal_slot) existing.portal_slot = portal_slot;
         }
-        existing.name_ptr = name_ptr;
+        existing.identity = identity;
         existing.model = model;
         return;
     }
@@ -267,7 +304,7 @@ void RememberLocalVehicle(u64 inst, u64 request = 0, u64 portal_slot = 0) {
     for (int slot = 1; slot <= kMaxVehicleIds; ++slot) {
         if (std::none_of(g_local_vehicles.begin(), g_local_vehicles.end(),
                          [=](const LocalVehicle& vehicle) { return vehicle.slot == slot; })) {
-            g_local_vehicles.push_back({inst, request, At<u64>(inst + 0x10), portal_slot, slot, model});
+            g_local_vehicles.push_back({inst, request, identity, portal_slot, slot, model});
             return;
         }
     }
@@ -276,12 +313,18 @@ void RememberLocalVehicle(u64 inst, u64 request = 0, u64 portal_slot = 0) {
 void ForgetLocalVehicle(u64 inst, u64 request = 0) {
     std::lock_guard lock(g_local_vehicle_mutex);
     std::erase_if(g_local_vehicles, [=](const LocalVehicle& vehicle) {
-        return (inst && vehicle.inst == inst) || (request && vehicle.request == request);
+        return (inst && (vehicle.inst == inst || (IsMechVehicle(vehicle.inst) && vehicle.identity == inst))) ||
+               (request && vehicle.request == request);
     });
 }
 
 u64 SpawnedInstance(u64 request) {
     const u64 comp = request ? ReadPointer(request + 0x40) : 0;
+    // O portal registra Character+0x370 ou MechVehicle+0x58 no pedido.
+    if (comp > 0x58 && ReadPointer(comp) == reinterpret_cast<u64>(g_base) + kMechVehicleRequestVtable) {
+        const u64 vehicle = comp - 0x58;
+        return IsMechVehicle(vehicle) ? vehicle : 0;
+    }
     return comp ? ReadPointer(comp + 0x20) : 0;
 }
 
@@ -339,12 +382,15 @@ struct Puppet {
     double punch_until = 0;        // 4.4.21: ate quando o motor toca o soco do outro jogo (sem forcar a marcha)
     double fly_pulse_start = -100; // 4.4.23: pulso duplo de X para entrar em voo quando o outro jogo esta em Flying
     double fly_cooldown = -100;
+    double native_flight_retry = -100;
     u32 prev_held = 0;
     u32 last_remote_ctx = 0;       // 4.4.24: ultimo ActionContext visto do outro jogo (bordas de pulo/soco/especial)
     bool pending_melee = false;    // 4.4.24: bordas latentes consumidas no ControlHook (nunca se perdem entre Ticks)
     bool pending_special = false;
     bool pending_jump = false;
     bool pending_slam = false;
+    u32 pending_action = 0;
+    double pending_action_until = 0;
     double jump_until = 0;         // 4.4.24: janela minima do pulo antes de espelhar pouso em Default
     float face_ang = 0.0f;         // 4.4.16: cara suavizada (angulo)
     bool have_face = false;
@@ -457,8 +503,7 @@ Drive g_drive[kMaxPuppets];
 int g_drive_count = 0;
 
 double g_last_spawn = 0;
-u32 g_held_latch = 0;
-double g_held_latch_time = 0;
+std::array<double, 4> g_button_until{-100, -100, -100, -100};
 std::atomic<u32> g_last_held{0};
 u32 g_held_sent = 0; // 4.4.21: ultimo botao enviado (a sonda usa para dar a rajada no soco)
 unsigned g_seen_epoch = 0;
@@ -512,6 +557,27 @@ s32 ContextIdByHash(u32 want_hash) {
         if (factory && Readable(factory + 0x34, 4) && At<u32>(factory + 0x34) == want_hash) return i;
     }
     return -1;
+}
+
+bool SharedAction(u32 hash) {
+    return hash == kCtxLandSlam || hash == kCtxFlying || hash == kCtxGliding;
+}
+
+bool IsLocalPlayer(u64 inst);
+bool RunFlightAddon(u64 inst, bool start);
+
+HLE_SYSV_ABI u64 SetActionHook(u64 inst, u64 id, u64 param, u64 flags, u64 sub, u64 extra) {
+    const bool local = runtime::mp_net::SelfId() && IsLocalPlayer(inst);
+    const u32 before = local ? ActiveContextHash(inst) : 0;
+    const u64 result = g_set_action(inst, id, param, flags, sub, extra);
+    if (local) {
+        const u32 after = ActiveContextHash(inst);
+        if (after != before && SharedAction(after)) {
+            const std::string character = LocalCharacter(inst);
+            if (!character.empty()) Announce("a|" + CurrentArea() + "|" + character + "|" + std::to_string(after));
+        }
+    }
+    return result;
 }
 
 // ---- ganchos ----------------------------------------------------------------------------------------------------
@@ -718,19 +784,35 @@ HLE_SYSV_ABI u64 ControlHook(u64 inst, float dt) {
         return result;
     }
     bool want_melee = false, want_special = false, want_jump = false, want_slam = false;
+    u32 action = 0;
     u32 held = d ? d->held : 0, prev_btn = d ? d->prev : 0;
     if (d && d->puppet && d->puppet->inst == inst) {
         if (d->puppet->pending_melee)   { want_melee = true;   d->puppet->pending_melee = false;   held |= kSquare; prev_btn &= ~kSquare; }
         if (d->puppet->pending_special) { want_special = true; d->puppet->pending_special = false; held |= kCircle; prev_btn &= ~kCircle; }
         if (d->puppet->pending_jump)    { want_jump = true;    d->puppet->pending_jump = false;    held |= kCross;  prev_btn &= ~kCross; }
         if (d->puppet->pending_slam)    { want_slam = true;    d->puppet->pending_slam = false; }
+        action = d->puppet->pending_action;
     }
-    const u32 pressed = held & ~prev_btn, released = prev_btn & ~held;
+    const u32 pressed = held & ~prev_btn;
     if (pressed & kSquare) want_melee = true;
     if (pressed & kCircle) want_special = true;
     if (pressed & kCross)  want_jump = true;
 
     const u32 ctx_before = d ? ActiveContextHash(inst) : 0;
+    const bool airborne = ctx_before == kCtxJumping || ctx_before == kCtxFalling;
+    const bool slam_combo = d && (pressed & kSquare) && ((held | prev_btn) & kCross);
+    want_slam |= slam_combo && airborne;
+    if (slam_combo && ctx_before == kCtxDefault && want_jump && d->puppet) {
+        d->puppet->pending_action = kCtxLandSlam;
+        d->puppet->pending_action_until = runtime::mp_net::Now() + 0.45;
+        action = kCtxLandSlam;
+    }
+    if (want_slam) action = kCtxLandSlam;
+    if (!action && d && (d->ctx_hash == kCtxFlying || d->ctx_hash == kCtxGliding)) action = d->ctx_hash;
+    if (action == kCtxLandSlam) {
+        want_melee = false;
+        held &= ~kSquare;
+    }
     const bool walking = d && d->ground && (ctx_before == 0 || ctx_before == kCtxDefault) &&
                          !d->punching && !held && !want_jump && !want_slam;
     if (d) {
@@ -742,26 +824,26 @@ HLE_SYSV_ABI u64 ControlHook(u64 inst, float dt) {
     bool used_player_ctrl = false;
     // No chao, o eixo da locomocao vem do caminho recebido. O analogo falso
     // depende da camera deste PC e fica reservado para os contextos de acao.
-    if (d && !walking && g_player_mode.load()) {
+    if (d && g_player_mode.load()) {
         if (FakeController* fc = FakeControllerFor(d->slot_key, inst)) {
             used_player_ctrl = true;
             active_fc = fc;
             At<u64>(inst + 0x3a0) = fc->ctrl;
             At<u32>(fc->holder + 0x00) = held;
             At<u32>(fc->holder + 0x04) = prev_btn;
-            At<u32>(fc->holder + 0x08) = pressed;
-            At<u32>(fc->holder + 0x0c) = released;
+            At<u32>(fc->holder + 0x08) = held & ~prev_btn;
+            At<u32>(fc->holder + 0x0c) = prev_btn & ~held;
             // 4.4.24: BrainModule::PollButtons (eboot+0xec3230 via owner->vt[0x7d8] = ctrl+0x18) le 3 triplas de botoes:
             // +0x24..0x2c (indice 0), +0x30..0x38 (indice 1 = gamepad INPG!), e +0x3c..0x44 (indice 2).
             for (u64 off : {0x24ull, 0x30ull, 0x3cull}) {
                 At<u32>(fc->ctrl + off + 0) = held;
-                At<u32>(fc->ctrl + off + 4) = pressed;
-                At<u32>(fc->ctrl + off + 8) = released;
+                At<u32>(fc->ctrl + off + 4) = held & ~prev_btn;
+                At<u32>(fc->ctrl + off + 8) = prev_btn & ~held;
             }
             if (Readable(inst + 0x4f8, 0x18)) {
                 At<u32>(inst + 0x4f8 + 0xc) = held;
-                At<u32>(inst + 0x4f8 + 0x10) = pressed;
-                At<u32>(inst + 0x4f8 + 0x14) = released;
+                At<u32>(inst + 0x4f8 + 0x10) = held & ~prev_btn;
+                At<u32>(inst + 0x4f8 + 0x14) = prev_btn & ~held;
             }
             d->prev = held;
             // 4.4.24: destrava o ping-pong PreUpdate/PostUpdate (byte [brain+0x117] bits 0x08/0x10) e liga bit 0x01
@@ -770,7 +852,7 @@ HLE_SYSV_ABI u64 ControlHook(u64 inst, float dt) {
                                         ctx_before == kCtxJumping || ctx_before == kCtxFalling) &&
                                        (d->gear > 3 || std::hypot(d->dx, d->dz) > 0.05f);
             const int stick_gear = airborne_move ? std::max(d->gear, 5) : d->gear;
-            const bool walk = (stick_gear > 3) && !d->hold && !d->punching;
+            const bool walk = !walking && (stick_gear > 3) && !d->hold && !d->punching;
             WriteCameraStick(fc->holder, stick_gear, d->dx, d->dz, walk);
             At<u8>(inst + 0x399) = 1;
         }
@@ -779,11 +861,28 @@ HLE_SYSV_ABI u64 ControlHook(u64 inst, float dt) {
         if (Readable(inst + 0x3a0, 8) && IsOurFakeCtrl(At<u64>(inst + 0x3a0))) At<u64>(inst + 0x3a0) = 0;
         if (Readable(inst + 0x4f8, 0x18)) {
             At<u32>(inst + 0x4f8 + 0xc) = held;
-            At<u32>(inst + 0x4f8 + 0x10) = pressed;
-            At<u32>(inst + 0x4f8 + 0x14) = released;
+            At<u32>(inst + 0x4f8 + 0x10) = held & ~prev_btn;
+            At<u32>(inst + 0x4f8 + 0x14) = prev_btn & ~held;
         }
         d->prev = held;
         At<u8>(inst + 0x399) = walking ? 0 : 1;
+    }
+    if (action == kCtxFlying && ctx_before != kCtxFlying && d->puppet) {
+        const double now = runtime::mp_net::Now();
+        if (now >= d->puppet->native_flight_retry) {
+            d->puppet->native_flight_retry = now + 0.45;
+            RunFlightAddon(inst, true);
+        }
+    } else if (action && action != ctx_before && (action != kCtxLandSlam || airborne || !want_jump)) {
+        const s32 id = ContextIdByHash(action);
+        if (id >= 0) Call(kSetActionFn, inst, static_cast<u64>(id), 0, 0, 0xffffffffu);
+    }
+    if (action && d && ActiveContextHash(inst) == action && d->puppet) {
+        d->puppet->pending_action = 0;
+        if (action == kCtxLandSlam) {
+            d->punching = false;
+            d->puppet->punch_until = 0;
+        }
     }
     const u64 result = g_control(inst, dt);
     if (!d || !Readable(inst + 0x10, 0x500) || At<u64>(inst + 0x10) != d->name) return result;
@@ -812,13 +911,6 @@ HLE_SYSV_ABI u64 ControlHook(u64 inst, float dt) {
             local_ctx = ActiveContextHash(inst);
         }
     }
-    if (want_slam && (local_ctx == kCtxJumping || local_ctx == kCtxFalling) && kSetActionFn) {
-        const s32 slam_id = ContextIdByHash(kCtxLandSlam);
-        if (slam_id >= 0) {
-            Call(kSetActionFn, inst, static_cast<u64>(slam_id), 0, 0, 0xffffffffu);
-            local_ctx = ActiveContextHash(inst);
-        }
-    }
     if (want_special && local_ctx == kCtxDefault && kSetActionFn) {
         const s32 spec_id = ContextIdByHash(kCtxSpecialMove);
         if (spec_id >= 0) {
@@ -834,28 +926,28 @@ HLE_SYSV_ABI u64 ControlHook(u64 inst, float dt) {
         }
     }
 
-    // 4.4.24: desanexa inst+0x399 e inst+0x3a0 fora do ControlHook (evita rumble/LED em 0x199fd4e, HUD em 0x19a0250 e ~Character).
-    At<u8>(inst + 0x399) = 0;
-    if (Readable(inst + 0x3a0, 8) && IsOurFakeCtrl(At<u64>(inst + 0x3a0))) At<u64>(inst + 0x3a0) = 0;
-
     // 4.4.23/4.4.24: se o outro jogo ja pousou (Default) e o fantasma continuava em voo/planar/queda (ex.: Teleport em rampa), pousa na hora
-    if (d->ctx_hash == kCtxDefault &&
+    if (d->ctx_hash == kCtxDefault && !action &&
         (local_ctx == kCtxFlying || local_ctx == kCtxGliding || local_ctx == kCtxFalling ||
          (local_ctx == kCtxJumping && !d->jump_active)) &&
         kSetActionFn) {
-        const s32 def_id = ContextIdByHash(kCtxDefault);
+        const bool stopped = local_ctx == kCtxFlying && RunFlightAddon(inst, false);
+        const s32 def_id = stopped ? -1 : ContextIdByHash(kCtxDefault);
         if (def_id >= 0) {
             Call(kSetActionFn, inst, static_cast<u64>(def_id), 0, 0, 0xffffffffu);
-            local_ctx = kCtxDefault;
         }
+        local_ctx = ActiveContextHash(inst);
     }
+    // O controle da replica so precisa estar anexado durante a atualizacao.
+    At<u8>(inst + 0x399) = 0;
+    if (IsOurFakeCtrl(ReadPointer(inst + 0x3a0))) At<u64>(inst + 0x3a0) = 0;
     const bool in_action = d->punching || (local_ctx != 0 && local_ctx != kCtxDefault);
     const u64 loc = Readable(inst + 0x90, 8) ? At<u64>(inst + 0x90) : 0;
     if (in_action) {
         if ((d->punching || local_ctx == kCtxFighting || local_ctx == kCtxConeAttack) && loc && Readable(loc + 0x70, 4)) {
             At<u32>(loc + 0x70) = 0;
         }
-    } else {
+    } else if (d->ground) {
         ApplyGroundLocomotion(inst, *d);
     }
     Teleport(inst, d->x, d->y, d->z);
@@ -932,6 +1024,7 @@ HLE_SYSV_ABI u64 SpawnHook(u64 spawner, u64 request, u64 flag, u64 a, u64 b, u64
     const bool local = !g_spawning && !IsOurRequest(request);
     const u64 portal_slot = local && Readable(spawner, 0x200) &&
         At<u64>(spawner) == reinterpret_cast<u64>(g_base) + kSpawnerVtable ? ReadPointer(spawner + 0x1f0) : 0;
+    const std::string vehicle_model = PortalVehicleModel(portal_slot);
     if (local) {
         std::lock_guard lock(g_spawner_mutex);
         const unsigned epoch = g_area_epoch;
@@ -958,7 +1051,7 @@ HLE_SYSV_ABI u64 SpawnHook(u64 spawner, u64 request, u64 flag, u64 a, u64 b, u64
     // carro. O pedido nativo continua apontando para a instancia criada.
     if (local) {
         if (const u64 inst = SpawnedInstance(request); inst && !IsPuppetFast(inst)) {
-            RememberLocalVehicle(inst, request, portal_slot);
+            RememberLocalVehicle(inst, request, portal_slot, vehicle_model);
         }
     }
     return result;
@@ -976,7 +1069,6 @@ constexpr u64 kGizmoAboutToPlayEvent = 0x3174710;
 constexpr u64 kVehicleCreatedEvent = 0x30e1500;
 constexpr u64 kVehicleRemovedEvent = 0x30e1480;
 std::map<std::pair<std::string, int>, double> g_recent_gizmos;
-std::string CurrentArea();
 
 std::string GizmoName(u64 gizmo) {
     std::string name;
@@ -1353,11 +1445,129 @@ std::vector<u64> g_wave_spawners; // ultima varredura, sob g_gadget_mutex
 constexpr u64 kCharacterVtable = 0x2bdf860; // personagens (jogadores, capangas, Doc Brown...): nome em +0x10
 std::vector<u64> g_characters; // da ultima varredura (g_gadget_mutex)
 std::vector<u64> g_builds;     // montinhos de pecas (g_gadget_mutex)
+constexpr u64 kHubFlightAddonVtable = 0x2cc5500, kLevelFlightAddonVtable = 0x2cc5940;
+std::vector<u64> g_flight_addons;
+constexpr u64 kShiftAreaVtable = 0x2c9b710, kShiftAddonVtable = 0x2c9c220;
+constexpr u64 kShiftAddonId = 0x3153638;
+u64 g_shift_position_fn = 0, g_shift_queue_fn = 0, g_shift_arrive_fn = 0;
+u64 g_character_addons_fn = 0, g_find_addon_fn = 0;
+using ShiftFn = void(HLE_SYSV_ABI*)(u64, u64);
+ShiftFn g_shift_arrive = nullptr;
+std::vector<u64> g_shift_areas;
+unsigned g_shift_area_epoch = 0;
+
+struct ShiftReplay {
+    u64 target;
+    double time;
+};
+std::map<u64, ShiftReplay> g_shift_replays;
+std::map<u64, ShiftReplay> g_shift_arrivals;
+
+bool ShiftPosition(u64 target, std::array<float, 4>& position) {
+    if (!g_shift_position_fn || !Readable(target, 0xe0)) return false;
+    const u64 marker = ReadPointer(target + 0xb8);
+    if (!EngineMethod(marker, 0x68)) return false;
+    Call(g_shift_position_fn, target, reinterpret_cast<u64>(position.data()));
+    return std::isfinite(position[0]) && std::isfinite(position[1]) && std::isfinite(position[2]);
+}
+
+HLE_SYSV_ABI void ShiftArriveHook(u64 target, u64 character_ref) {
+    const u64 actor = character_ref > 0x370 ? character_ref - 0x370 : 0;
+    if (GetCurrentThreadId() != g_main_tid || !runtime::mp_net::SelfId() || !IsLocalPlayer(actor)) {
+        g_shift_arrive(target, character_ref);
+        return;
+    }
+    const auto pending = g_shift_replays.find(actor);
+    const bool replayed = pending != g_shift_replays.end() && pending->second.target == target &&
+                          runtime::mp_net::Now() - pending->second.time <= 20.0;
+    if (pending != g_shift_replays.end()) g_shift_replays.erase(pending);
+    alignas(16) std::array<float, 4> position{};
+    const bool identified = ShiftPosition(target, position);
+    g_shift_arrive(target, character_ref);
+    if (!identified) return;
+    g_shift_arrivals[actor] = {target, runtime::mp_net::Now()};
+    if (replayed) {
+        std::printf("[MP] Shift: chegada da quest remota concluida neste jogo\n");
+        std::fflush(stdout);
+    } else if (!g_applying) {
+        char marker[112];
+        std::snprintf(marker, sizeof(marker), "%.3f,%.3f,%.3f", position[0], position[1], position[2]);
+        Announce("h|" + CurrentArea() + "|" + LocalCharacter(actor) + "|" + marker);
+        std::printf("[MP] Shift: chegada confirmada, destino %s enviado\n", marker);
+        std::fflush(stdout);
+    }
+}
+
+u64 ShiftAddon(u64 character) {
+    if (!g_character_addons_fn || !g_find_addon_fn || !Readable(character, 0x500)) return 0;
+    const u64 addons = Call(g_character_addons_fn, character);
+    if (!addons) return 0;
+    const u64 base = reinterpret_cast<u64>(g_base);
+    const u64 addon = Call(g_find_addon_fn, addons, base + kShiftAddonId, 0);
+    if (ReadPointer(addon) != base + kShiftAddonVtable || !Readable(addon, 0x110)) return 0;
+    const u64 owner = ReadPointer(addon + 0xa8);
+    const u64 getter = EngineMethod(owner, 0x570);
+    return getter && Call(getter, owner) == character ? addon : 0;
+}
+
+u64 FindShiftTarget(float x, float y, float z) {
+    std::vector<u64> areas;
+    {
+        std::lock_guard lock(g_gadget_mutex);
+        if (g_shift_area_epoch != g_area_epoch) return 0;
+        areas = g_shift_areas;
+    }
+    const u64 vtable = reinterpret_cast<u64>(g_base) + kShiftAreaVtable;
+    u64 selected = 0;
+    float best = 0.25f;
+    for (u64 area : areas) {
+        if (ReadPointer(area) != vtable) continue;
+        for (u64 field : {0x1a8ull, 0x1b0ull, 0x1b8ull}) {
+            const u64 target = ReadPointer(area + field);
+            if (!target || !Readable(target + 0xc0, 4)) continue;
+            const int state = At<s32>(target + 0xc0);
+            if (state < 0 || state > 8) continue;
+            alignas(16) std::array<float, 4> position{};
+            if (!ShiftPosition(target, position)) continue;
+            const float distance = std::hypot(x - position[0], y - position[1], z - position[2]);
+            if (distance >= best) continue;
+            best = distance;
+            selected = target;
+        }
+    }
+    return selected;
+}
+
+bool RunFlightAddon(u64 inst, bool start) {
+    const u64 base = reinterpret_cast<u64>(g_base);
+    u64 addon = 0, method = 0;
+    {
+        std::lock_guard lock(g_gadget_mutex);
+        for (const u64 candidate : g_flight_addons) {
+            const u64 vtable = ReadPointer(candidate);
+            if ((vtable != base + kHubFlightAddonVtable && vtable != base + kLevelFlightAddonVtable) ||
+                ReadPointer(candidate + 0x80) != inst || !ReadPointer(candidate + 0x88)) continue;
+            method = ReadPointer(vtable + (start ? 0x2f0 : 0x300));
+            if (method < base || method >= base + 0x2300000 || !Readable(method, 4) ||
+                At<u32>(method) != 0xe5894855) continue;
+            addon = candidate;
+            break;
+        }
+    }
+    if (!addon) return false;
+    using FlightFn = void(HLE_SYSV_ABI*)(u64);
+    reinterpret_cast<FlightFn>(method)(addon);
+    return true;
+}
 
 void ScanGadgets() {
+    const unsigned epoch = g_area_epoch;
     const u64 want_char = reinterpret_cast<u64>(g_base) + kCharacterVtable;
     const u64 want_spawner = reinterpret_cast<u64>(g_base) + kScriptSpawnerVtable;
-    std::vector<u64> found, chars, builds_found, spawners;
+    const u64 hub_flight = reinterpret_cast<u64>(g_base) + kHubFlightAddonVtable;
+    const u64 level_flight = reinterpret_cast<u64>(g_base) + kLevelFlightAddonVtable;
+    const u64 shift_area = reinterpret_cast<u64>(g_base) + kShiftAreaVtable;
+    std::vector<u64> found, chars, builds_found, spawners, flight_addons, shift_areas;
     std::vector<u64> buf(1 << 17); // 1 MB
     HANDLE self = GetCurrentProcess();
     for (u64 addr = 0x1000000000ull; addr < 0x1100000000ull;) {
@@ -1373,6 +1583,8 @@ void ScanGadgets() {
                 for (SIZE_T i = 0; i < got / 8; ++i) {
                     if (buf[i] == want_char) chars.push_back(p + i * 8);
                     else if (buf[i] == want_spawner) spawners.push_back(p + i * 8);
+                    else if (buf[i] == hub_flight || buf[i] == level_flight) flight_addons.push_back(p + i * 8);
+                    else if (buf[i] == shift_area) shift_areas.push_back(p + i * 8);
                     else if (buf[i] == reinterpret_cast<u64>(g_base) + kBuildVtable) builds_found.push_back(p + i * 8);
                     else if ((buf[i] >> 24) == ((reinterpret_cast<u64>(g_base) + 0x2c00000) >> 24) && IsGadgetVtable(buf[i])) {
                         found.push_back(p + i * 8);
@@ -1387,6 +1599,9 @@ void ScanGadgets() {
     g_characters.swap(chars);
     g_builds.swap(builds_found);
     g_wave_spawners.swap(spawners);
+    g_flight_addons.swap(flight_addons);
+    g_shift_areas.swap(shift_areas);
+    g_shift_area_epoch = epoch;
 }
 
 void StartGadgetScan(double now) {
@@ -1399,11 +1614,12 @@ void StartGadgetScan(double now) {
 }
 
 // os gadgets vivos com este nome, em ordem de endereco (o "ordem" do aviso desempata nomes repetidos)
-std::vector<u64> GadgetsNamed(const std::string& name) {
+std::vector<u64> GadgetsNamed(const std::string& name, u64 type = 0) {
     std::vector<u64> out;
     std::lock_guard lock(g_gadget_mutex);
     for (u64 g : g_gadgets) {
-        if (ValidGadget(g) && GadgetName(g) == name && std::find(out.begin(), out.end(), g) == out.end()) out.push_back(g);
+        if (ValidGadget(g) && (!type || At<u64>(g) == reinterpret_cast<u64>(g_base) + type) &&
+            GadgetName(g) == name && std::find(out.begin(), out.end(), g) == out.end()) out.push_back(g);
     }
     std::sort(out.begin(), out.end());
     return out;
@@ -1621,14 +1837,18 @@ HLE_SYSV_ABI u64 MsRequestHook(u64 obj, u64 state, u64 param, u64 force, u64 imm
 }
 
 HLE_SYSV_ABI u64 TriggerObstacleHook(u64 unused, u64 ctx, u64 who, u64 a, u64 b, u64 c) {
-    if (!g_applying && g_enabled && ValidGadget(ctx) && IsLocalPlayer(who)) {
+    const int self = runtime::mp_net::SelfId();
+    const bool component = who > 0x370 && IsLocalPlayer(who - 0x370);
+    if (!g_applying && self && ValidGadget(ctx) && (IsLocalPlayer(who) || component)) {
         const std::string name = GadgetName(ctx);
-        if (!name.empty() && !IsLocalOnlyGadget(name)) {
-            const std::vector<u64> same = GadgetsNamed(name);
+        if (!name.empty()) {
+            const u64 type = At<u64>(ctx) - reinterpret_cast<u64>(g_base);
+            const std::vector<u64> same = GadgetsNamed(name, type);
             const auto it = std::find(same.begin(), same.end(), ctx);
             const int order = it == same.end() ? 0 : static_cast<int>(it - same.begin());
-            const u64 type = At<u64>(ctx) - reinterpret_cast<u64>(g_base);
-            Announce("o|" + CurrentArea() + "|" + name + "|" + std::to_string(order) + "|" + std::to_string(type));
+            const char* actor_form = component ? "component" : "character";
+            Announce("o|" + CurrentArea() + "|" + name + "|" + std::to_string(order) + "|" +
+                     std::to_string(type) + "|" + actor_form);
             std::printf("[MP] acionei %s (#%d): avisando a sala\n", name.c_str(), order);
             std::fflush(stdout);
         }
@@ -1638,12 +1858,11 @@ HLE_SYSV_ABI u64 TriggerObstacleHook(u64 unused, u64 ctx, u64 who, u64 a, u64 b,
 
 HLE_SYSV_ABI u64 RequestDtorHook(u64 request, u64 a, u64 b, u64 c, u64 d, u64 e) {
     ForgetLocalVehicle(0, request);
-    if (IsOurRequest(request) && Readable(request + 0x40, 8)) {
-        const u64 comp = At<u64>(request + 0x40);
-        const u64 inst = comp && Readable(comp + 0x20, 8) ? At<u64>(comp + 0x20) : 0;
+    if (IsOurRequest(request)) {
+        const u64 inst = SpawnedInstance(request);
         if (inst) {
             LiveInstDrop(inst);
-            if (Readable(inst + 0x399, 0x10) && !IsLocalPlayer(inst)) {
+            if (!IsMechVehicle(inst) && Readable(inst + 0x399, 0x10) && !IsLocalPlayer(inst)) {
                 At<u8>(inst + 0x399) = 0;
                 if (IsOurFakeCtrl(At<u64>(inst + 0x3a0))) At<u64>(inst + 0x3a0) = 0;
             }
@@ -2028,7 +2247,7 @@ bool SlotUsedByLocalPlayer(u64 slot) {
                 // O jogo permite dois Batmoveis, desde que o pedido de cada um use seu slot.
                 std::lock_guard lock(g_local_vehicle_mutex);
                 return std::any_of(g_local_vehicles.begin(), g_local_vehicles.end(), [=](const LocalVehicle& v) {
-                    return v.portal_slot == slot && ReadPointer(v.inst + 0x10) == v.name_ptr &&
+                    return v.portal_slot == slot && VehicleIdentity(v.inst) == v.identity &&
                            (!v.request || SpawnedInstance(v.request) == v.inst);
                 });
             }
@@ -2056,9 +2275,20 @@ u64 TemplateRequest(u64 spawner) {
     return 0;
 }
 
-bool PickSpawner(u64* spawner, u64* request) {
+bool PickSpawner(u64* spawner, u64* request, bool vehicle) {
     std::lock_guard lock(g_spawner_mutex);
     const unsigned epoch = g_area_epoch;
+    if (vehicle) {
+        for (auto it = g_spawners.rbegin(); it != g_spawners.rend(); ++it) {
+            if (it->epoch != epoch || !ValidSpawner(it->spawner) ||
+                PortalVehicleModel(ReadPointer(it->spawner + 0x1f0)).empty()) continue;
+            if (const u64 r = TemplateRequest(it->spawner); r && ReadPointer(r + 0x38)) {
+                *spawner = it->spawner;
+                *request = r;
+                return true;
+            }
+        }
+    }
     for (auto it = g_spawners.rbegin(); it != g_spawners.rend(); ++it) {
         if (it->epoch != epoch || !ValidSpawner(it->spawner)) continue;
         if (u64 r = TemplateRequest(it->spawner)) {
@@ -2118,7 +2348,7 @@ bool Spawn(Puppet& p) {
         return false;
     }
     u64 spawner = 0, model = 0;
-    if (!PickSpawner(&spawner, &model)) {
+    if (!PickSpawner(&spawner, &model, p.idx >= kFirstVehiclePuppet)) {
         static double last_note = -100;
         if (runtime::mp_net::Now() - last_note > 10.0) {
             last_note = runtime::mp_net::Now();
@@ -2150,6 +2380,8 @@ bool Spawn(Puppet& p) {
     // 4.4.23: flag = 0 (3o argumento edx em eboot+0x158c952): cria o personagem normalmente mas PULA 100% do registro
     // Party::AddCharacter (0x14b4e30). O fantasma nunca entra na party local nem na roda de figuras (triangulo/Y).
     g_spawn(spawner, request, 0, 0, 0, 0);
+    // Registra a replica antes do proximo Tick que consulta os veiculos nativos.
+    if (const u64 inst = SpawnedInstance(request); inst && !IsLocalPlayer(inst)) LiveInstAdd(inst);
     g_spawning_flag_for_load = false;
     g_spawning = false;
     At<u64>(spawner + 0x1f0) = original_slot;
@@ -2187,7 +2419,7 @@ void Despawn(Puppet& p) {
     // 4.4.12: se o personagem ja foi desfeito pelo jogo (troca de figura, portal, fim de fase), o pedido pode ter
     // sido reaproveitado por outra carga: nao chama o destrutor dele (derrubava o personagem do jogador / caia).
     const bool alive = inst && PuppetAlive(p);
-    if (alive && !IsLocalPlayer(inst) && Readable(inst + 0x399, 0x10)) {
+    if (alive && !IsMechVehicle(inst) && !IsLocalPlayer(inst) && Readable(inst + 0x399, 0x10)) {
         At<u8>(inst + 0x399) = 0;
         if (IsOurFakeCtrl(At<u64>(inst + 0x3a0))) At<u64>(inst + 0x3a0) = 0;
     }
@@ -2312,7 +2544,35 @@ void Teleport(u64 inst, float x, float y, float z) {
 }
 
 bool PuppetAlive(const Puppet& p) {
+    if (p.idx >= kFirstVehiclePuppet) {
+        return p.inst && SpawnedInstance(p.request) == p.inst && VehicleIdentity(p.inst) == p.inst_name;
+    }
     return p.inst && Readable(p.inst + 0x10, 0x500) && At<u64>(p.inst + 0x10) == p.inst_name;
+}
+
+u64 VehicleMatrix(u64 inst) {
+    if (!IsMechVehicle(inst)) return 0;
+    const u64 body = ReadPointer(inst + 0x48);
+    const u64 transform = body ? ReadPointer(body + 0x70) : 0;
+    return transform && Readable(transform + 0x30, 0x40) ? transform + 0x30 : 0;
+}
+
+void PlaceVehicle(u64 inst, float x, float y, float z, float fx, float fz) {
+    const u64 matrix = VehicleMatrix(inst);
+    if (!matrix) return;
+    At<float>(matrix + 0x30) = x;
+    At<float>(matrix + 0x34) = y;
+    At<float>(matrix + 0x38) = z;
+    const float heading_x = At<float>(matrix + 0x20), heading_z = At<float>(matrix + 0x28);
+    const float current = std::hypot(heading_x, heading_z), desired = std::hypot(fx, fz);
+    if (!std::isfinite(current) || !std::isfinite(desired) || current <= 0.01f || desired <= 0.01f) return;
+    const float yaw = std::atan2(fx, fz) - std::atan2(heading_x, heading_z);
+    const float sine = std::sin(yaw), cosine = std::cos(yaw);
+    for (u64 row : {0ull, 0x10ull, 0x20ull}) {
+        const float rx = At<float>(matrix + row), rz = At<float>(matrix + row + 8);
+        At<float>(matrix + row) = cosine * rx + sine * rz;
+        At<float>(matrix + row + 8) = cosine * rz - sine * rx;
+    }
 }
 
 struct RemotePose {
@@ -2381,6 +2641,11 @@ void Steer(Puppet& p, double now, Drive* d) {
     const Remote& r = p.cur;
     const double age = now - p.cur_time;
     const RemotePose pose = SampleRemotePose(p, now);
+    if (IsMechVehicle(p.inst)) {
+        PlaceVehicle(p.inst, pose.x, pose.y, pose.z, pose.fx, pose.fz);
+        d->inst = 0;
+        return;
+    }
     const u64 pos = PositionAddress(p.inst);
     if (!pos) {
         d->inst = 0;
@@ -2395,10 +2660,6 @@ void Steer(Puppet& p, double now, Drive* d) {
     d->name = p.inst_name;
     d->vehicle = p.idx >= kFirstVehiclePuppet;
     if (d->vehicle) {
-        if (Lower(LocalCharacter(p.inst)) != Lower(r.chr)) {
-            d->inst = 0;
-            return;
-        }
         const float facing = std::hypot(pose.fx, pose.fz);
         d->fx = std::isfinite(facing) && facing > 0.01f ? pose.fx / facing : 0.0f;
         d->fz = std::isfinite(facing) && facing > 0.01f ? pose.fz / facing : 1.0f;
@@ -2416,9 +2677,11 @@ void Steer(Puppet& p, double now, Drive* d) {
     d->held = age < 1.0 ? (r.held & kSentButtons) : 0;
     const u32 edge = d->held & ~p.prev_held;
     const bool ctx_changed = age < 0.5 && r.ctx_hash != 0 && r.ctx_hash != p.last_remote_ctx;
+    if (now > p.pending_action_until) p.pending_action = 0;
     p.last_remote_ctx = r.ctx_hash;
 
-    if ((edge & kSquare) || (ctx_changed && (r.ctx_hash == kCtxFighting || r.ctx_hash == kCtxConeAttack))) {
+    if (r.ctx_hash != kCtxLandSlam &&
+        ((edge & kSquare) || (ctx_changed && (r.ctx_hash == kCtxFighting || r.ctx_hash == kCtxConeAttack)))) {
         p.pending_melee = true;
         p.punch_until = now + 0.35;
         std::printf("[MP] soco do outro jogo (%s) botao %x ctx %x\n", p.name.c_str(), edge, r.ctx_hash);
@@ -2432,8 +2695,10 @@ void Steer(Puppet& p, double now, Drive* d) {
         p.pending_jump = true;
         p.jump_until = now + 0.45;
     }
-    if (ctx_changed && r.ctx_hash == kCtxLandSlam) {
-        p.pending_slam = true;
+    if (ctx_changed && SharedAction(r.ctx_hash)) {
+        p.pending_action = r.ctx_hash;
+        p.pending_action_until = now + 0.65;
+        if (r.ctx_hash == kCtxLandSlam) p.pending_slam = true;
     }
     d->jump_active = now < p.jump_until;
 
@@ -2884,6 +3149,76 @@ std::vector<std::string> LocalPartyNames(const std::string& active) {
     return out;
 }
 
+u64 VehicleDescriptor(u64 handle) {
+    if (!g_vehicle_resource_fn || !ReadPointer(handle)) return 0;
+    const u64 desc = Call(g_vehicle_resource_fn, handle);
+    const u64 type = EngineMethod(desc, 0x48);
+    return type && static_cast<int>(Call(type, desc)) == 9 ? desc : 0;
+}
+
+u64 VehicleModelData(u64 descriptor) {
+    const u64 properties = descriptor ? ReadPointer(descriptor + 0x388) : 0;
+    return properties ? ReadPointer(properties + 0x10) : 0;
+}
+
+std::string VehicleModelString(u64 label) {
+    std::string text;
+    for (u64 i = 0; i < 200 && Readable(label + i, 1); ++i) {
+        const char c = At<char>(label + i);
+        if (!c) return VehicleModelLabel(text);
+        if (c < ' ' || c > '~') break;
+        text += c;
+    }
+    return {};
+}
+
+std::pair<u64, std::string> RegisteredVehicleModel(u64 body) {
+    const u64 object = ReadPointer(body + 0x70);
+    const u64 descriptor = object ? VehicleDescriptor(object + 0x10) : 0;
+    const u64 data = VehicleModelData(descriptor);
+    if (!Readable(data + 8, 0x18)) return {};
+    const s32 id = At<s16>(data + 8);
+    if (id < 0) return {};
+    // A instancia de ApiVehicle e o slot do Toy Pad usam a mesma definicao.
+    // O rótulo do slot conserva o nome do arquivo usado pelo carregador.
+    for (int i = 0; i < g_nslots; ++i) {
+        if (SlotState(i) != 1) continue;
+        const u64 slot = SlotAddress(i);
+        if (!slot || g_our_slots.count(slot)) continue;
+        std::string model = PortalVehicleModel(slot);
+        if (model.empty()) continue;
+        const u64 slot_data = VehicleModelData(VehicleDescriptor(slot + 0x68));
+        if (slot_data && Readable(slot_data + 8, 2) && At<s16>(slot_data + 8) == id) return {slot, std::move(model)};
+    }
+    if (std::string model = VehicleModelString(ReadPointer(data + 0x18)); !model.empty()) return {0, std::move(model)};
+    return {0, VehicleModelString(ReadPointer(descriptor + 0x18))};
+}
+
+void DiscoverRegisteredVehicles(double now) {
+    if (!g_vehicle_registry || !g_vehicle_resource_fn) return;
+    static double next_scan = 0;
+    if (now < next_scan) return;
+    next_scan = now + 0.3;
+    std::vector<u64> live;
+    const u64 base = reinterpret_cast<u64>(g_base);
+    for (u64 body = ReadPointer(base + g_vehicle_registry); body && live.size() < 128;
+         body = ReadPointer(body + 0x118)) {
+        if (!Readable(body, 0x228) || std::find(live.begin(), live.end(), body) != live.end()) break;
+        live.push_back(body);
+        const u64 component = ReadPointer(body + 0x220);
+        if (component <= 0x10) continue;
+        const u64 vehicle = component - 0x10;
+        if (!IsMechVehicle(vehicle) || VehicleIdentity(vehicle) != body || IsPuppetFast(vehicle)) continue;
+        auto [slot, model] = RegisteredVehicleModel(body);
+        if (!model.empty()) RememberLocalVehicle(vehicle, 0, slot, std::move(model));
+    }
+    std::lock_guard lock(g_local_vehicle_mutex);
+    std::erase_if(g_local_vehicles, [&](const LocalVehicle& vehicle) {
+        return !vehicle.request && IsMechVehicle(vehicle.inst) &&
+               std::find(live.begin(), live.end(), vehicle.identity) == live.end();
+    });
+}
+
 u64 VehicleForPlayer(u64 player, const std::string& character) {
     if (ValidVehicleName(character)) return player;
     if (!player || !Readable(player, 0xab8)) return 0;
@@ -2891,29 +3226,46 @@ u64 VehicleForPlayer(u64 player, const std::string& character) {
     // e a referencia ao veiculo em RidingData+0x630.
     const u64 riding = ReadPointer(player + 0xab0);
     const u64 vehicle = riding ? ReadPointer(riding + 0x630) : 0;
-    return vehicle && ValidVehicleName(LocalCharacter(vehicle)) ? vehicle : 0;
+    if (!vehicle) return 0;
+    const u64 base = reinterpret_cast<u64>(g_base);
+    const u64 vtable = ReadPointer(vehicle);
+    u64 mech = 0;
+    if (vtable == base + kCharacterVtable) {
+        const u64 getter = ReadPointer(vtable + 0x588);
+        if (getter > base && getter < base + 0x2300000) mech = Call(getter - base, vehicle);
+    }
+    std::lock_guard lock(g_local_vehicle_mutex);
+    for (const auto& entry : g_local_vehicles) {
+        if (entry.identity != VehicleIdentity(entry.inst) ||
+            (entry.request && SpawnedInstance(entry.request) != entry.inst)) continue;
+        if (entry.inst == vehicle || entry.inst == mech ||
+            (IsMechVehicle(entry.inst) && entry.identity == vehicle)) return entry.inst;
+    }
+    return !IsMechVehicle(vehicle) && ValidVehicleName(LocalCharacter(vehicle)) ? vehicle : 0;
 }
 
 bool VehiclePose(const LocalVehicle& vehicle, RemoteVehicle& pose) {
     const u64 inst = vehicle.inst;
-    if (!Readable(inst, 0x1b8) || IsPuppetFast(inst) ||
-        At<u64>(inst + 0x10) != vehicle.name_ptr || LocalCharacter(inst) != vehicle.model) return false;
-    const u64 pos = PositionAddress(inst);
-    if (!pos) return false;
+    if (!inst || IsPuppetFast(inst) || VehicleIdentity(inst) != vehicle.identity) return false;
+    const bool mech = IsMechVehicle(inst);
+    const u64 matrix = VehicleMatrix(inst);
+    const u64 pos = mech ? (matrix ? matrix + 0x30 : 0) : PositionAddress(inst);
+    const u64 facing = mech ? (matrix ? matrix + 0x20 : 0) : inst + 0x170;
+    if (!pos || !Readable(facing, 12)) return false;
     pose = {vehicle.slot, vehicle.model, At<float>(pos), At<float>(pos + 4), At<float>(pos + 8),
-            At<float>(inst + 0x170), At<float>(inst + 0x178)};
+            At<float>(facing), At<float>(facing + 8)};
     return std::isfinite(pose.x) && std::isfinite(pose.y) && std::isfinite(pose.z);
 }
 
 std::string LocalVehicles(u64 driven) {
-    if (driven) RememberLocalVehicle(driven);
     std::vector<RemoteVehicle> vehicles;
     {
         std::lock_guard lock(g_local_vehicle_mutex);
         std::erase_if(g_local_vehicles, [&](const LocalVehicle& v) {
             if (v.request && SpawnedInstance(v.request) != v.inst) return true;
             RemoteVehicle pose{};
-            if (!VehiclePose(v, pose)) return true;
+            if (VehicleIdentity(v.inst) != v.identity) return true;
+            if (!VehiclePose(v, pose)) return false;
             if (v.inst == driven) vehicles.insert(vehicles.begin(), std::move(pose));
             else if (vehicles.size() < kMaxRemoteVehicles) vehicles.push_back(std::move(pose));
             return false;
@@ -2951,8 +3303,19 @@ void SendLocal(u64 p1, double now) {
     const u64 loc0 = p1 && Readable(p1 + 0x90, 8) ? At<u64>(p1 + 0x90) : 0;
     const u64 loc = loc0 && Readable(loc0 + 0x80, 0x1c0) ? loc0 : 0; // na troca de fase o ponteiro fica solto (lixo)
     const std::string active = LocalCharacter(p1);
+    if (p1 && pos && !area.empty()) DiscoverRegisteredVehicles(now);
     const u64 driven = VehicleForPlayer(p1, active);
-    const std::string vehicle = driven ? LocalCharacter(driven) : std::string{};
+    std::string vehicle;
+    if (driven) {
+        RememberLocalVehicle(driven);
+        std::lock_guard lock(g_local_vehicle_mutex);
+        for (const auto& entry : g_local_vehicles) {
+            if (entry.inst == driven) {
+                vehicle = entry.model;
+                break;
+            }
+        }
+    }
     if (!p1 || !pos || (!loc && vehicle.empty()) || area.empty() || !Readable(p1 + 0x170, 0x240)) {
         std::snprintf(text, sizeof(text), "%s|-|0|0|0|3|0|1|0|1|0|0|0|%s", area.empty() ? "-" : area.c_str(), g_level_key.c_str());
         runtime::mp_net::SetLocalState(text);
@@ -2978,17 +3341,17 @@ void SendLocal(u64 p1, double now) {
     // 4.4.21: os botoes vem de varias fontes porque o jogo nao guarda o soco num lugar so: o controle do personagem
     // (party+0x24 segurados, +0x28 apertados agora) e o estado bruto apontado por party+0x18 (+0 atual / +4 anterior
     // / +8 apertados / +0xc soltos). Antes so uma delas era lida e o soco nunca chegava no outro lado.
-    u32 held = 0, raw[4] = {0, 0, 0, 0};
+    u32 held = 0, tapped = 0, raw[4] = {0, 0, 0, 0};
     const u64 party = At<u64>(p1 + 0x3a0);
     if (party && Readable(party + 0x18, 0x18)) {
         held |= At<u32>(party + 0x24);
-        held |= At<u32>(party + 0x28);
-        held |= At<u32>(party + 0x1c);
+        tapped |= At<u32>(party + 0x28) | At<u32>(party + 0x1c);
         if (const u64 holder = At<u64>(party + 0x18); holder && Readable(holder, 0x10)) {
             for (int k = 0; k < 4; ++k) {
                 raw[k] = At<u32>(holder + 4 * k);
-                held |= raw[k];
             }
+            held |= raw[0];
+            tapped |= raw[2];
         }
     }
     held &= kSentButtons;
@@ -3015,12 +3378,17 @@ void SendLocal(u64 p1, double now) {
             std::fflush(stdout);
         }
     }
-    // um toque curto (1-2 quadros) tem de sobreviver ate o proximo envio (~50 ms)
-    if (held) {
-        g_held_latch |= held;
-        g_held_latch_time = now;
-    } else if (now - g_held_latch_time > 0.08) {
-        g_held_latch = 0;
+    // Um toque curto sobrevive ate o proximo envio, com prazo por botao.
+    static u64 last_input_player = 0;
+    if (p1 != last_input_player) {
+        g_button_until.fill(-100);
+        last_input_player = p1;
+    }
+    constexpr std::array<u32, 4> buttons{kCross, kSquare, kCircle, kSentButtons & ~(kCross | kSquare | kCircle)};
+    u32 sent_buttons = held;
+    for (size_t i = 0; i < buttons.size(); ++i) {
+        if ((held | tapped) & buttons[i]) g_button_until[i] = now + 0.08;
+        if (now < g_button_until[i]) sent_buttons |= buttons[i];
     }
     std::string party_list; // 4.5.1: "nome;nome;nome" dos outros personagens equipados
     for (const std::string& one : LocalPartyNames(sent_chr)) {
@@ -3032,7 +3400,7 @@ void SendLocal(u64 p1, double now) {
                   sent_chr.c_str(), At<float>(pos), At<float>(pos + 4), At<float>(pos + 8),
                   loc ? At<s32>(loc + 0x238) : 3, loc ? At<float>(loc + 0x80) : 0.0f,
                   loc ? At<float>(loc + 0x88) : 0.0f, At<float>(p1 + 0x170), At<float>(p1 + 0x178),
-                  held | g_held_latch, runtime::mp_net::RttMs(), g_level_key.c_str(), LocalRegion().c_str(),
+                  sent_buttons, runtime::mp_net::RttMs(), g_level_key.c_str(), LocalRegion().c_str(),
                   party_list.c_str(), ctx_hash);
     std::string packet = text;
     const std::string vehicles = LocalVehicles(driven);
@@ -3139,6 +3507,24 @@ bool ResolveFunctions(bool again = false) {
         const u64 addr = reinterpret_cast<u64>(g_base) + offset;
         return Readable(addr, code.size()) && std::memcmp(g_base + offset, code.begin(), code.size()) == 0 ? offset : 0;
     };
+    const auto native = [&](u64 offset, std::initializer_list<u8> code) {
+        const u64 adjusted = checked(offset + high_shift, code);
+        return adjusted ? adjusted : checked(offset, code);
+    };
+    g_vehicle_resource_fn = native(0xd16de0, {0x55, 0x48, 0x89, 0xe5, 0x53, 0x50, 0x48, 0x89, 0xfb, 0x48, 0x8b, 0x3b});
+    // O spawner consulta a lista de ApiVehicle antes de aceitar uma tag repetida.
+    for (u64 ref = kSpawnFn + 0x110; ref < kSpawnFn + 0x160; ++ref) {
+        if (!checked(ref, {0x48, 0x8d, 0x05}) || !checked(ref + 7, {0x48, 0x8b, 0x18, 0x48, 0x85, 0xdb, 0x0f, 0x84})) continue;
+        const s64 relative = static_cast<s64>(ref + 7) + At<s32>(reinterpret_cast<u64>(g_base) + ref + 3);
+        if (relative < 0x2e00000 || relative >= 0x3400000) continue;
+        g_vehicle_registry = static_cast<u64>(relative);
+        break;
+    }
+    g_shift_position_fn = native(0x1271260, {0x55, 0x48, 0x89, 0xe5, 0x41, 0x56, 0x53, 0x48, 0x83, 0xec, 0x50, 0x48, 0x89, 0xf3});
+    g_shift_queue_fn = native(0x12710c0, {0x55, 0x48, 0x89, 0xe5, 0x41, 0x56, 0x53, 0x48, 0x83, 0xec, 0x20, 0x48, 0x89, 0xf0});
+    g_shift_arrive_fn = native(0x1273c70, {0x55, 0x48, 0x89, 0xe5, 0x41, 0x57, 0x41, 0x56, 0x41, 0x54, 0x53, 0x48, 0x83, 0xec, 0x50});
+    g_character_addons_fn = native(0xd6bbd0, {0x55, 0x48, 0x89, 0xe5, 0x48, 0x8b, 0x87, 0x80, 0x00, 0x00, 0x00});
+    g_find_addon_fn = native(0xa3ed50, {0x48, 0x83, 0xc7, 0x08, 0x48, 0x85, 0xd2, 0x48, 0x8d, 0x42, 0x20, 0x48, 0x0f, 0x44, 0xc7});
     g_vehicle_facing_fn = checked(0x98a700, {0x55, 0x48, 0x89, 0xe5, 0x41, 0x56, 0x53, 0x48, 0x81, 0xec});
     g_find_gizmo_fn = checked(0x19b3f00 + high_shift, {0x55, 0x48, 0x89, 0xe5, 0x41, 0x57, 0x41, 0x56, 0x41,
                                                     0x55, 0x41, 0x54, 0x53, 0x50, 0x49, 0x89, 0xf6});
@@ -3215,6 +3601,14 @@ bool InstallHooks() {
     g_hooks_installed = true;
     UnloadOurPortalSlots(); // 4.4.17
     g_control = reinterpret_cast<ControlFn>(Hook(g_control_fn ? g_control_fn : kControlFn, reinterpret_cast<const void*>(&ControlHook)));
+    g_set_action = reinterpret_cast<SetupFn>(Hook(kSetActionFn, reinterpret_cast<const void*>(&SetActionHook)));
+    if (g_shift_arrive_fn && g_shift_position_fn && g_shift_queue_fn && g_character_addons_fn && g_find_addon_fn) {
+        g_shift_arrive = reinterpret_cast<ShiftFn>(Hook(g_shift_arrive_fn, reinterpret_cast<const void*>(&ShiftArriveHook)));
+    }
+    std::printf("[MP] registro nativo de veiculos: %s | conclusao Shift: %s\n",
+                g_vehicle_registry && g_vehicle_resource_fn ? "ativo" : "indisponivel",
+                g_shift_arrive ? "ativa" : "indisponivel");
+    std::fflush(stdout);
     g_spawn = reinterpret_cast<SpawnFn>(Hook(kSpawnFn, reinterpret_cast<const void*>(&SpawnHook)));
     if (g_script_spawn_fn) {
         g_script_spawn = reinterpret_cast<SetupFn>(Hook(g_script_spawn_fn, reinterpret_cast<const void*>(&ScriptSpawnHook)));
@@ -3401,7 +3795,8 @@ std::vector<std::string> SplitEvent(const std::string& value, size_t limit = 16)
 
 void LogAreaEvent(const std::string& payload) {
     const auto fields = SplitEvent(payload);
-    if (fields.size() < 4 || fields[0] == "o" || fields[0] == "k" || fields[0] == "g") return;
+    if (fields.size() < 4 || fields[0] == "o" || fields[0] == "k" || fields[0] == "g" ||
+        fields[0] == "a" || fields[0] == "h") return;
     if (g_world_log_level != g_level_key) {
         g_world_log.clear();
         g_world_log_level = g_level_key;
@@ -3517,10 +3912,10 @@ void SendStateChanges(double now, double area_time) {
             Log("[MP] %s muda sozinho o tempo todo: fica fora da sincronizacao", name);
             continue;
         }
-        const std::vector<u64> same = GadgetsNamed(name);
+        const u64 type = At<u64>(c.obj) - reinterpret_cast<u64>(g_base);
+        const std::vector<u64> same = GadgetsNamed(name, type);
         const auto it = std::find(same.begin(), same.end(), c.obj);
         const int order = it == same.end() ? 0 : static_cast<int>(it - same.begin());
-        const u64 type = At<u64>(c.obj) - reinterpret_cast<u64>(g_base);
         if (IsQuestGadget(name) || IsLocalOnlyGadget(name)) {
             Announce("q|" + CurrentArea() + "|" + name + "#" + std::to_string(order) + "|" +
                      std::to_string(c.state) + "|" + std::to_string(c.param) + "|" + std::to_string(type));
@@ -3593,14 +3988,16 @@ void GoToLevelNow(const std::string& key, double now) {
 // Aviso guardado enquanto estavamos fora de uma fase: aplica assim que o jogador entra no jogo (e so entao).
 void ApplyDeferredLevel(double now) {
     if (g_deferred_level.empty()) return;
-    if (now - g_deferred_time > 180.0) { // velho demais: o amigo ja foi para outro lugar
+    if (g_deferred_level == g_level_key || now - g_deferred_time > 180.0) {
         g_deferred_level.clear();
         return;
     }
-    if (!ThisGameInLevel()) return;
-    std::printf("[MP] entrando na fase %s que ficou guardada\n", g_deferred_level.c_str());
+    if (!ThisGameInLevel() || now - g_level_request_time < 25.0) return;
+    const std::string target = std::move(g_deferred_level);
+    g_deferred_level.clear();
+    std::printf("[MP] entrando na fase %s que ficou guardada\n", target.c_str());
     std::fflush(stdout);
-    GoToLevelNow(g_deferred_level, now);
+    GoToLevelNow(target, now);
 }
 
 // 4.4.9: estado do multiplayer para o painel F9 (linha viva, atualizada ~2x por segundo na thread principal).
@@ -3721,11 +4118,9 @@ u64 WorldEventActor(int from) {
 }
 
 u64 EventGadget(const std::string& name, int order, u64 type) {
-    const std::vector<u64> objects = GadgetsNamed(name);
+    const std::vector<u64> objects = GadgetsNamed(name, type);
     if (order < 0 || static_cast<size_t>(order) >= objects.size()) return 0;
-    const u64 obj = objects[order];
-    if (type && At<u64>(obj) != reinterpret_cast<u64>(g_base) + type) return 0;
-    return obj;
+    return objects[order];
 }
 
 bool ApplyWorldEvent(const PendingEvent& event, const std::string& area, double now) {
@@ -3733,8 +4128,52 @@ bool ApplyWorldEvent(const PendingEvent& event, const std::string& area, double 
     if (f.size() < 4) return true;
     const std::string& kind = f[0];
     if (kind != "b" && kind != "k" && kind != "o" && kind != "m" && kind != "r" &&
-        kind != "c" && kind != "q" && kind != "g" && kind != "n") return true;
-    if (!ThisGameInLevel() || (!event.level.empty() && event.level != g_level_key) || f[1] != area) return false;
+        kind != "c" && kind != "q" && kind != "g" && kind != "n" && kind != "a" && kind != "h") return true;
+    if (!ThisGameInLevel() || (!event.level.empty() && event.level != g_level_key) ||
+        (f[1] != area && kind != "a")) return false;
+
+    if (kind == "a") {
+        const u32 action = static_cast<u32>(std::strtoul(f[3].c_str(), nullptr, 10));
+        if (event.level.empty() || !SharedAction(action) || now - event.time > 1.5) return true;
+        const auto sender = g_puppets.find(event.from * kPuppetStride);
+        if (sender == g_puppets.end() || sender->second.stage != Stage::kActive) return false;
+        Puppet& puppet = sender->second;
+        if (puppet.standin || puppet.cur.chr != f[2] || puppet.spawn_level != g_level_key) return true;
+        puppet.pending_action = action;
+        puppet.pending_action_until = now + 0.65;
+        return true;
+    }
+    if (kind == "h") {
+        if (!g_shift_arrive || event.level.empty() || f.size() != 4) return true;
+        float x, y, z;
+        char trailing;
+        if (std::sscanf(f[3].c_str(), "%f,%f,%f%c", &x, &y, &z, &trailing) != 3 ||
+            !std::isfinite(x) || !std::isfinite(y) || !std::isfinite(z)) return true;
+        const u64 target = FindShiftTarget(x, y, z);
+        if (!target) return false;
+        const u64 base = reinterpret_cast<u64>(g_base);
+        u64 actor = 0, addon = 0;
+        for (int i = 0; i < 2; ++i) {
+            const u64 candidate = ReadPointer(base + kPlayerTable + i * 8);
+            const auto arrival = g_shift_arrivals.find(candidate);
+            if (arrival != g_shift_arrivals.end() && arrival->second.target == target &&
+                arrival->second.time >= event.time - 1.0) return true;
+            const u64 candidate_addon = ShiftAddon(candidate);
+            if (!candidate_addon) continue;
+            if (!actor || LocalCharacter(candidate) == f[2]) {
+                actor = candidate;
+                addon = candidate_addon;
+            }
+        }
+        if (!addon || At<s32>(target + 0xc0) < 2) return false;
+        const u64 queued = ReadPointer(addon + 0xc0);
+        if (queued) return false;
+        g_shift_replays[actor] = {target, now};
+        Call(g_shift_queue_fn, addon, target);
+        std::printf("[MP] Shift: animacao nativa agendada para %s, destino %s\n", LocalCharacter(actor).c_str(), f[3].c_str());
+        std::fflush(stdout);
+        return false; // o aviso so termina quando o motor registra a chegada
+    }
 
     const int order = std::atoi(f[3].c_str());
     if (kind == "n") {
@@ -3853,7 +4292,6 @@ bool ApplyWorldEvent(const PendingEvent& event, const std::string& area, double 
         }
         return true;
     }
-    if (kind == "o" && IsLocalOnlyGadget(f[2])) return true;
     if (kind == "b" && (!Readable(obj + 0x260, 1) || At<u8>(obj + 0x260))) return true;
     // A alavanca aciona os scripts locais com um jogador real. O boneco remoto n?o
     // ? membro da party e os scripts da fase podem ignor?-lo.
@@ -3861,7 +4299,10 @@ bool ApplyWorldEvent(const PendingEvent& event, const std::string& area, double 
     if (!actor || !Readable(actor, 0x500)) return false;
     WorldReplay replay;
     if (kind == "o") {
-        Call(kTriggerObstacleFn, 0, obj, actor);
+        const std::string form = f.size() > 5 ? f[5] : "character";
+        const u64 source = form == "none" ? 0 : form == "component" ? actor + 0x370 : actor;
+        Call(kTriggerObstacleFn, 0, obj, source);
+        Log("[MP] %s acionado pelo outro jogo", f[2]);
     } else {
         Call8(kBlowUpFn, obj, actor, 0, 1, 0, 0, 0, 0);
         LogAreaEvent(event.payload);
@@ -3870,6 +4311,8 @@ bool ApplyWorldEvent(const PendingEvent& event, const std::string& area, double 
 }
 
 void ReceiveEvents(const std::string& area, double now) {
+    std::erase_if(g_shift_replays, [=](const auto& replay) { return now - replay.second.time > 20.0; });
+    std::erase_if(g_shift_arrivals, [=](const auto& arrival) { return now - arrival.second.time > 20.0; });
     for (auto& [from, payload] : runtime::mp_net::TakeEvents()) {
         if (payload.starts_with("L|")) {
             const std::string key = payload.substr(2);
@@ -3964,6 +4407,8 @@ void Tick() {
         static std::string last_level_here;
         if (g_level_key != last_level_here) {
             last_level_here = g_level_key;
+            g_shift_replays.clear();
+            g_shift_arrivals.clear();
             if (PlayableLevel(g_level_key) && g_world_log_level != g_level_key) {
                 g_world_log.clear();
                 g_world_log_level = g_level_key;
@@ -4186,14 +4631,13 @@ void Tick() {
         // do mesmo mundo). Mesma fase = mesmo mundo. E a tolerancia do estado subiu para 10 s (engasgo do outro jogo).
         const bool same_world = p.cur.level.empty() ? p.cur.area == area : p.cur.level == g_level_key;
         const bool show_actor = vehicle || (!IsVehicleName(p.cur.chr) &&
-            (main.cur.vehicle.empty() || main.cur.vehicles.empty() || g_unsupported.count(Lower(main.cur.vehicle)) ||
-             (p.stage == Stage::kActive && std::none_of(main.cur.vehicles.begin(), main.cur.vehicles.end(),
+            (main.cur.vehicle.empty() || std::none_of(main.cur.vehicles.begin(), main.cur.vehicles.end(),
                 [&](const RemoteVehicle& item) {
                     if (item.name != main.cur.vehicle) return false;
                     const auto replica = g_puppets.find(base_key + kFirstVehiclePuppet + item.slot);
                     return replica != g_puppets.end() && replica->second.stage == Stage::kActive &&
-                           PuppetAlive(replica->second) && Lower(LocalCharacter(replica->second.inst)) == Lower(item.name);
-                }))));
+                           PuppetAlive(replica->second) && replica->second.loading == item.name;
+                })));
         const bool want = settled && p.cur.valid && p.cur.ingame && same_world && now - p.cur_time < 10.0 &&
                           p.cur.chr != "-" && !p.cur.chr.empty() && show_actor;
         p.want = want;
@@ -4332,25 +4776,25 @@ void Tick() {
             }
             break;
         case Stage::kSpawning: {
-            const u64 request = p.request;
-            const u64 comp = request && Readable(request + 0x40, 8) ? At<u64>(request + 0x40) : 0;
-            const u64 inst = comp && Readable(comp + 0x20, 8) ? At<u64>(comp + 0x20) : 0;
-            if (inst && Readable(inst + 0x10, 0x500)) {
+            const u64 inst = SpawnedInstance(p.request);
+            const bool mech = IsMechVehicle(inst);
+            if (inst && (mech ? vehicle && VehicleMatrix(inst) : Readable(inst + 0x10, 0x500))) {
                 p.inst = inst;
-                p.inst_name = At<u64>(inst + 0x10);
+                p.inst_name = vehicle ? VehicleIdentity(inst) : At<u64>(inst + 0x10);
                 LiveInstAdd(inst);
                 p.stage = Stage::kActive;
                 p.stage_time = now;
                 // 4.4.23: com flag = 0 no Spawn, o fantasma nunca entra na party nem na roda de figuras. O slot
                 // (Player Load Slot dedicado) permanece carregado (estado 1) para os assets do boneco nunca sumirem.
-                Teleport(inst, p.cur.x, p.cur.y, p.cur.z);
-                Log("[MP] %s apareceu como %s", p.name, LocalCharacter(inst));
+                if (mech) PlaceVehicle(inst, p.cur.x, p.cur.y, p.cur.z, p.cur.fx, p.cur.fz);
+                else Teleport(inst, p.cur.x, p.cur.y, p.cur.z);
+                Log("[MP] %s apareceu como %s", p.name, mech ? PortalVehicleModel(p.slot) : LocalCharacter(inst));
                 // nome que o jogo nao conhece como figura (ex.: Wheatley): o descritor cai no personagem do spawner.
                 // A primeira vez pode ser so a carga recente; na terceira desiste e mostra so o nome.
                 const std::string low = Lower(p.cur.chr);
                 if (p.standin) {
                     // substituto: ja sabe que e outro personagem
-                } else if (Lower(LocalCharacter(inst)) == low) {
+                } else if (mech ? PortalVehicleModel(p.slot) == low : Lower(LocalCharacter(inst)) == low) {
                     g_wrong_count.erase(low);
                 } else if (vehicle || ++g_wrong_count[low] >= 3) {
                     if (!vehicle) g_unsupported.insert(low);
@@ -4359,6 +4803,7 @@ void Tick() {
                     p.load_fail_time = now;
                     p.retry_time = now + 5.0;
                 }
+                if (vehicle && p.stage == Stage::kActive) p.loading = p.cur.chr;
             } else if (now - p.stage_time > 10.0) {
                 Despawn(p);
             }
@@ -4394,7 +4839,7 @@ void Tick() {
             // 4.5: o pedido acabou preso na party do jogador local (inst+0x3a0 igual): desfaz agora para nao derrubar o
             // jogo na troca de figura e volta com um slot independente
             const u64 local_party = p1 && Readable(p1 + 0x3a0, 8) ? At<u64>(p1 + 0x3a0) : 0;
-            if (local_party && Readable(p.inst + 0x3a0, 8) && At<u64>(p.inst + 0x3a0) == local_party) {
+            if (!vehicle && local_party && Readable(p.inst + 0x3a0, 8) && At<u64>(p.inst + 0x3a0) == local_party) {
                 Despawn(p);
                 Log("[MP] %s ficou com a party do jogador local: desfazendo o fantasma", p.name);
                 p.retry_time = now + 2.0;
@@ -4413,14 +4858,19 @@ void Tick() {
                     break;
                 }
             }
-            if (!p.standin && Lower(LocalCharacter(p.inst)) != Lower(p.cur.chr) && now - p.stage_time > 1.0 &&
+            if (vehicle && p.loading != p.cur.chr) {
+                Despawn(p);
+                p.retry_time = 0;
+                break;
+            }
+            if (!vehicle && !p.standin && Lower(LocalCharacter(p.inst)) != Lower(p.cur.chr) && now - p.stage_time > 1.0 &&
                 !g_unsupported.count(Lower(p.cur.chr)) &&
                 (FindLoadedSlot(p.cur.chr) || (!SomeoneLoading() && now - p.load_fail_time > 15.0 && (CanLoad() || RecycleSlot())))) {
                 Despawn(p);
                 p.retry_time = 0;
                 break;
             }
-            if (now - p.stage_time > 1.5 && g_drive_count < kMaxPuppets) { // deixa a chegada pelo portal terminar
+            if ((vehicle || now - p.stage_time > 1.5) && g_drive_count < kMaxPuppets) {
                 Drive& d = g_drive[g_drive_count];
                 d.puppet = &p;
                 d.slot_key = key;
@@ -4436,7 +4886,7 @@ void Tick() {
                 }
                 Steer(p, now, &d);
                 d.prev = prev;
-                ++g_drive_count;
+                if (d.inst) ++g_drive_count;
             }
             break;
         }
