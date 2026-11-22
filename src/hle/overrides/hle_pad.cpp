@@ -914,9 +914,6 @@ void PrintPadStats() {
 namespace {
 
 std::atomic<bool> g_macro_enabled{false};
-std::atomic<bool> g_skip_spam{false};
-double g_spam_time = 0.0;
-int g_spam_count = 0;
 int g_macro_state = 0;
 double g_macro_time = 0.0;
 int g_macro_presses = 0;
@@ -945,40 +942,12 @@ void PadMacroTick(u64 draws, u64 stable_frames) {
     const double now = Seconds();
     switch (g_macro_state) {
     case 0: // espera a tela de titulo
-        // Tentativa de pular a abertura (Fase 17): entre 35 s e 200 s, enquanto a tela de titulo
-        // nao aparece, alterna X, O e triangulo - um toque a cada 1,5 s e, a cada quarta vez, os
-        // tres segurados por 1,2 s (alguns jogos da TT pedem segurar).
-        // Tambem para no menu principal (175/176 draws): um toque que passa da tela de titulo
-        // antes de ela ser reconhecida nao pode continuar e acionar "Novo Jogo" (Fase 19).
-        if (g_skip_spam.load(std::memory_order_relaxed) && now >= 35.0 && now < 200.0 && draws != 134 && draws != 136 &&
-            draws != 175 && draws != 176 && now - g_spam_time >= 1.5) {
-            static const u32 kSkipButtons[3] = {kCross, kCircle, kTriangle};
-            g_spam_time = now;
-            ++g_spam_count;
-            std::lock_guard lock(g_script_mutex);
-            ScriptStep step{};
-            step.start_s = now;
-            if (g_spam_count % 4 == 0) {
-                step.button = kCross | kCircle | kTriangle;
-                step.end_s = now + 1.2;
-            } else {
-                step.button = kSkipButtons[g_spam_count % 3];
-                step.end_s = now + 0.3;
-                step.reads_left = 2;
-            }
-            g_script.push_back(step);
-        }
         if ((draws == 134 || draws == 136) && stable_frames >= 60) {
-            if (g_spam_count) {
-                log::Tagged("MACRO", "t=%.1fs %d X / O / triangle taps sent since 35 s to try skipping intro", now,
-                            g_spam_count);
-            }
             MacroPress(kOptions, 0.0, 0.3, "title screen (134/136 draws) idle: OPTIONS");
             g_macro_state = 1;
             g_macro_time = now;
         } else if ((draws == 175 || draws == 176) && stable_frames >= 30) {
-            log::Tagged("MACRO", "t=%.1fs already at main menu (one of %d intro-skip taps passed the title screen)", now,
-                        g_spam_count);
+            log::Tagged("MACRO", "t=%.1fs already at main menu", now);
             g_macro_state = 1;
             g_macro_time = now;
         }
@@ -1028,11 +997,6 @@ void PadMacroTick(u64 draws, u64 stable_frames) {
 
 void SetLoadGameMacro(bool enabled) {
     g_macro_enabled = enabled;
-}
-
-// Com o macro ligado: tambem tenta pular a cutscene de abertura (X / O / triangulo, 35-200 s).
-void SetSkipIntroSpam(bool enabled) {
-    g_skip_spam = enabled;
 }
 
 bool SetPadInputScript(const char* text) {

@@ -1,3 +1,4 @@
+#include <atomic>
 #include <chrono>
 #include <cinttypes>
 #include <cmath>
@@ -52,7 +53,6 @@ void StartToypadListener(int port); // app LegoToypad (cliente TCP em 127.0.0.1)
 bool ParsePortalJson(const std::string& json, int pad, std::array<u8, 7>* uid, u32* id);
 bool SetPadInputScript(const char* text);
 void SetLoadGameMacro(bool enabled);
-void SetSkipIntroSpam(bool enabled);
 void SetPadKeyboardEnabled(bool enabled);
 void SetPadBackgroundInput(bool enabled);
 void SetNgs2VoiceClock(bool enabled);
@@ -108,20 +108,58 @@ void StartPerfThread();
 
 namespace {
 
-// Fase 61: mod "pular qualquer cutscene". A funcao do eboot em 0x173fd80 decide se a cutscene atual aceita
-// ser pulada: depois das checagens de estado, vale o "allowcutskip" do nivel ou o bit 0 de [obj+0xe8] (cena
-// ja vista / jogo completo). Troca essa ultima leitura por "mov al, 1", mantendo as checagens de antes.
 bool g_skip_cutscenes = false;
 runtime::multiplayer::Config g_mp_config; // Fase 79: --mp-server/--mp-room/--mp-name (caixa do launcher)
 bool g_keep_16x9 = false; // 1.9.1: --keep-16x9 = tela de outra proporcao com barras (sem corrigir a camera)
 
-cutscene_patch::Result PatchCutsceneSkip(const loader::ElfPieLoader& elf) {
-    std::vector<std::span<uint8_t>> code;
-    for (const auto& segment : elf.segments()) {
-        if ((segment.flags & 1) && segment.vaddr <= elf.image_size() && segment.filesz <= elf.image_size() - segment.vaddr)
-            code.emplace_back(elf.base() + segment.vaddr, static_cast<size_t>(segment.filesz));
+using CutscenePredicate = bool(HLE_SYSV_ABI*)(void*);
+CutscenePredicate g_native_skip_permission = nullptr;
+CutscenePredicate g_native_startup_scene = nullptr;
+
+HLE_SYSV_ABI bool CutsceneSkipPermission(void* scene) {
+    if (!g_native_skip_permission(scene)) return false;
+    if (!g_native_startup_scene(scene)) return true;
+    static std::atomic<bool> reported{false};
+    if (!reported.exchange(true)) {
+        std::printf("[CUTSCENES] Loading_Screen_startup segue a transicao normal\n");
+        std::fflush(stdout);
     }
-    return cutscene_patch::Apply(code);
+    return false;
+}
+
+void ConfigureCutsceneSkip(const loader::ElfPieLoader& elf) {
+    std::vector<std::span<uint8_t>> code;
+    std::vector<std::span<uint8_t>> vtables;
+    for (const auto& segment : elf.segments()) {
+        if (segment.vaddr > elf.image_size() || segment.filesz > elf.image_size() - segment.vaddr) continue;
+        if (segment.flags & loader::PF_X) {
+            code.emplace_back(elf.base() + segment.vaddr, static_cast<size_t>(segment.filesz));
+        } else if (segment.type == loader::PT_SCE_RELRO) {
+            vtables.emplace_back(elf.base() + segment.vaddr, static_cast<size_t>(segment.filesz));
+        }
+    }
+    const auto* permission = cutscene_patch::FindSkipPermission(code);
+    const auto* startup = cutscene_patch::FindStartupClassifier(code);
+    auto* slot = permission && startup ? cutscene_patch::FindPermissionSlot(vtables, permission) : nullptr;
+    if (!slot) {
+        std::printf("Cutscenes : WARNING: skip controls not configured (unrecognized eboot)\n");
+        return;
+    }
+    g_native_skip_permission = reinterpret_cast<CutscenePredicate>(permission);
+    g_native_startup_scene = reinterpret_cast<CutscenePredicate>(startup);
+    const CutscenePredicate hook = &CutsceneSkipPermission;
+    // O aviso e a leitura do botao passam pela mesma entrada virtual.
+    std::memcpy(slot, &hook, sizeof(hook));
+    std::printf("Cutscenes : opening logos use the normal startup sequence\n");
+
+    if (!g_skip_cutscenes) return;
+    const cutscene_patch::Result skip = cutscene_patch::Apply(code);
+    if (skip.applied) {
+        std::printf("Cutscenes : story skip enabled (--skip-cutscenes, eboot+0x%llx, %d gates)\n",
+                    static_cast<unsigned long long>(skip.at), skip.gates);
+    } else {
+        std::printf("Cutscenes : WARNING: story skip patch not applied (pattern not found)\n");
+    }
 }
 
 std::filesystem::path FindPatchDir(const std::filesystem::path& app0) {
@@ -1327,10 +1365,7 @@ int main(int argc, char** argv) {
                 text = *end == ',' ? end + 1 : end;
             }
         } else if (!std::strcmp(argv[i], "--load-game-macro")) {
-            hle::SetLoadGameMacro(true); // titulo -> OPTIONS; menu principal -> BAIXO, X, X, X, X
-            hle::SetSkipIntroSpam(true); // e, antes do titulo, X / O / triangulo para tentar pular a abertura
-        } else if (!std::strcmp(argv[i], "--no-skip-spam")) {
-            hle::SetSkipIntroSpam(false); // controle: macro sem a tentativa de pular a abertura
+            hle::SetLoadGameMacro(true); // comeca no titulo
         } else if (!std::strcmp(argv[i], "--no-vulkan-draws")) {
             hle::gnm::SetVulkanDraws(false); // Vulkan so limpa a tela, sem a geometria do jogo
         } else if (!std::strcmp(argv[i], "--no-srgb-display")) {
@@ -1794,18 +1829,8 @@ int main(int argc, char** argv) {
                     ps.other_forms);
     }
 
-    if (g_skip_cutscenes) {
-        // 4.4.33: diz tambem ONDE liberou (eboot+0x...) e quantas saidas antecipadas foram desarmadas, para o log
-        // mostrar o que aconteceu em cada versao do jogo (EUR/USA tem o mesmo codigo em enderecos diferentes).
-        const cutscene_patch::Result skip = PatchCutsceneSkip(elf);
-        if (skip.applied) {
-            std::printf("Cutscenes : all can be skipped (--skip-cutscenes, eboot+0x%llx, %d gates)\n",
-                        static_cast<unsigned long long>(skip.at), skip.gates);
-        } else {
-            std::printf("Cutscenes : WARNING: different eboot, skip mod not applied (pattern not found)\n");
-        }
-    }
     if (!selftest) {
+        ConfigureCutsceneSkip(elf);
         hle::anomaly::Install(elf.base()); // Fase 67: carregador de mods Anomaly (connorh315), se houver pacotes de mod
         if (const char* pass = std::getenv("LD_MP_PASS"); pass && g_mp_config.password.empty()) g_mp_config.password = pass;
         runtime::multiplayer::Configure(g_mp_config); // Fase 79: sem --mp-server/--mp-room nao faz nada

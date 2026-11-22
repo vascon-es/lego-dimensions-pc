@@ -41,6 +41,60 @@ inline uint8_t* FindUnique(std::span<const std::span<uint8_t>> segments, const u
 }
 } // namespace detail
 
+inline uint8_t* FindSkipPermission(std::span<const std::span<uint8_t>> code) {
+    // Prologo de Cutscene::CanSkip, incluindo o primeiro teste de flags da sequencia.
+    constexpr std::array<uint8_t, 24> signature{
+        0x55, 0x48, 0x89, 0xe5, 0x53, 0x50, 0x48, 0x89, 0xfb, 0x48, 0x8b, 0x03,
+        0xff, 0x50, 0x10, 0x8b, 0x88, 0x90, 0x03, 0x00, 0x00, 0xf6, 0xc1, 0x80};
+    return detail::FindUnique(code, signature.data(), signature.size(), nullptr);
+}
+
+inline uint8_t* FindStartupClassifier(std::span<const std::span<uint8_t>> code) {
+    // O caminho de pulo chama a funcao que reconhece Loading_Screen_startup
+    // no conjunto de sequencias da propria cena.
+    constexpr std::array<uint8_t, 12> call_site{
+        0xc6, 0x45, 0xe7, 0, 0xc6, 0x45, 0xe6, 0, 0x48, 0x89, 0xdf, 0xe8};
+    constexpr std::array<uint8_t, 15> after_call{
+        0x48, 0x8d, 0x75, 0xe7, 0x48, 0x8d, 0x55, 0xe6, 0x48, 0x89, 0xdf, 0x84, 0xc0, 0x74, 0x07};
+    constexpr std::array<uint8_t, 16> classifier{
+        0x55, 0x48, 0x89, 0xe5, 0x48, 0x8b, 0x07, 0xff, 0x50, 0x10, 0x31, 0xf6, 0x48, 0x89, 0xc7, 0xe8};
+    const auto* call = detail::FindUnique(code, call_site.data(), call_site.size(), nullptr);
+    if (!call) return nullptr;
+    const auto operand = reinterpret_cast<uintptr_t>(call) + call_site.size();
+    const auto next = operand + sizeof(int32_t);
+    for (const auto segment : code) {
+        const auto begin = reinterpret_cast<uintptr_t>(segment.data());
+        const auto end = begin + segment.size();
+        if (operand < begin || next > end || end - next < after_call.size()) continue;
+        if (std::memcmp(reinterpret_cast<const void*>(next), after_call.data(), after_call.size())) return nullptr;
+        int32_t displacement = 0;
+        std::memcpy(&displacement, reinterpret_cast<const void*>(operand), sizeof(displacement));
+        const auto target = static_cast<uintptr_t>(static_cast<intptr_t>(next) + displacement);
+        for (const auto callee : code) {
+            const auto start = reinterpret_cast<uintptr_t>(callee.data());
+            if (target < start || target - start > callee.size() || callee.size() - (target - start) < classifier.size())
+                continue;
+            auto* function = callee.data() + (target - start);
+            return std::memcmp(function, classifier.data(), classifier.size()) == 0 ? function : nullptr;
+        }
+        return nullptr;
+    }
+    return nullptr;
+}
+
+inline uint8_t* FindPermissionSlot(std::span<const std::span<uint8_t>> data, const uint8_t* function) {
+    uint8_t* slot = nullptr;
+    const auto address = reinterpret_cast<uintptr_t>(function);
+    for (const auto segment : data) {
+        for (size_t i = 0; i + sizeof(address) <= segment.size(); i += sizeof(address)) {
+            if (std::memcmp(segment.data() + i, &address, sizeof(address))) continue;
+            if (slot) return nullptr;
+            slot = segment.data() + i;
+        }
+    }
+    return slot;
+}
+
 inline Result Apply(std::span<const std::span<uint8_t>> segments) {
     constexpr std::array<uint8_t, 8> original{0x8A, 0x83, 0xE8, 0, 0, 0, 0x24, 1};
     constexpr std::array<uint8_t, 8> patched{0xB0, 1, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90};
