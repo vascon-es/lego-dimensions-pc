@@ -138,8 +138,8 @@ void ConfigureCutsceneSkip(const loader::ElfPieLoader& elf) {
             vtables.emplace_back(elf.base() + segment.vaddr, static_cast<size_t>(segment.filesz));
         }
     }
-    const auto* permission = cutscene_patch::FindSkipPermission(code);
-    const auto* startup = cutscene_patch::FindStartupClassifier(code);
+    auto* permission = cutscene_patch::FindSkipPermission(code);
+    auto* startup = cutscene_patch::FindStartupClassifier(code);
     auto* slot = permission && startup ? cutscene_patch::FindPermissionSlot(vtables, permission) : nullptr;
     if (!slot) {
         std::printf("Cutscenes : WARNING: skip controls not configured (unrecognized eboot)\n");
