@@ -101,15 +101,6 @@ constexpr int kMaxPuppets = 24;   // 4.5.1: cada amigo pode aparecer com mais de
 constexpr int kPuppetStride = 64;
 constexpr int kFirstVehiclePuppet = 8;
 constexpr int kMaxRemoteVehicles = 2;
-// 4.5.1: quantos personagens de cada amigo aparecem ao mesmo tempo. Com 2 pessoas na sala: 6 de cada (sobra sempre
-// um personagem do outro para voce ver); com 3: 5 de cada; com mais: o que couber em 12 dividido pelas pessoas.
-int PartyCap(size_t peers) {
-    // 4.4.9: um personagem por amigo. Os personagens extras da party copiavam a posicao do dono e ficavam andando
-    // sozinhos procurando o mesmo ponto (pareciam "sem comando"). O nome do amigo continua no personagem dele.
-    (void)peers;
-    return 1;
-}
-
 const char kAllocTag[] = "MPGHOST";
 
 Config g_config;
@@ -212,6 +203,10 @@ using ControlFn = u64(HLE_SYSV_ABI*)(u64, float);
 using SetupFn = u64(HLE_SYSV_ABI*)(u64, u64, u64, u64, u64, u64);
 SetupFn g_setup = nullptr;
 SetupFn g_slot_load = nullptr;
+SetupFn g_find_native_slot = nullptr;
+u64 g_begin_slot_load = 0, g_find_native_slot_fn = 0;
+std::array<std::atomic<u64>, kMaxSlotsSeen> g_replica_slots{};
+thread_local bool g_replica_slot_work = false;
 SetupFn g_set_action = nullptr;
 using SpawnFn = u64(HLE_SYSV_ABI*)(u64, u64, u64, u64, u64, u64);
 using DtorFn = u64(HLE_SYSV_ABI*)(u64, u64, u64, u64, u64, u64);
@@ -264,6 +259,29 @@ u64 EngineMethod(u64 object, u64 slot) {
     if (table < base + 0x2300000 || table >= base + 0x3400000) return 0;
     const u64 method = ReadPointer(table + slot);
     return method >= base && method < base + 0x2300000 ? method - base : 0;
+}
+
+bool IsReplicaSlot(u64 slot) {
+    return slot && std::any_of(g_replica_slots.begin(), g_replica_slots.end(), [=](const auto& entry) {
+        return entry.load(std::memory_order_acquire) == slot;
+    });
+}
+
+bool ReserveReplicaSlot(u64 slot) {
+    if (IsReplicaSlot(slot)) return true;
+    for (auto& entry : g_replica_slots) {
+        u64 empty = 0;
+        if (entry.compare_exchange_strong(empty, slot)) return true;
+    }
+    return false;
+}
+
+void ForgetReplicaSlot(u64 slot) {
+    if (!slot) return;
+    for (auto& entry : g_replica_slots) {
+        u64 expected = slot;
+        if (entry.compare_exchange_strong(expected, 0)) return;
+    }
 }
 
 std::string VehicleModelLabel(std::string label) {
@@ -511,7 +529,6 @@ double g_last_log = 0;
 
 bool IsOurRequest(u64 request) { return LiveHas(request); }
 
-bool CanLoad(); // slots (abaixo)
 std::vector<std::string> g_our_chars; // personagens que NOS carregamos (minusculas), os unicos que cancelamos/descarregamos
 double g_stuck_since[kMaxSlotsSeen] = {};
 
@@ -1018,6 +1035,20 @@ HLE_SYSV_ABI u64 SlotLoadHook(u64 out, u64 a, u64 b, u64 c, u64 d, u64 e) {
         std::fflush(stdout);
     }
     return r;
+}
+
+HLE_SYSV_ABI u64 FindNativeSlotHook(u64 out, u64 a, u64 b, u64 c, u64 d, u64 e) {
+    const u64 result = g_find_native_slot(out, a, b, c, d, e);
+    const u64 slot = ReadPointer(out);
+    if (!g_replica_slot_work && IsReplicaSlot(slot)) {
+        // A busca nativa reteve uma referencia. Devolve-a e deixa o jogo
+        // carregar a figura local num slot proprio.
+        if (const u64 release = EngineMethod(slot, 0x30)) {
+            At<u64>(out) = 0;
+            Call(release, slot);
+        }
+    }
+    return result;
 }
 
 HLE_SYSV_ABI u64 SpawnHook(u64 spawner, u64 request, u64 flag, u64 a, u64 b, u64 c) {
@@ -1899,40 +1930,35 @@ std::string SlotName(int i) {
 std::map<std::string, int> g_wrong_count; // personagem -> vezes que o fantasma apareceu com outro
 std::set<std::string> g_unsupported;       // personagens que nao aparecem certos: so o nome
 std::map<u64, std::string> g_our_slots; // slot -> personagem que NOS carregamos nele
-bool OursFamily(const std::string& slot_name);
+int SlotIndexOf(u64 slot);
 
-// Um slot que o jogo carregou como VARIANTE de um fantasma (o proximo Doctor, o Homer bravo...) pertence ao fantasma
-// que o pediu: e solto quando ele some. Fantasma nenhum nasce dele (nascer de la e depois perder o slot derrubava a
-// thread de fundo). Servem: os slots que nos carregamos e os das figuras do proprio jogador.
-std::string LocalCharacter(u64 inst);
+void PruneReplicaSlots() {
+    for (auto it = g_our_slots.begin(); it != g_our_slots.end();) {
+        const u64 slot = it->first;
+        const int index = SlotIndexOf(slot);
+        if (index < 0 || SlotState(index) <= 0) {
+            ForgetReplicaSlot(slot);
+            it = g_our_slots.erase(it);
+        } else {
+            ++it;
+        }
+    }
+}
+
 bool LocalPlayerUses(const std::string& slot_name);
-
-// 4.5: personagem repetido (P1 e P2 escolhem o mesmo, ex. o Batman). O slot da figura do jogador local NAO serve para
-// o fantasma: o motor liga o pedido ao mesmo personagem da party (inst+0x3a0), um dos dois some e a troca de figura
-// derruba o jogo. Se for o mesmo personagem que o jogador local usa, esta funcao devolve 0 e o Tick carrega o
-// personagem num "Player Load Slot" proprio (duas instancias isoladas).
 bool PortalSlotsAllowed();
 
 u64 FindLoadedSlot(const std::string& chr, bool vehicle = false) {
-    const std::string want = Lower(chr) + ".cd";
-    u64 ours = 0;
-    for (int i = 0; i < g_nall; ++i) {
-        if (!vehicle && !PortalSlotsAllowed() && i < g_nslots) continue; // personagens usam o Player Load Slot
-        if (SlotState(i) != 1) continue;
-        const std::string name = SlotName(i);
-        if (name != want) continue;
-        const u64 slot = SlotAddress(i);
-        if (!slot) continue;
-        const auto it = g_our_slots.find(slot);
-        if (it != g_our_slots.end()) { // nosso, deste personagem: instancia separada, serve
-            if (it->second + ".cd" == want && !ours) ours = slot;
-            continue;
-        }
-        if (vehicle || OursFamily(want)) continue; // carro usa apenas o slot dedicado criado para ele
-        if (LocalPlayerUses(name)) continue;   // figura do jogador local: nunca compartilha a party com um fantasma
-        return slot;                           // figura do jogador, livre
+    const std::string name = Lower(chr);
+    const std::string label = name + ".cd";
+    // Uma replica so nasce de um slot que foi carregado para as replicas.
+    for (const auto& [slot, model] : g_our_slots) {
+        if (model != name) continue;
+        const int index = SlotIndexOf(slot);
+        if (index >= 0 && (vehicle || index >= g_nslots || IsReplicaSlot(slot) || PortalSlotsAllowed()) &&
+            SlotState(index) == 1 && SlotName(index) == label) return slot;
     }
-    return ours;
+    return 0;
 }
 
 int FreeSlots() { // do portal
@@ -1941,20 +1967,36 @@ int FreeSlots() { // do portal
     return n;
 }
 
-bool FreePlayerSlot();
-// Alguns personagens (Bane, Cyborg...) fazem o jogo reservar mais um slot do portal ("<nome>_bigfig", fica em
-// estado 2): conta com ele para sobrar sempre kKeepFreeSlots livres para uma figura nova no portal.
-bool UsePlayerSlot() { return FreePlayerSlot() && FreeSlots() >= kKeepFreeSlots; } // a reserva bigfig e cancelada (SlotMaintenance)
-bool CanLoad() { return UsePlayerSlot() || FreeSlots() >= kKeepFreeSlots + 1; }
+bool SlotJobDone(u64 slot);
 
-bool FreePlayerSlot() { // slot de jogador vazio e com memoria (preparo da fase com o gancho)
-    for (int i = g_nslots; i < g_nall; ++i) {
+u64 FreeReplicaSlot(bool player) {
+    const int first = player ? g_nslots : 0;
+    const int last = player ? g_nall : g_nslots;
+    for (int i = last - 1; i >= first; --i) {
         const u64 slot = SlotAddress(i);
-        if (!slot || !Readable(slot + 0x58, 8) || !Readable(slot + 0x2d4, 4)) continue;
-        // com memoria propria (os 2 ultimos usam a memoria geral e nao carregam: +0x2d4 = 1)
-        if (SlotState(i) == 0 && At<u32>(slot + 0x58) != 0 && !At<u8>(slot + 0x2d4)) return true;
+        if (!slot || !Readable(slot, 0x2dc) || IsReplicaSlot(slot)) continue;
+        // Os ultimos Player Load Slots usam memoria geral e nao carregam por aqui.
+        if (SlotState(i) == 0 && At<s32>(slot + 0x2d8) <= 0 && SlotJobDone(slot) &&
+            At<u32>(slot + 0x58) && !At<u8>(slot + 0x2d4) &&
+            (!g_find_native_slot || (EngineMethod(slot, 0x18) && EngineMethod(slot, 0x30)))) return slot;
     }
-    return false;
+    return 0;
+}
+
+u64 CharacterReplicaSlot(const std::string& chr) {
+    const int free = FreeSlots();
+    if (free < kKeepFreeSlots) return 0;
+    const bool portal_preferred = PortalSlotsAllowed();
+    const bool independent_load = g_begin_slot_load && g_find_native_slot;
+    if (independent_load && portal_preferred && free > kKeepFreeSlots) {
+        if (const u64 slot = FreeReplicaSlot(false)) return slot;
+    }
+    if (const u64 slot = FreeReplicaSlot(true)) return slot;
+    // Quando as figuras coincidem, um slot fisico extra evita pegar o da party local.
+    if (independent_load && free > kKeepFreeSlots && LocalPlayerUses(Lower(chr) + ".cd")) {
+        return FreeReplicaSlot(false);
+    }
+    return 0;
 }
 
 bool IsSlot(u64 slot) {
@@ -1974,13 +2016,17 @@ bool Ours(const std::string& slot_name) {
     return false;
 }
 
-std::string LocalCharacter(u64 inst); // (declarado acima, antes de FindLoadedSlot)
 void Log(const char* fmt, const std::string& a, const std::string& b = {});
 
-bool LocalPlayerUses(const std::string& slot_name) { // o jogador 1 ou 2 deste PC esta com esse personagem
+bool LocalPlayerUses(const std::string& slot_name) {
     for (int k = 0; k < 2; ++k) {
         const u64 inst = At<u64>(reinterpret_cast<u64>(g_base) + kPlayerTable + 8 * k);
         if (inst && Lower(LocalCharacter(inst)) + ".cd" == slot_name) return true;
+    }
+    for (int i = 0; i < g_nall; ++i) {
+        if (SlotState(i) != 1 || SlotName(i) != slot_name) continue;
+        const u64 slot = SlotAddress(i);
+        if (slot && !g_our_slots.count(slot) && !IsReplicaSlot(slot)) return true;
     }
     return false;
 }
@@ -2024,6 +2070,7 @@ bool SlotJobDone(u64 slot) {
 }
 
 bool SlotUsedByLocalPlayer(u64 slot);
+void Unload(u64 slot);
 
 void SlotMaintenance(double now) {
     for (int i = 0; i < g_nall; ++i) {
@@ -2041,7 +2088,8 @@ void SlotMaintenance(double now) {
         if (!g_stuck_since[i]) g_stuck_since[i] = now;
         if (now - g_stuck_since[i] > 6.0 && SlotJobDone(slot)) {
             Log("[MP] descarregando a variante solta %s", name);
-            Call(kSlotStateFn, slot, 3, 0); // o pedido foi solto (estado 2): o jogo faz o mesmo (eboot+157f10f)
+            if (IsReplicaSlot(slot)) Unload(slot);
+            else Call(kSlotStateFn, slot, 3, 0); // o pedido foi solto (estado 2): o jogo faz o mesmo (eboot+157f10f)
             g_stuck_since[i] = 0;
         }
     }
@@ -2055,8 +2103,10 @@ double g_last_unload = -100;
 void Unload(u64 slot) {
     if (!SlotJobDone(slot)) return; // ainda carregando em segundo plano: tenta de novo depois
     g_last_unload = runtime::mp_net::Now();
-    g_our_slots.erase(slot);
+    const u64 release = IsReplicaSlot(slot) ? EngineMethod(slot, 0x30) : 0;
     Call(kSlotStateFn, slot, 3, 0);
+    if (release) Call(release, slot);
+    // Mantem a identidade ate o motor esvaziar o slot.
 }
 double g_state2_since[kMaxSlotsSeen] = {};
 
@@ -2128,6 +2178,7 @@ void ReclaimReserve(double now) {
         if (SlotState(i) != 1 || !Ours(name) || SlotUsedByLocalPlayer(slot)) continue;
         if (pass == 0 && !Settled(slot)) continue;
         if (pass == 1) { // em uso: tira os fantasmas agora; o slot e descarregado (passo 0) quando assentar
+            if (!PuppetUses(slot)) continue;
             for (auto& [id, p] : g_puppets) {
                 if (p.slot == slot && (p.stage == Stage::kSpawning || p.stage == Stage::kActive)) Despawn(p);
                 if (p.slot == slot) {
@@ -2161,14 +2212,18 @@ bool ReclaimForCloser(const Puppet& wanting, double now) {
         float nearest = 1e9f;
         bool used = false;
         bool recent = false;
+        bool reserve_only = true;
         for (auto& [id, q] : g_puppets) {
             if (q.slot == slot && q.stage != Stage::kNone) {
                 used = true;
+                reserve_only &= q.idx > 0 && q.idx < kFirstVehiclePuppet;
                 nearest = std::min(nearest, q.distance);
                 recent |= now - q.stage_time < 20.0; // apareceu ha pouco: fica pelo menos 20 s
             }
         }
-        if (recent) continue;
+        if (recent || (!used && !Settled(slot)) ||
+            (wanting.idx > 0 && wanting.idx < kFirstVehiclePuppet && used && !reserve_only)) continue;
+        if (wanting.idx == 0 && used && reserve_only) nearest = 1e8f;
         if (!used) nearest = 1e8f; // ninguem usa: o melhor candidato
         if (nearest > best_distance) {
             best_distance = nearest;
@@ -2242,7 +2297,7 @@ bool SlotUsedByLocalPlayer(u64 slot) {
         // quando os dois jogadores usam o mesmo personagem (ex.: dois Batmans independentes).
         const auto it = g_our_slots.find(slot);
         if (it != g_our_slots.end() && name == it->second + ".cd") {
-            if (i >= g_nslots) return false;
+            if (i >= g_nslots || IsReplicaSlot(slot)) return false;
             if (ValidVehicleName(it->second)) {
                 // O jogo permite dois Batmoveis, desde que o pedido de cada um use seu slot.
                 std::lock_guard lock(g_local_vehicle_mutex);
@@ -2377,9 +2432,12 @@ bool Spawn(Puppet& p) {
     std::fflush(stdout);
     g_spawning = true;
     g_spawning_flag_for_load = true;
+    const bool previous_slot_work = g_replica_slot_work;
+    g_replica_slot_work = true;
     // 4.4.23: flag = 0 (3o argumento edx em eboot+0x158c952): cria o personagem normalmente mas PULA 100% do registro
     // Party::AddCharacter (0x14b4e30). O fantasma nunca entra na party local nem na roda de figuras (triangulo/Y).
     g_spawn(spawner, request, 0, 0, 0, 0);
+    g_replica_slot_work = previous_slot_work;
     // Registra a replica antes do proximo Tick que consulta os veiculos nativos.
     if (const u64 inst = SpawnedInstance(request); inst && !IsLocalPlayer(inst)) LiveInstAdd(inst);
     g_spawning_flag_for_load = false;
@@ -3134,16 +3192,20 @@ std::string LocalRegion() {
     return id.empty() ? std::string("?") : id;
 }
 
-// 4.5.1: os outros personagens equipados deste jogador (os slots de jogador do portal, menos o que esta em uso agora).
+// As figuras de reserva podem estar nos slots fisicos do portal ou nos slots de jogador.
 // Vao no estado para os outros verem a party inteira, nao so o personagem ativo.
 std::vector<std::string> LocalPartyNames(const std::string& active) {
     std::vector<std::string> out;
-    for (int i = g_nslots; i < g_nall && out.size() < 6; ++i) {
+    const std::string active_name = Lower(active);
+    for (int i = 0; i < g_nall && out.size() < 6; ++i) {
         if (SlotState(i) != 1) continue;
-        std::string name = SlotName(i);
-        if (name.size() > 3 && name.compare(name.size() - 3, 3, ".cd") == 0) name.resize(name.size() - 3);
-        if (name.empty() || IsVehicleName(name) || Lower(name) == Lower(active)) continue;
-        if (g_our_slots.count(SlotAddress(i))) continue; // slot que NOS carregamos para um fantasma
+        std::string name = Lower(SlotName(i));
+        if (!name.ends_with(".cd")) continue;
+        name.resize(name.size() - 3);
+        if (name.empty() || IsVehicleName(name) || name == active_name || name.ends_with("_bigfig") ||
+            std::find(out.begin(), out.end(), name) != out.end()) continue;
+        const u64 slot = SlotAddress(i);
+        if (g_our_slots.count(slot) || IsReplicaSlot(slot)) continue;
         out.push_back(name);
     }
     return out;
@@ -3511,6 +3573,17 @@ bool ResolveFunctions(bool again = false) {
         const u64 adjusted = checked(offset + high_shift, code);
         return adjusted ? adjusted : checked(offset, code);
     };
+    const auto slot_load_callee = [&](u64 instruction, std::initializer_list<u8> prologue) -> u64 {
+        const u64 ip = kSlotLoadFn + instruction;
+        const u64 base = reinterpret_cast<u64>(g_base);
+        if (!Readable(base + ip, 5) || g_base[ip] != 0xe8) return 0;
+        const s64 target = static_cast<s64>(ip + 5) + At<s32>(base + ip + 1);
+        return target > 0 && target < 0x2300000 ? checked(static_cast<u64>(target), prologue) : 0;
+    };
+    g_find_native_slot_fn = slot_load_callee(0xd1, {0x55, 0x48, 0x89, 0xe5, 0x41, 0x57, 0x41, 0x56, 0x41, 0x55,
+                                                   0x41, 0x54, 0x53, 0x48, 0x83, 0xec, 0x38, 0x48, 0x89, 0x4d, 0xb0});
+    g_begin_slot_load = slot_load_callee(0x2bc, {0x55, 0x48, 0x89, 0xe5, 0x41, 0x57, 0x41, 0x56, 0x41, 0x55,
+                                                0x41, 0x54, 0x53, 0x48, 0x81, 0xec, 0xa8, 0, 0, 0, 0x49, 0x89, 0xf7, 0x49, 0x89, 0xfd});
     g_vehicle_resource_fn = native(0xd16de0, {0x55, 0x48, 0x89, 0xe5, 0x53, 0x50, 0x48, 0x89, 0xfb, 0x48, 0x8b, 0x3b});
     // O spawner consulta a lista de ApiVehicle antes de aceitar uma tag repetida.
     for (u64 ref = kSpawnFn + 0x110; ref < kSpawnFn + 0x160; ++ref) {
@@ -3585,7 +3658,7 @@ void UnloadOurPortalSlots() {
     if (PortalSlotsAllowed()) return;
     for (auto it = g_our_slots.begin(); it != g_our_slots.end();) {
         const int idx = SlotIndexOf(it->first);
-        if (idx < 0 || idx >= g_nslots) {
+        if (idx < 0 || idx >= g_nslots || IsReplicaSlot(it->first)) {
             ++it;
             continue;
         }
@@ -3616,6 +3689,11 @@ bool InstallHooks() {
     g_dtor = reinterpret_cast<DtorFn>(Hook(kRequestDtorFn, reinterpret_cast<const void*>(&RequestDtorHook)));
     if (const char* env = std::getenv("LD_MP_SLOTS")) g_extra_slots = std::clamp(std::atoi(env) - 7, 0, 1);
     g_setup = reinterpret_cast<SetupFn>(Hook(kLevelSetupFn, reinterpret_cast<const void*>(&LevelSetupHook))); // sem ele: so o portal
+    if (g_find_native_slot_fn && g_begin_slot_load) {
+        g_find_native_slot = reinterpret_cast<SetupFn>(Hook(g_find_native_slot_fn, reinterpret_cast<const void*>(&FindNativeSlotHook)));
+    }
+    std::printf("[MP] slots independentes para figuras repetidas: %s\n", g_find_native_slot ? "ativos" : "indisponiveis");
+    std::fflush(stdout);
     g_slot_load = reinterpret_cast<SetupFn>(Hook(kSlotLoadFn, reinterpret_cast<const void*>(&SlotLoadHook)));
     // Fase 80: objetos que os outros quebram no mundo deles quebram no nosso
     g_blowup = reinterpret_cast<BlowUpFn>(Hook(kBlowUpFn, reinterpret_cast<const void*>(&BlowUpHook)));
@@ -4354,21 +4432,41 @@ void ReceiveEvents(const std::string& area, double now) {
     });
 }
 
-void LoadPuppetSlot(Puppet& p, double now, bool player_slot, bool vehicle) {
+void LoadPuppetSlot(Puppet& p, double now, u64 dedicated, bool vehicle) {
     std::memset(p.load_buffer, 0, sizeof(p.load_buffer));
+    const bool player_slot = dedicated && SlotIndexOf(dedicated) >= g_nslots;
     At<s32>(reinterpret_cast<u64>(p.load_buffer) + 96) = player_slot ? 1 : 0; // tipo: 0 portal, 1 jogador
     std::snprintf(p.load_name, sizeof(p.load_name), "%s", p.cur.chr.c_str());
     const u64 buffer = reinterpret_cast<u64>(p.load_buffer);
     Call(kDescFn, buffer, reinterpret_cast<u64>(p.load_name), 0x73db, 0);
-    Call(kSlotLoadFn, buffer + 64, 0, buffer + 96, buffer, vehicle ? 1 : 0, 1);
-    const u64 slot = At<u64>(buffer + 64);
-    if (const std::string low = Lower(p.cur.chr); std::find(g_our_chars.begin(), g_our_chars.end(), low) == g_our_chars.end()) {
-        g_our_chars.push_back(low);
+    u64 slot = 0;
+    if (dedicated && g_begin_slot_load && g_find_native_slot) {
+        const u64 retain = EngineMethod(dedicated, 0x18);
+        if (retain && EngineMethod(dedicated, 0x30) && ReserveReplicaSlot(dedicated)) {
+            const bool previous_slot_work = g_replica_slot_work;
+            g_replica_slot_work = true;
+            // Comeca a carga no endereco escolhido, sem a busca nativa pela figura local.
+            Call(g_begin_slot_load, dedicated, buffer);
+            g_replica_slot_work = previous_slot_work;
+            if (At<s32>(dedicated + 0x2c8) != 0) {
+                Call(retain, dedicated);
+                slot = dedicated;
+            } else {
+                ForgetReplicaSlot(dedicated);
+            }
+        }
+    } else if (vehicle || (player_slot && !LocalPlayerUses(Lower(p.cur.chr) + ".cd"))) {
+        Call(kSlotLoadFn, buffer + 64, 0, buffer + 96, buffer, vehicle ? 1 : 0, 1);
+        slot = At<u64>(buffer + 64);
     }
     p.loading = p.cur.chr;
     p.standin = false;
     p.slot = IsSlot(slot) ? slot : 0;
-    if (p.slot) g_our_slots[p.slot] = Lower(p.cur.chr);
+    if (p.slot) {
+        const std::string name = Lower(p.cur.chr);
+        g_our_slots[p.slot] = name;
+        if (std::find(g_our_chars.begin(), g_our_chars.end(), name) == g_our_chars.end()) g_our_chars.push_back(name);
+    }
     p.stage = p.slot ? Stage::kLoading : Stage::kNone;
     p.stage_time = now;
     if (!p.slot) p.load_fail_time = now; // nao deu agora: so o nome, e tenta de novo depois
@@ -4399,6 +4497,7 @@ void Tick() {
         p1 = 0;
     }
     UpdateSlotCounts();
+    PruneReplicaSlots();
     UpdateLevelKey();
     // 4.4.32: a fase mudou (fim de missao -> proxima fase, volta ao hub, tela de carregamento): os fantasmas da fase
     // antiga nao existem mais. Solta todos SEM tocar no jogo - era isso que derrubava o jogo de quem segue o outro
@@ -4569,7 +4668,6 @@ void Tick() {
     const int old_count = g_drive_count;
     std::copy(g_drive, g_drive + old_count, old);
     g_drive_count = 0;
-    const int party_cap = PartyCap(peers.size());
     for (const auto& peer : peers) {
         const int base_key = peer.id * kPuppetStride;
         if (g_puppets.size() >= kMaxPuppets && !g_puppets.count(base_key)) continue;
@@ -4583,9 +4681,15 @@ void Tick() {
             if (ParseRemote(peer.state, &r)) UpdateRemote(main, std::move(r), peer.state_time);
             main.seq = peer.seq;
         }
-        const int cap = std::min<int>(party_cap, 1 + static_cast<int>(main.cur.party.size()));
-        std::vector<int> indices;
-        for (int i = 0; i < cap; ++i) indices.push_back(i);
+        std::vector<int> indices{0};
+        const std::string active_figure = Lower(main.cur.chr);
+        // A reserva que coincide com uma figura deste jogador ganha sua propria replica.
+        for (size_t i = 0; i < main.cur.party.size(); ++i) {
+            const std::string figure = Lower(main.cur.party[i]);
+            if (figure != active_figure && LocalPlayerUses(figure + ".cd")) {
+                indices.push_back(static_cast<int>(i) + 1);
+            }
+        }
         for (const RemoteVehicle& v : main.cur.vehicles) indices.push_back(kFirstVehiclePuppet + v.slot);
         for (auto it = g_puppets.upper_bound(base_key); it != g_puppets.end() && it->first < base_key + kPuppetStride;) {
             if (std::find(indices.begin(), indices.end(), it->second.idx) != indices.end()) {
@@ -4621,6 +4725,10 @@ void Tick() {
                     state.vehicle.clear();
                 } else {
                     state.chr = main.cur.party[idx - 1];
+                    state.held = state.ctx_hash = 0;
+                    state.gear = 3;
+                    state.dx = state.dz = 0;
+                    state.vehicle.clear();
                     const double angle = 2.4 * idx;
                     state.x += static_cast<float>(std::cos(angle)) * 0.55f;
                     state.z += static_cast<float>(std::sin(angle)) * 0.55f;
@@ -4631,7 +4739,7 @@ void Tick() {
         // do mesmo mundo). Mesma fase = mesmo mundo. E a tolerancia do estado subiu para 10 s (engasgo do outro jogo).
         const bool same_world = p.cur.level.empty() ? p.cur.area == area : p.cur.level == g_level_key;
         const bool show_actor = vehicle || (!IsVehicleName(p.cur.chr) &&
-            (main.cur.vehicle.empty() || std::none_of(main.cur.vehicles.begin(), main.cur.vehicles.end(),
+            (idx != 0 || main.cur.vehicle.empty() || std::none_of(main.cur.vehicles.begin(), main.cur.vehicles.end(),
                 [&](const RemoteVehicle& item) {
                     if (item.name != main.cur.vehicle) return false;
                     const auto replica = g_puppets.find(base_key + kFirstVehiclePuppet + item.slot);
@@ -4677,15 +4785,14 @@ void Tick() {
             continue;
         }
         switch (p.stage) {
-        case Stage::kNone:
+        case Stage::kNone: {
             if (now < p.retry_time || now - g_last_spawn < 0.5) break;
             p.retry_time = now + 1.0;
             // 4.4.13: sem boneco e o personagem ja esta carregado: entra na hora (as esperas de carga nao valem aqui).
             // Era isso que deixava "so o nome" por 2-3 s cada vez que o jogo desfazia o fantasma.
             if (!g_unsupported.count(Lower(p.cur.chr))) {
                 if (const u64 loaded = FindLoadedSlot(p.cur.chr, vehicle);
-                    loaded && !SlotUsedByLocalPlayer(loaded) &&
-                    (vehicle || PortalSlotsAllowed() || SlotIndexOf(loaded) >= g_nslots)) {
+                    loaded && !SlotUsedByLocalPlayer(loaded)) {
                     p.slot = loaded;
                     p.standin = false;
                     p.stage = Stage::kReady;
@@ -4705,43 +4812,21 @@ void Tick() {
                 // Tag items usam a carga do portal, com um slot novo, assim
                 // como o carregador nativo da figura veicular.
                 if (!SomeoneLoading() && now - p.load_fail_time > 5.0 && FreeSlots() > kKeepFreeSlots) {
-                    LoadPuppetSlot(p, now, false, true);
+                    LoadPuppetSlot(p, now, 0, true);
                 }
                 break;
             }
-            if (CanLoad() && SomeoneLoading()) {
+            const u64 dedicated = CharacterReplicaSlot(p.cur.chr);
+            const bool busy = SomeoneLoading();
+            if (busy) {
                 // o jogo carrega um personagem por vez: espera a vez (enquanto isso so o nome aparece)
                 if (!p.wait_since) p.wait_since = now;
-            } else if (LocalPlayerUses(Lower(p.cur.chr) + ".cd") && !FreePlayerSlot()) {
-                // 4.4.7: o outro jogo esta com o MESMO personagem e nao ha slot de jogador livre: entra com um
-                // personagem ja carregado (nome dele em cima) - antes ficava so o nome e o boneco ia e voltava.
-                if (u64 slot = StandInSlot()) {
-                    p.slot = slot;
-                    p.standin = true;
-                    p.stage = Stage::kReady;
-                } else {
-                    p.retry_time = now + 3.0;
-                }
-                break;
-            } else if (const bool shares_local = LocalPlayerUses(Lower(p.cur.chr) + ".cd");
-                       CanLoad() && now - p.load_fail_time > 15.0 && now - g_last_unload > 8.0 &&
-                       (!shares_local || FreePlayerSlot())) { // carrega num slot livre
+            } else if (dedicated && now - p.load_fail_time > 15.0 && now - g_last_unload > 8.0) {
                 p.wait_since = 0;
-                // 4.5: personagem igual ao do jogador local (o mesmo Batman nos dois): o slot TEM de ser um "Player Load
-                // Slot" proprio, nunca o do portal/party do jogador (duas instancias isoladas, sem colisao de ponteiro)
-                // 4.4.16: SEMPRE no slot de jogador quando houver um livre: esses slots nao aparecem na roda de
-                // figuras, entao o jogador local nao consegue mais entrar no personagem do outro (era isso que
-                // derrubava o jogo). LD_MP_SLOT=portal volta ao comportamento antigo.
-                const bool portal_always = PortalSlotsAllowed();
-                const bool player_slot = !portal_always && (shares_local || UsePlayerSlot());
-                if (!portal_always && !player_slot) { // 4.4.17: sem slot de jogador livre, nem carrega (roda limpa)
-                    p.retry_time = now + 3.0;
-                    break;
-                }
-                LoadPuppetSlot(p, now, player_slot, false);
-            } else if (!SomeoneLoading() && now - p.load_fail_time > 15.0 && RecycleSlot()) {
+                LoadPuppetSlot(p, now, dedicated, false);
+            } else if (!dedicated && now - p.load_fail_time > 15.0 && RecycleSlot()) {
                 p.retry_time = now + 1.0; // o slot esvazia em seguida; carrega na proxima tentativa
-            } else if (!SomeoneLoading() && ReclaimForCloser(p, now)) {
+            } else if (!dedicated && ReclaimForCloser(p, now)) {
                 // sem slot: tirou de quem esta bem mais longe (esse aparece com um substituto)
             } else if (now - p.want_since > 3.0) {
                 if (u64 slot = StandInSlot()) { // sem slot por enquanto: aparece com um personagem ja carregado
@@ -4751,6 +4836,7 @@ void Tick() {
                 }
             }
             break;
+        }
         case Stage::kLoading:
             if (p.slot && Readable(p.slot + 0x2c8, 4) && At<s32>(p.slot + 0x2c8) == 1) {
                 if (!p.ready_time) p.ready_time = now;
@@ -4777,6 +4863,11 @@ void Tick() {
             break;
         case Stage::kSpawning: {
             const u64 inst = SpawnedInstance(p.request);
+            if (IsLocalPlayer(inst)) {
+                ReleasePuppet(p);
+                p.retry_time = now + 3.0;
+                break;
+            }
             const bool mech = IsMechVehicle(inst);
             if (inst && (mech ? vehicle && VehicleMatrix(inst) : Readable(inst + 0x10, 0x500))) {
                 p.inst = inst;
@@ -4865,7 +4956,8 @@ void Tick() {
             }
             if (!vehicle && !p.standin && Lower(LocalCharacter(p.inst)) != Lower(p.cur.chr) && now - p.stage_time > 1.0 &&
                 !g_unsupported.count(Lower(p.cur.chr)) &&
-                (FindLoadedSlot(p.cur.chr) || (!SomeoneLoading() && now - p.load_fail_time > 15.0 && (CanLoad() || RecycleSlot())))) {
+                (FindLoadedSlot(p.cur.chr) || (!SomeoneLoading() && now - p.load_fail_time > 15.0 &&
+                                             (CharacterReplicaSlot(p.cur.chr) || RecycleSlot())))) {
                 Despawn(p);
                 p.retry_time = 0;
                 break;
