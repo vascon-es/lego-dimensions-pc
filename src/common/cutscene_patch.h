@@ -1,6 +1,7 @@
 #pragma once
 #include <windows.h>
 #include <array>
+#include <cctype>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -154,16 +155,28 @@ inline bool Arm(std::span<const std::span<uint8_t>> segments) {
     return found.applied;
 }
 
-// "Area jogavel" para o skip: tela inicial/sala do portal (hubarea), abertura (impose), titulo, cena do tubo e telas de
-// carregamento NAO contam. E' nessas que o jogo desenha o aviso "Pular" por cima de "Player 1"/menu.
+// "Area jogavel" para o skip. Nao sao fases (o jogo desenha o aviso "Pular" nelas, e era ele que aparecia por cima de
+// "Player 1"/menu): a sala do portal/tela inicial e o hub, com os nomes que o jogo usa - hubarea, hub, hub_dc, portalroom,
+// vorton, vorton_opus - mais titulo, abertura (impose), cena do tubo (slideways) e telas de carregamento.
 inline bool PlayableArea(const std::string& area) {
     std::string low;
     low.reserve(area.size());
     for (const char c : area) low += static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
-    return !low.empty() && low.find("loadingscreen") == std::string::npos && low.find("loading_screen") == std::string::npos &&
-           low.find("titles") == std::string::npos && low.find("startup") == std::string::npos &&
-           low.find("impose") == std::string::npos && low.find("slideways") == std::string::npos &&
-           low.find("hubarea") == std::string::npos && low.find("hub_area") == std::string::npos;
+    if (low.empty()) return false;
+    for (const char* not_level : {"loadingscreen", "loading_screen", "titles", "startup", "impose", "slideways"}) {
+        if (low.find(not_level) != std::string::npos) return false;
+    }
+    for (size_t i = 0; i < low.size();) {
+        size_t j = i;
+        while (j < low.size() && (std::isalnum(static_cast<unsigned char>(low[j])) || low[j] == '_')) ++j;
+        const std::string part = low.substr(i, j - i);
+        if (part == "hub" || part == "hubarea" || part == "portalroom" || part.rfind("hub_", 0) == 0 ||
+            part.rfind("vorton", 0) == 0) {
+            return false;
+        }
+        i = j + 1;
+    }
+    return true;
 }
 
 // Chamado quando o jogo entra/sai de uma fase jogavel (radar de arquivos). Idempotente e barato quando nao muda.

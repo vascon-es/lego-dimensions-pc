@@ -131,6 +131,16 @@ int main() {
         // 4.4.41: "fase jogavel" - a sala do portal (hubarea) e' a tela inicial e nao pode ligar o patch
         check(!cutscene_patch::live::PlayableArea("hubarea"));
         check(!cutscene_patch::live::PlayableArea("HubArea"));
+        check(!cutscene_patch::live::PlayableArea("hub"));
+        check(!cutscene_patch::live::PlayableArea("hub_dc"));
+        check(!cutscene_patch::live::PlayableArea("portalroom"));
+        check(!cutscene_patch::live::PlayableArea("vorton"));
+        check(!cutscene_patch::live::PlayableArea("vorton_opus"));
+        check(!cutscene_patch::live::PlayableArea("loadingscreen_slideways"));
+        check(cutscene_patch::live::PlayableArea("mainintro_gotham"));
+        check(cutscene_patch::live::PlayableArea("1wizardofoz"));
+        check(cutscene_patch::live::PlayableArea("dc_quest03"));
+        check(cutscene_patch::live::PlayableArea("2thesimpsonshouse"));
         check(!cutscene_patch::live::PlayableArea("titles_portalroom"));
         check(!cutscene_patch::live::PlayableArea("loading_screen_startup"));
         check(!cutscene_patch::live::PlayableArea("loading_screen_default"));
@@ -139,7 +149,7 @@ int main() {
         check(!cutscene_patch::live::PlayableArea(""));
         check(cutscene_patch::live::PlayableArea("gotham_city"));
         check(cutscene_patch::live::PlayableArea("mystery_mansion"));
-        check(cutscene_patch::live::PlayableArea("vorton_arena"));
+        check(!cutscene_patch::live::PlayableArea("vorton_arena")); // vorton* e' o hub, nao uma fase
         std::filesystem::remove_all(root);
         std::cout<<"Region discovery, cutscene patch and level-gated skip checks passed\n";
         return 0;
