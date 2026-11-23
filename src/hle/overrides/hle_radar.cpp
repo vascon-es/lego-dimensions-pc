@@ -13,6 +13,7 @@
 
 #include "hle/hle_log.h"
 #include "render/vulkan_backend.h"
+#include "common/cutscene_patch.h"
 
 namespace hle::radar {
 
@@ -237,6 +238,13 @@ void OnRead(const std::string& guest_path, s64 offset, u64 size) {
     }
     for (const std::string& area : mp_areas) {
         runtime::multiplayer::OnArea(area); // Fase 79: multiplayer (nada se estiver desligado)
+    }
+    // 4.4.40: "pular cutscene" so dentro de fase. Uma area jogavel nesta leva liga o patch; uma leva so com titulo,
+    // abertura ou carregamento desliga (devolve os bytes do jogo).
+    if (!areas.empty()) {
+        bool playable = false;
+        for (const std::string& area : areas) playable = playable || cutscene_patch::live::PlayableArea(area);
+        cutscene_patch::live::SetInLevel(playable);
     }
 }
 
