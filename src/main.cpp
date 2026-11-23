@@ -111,18 +111,17 @@ bool g_skip_cutscenes = false;
 runtime::multiplayer::Config g_mp_config; // Fase 79: --mp-server/--mp-room/--mp-name (caixa do launcher)
 bool g_keep_16x9 = false; // 1.9.1: --keep-16x9 = tela de outra proporcao com barras (sem corrigir a camera)
 
-// Fase 61: mod "pular qualquer cutscene". A funcao do eboot em 0x173fd80 decide se a cutscene atual aceita
-// ser pulada: depois das checagens de estado, vale o "allowcutskip" do nivel ou o bit 0 de [obj+0xe8] (cena
-// ja vista / jogo completo). Troca essa ultima leitura por "mov al, 1", mantendo as checagens de antes.
-// 4.4.33: o codigo e' o mesmo na versao EUR e na USA (achado por padrao de bytes, nunca por endereco fixo); as
-// saidas antecipadas da MESMA funcao tambem sao desarmadas, senao a cutscene de historia nao aceita o pulo.
-cutscene_patch::Result PatchCutsceneSkip(const loader::ElfPieLoader& elf) {
+// Fase 61: mod "pular cutscene" (patch de bytes no eboot, achado por padrao - o endereco muda entre EUR e USA).
+// 4.4.44: o patch fica ARMADO na abertura (bytes achados, nada escrito) e so e' LIGADO dentro de uma fase jogavel. No hub
+// (sala do portal = tela inicial) e nas telas de carregamento ele fica desligado, e o jogo decide sozinho como sempre fez -
+// era dali que vinha o aviso "Pular" desenhado por cima de "Player 1"/menu.
+bool ArmCutsceneSkip(const loader::ElfPieLoader& elf) {
     std::vector<std::span<uint8_t>> code;
     for (const auto& segment : elf.segments()) {
         if ((segment.flags & 1) && segment.vaddr <= elf.image_size() && segment.filesz <= elf.image_size() - segment.vaddr)
             code.emplace_back(elf.base() + segment.vaddr, static_cast<size_t>(segment.filesz));
     }
-    return cutscene_patch::Apply(code);
+    return cutscene_patch::live::Arm(code);
 }
 
 std::filesystem::path FindPatchDir(const std::filesystem::path& app0) {
@@ -1793,12 +1792,9 @@ int main(int argc, char** argv) {
     }
 
     if (g_skip_cutscenes) {
-        // 4.4.33: diz tambem ONDE liberou (eboot+0x...) e quantas saidas antecipadas foram desarmadas, para o log
-        // mostrar o que aconteceu em cada versao do jogo (EUR/USA tem o mesmo codigo em enderecos diferentes).
-        const cutscene_patch::Result skip = PatchCutsceneSkip(elf);
-        if (skip.applied) {
-            std::printf("Cutscenes : all can be skipped (--skip-cutscenes, eboot+0x%llx, %d gates)\n",
-                        static_cast<unsigned long long>(skip.at), skip.gates);
+        if (ArmCutsceneSkip(elf)) {
+            std::printf("Cutscenes : skip on inside levels only (%d gates); hub/title stay as the game does\n",
+                        cutscene_patch::live::Gates());
         } else {
             std::printf("Cutscenes : WARNING: different eboot, skip mod not applied (pattern not found)\n");
         }
