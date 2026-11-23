@@ -1892,7 +1892,21 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
                                  : "[LEGO Dimensions PC] Frames (Flips): %" PRIu64 " | .DAT open: %" PRIu64 " | Threads: %d%s",
                       g_flip_count.load(), fs::DatFilesOpened(), runtime::AliveGuestThreads(), warm);
         SetWindowTextA(hwnd, title);
-        if (!render::VulkanRenderer::Instance().Active()) {
+        // 4.4.40: a janela ficava para sempre com "Nothing rendered yet" quando o Vulkan nao subia na abertura (driver
+        // ainda carregando, area de trabalho remota, GPU trocada com o jogo aberto, driver reiniciado). Agora tenta de
+        // novo a cada 5 s, ate 40 vezes, e o motivo real (LastError) aparece na tela para o jogador poder reportar.
+        auto& renderer = render::VulkanRenderer::Instance();
+        if (!renderer.Active()) {
+            static int retries = 0;
+            static int ticks = 0;
+            if (++ticks >= 5) {
+                ticks = 0;
+                if (retries < 40 && renderer.Initialize(hwnd)) {
+                    log::Tagged("VULKAN", "initialized on retry %d: %s", retries + 1, renderer.Describe().c_str());
+                } else if (retries < 40) {
+                    ++retries;
+                }
+            }
             InvalidateRect(hwnd, nullptr, FALSE); // sem Vulkan: redesenha o texto por GDI
         }
         return 0;
@@ -1912,13 +1926,26 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
         RECT rc;
         GetClientRect(hwnd, &rc);
         FillRect(dc, &rc, static_cast<HBRUSH>(GetStockObject(BLACK_BRUSH)));
-        char text[160];
-        std::snprintf(text, sizeof(text),
-                      "Nothing rendered yet.  Enter=OPTIONS  Space=X  Esc=O  X=square  Y=triangle  "
-                      "arrows=D-pad  WASD=stick   Flips: %" PRIu64, g_flip_count.load());
+        const std::string& why = render::VulkanRenderer::Instance().LastError();
+        char text[640];
+        if (why.empty()) {
+            std::snprintf(text, sizeof(text),
+                          "Nothing rendered yet.  Enter=OPTIONS  Space=X  Esc=O  X=square  Y=triangle  "
+                          "arrows=D-pad  WASD=stick   Flips: %" PRIu64, g_flip_count.load());
+        } else {
+            // 4.4.40: sem Vulkan a janela e' a unica pista que o jogador tem. Diz o motivo e o que fazer.
+            std::snprintf(text, sizeof(text),
+                          "Nothing rendered yet - the graphics device did not start up.\n\n"
+                          "Reason: %s\n\n"
+                          "What to try: install/update the video card driver (NVIDIA, AMD or Intel), close other programs "
+                          "that may hold the GPU, and start the game again. This window keeps trying every 5 seconds."
+                          "\n\nFlips: %" PRIu64, why.c_str(), g_flip_count.load());
+        }
         SetBkMode(dc, TRANSPARENT);
         SetTextColor(dc, RGB(200, 200, 200));
-        DrawTextA(dc, text, -1, &rc, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+        RECT box = rc;
+        InflateRect(&box, -24, -24);
+        DrawTextA(dc, text, -1, &box, DT_CENTER | DT_VCENTER | DT_WORDBREAK);
         EndPaint(hwnd, &ps);
         return 0;
     }

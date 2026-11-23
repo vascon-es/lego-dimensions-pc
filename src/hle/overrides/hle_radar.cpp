@@ -13,6 +13,7 @@
 
 #include "hle/hle_log.h"
 #include "render/vulkan_backend.h"
+#include "common/cutscene_patch.h"
 
 namespace hle::radar {
 
@@ -116,6 +117,9 @@ std::string AreaName(const std::string& lower_name) {
     const std::string dir = lower_name.substr(parent + 1, slash - parent - 1);
     return stem == dir && dir != "levels" ? stem : std::string(); // levels\levels.txt e a lista de fases, nao uma area
 }
+
+// 4.4.40: definida mais abaixo; usada pelo bloco que liga/desliga o patch de cutscene.
+bool SkiplevelIsPlayable(const std::string& area);
 
 bool IsScreenFile(const std::string& lower_name) {
     for (const char* needle : {".gsc", ".txt", ".csv", ".lip", "screen"}) {
@@ -238,6 +242,24 @@ void OnRead(const std::string& guest_path, s64 offset, u64 size) {
     for (const std::string& area : mp_areas) {
         runtime::multiplayer::OnArea(area); // Fase 79: multiplayer (nada se estiver desligado)
     }
+    // 4.4.40: "pular cutscene" so dentro de fase. Uma area jogavel nesta leva liga o patch; uma leva so com titulo,
+    // abertura ou carregamento desliga (devolve os bytes do jogo).
+    if (!areas.empty()) {
+        bool playable = false;
+        for (const std::string& area : areas) playable = playable || SkiplevelIsPlayable(area);
+        cutscene_patch::live::SetInLevel(playable);
+    }
+}
+
+// 4.4.40: "fase jogavel" para o patch de cutscene. Titulo, abertura (impose), cena do tubo e telas de carregamento
+// NAO contam: o jogo desenha o aviso "Pular" nelas e ele aparecia por cima do menu da tela inicial.
+bool SkiplevelIsPlayable(const std::string& area) {
+    std::string low;
+    low.reserve(area.size());
+    for (const char c : area) low += static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    return !low.empty() && low.find("loadingscreen") == std::string::npos && low.find("loading_screen") == std::string::npos &&
+           low.find("titles") == std::string::npos && low.find("startup") == std::string::npos &&
+           low.find("impose") == std::string::npos && low.find("slideways") == std::string::npos;
 }
 
 bool FindStoredFile(const std::string& lower_suffix, StoredFile* out) {

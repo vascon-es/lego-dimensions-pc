@@ -87,20 +87,19 @@ int main() {
         std::array<uint8_t,64> bytes{};
         std::array<std::span<uint8_t>,2> segments{std::span(bytes).first(32),std::span(bytes).subspan(32)};
         check(!cutscene_patch::Apply(segments));
-        // uma ocorrencia: libera a leitura e desarma SO a saida "test eax,0x4000000; je; xor eax,eax" da mesma funcao
-        constexpr std::array<uint8_t,9> gate_a{0xA9,0x00,0x00,0x00,0x04,0x74,0x04,0x31,0xC0}; // obrigatoria
-        constexpr std::array<uint8_t,4> gate_b{0xA8,0x01,0x74,0x04};                             // menu/atracao
-        std::array<uint8_t,9> gate_b_tail{0x31,0xC0,0xEB,0x1D,0,0,0,0,0};
-        std::copy(gate_b.begin(),gate_b.end(),bytes.begin()+4);
-        std::copy(gate_b_tail.begin(),gate_b_tail.end(),bytes.begin()+8);
-        std::copy(gate_a.begin(),gate_a.end(),bytes.begin()+14);
+        // uma ocorrencia: libera a leitura e desarma as DUAS saidas antecipadas da mesma funcao
+        // (bit 0 e test eax,0x04000000) - a amostra tem as duas, cada uma com o seu "je +4; xor eax,eax; jmp"
+        constexpr std::array<uint8_t,8> gate_bit0{0xA8,0x01,0x74,0x04,0x31,0xC0,0xEB,0x1D};
+        constexpr std::array<uint8_t,11> gate_forced{0xA9,0x00,0x00,0x00,0x04,0x74,0x04,0x31,0xC0,0xEB,0x1D};
+        std::copy(gate_bit0.begin(),gate_bit0.end(),bytes.begin());
+        std::copy(gate_forced.begin(),gate_forced.end(),bytes.begin()+10);
         std::copy(signature.begin(),signature.end(),bytes.begin()+24);
         {
             const auto result=cutscene_patch::Apply(segments);
-            check(result && result.applied && result.gates==1 && result.at==24);
+            check(result && result.applied && result.gates==2 && result.at==24);
             check(bytes[24]==0xB0 && bytes[25]==1);
-            check(bytes[21]==0xB0 && bytes[22]==1);   // a saida 0x4000000 foi desarmada
-            check(bytes[8]==0x31 && bytes[9]==0xC0); // a do bit 0 continua "xor eax,eax"
+            check(bytes[4]==0xB0 && bytes[5]==1);     // bit 0 desarmada
+            check(bytes[17]==0xB0 && bytes[18]==1);   // test eax,0x04000000 desarmada
         }
         // duas ocorrencias: ambiguo, nao pode mexer em nada (nem nas saidas antecipadas)
         std::copy(signature.begin(),signature.end(),bytes.begin());
@@ -117,8 +116,20 @@ int main() {
         const auto split_before=split;
         std::array<std::span<uint8_t>,2> split_segments{std::span(split).first(3),std::span(split).subspan(3)};
         check(!cutscene_patch::Apply(split_segments) && split==split_before);
+        // 4.4.40: o patch fica ARMADO e so liga dentro de fase (a cena da tela inicial nunca e' tocada)
+        std::array<uint8_t,64> live{};
+        std::copy(signature.begin(),signature.end(),live.begin()+8);
+        std::array<std::span<uint8_t>,1> live_segment{std::span(live)};
+        check(cutscene_patch::live::Arm(live_segment));
+        check(live[8]==0x8A && !cutscene_patch::live::InLevel()); // armado nao escreve nada
+        cutscene_patch::live::SetInLevel(true);
+        check(cutscene_patch::live::InLevel() && live[8]==0xB0 && live[9]==1);
+        cutscene_patch::live::SetInLevel(true); // idempotente
+        check(live[8]==0xB0 && live[9]==1);
+        cutscene_patch::live::SetInLevel(false);
+        check(!cutscene_patch::live::InLevel() && live[8]==0x8A && live[9]==0x83 && live[10]==0xE8);
         std::filesystem::remove_all(root);
-        std::cout<<"Region discovery and bounded cutscene patch checks passed\n";
+        std::cout<<"Region discovery, cutscene patch and level-gated skip checks passed\n";
         return 0;
     } catch (...) { std::filesystem::remove_all(root); throw; }
 }

@@ -2779,8 +2779,11 @@ std::vector<Row> Rows() {
                         SaveSettings();
                     }});
     rows.push_back({kTabGame, RowKind::kChoice, ui::T(L"Pular cutscenes", L"Skip cutscenes"),
-                    ui::T(L"Qualquer cutscene pode ser pulada, mesmo sem 100%.", L"Any cutscene can be skipped, even without 100%."), OnOff(g_opt_skip),
-                    toggle(g_opt_skip)});
+                    ui::T(L"Cutscenes dentro das fases podem ser puladas, mesmo sem 100%. A abertura e a tela inicial ficam "
+                         L"como o jogo faz.",
+                         L"Cutscenes inside levels can be skipped, even without 100%. The opening and the title screen stay "
+                         L"exactly as the game does them."),
+                    OnOff(g_opt_skip), toggle(g_opt_skip)});
     rows.push_back({kTabGame, RowKind::kChoice, ui::T(L"Abrir o LegoToypad com o jogo", L"Start LegoToypad with the game"),
                     ui::T(L"O portal na tela (tools\\LegoToypad.exe).", L"The on-screen portal (tools\\LegoToypad.exe)."), OnOff(g_opt_toypad), toggle(g_opt_toypad)});
     rows.push_back({kTabGame, RowKind::kChoice, ui::T(L"Multiplayer online (alfa)", L"Online multiplayer (alpha)"),

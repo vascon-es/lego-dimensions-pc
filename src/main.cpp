@@ -116,13 +116,16 @@ bool g_keep_16x9 = false; // 1.9.1: --keep-16x9 = tela de outra proporcao com ba
 // antecipadas da MESMA funcao, sempre por padrao de bytes (o endereco muda entre a versao EUR e a USA).
 // Aqui nao existe mais nada de "pular logos": o gancho na vtable que mexia na decisao de pulo em tempo de execucao
 // (e por causa dele a abertura/cenas iniciais quebravam) foi removido por completo.
-cutscene_patch::Result PatchCutsceneSkip(const loader::ElfPieLoader& elf) {
+// 4.4.40: o patch nao e' aplicado na abertura. Ele fica ARMADO (bytes achados, nada escrito) e so e' ligado quando o radar
+// de arquivos ve uma fase jogavel - a cena de atracao da tela inicial tambem e' "cutscene" para o jogo e, com o patch
+// ligado la, ela desenhava o aviso "Pular" por cima de "Player 1" e do menu do titulo.
+bool ArmCutsceneSkip(const loader::ElfPieLoader& elf) {
     std::vector<std::span<uint8_t>> code;
     for (const auto& segment : elf.segments()) {
         if ((segment.flags & 1) && segment.vaddr <= elf.image_size() && segment.filesz <= elf.image_size() - segment.vaddr)
             code.emplace_back(elf.base() + segment.vaddr, static_cast<size_t>(segment.filesz));
     }
-    return cutscene_patch::Apply(code);
+    return cutscene_patch::live::Arm(code);
 }
 
 std::filesystem::path FindPatchDir(const std::filesystem::path& app0) {
@@ -1793,10 +1796,9 @@ int main(int argc, char** argv) {
     }
 
     if (g_skip_cutscenes) {
-        const cutscene_patch::Result skip = PatchCutsceneSkip(elf);
-        if (skip.applied) {
-            std::printf("Cutscenes : all can be skipped (--skip-cutscenes, eboot+0x%llx, %d gates)\n",
-                        static_cast<unsigned long long>(skip.at), skip.gates);
+        if (ArmCutsceneSkip(elf)) {
+            std::printf("Cutscenes : skip on inside levels only (%d gates); opening/title scenes stay untouched\n",
+                        cutscene_patch::live::Gates());
         } else {
             std::printf("Cutscenes : WARNING: different eboot, skip mod not applied (pattern not found)\n");
         }

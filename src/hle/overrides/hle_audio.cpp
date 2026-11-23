@@ -555,29 +555,66 @@ struct Device {
     HWAVEOUT handle = nullptr;
     WAVEHDR headers[kBuffers]{};
     std::vector<s16> data[kBuffers];
-    bool tried = false;
+    u32 opened_rate = 0;
+    double next_try = 0.0;
+    unsigned attempts = 0;
 
+    // 4.4.40: o problema do "sem audio" era aqui. Antes, a PRIMEIRA tentativa marcava <tried> para sempre: se o
+    // waveOutOpen falhasse no inicio (placa ainda subindo, saida trocada no Windows, fone ligado depois, driver em modo
+    // exclusivo por outro programa, saida HDMI desligada), o jogo ficava mudo a sessao inteira - e o log dizia
+    // "no audio device" mesmo com a placa funcionando. Agora tenta o dispositivo padrao, depois cada dispositivo
+    // enumerado, aceita 48 kHz / 44,1 kHz / a taxa pedida, e volta a tentar a cada 2 s.
     bool Open(u32 rate) {
-        if (handle || tried) {
-            return handle != nullptr;
+        if (handle) {
+            return true;
         }
-        tried = true;
-        WAVEFORMATEX format{};
-        format.wFormatTag = WAVE_FORMAT_PCM;
-        format.nChannels = 2;
-        format.nSamplesPerSec = rate;
-        format.wBitsPerSample = 16;
-        format.nBlockAlign = 4;
-        format.nAvgBytesPerSec = rate * 4;
-        if (waveOutOpen(&handle, WAVE_MAPPER, &format, 0, 0, CALLBACK_NULL) != MMSYSERR_NOERROR) {
-            handle = nullptr;
-            g_audio_stats.device_failed = true;
-            std::printf("[AUDIO] waveOutOpen failed: no audio device (game will run without sound)\n");
+        const double now = AudioSeconds();
+        if (next_try > now) {
             return false;
         }
-        g_audio_stats.device_open = true;
-        std::printf("[AUDIO] audio device opened: %u Hz, stereo, 16-bit (waveOut)\n", rate);
-        return true;
+        next_try = now + 2.0;
+        const u32 rates[] = {rate ? rate : 48000, 48000, 44100};
+        const UINT count = waveOutGetNumDevs();
+        std::vector<UINT> devices;
+        devices.push_back(WAVE_MAPPER);
+        for (UINT i = 0; i < count; ++i) {
+            devices.push_back(i);
+        }
+        MMRESULT last = MMSYSERR_NOERROR;
+        for (const UINT device : devices) {
+            for (const u32 hz : rates) {
+                WAVEFORMATEX format{};
+                format.wFormatTag = WAVE_FORMAT_PCM;
+                format.nChannels = 2;
+                format.nSamplesPerSec = hz;
+                format.wBitsPerSample = 16;
+                format.nBlockAlign = 4;
+                format.nAvgBytesPerSec = hz * 4;
+                last = waveOutOpen(&handle, device, &format, 0, 0, CALLBACK_NULL);
+                if (last == MMSYSERR_NOERROR) {
+                    opened_rate = hz;
+                    g_audio_stats.device_failed = false;
+                    g_audio_stats.device_open = true;
+                    WAVEOUTCAPSA caps{};
+                    waveOutGetDevCapsA(device, &caps, sizeof(caps));
+                    std::printf("[AUDIO] audio device opened: %u Hz, stereo, 16-bit (waveOut, %s)%s\n", hz,
+                                caps.szPname[0] ? caps.szPname : "?",
+                                hz == rate ? "" : " - driver converts the rate");
+                    return true;
+                }
+                handle = nullptr;
+            }
+        }
+        ++attempts;
+        g_audio_stats.device_failed = true;
+        char text[160] = "unknown";
+        waveOutGetErrorTextA(last, text, sizeof(text));
+        if (attempts == 1 || attempts % 15 == 0) { // 1a vez e depois a cada ~30 s: nao enche o log
+            std::printf("[AUDIO] no sound output yet: waveOutOpen failed (%s; %u device(s) visible, %u tries). Retrying every "
+                        "2 s - the game keeps running without sound until one works.\n",
+                        text, count, attempts);
+        }
+        return false;
     }
 
     u32 Queued() const {
@@ -1185,6 +1222,9 @@ HLE_IMPL(int, sceAudioOutOutput, int handle, const void* buffer) {
                 }
                 std::lock_guard device(g_device_mutex);
                 AudioDumpWrite(stereo.data(), samples);
+                if (!g_device.handle) {
+                    g_device.Open(port.frequency); // 4.4.40: a saida pode aparecer depois da abertura do port
+                }
                 g_device.Write(stereo.data(), samples); // (o dispositivo e aberto em sceAudioOutOpen)
             }
         }
