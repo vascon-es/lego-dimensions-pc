@@ -111,21 +111,18 @@ bool g_skip_cutscenes = false;
 runtime::multiplayer::Config g_mp_config; // Fase 79: --mp-server/--mp-room/--mp-name (caixa do launcher)
 bool g_keep_16x9 = false; // 1.9.1: --keep-16x9 = tela de outra proporcao com barras (sem corrigir a camera)
 
-// Fase 61 (4.4.38): mod "pular cutscene". A funcao do eboot decide se a cutscene atual aceita ser pulada (depois das
-// checagens de estado que o proprio jogo faz). O patch troca a ultima leitura por "mov al, 1" e desarma as saidas
-// antecipadas da MESMA funcao, sempre por padrao de bytes (o endereco muda entre a versao EUR e a USA).
-// Aqui nao existe mais nada de "pular logos": o gancho na vtable que mexia na decisao de pulo em tempo de execucao
-// (e por causa dele a abertura/cenas iniciais quebravam) foi removido por completo.
-// 4.4.40: o patch nao e' aplicado na abertura. Ele fica ARMADO (bytes achados, nada escrito) e so e' ligado quando o radar
-// de arquivos ve uma fase jogavel - a cena de atracao da tela inicial tambem e' "cutscene" para o jogo e, com o patch
-// ligado la, ela desenhava o aviso "Pular" por cima de "Player 1" e do menu do titulo.
-bool ArmCutsceneSkip(const loader::ElfPieLoader& elf) {
+// Fase 61: mod "pular qualquer cutscene". A funcao do eboot em 0x173fd80 decide se a cutscene atual aceita
+// ser pulada: depois das checagens de estado, vale o "allowcutskip" do nivel ou o bit 0 de [obj+0xe8] (cena
+// ja vista / jogo completo). Troca essa ultima leitura por "mov al, 1", mantendo as checagens de antes.
+// 4.4.33: o codigo e' o mesmo na versao EUR e na USA (achado por padrao de bytes, nunca por endereco fixo); as
+// saidas antecipadas da MESMA funcao tambem sao desarmadas, senao a cutscene de historia nao aceita o pulo.
+cutscene_patch::Result PatchCutsceneSkip(const loader::ElfPieLoader& elf) {
     std::vector<std::span<uint8_t>> code;
     for (const auto& segment : elf.segments()) {
         if ((segment.flags & 1) && segment.vaddr <= elf.image_size() && segment.filesz <= elf.image_size() - segment.vaddr)
             code.emplace_back(elf.base() + segment.vaddr, static_cast<size_t>(segment.filesz));
     }
-    return cutscene_patch::live::Arm(code);
+    return cutscene_patch::Apply(code);
 }
 
 std::filesystem::path FindPatchDir(const std::filesystem::path& app0) {
@@ -1796,9 +1793,10 @@ int main(int argc, char** argv) {
     }
 
     if (g_skip_cutscenes) {
-        if (ArmCutsceneSkip(elf)) {
-            std::printf("Cutscenes : skip on inside levels only (%d gates); opening/title scenes stay untouched\n",
-                        cutscene_patch::live::Gates());
+        const cutscene_patch::Result skip = PatchCutsceneSkip(elf);
+        if (skip.applied) {
+            std::printf("Cutscenes : all can be skipped (--skip-cutscenes, eboot+0x%llx, %d gates)\n",
+                        static_cast<unsigned long long>(skip.at), skip.gates);
         } else {
             std::printf("Cutscenes : WARNING: different eboot, skip mod not applied (pattern not found)\n");
         }
