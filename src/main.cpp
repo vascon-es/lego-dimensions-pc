@@ -45,9 +45,75 @@
 namespace hle {
 void ResetUserServiceEvents();
 void SetVirtualToypadConnected(bool connected);
-bool UseRealToypad(); // Fase 61: mod "pular qualquer cutscene". A funcao do eboot decide se a cutscene atual aceita ser pulada (depois
-// das checagens de estado do proprio jogo). Troca a leitura final por "mov al, 1"; o patch e' achado por padrao de bytes,
-// entao vale para a versao EUR e para a USA (o endereco muda de uma para a outra).
+bool UseRealToypad(); // Fase 61: Toy Pad fisico pelo HID do Windows
+void SetRand15Bits(bool enabled);
+void StartPortalWatcher(const std::filesystem::path& portal_file);
+void StartToypadListener(int port); // app LegoToypad (cliente TCP em 127.0.0.1)
+bool ParsePortalJson(const std::string& json, int pad, std::array<u8, 7>* uid, u32* id);
+bool SetPadInputScript(const char* text);
+void SetLoadGameMacro(bool enabled);
+void SetPadKeyboardEnabled(bool enabled);
+void SetPadBackgroundInput(bool enabled);
+void SetNgs2VoiceClock(bool enabled);
+void SetNgs2VoiceLog(bool enabled);
+void SetAudioOutput(bool enabled);
+void SetAudioDump(const char* path);
+void SetSaveUi(bool enabled);
+void SetSavesDirName(const char* name);
+void SetAddcontDirectory(const std::filesystem::path& directory); // Fase 46: DLC
+void SetPlayerName(int index, const std::string& name);           // Fase 65: apelidos dos jogadores
+int TestSaveUi();
+void SetPadStickLog(bool enabled);
+namespace padsdl {
+void SetEnabled(bool enabled);
+}
+namespace gnm {
+void SetFrameDumpDirectory(const std::filesystem::path& directory);
+void SetShaderDumpDirectory(const std::filesystem::path& directory);
+void FlushShaderDumps(); // Fase 45: o extrator grava em segundo plano
+void SetCutsceneWatchdog(u32 seconds);
+void AddFrameDumpAt(u32 seconds);
+void SetVulkanDraws(bool enabled);
+void SetGameShaders(bool enabled);
+void SetTargetLog(bool enabled);
+void SetGeometryCache(bool enabled);
+void SetReadback(bool enabled);
+void SetHitchLog(bool enabled);
+void SetAsyncPairs(bool enabled);
+void SetParallelDma(bool enabled);
+void SetAsyncTextures(bool enabled);
+void StartShaderWarmup(bool enabled);
+void SetAot(bool enabled, bool first);
+void SetSyncShaders(bool enabled, double pipeline_budget_ms);
+void SetLiveSyncBudget(double ms); // Fase 56
+void SetPairBudget(double budget_ms);
+void SetGeometryBudget(double budget_ms); // Fase 61
+void SetButtonIcons(const char* name);    // Fase 62
+void SetPreloadAllAot(bool enabled);
+void SetSyncTextures(bool enabled, double budget_ms, double spike_budget_ms, u32 spike_count);
+void SetTextureWait(bool enabled); // Fase 45
+void SetParallelTextures(bool enabled); // Fase 59
+bool SelftestDetile(); // Fase 59
+void SetStallStacks(bool enabled); // Fase 59
+void SetLazyAot(bool enabled);      // Fase 59
+void PreloadAotIndex();
+void SetTextureRefresh(bool enabled);
+void SetLiveCompiler(const std::filesystem::path& tool, const std::filesystem::path& root, const std::filesystem::path& shader_dir);
+void SetSrgbDisplay(bool enabled);
+void AddProfileAt(u32 seconds);
+void StartPerfThread();
+}
+} // namespace hle
+
+namespace {
+
+bool g_skip_cutscenes = false;
+runtime::multiplayer::Config g_mp_config; // Fase 79: --mp-server/--mp-room/--mp-name (caixa do launcher)
+bool g_keep_16x9 = false; // 1.9.1: --keep-16x9 = tela de outra proporcao com barras (sem corrigir a camera)
+
+// Fase 61: mod "pular qualquer cutscene" (versao inicial do port). A funcao do eboot decide se a cutscene atual aceita
+// ser pulada, depois das checagens de estado do proprio jogo; o patch troca a leitura final por "mov al, 1" e e' achado
+// por padrao de bytes (o endereco muda entre a versao EUR e a USA).
 bool PatchCutsceneSkip(const loader::ElfPieLoader& elf) {
     std::vector<std::span<uint8_t>> code;
     for (const auto& segment : elf.segments()) {
