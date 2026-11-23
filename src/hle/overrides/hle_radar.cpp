@@ -257,9 +257,12 @@ bool SkiplevelIsPlayable(const std::string& area) {
     std::string low;
     low.reserve(area.size());
     for (const char c : area) low += static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    // "hubarea" e' a sala do portal (tela inicial/menu, onde ficam "Player 1" e o aviso de pulo). O log de 4.4.40 mostrou
+    // que era ela que ligava o patch antes de qualquer fase - e por isso o "Pular" continuava aparecendo no menu.
     return !low.empty() && low.find("loadingscreen") == std::string::npos && low.find("loading_screen") == std::string::npos &&
            low.find("titles") == std::string::npos && low.find("startup") == std::string::npos &&
-           low.find("impose") == std::string::npos && low.find("slideways") == std::string::npos;
+           low.find("impose") == std::string::npos && low.find("slideways") == std::string::npos &&
+           low.find("hubarea") == std::string::npos && low.find("hub_area") == std::string::npos;
 }
 
 bool FindStoredFile(const std::string& lower_suffix, StoredFile* out) {
