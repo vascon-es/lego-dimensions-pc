@@ -6,6 +6,7 @@
 #include <cstring>
 #include <mutex>
 #include <span>
+#include <string>
 #include <vector>
 
 namespace cutscene_patch {
@@ -151,6 +152,18 @@ inline bool Arm(std::span<const std::span<uint8_t>> segments) {
     g_in_level = false; // comeca desligado: nada muda na abertura nem na tela inicial
     g_gates = found.gates;
     return found.applied;
+}
+
+// "Area jogavel" para o skip: tela inicial/sala do portal (hubarea), abertura (impose), titulo, cena do tubo e telas de
+// carregamento NAO contam. E' nessas que o jogo desenha o aviso "Pular" por cima de "Player 1"/menu.
+inline bool PlayableArea(const std::string& area) {
+    std::string low;
+    low.reserve(area.size());
+    for (const char c : area) low += static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    return !low.empty() && low.find("loadingscreen") == std::string::npos && low.find("loading_screen") == std::string::npos &&
+           low.find("titles") == std::string::npos && low.find("startup") == std::string::npos &&
+           low.find("impose") == std::string::npos && low.find("slideways") == std::string::npos &&
+           low.find("hubarea") == std::string::npos && low.find("hub_area") == std::string::npos;
 }
 
 // Chamado quando o jogo entra/sai de uma fase jogavel (radar de arquivos). Idempotente e barato quando nao muda.

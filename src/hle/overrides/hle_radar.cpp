@@ -118,9 +118,6 @@ std::string AreaName(const std::string& lower_name) {
     return stem == dir && dir != "levels" ? stem : std::string(); // levels\levels.txt e a lista de fases, nao uma area
 }
 
-// 4.4.40: definida mais abaixo; usada pelo bloco que liga/desliga o patch de cutscene.
-bool SkiplevelIsPlayable(const std::string& area);
-
 bool IsScreenFile(const std::string& lower_name) {
     for (const char* needle : {".gsc", ".txt", ".csv", ".lip", "screen"}) {
         if (lower_name.find(needle) != std::string::npos) {
@@ -246,23 +243,9 @@ void OnRead(const std::string& guest_path, s64 offset, u64 size) {
     // abertura ou carregamento desliga (devolve os bytes do jogo).
     if (!areas.empty()) {
         bool playable = false;
-        for (const std::string& area : areas) playable = playable || SkiplevelIsPlayable(area);
+        for (const std::string& area : areas) playable = playable || cutscene_patch::live::PlayableArea(area);
         cutscene_patch::live::SetInLevel(playable);
     }
-}
-
-// 4.4.40: "fase jogavel" para o patch de cutscene. Titulo, abertura (impose), cena do tubo e telas de carregamento
-// NAO contam: o jogo desenha o aviso "Pular" nelas e ele aparecia por cima do menu da tela inicial.
-bool SkiplevelIsPlayable(const std::string& area) {
-    std::string low;
-    low.reserve(area.size());
-    for (const char c : area) low += static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
-    // "hubarea" e' a sala do portal (tela inicial/menu, onde ficam "Player 1" e o aviso de pulo). O log de 4.4.40 mostrou
-    // que era ela que ligava o patch antes de qualquer fase - e por isso o "Pular" continuava aparecendo no menu.
-    return !low.empty() && low.find("loadingscreen") == std::string::npos && low.find("loading_screen") == std::string::npos &&
-           low.find("titles") == std::string::npos && low.find("startup") == std::string::npos &&
-           low.find("impose") == std::string::npos && low.find("slideways") == std::string::npos &&
-           low.find("hubarea") == std::string::npos && low.find("hub_area") == std::string::npos;
 }
 
 bool FindStoredFile(const std::string& lower_suffix, StoredFile* out) {

@@ -128,6 +128,18 @@ int main() {
         check(live[8]==0xB0 && live[9]==1);
         cutscene_patch::live::SetInLevel(false);
         check(!cutscene_patch::live::InLevel() && live[8]==0x8A && live[9]==0x83 && live[10]==0xE8);
+        // 4.4.41: "fase jogavel" - a sala do portal (hubarea) e' a tela inicial e nao pode ligar o patch
+        check(!cutscene_patch::live::PlayableArea("hubarea"));
+        check(!cutscene_patch::live::PlayableArea("HubArea"));
+        check(!cutscene_patch::live::PlayableArea("titles_portalroom"));
+        check(!cutscene_patch::live::PlayableArea("loading_screen_startup"));
+        check(!cutscene_patch::live::PlayableArea("loading_screen_default"));
+        check(!cutscene_patch::live::PlayableArea("impose"));
+        check(!cutscene_patch::live::PlayableArea("slideways"));
+        check(!cutscene_patch::live::PlayableArea(""));
+        check(cutscene_patch::live::PlayableArea("gotham_city"));
+        check(cutscene_patch::live::PlayableArea("mystery_mansion"));
+        check(cutscene_patch::live::PlayableArea("vorton_arena"));
         std::filesystem::remove_all(root);
         std::cout<<"Region discovery, cutscene patch and level-gated skip checks passed\n";
         return 0;
