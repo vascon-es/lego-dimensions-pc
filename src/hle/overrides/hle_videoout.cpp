@@ -20,8 +20,11 @@
 #include "hle/trophy_popup.h"
 #include "hle/overrides/hle_toypad.h"
 #include "common/toypad_process.h"
+#include "common/nu_font.h"
+#include "loader/elf_pie_loader.h"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cinttypes>
@@ -32,6 +35,7 @@
 #include <cstdlib>
 #include <deque>
 #include <filesystem>
+#include <fstream>
 #include <string>
 #include <mutex>
 #include <optional>
@@ -135,6 +139,122 @@ std::atomic<u32> g_window_width{1920}, g_window_height{1080};
 bool g_fullscreen = false;
 std::atomic<bool> g_stats_overlay{false};
 std::atomic<bool> g_video_menu_open{false};
+std::atomic<bool> g_graphics_from_options{false};
+std::atomic<u64> g_options_last_render{0};
+std::filesystem::path g_launcher_ini_path;
+using OptionsEvent = void (HLE_SYSV_ABI*)(void*, int, const void*, int);
+OptionsEvent g_original_options_event = nullptr;
+void* g_guest_options_event = nullptr;
+void* g_guest_pause_events[2]{};
+using NativeGetChild = u8*(HLE_SYSV_ABI*)(u8*, int);
+using NativeSetText = void (HLE_SYSV_ABI*)(u8*, const char*);
+using NativeGetFocus = u8*(HLE_SYSV_ABI*)(u8*);
+using NativeConfirm = void (HLE_SYSV_ABI*)(u8*);
+NativeGetChild g_native_get_child = nullptr;
+NativeSetText g_native_set_text = nullptr;
+NativeGetFocus g_native_get_focus = nullptr;
+NativeConfirm g_native_confirm = nullptr;
+using LegacyMenuLine = void (HLE_SYSV_ABI*)(u8*, const char*, u32);
+using LegacyOptionsUpdate = void (HLE_SYSV_ABI*)(u8*);
+LegacyMenuLine g_legacy_menu_line = nullptr;
+LegacyOptionsUpdate g_legacy_options_update = nullptr;
+u8* g_legacy_options_screen = nullptr;
+int g_legacy_graphics_row = -1;
+u8* g_native_graphics_entry = nullptr;
+u8* g_native_options_screen = nullptr;
+size_t g_native_graphics_slot = 0;
+std::atomic<bool> g_native_wait_confirm_release{false};
+bool OpenGraphicsFromOptions();
+u8** g_guest_graphics_config = nullptr;
+std::atomic<bool> g_disable_dof{false};
+std::atomic<float> g_scene_distance{1.0f};
+static_assert(std::atomic<float>::is_always_lock_free);
+bool g_scene_distance_supported = false;
+constexpr std::array<float, 3> kSceneDistances{1.0f, 0.85f, 0.70f};
+
+bool NativeOptionsVisible() {
+    const u64 last = g_options_last_render.load(std::memory_order_relaxed);
+    return last && GetTickCount64() - last < 350;
+}
+
+u8* NativeOption(u8* screen, size_t offset) {
+    return *reinterpret_cast<u8**>(screen + offset);
+}
+
+std::array<u8*, 3> NativeOptionWidgets(u8* entry) {
+    const auto child = entry ? g_native_get_child(entry, 0) : nullptr;
+    const auto label = child ? g_native_get_child(child, 0) : nullptr;
+    return {entry, child, label};
+}
+
+void HLE_SYSV_ABI DrawNativeOptions(const void* data, u8* screen) {
+    g_options_last_render.store(GetTickCount64(), std::memory_order_relaxed);
+    auto* active_entry = screen == g_native_options_screen && g_native_graphics_slot
+        ? NativeOption(screen, g_native_graphics_slot) : nullptr;
+    if (g_native_confirm && (!active_entry || active_entry != g_native_graphics_entry || !active_entry[0x229])) {
+        g_native_options_screen = screen;
+        g_native_graphics_entry = nullptr;
+        g_native_graphics_slot = 0;
+        const auto volume = NativeOptionWidgets(NativeOption(screen, 0xe0));
+        const auto label_type = volume[2] ? *reinterpret_cast<void**>(volume[2]) : nullptr;
+        constexpr size_t hidden_options[]{0xf8, 0xe8, 0xf0, 0x130, 0x110};
+        for (const auto offset : hidden_options) {
+            const auto entry = NativeOption(screen, offset);
+            if (!entry || entry[0x229]) continue; // reserva ocupada nessa tela: nao altera
+            const auto widgets = NativeOptionWidgets(entry);
+            const auto found = std::ranges::find_if(widgets, [label_type](u8* widget) {
+                return widget && label_type && *reinterpret_cast<void**>(widget) == label_type;
+            });
+            if (found == widgets.end()) continue;
+            const char* caption = lang::Pt() ? "Gr\xc3\xa1" "ficos" : "Graphics";
+            const auto label = *found;
+            g_native_set_text(label, caption);
+            // A legenda e literal do port. O texto nativo normalmente refere a tabela de traducao.
+            *reinterpret_cast<const char**>(label + 0x270) = caption;
+            entry[0x229] = 1;
+            g_native_graphics_entry = entry;
+            g_native_graphics_slot = offset;
+            log::Tagged("VIDEO-MENU", "native graphics item enabled (slot %#zx)", offset);
+            break;
+        }
+    }
+    g_original_options_event(g_guest_options_event, 0, data, 0);
+}
+
+void HLE_SYSV_ABI ConfirmNativeOptions(u8* screen) {
+    const auto menu = NativeOption(screen, 0x68);
+    if (screen == g_native_options_screen && g_native_graphics_entry && menu &&
+        g_native_get_focus(menu) == g_native_graphics_entry && OpenGraphicsFromOptions()) return;
+    g_native_confirm(screen);
+}
+
+void HLE_SYSV_ABI DrawLegacyGraphics(u8* screen, const char* back, const int* menu_alpha) {
+    const auto alpha = static_cast<u32>(*menu_alpha * 255 / 256);
+    g_legacy_menu_line(screen, back, alpha);
+    // O menu de pausa usa esta mesma rotina para desenhar e contar suas linhas.
+    // Acrescenta o item ao final para preservar os indices das opcoes originais.
+    const auto row = *reinterpret_cast<const int*>(screen + 0x9c);
+    if (screen != g_legacy_options_screen || g_legacy_graphics_row != row) {
+        g_legacy_options_screen = screen;
+        g_legacy_graphics_row = row;
+        log::Tagged("VIDEO-MENU", "pause graphics item enabled (row %d)", row);
+    }
+    g_options_last_render.store(GetTickCount64(), std::memory_order_relaxed);
+    g_legacy_menu_line(screen, lang::Pt() ? "Gr\xc3\xa1" "ficos" : "Graphics", alpha);
+}
+
+void HLE_SYSV_ABI UpdateLegacyOptions(u8* screen) {
+    const auto action = *reinterpret_cast<const int*>(screen + 0x40);
+    const bool confirm = *reinterpret_cast<const int*>(screen + 0x70) != 0;
+    if (screen == g_legacy_options_screen && action == g_legacy_graphics_row &&
+        confirm && OpenGraphicsFromOptions()) return;
+    g_legacy_options_update(screen);
+}
+
+void HLE_SYSV_ABI NativePauseEvent(bool paused) {
+    render::SetGameMenuPaused(paused);
+    g_original_options_event(g_guest_pause_events[paused], 0, nullptr, 0);
+}
 std::atomic<bool> g_image_menu_open{false};
 std::atomic<bool> g_achievements_overlay_open{false};
 std::atomic<bool> g_logs_overlay_open{false};
@@ -161,9 +281,10 @@ int g_logs_visible_count = 24;
 bool g_logs_auto_follow = true;
 std::string g_logs_banner_msg;
 int g_logs_banner_timer = 0;
-int g_menu_selected = 0;
-int g_save_confirm_timer = 0;
-bool g_save_needs_xess_restart = false;
+std::atomic<int> g_menu_selected{0};
+std::atomic<int> g_save_confirm_timer{0};
+std::atomic<bool> g_save_needs_xess_restart{false};
+std::atomic<bool> g_save_needs_resolution_restart{false};
 WINDOWPLACEMENT g_windowed_placement{sizeof(WINDOWPLACEMENT)};
 
 static std::vector<int> GetFilteredAchievements(int filter) {
@@ -183,7 +304,7 @@ static std::vector<int> GetFilteredAchievements(int filter) {
 struct MenuItem {
     std::string label;
     std::vector<std::string> options;
-    int selected = 0;
+    std::atomic<int> selected{0};
 };
 
 enum MenuIdx {
@@ -192,6 +313,8 @@ enum MenuIdx {
     kMenuRenderScale,
     kMenuUpscaler,
     kMenuAA,
+    kMenuDepthOfField,
+    kMenuSceneDistance,
     kMenuDisplayMode,
     kMenuFps,
     kMenuFpsCounter,
@@ -206,12 +329,14 @@ enum MenuIdx {
 };
 
 // F1 / L3+R3 menu
-static std::vector<MenuItem> g_menu_items = {
+static std::array<MenuItem, kMenuCount> g_menu_items{{
     {"WINDOW RES (RESTART)", {"1280X720", "1600X900", "1920X1080", "2560X1080", "2560X1440", "3440X1440", "3840X2160"}, 2},
     {"TARGET UPSCALE RES", {"AUTO (WINDOW)", "1280X720", "1600X900", "1920X1080", "2560X1080", "2560X1440", "3440X1440", "3840X2160"}, 0},
     {"RENDER SCALE (RESTART)", {"50%", "67%", "75%", "85%", "100%", "125%", "150%", "200%"}, 4},
     {"UPSCALER", {"OFF", "FSR 1.0", "FSR 2", "FSR 3", "FSR 4", "INTEL XESS 3.0"}, 1},
     {"ANTI-ALIASING", {"OFF", "TAA X16", "FSR 3 AA", "FSR 4 AA", "XESS NATIVE AA"}, 0},
+    {"DEPTH OF FIELD", {"GAME DEFAULT", "OFF"}, 0},
+    {"SCENE DISTANCE", {"100%", "85%", "70%"}, 0},
     {"DISPLAY MODE", {"FULLSCREEN", "WINDOWED"}, 0},
     {"FRAME RATE (RESTART)", {"30 FPS", "60 FPS", "UNLOCKED", "UNLOCKED NO VSYNC"}, 1},
     {"FPS COUNTER (F10)", {"OFF", "ON"}, 0},
@@ -222,9 +347,11 @@ static std::vector<MenuItem> g_menu_items = {
     {"BLANK FREQUENCY", {"900 HZ", "600 HZ", "300 HZ", "120 HZ", "60 HZ"}, 0},
     {"MULTIPLAYER ROOM (F4)", {"< PRESS ENTER >"}, 0},
     {"JOIN/CONFIG ROOM (F3)", {"< PRESS ENTER >"}, 0}
-};
+}};
+std::array<std::atomic<int>, kMenuFpsCounter + 1> g_graphics_saved{};
 
 static std::filesystem::path GetLauncherIniPath() {
+    if (!g_launcher_ini_path.empty()) return g_launcher_ini_path;
     wchar_t exe[MAX_PATH];
     if (GetModuleFileNameW(nullptr, exe, MAX_PATH)) {
         std::filesystem::path root = std::filesystem::path(exe).parent_path();
@@ -449,6 +576,199 @@ void SetFullscreen(HWND hwnd, bool enabled) {
 
 } // namespace
 
+void SetGraphicsIniRoot(const std::filesystem::path& root) {
+    g_launcher_ini_path = root / L"launcher.ini";
+    const auto ini = g_launcher_ini_path.wstring();
+    g_disable_dof = GetPrivateProfileIntW(L"launcher", L"profundidade_campo", 1, ini.c_str()) == 0;
+    const int distance = GetPrivateProfileIntW(L"launcher", L"distancia_cenario", 0, ini.c_str());
+    g_scene_distance = kSceneDistances[std::clamp(distance, 0, static_cast<int>(kSceneDistances.size()) - 1)];
+}
+
+void InstallNativeGraphicsMenu(const loader::ElfPieLoader& elf) {
+    // Assinaturas da versao PS4 testada. Nao escreve em um ELF com instrucoes diferentes.
+    const auto matches = [&elf](u64 offset, const auto& bytes) {
+        return offset <= elf.image_size() && bytes.size() <= elf.image_size() - offset &&
+               std::memcmp(elf.base() + offset, bytes.data(), bytes.size()) == 0;
+    };
+    constexpr u64 options_site = 0xcbda11;
+    constexpr std::array<u8, 20> options_code{
+        0x48, 0x8d, 0x3d, 0x88, 0x1d, 0x47, 0x02, 0x48, 0x8d, 0x55, 0xa8, 0x31, 0xf6, 0x31, 0xc9,
+        0xe8, 0xdb, 0x52, 0x80, 0xff};
+    if (matches(options_site, options_code)) {
+        g_original_options_event = reinterpret_cast<OptionsEvent>(elf.base() + 0x4c2d00);
+        g_guest_options_event = elf.base() + 0x312f7a0;
+        // lea rdi,[rbp-0x58]; mov rsi,r12; mov rax,funcao; call rax
+        std::array<u8, 20> code{0x48, 0x8d, 0x7d, 0xa8, 0x4c, 0x89, 0xe6, 0x48, 0xb8};
+        const auto callback = reinterpret_cast<u64>(DrawNativeOptions);
+        std::memcpy(code.data() + 9, &callback, sizeof(callback));
+        code[17] = 0xff;
+        code[18] = 0xd0;
+        code[19] = 0x90;
+        std::memcpy(elf.base() + options_site, code.data(), code.size());
+    }
+
+    const auto absolute_jump = [](u8* at, u64 dest) {
+        at[0] = 0x48;
+        at[1] = 0xb8;
+        std::memcpy(at + 2, &dest, sizeof(dest));
+        at[10] = 0xff;
+        at[11] = 0xe0;
+    };
+    constexpr u64 confirm = 0xcbb920;
+    constexpr std::array<u8, 16> confirm_code{
+        0x55, 0x48, 0x89, 0xe5, 0x41, 0x57, 0x41, 0x56, 0x41, 0x54, 0x53, 0x48, 0x83, 0xec, 0x20, 0x48};
+    // O ultimo byte da assinatura inicia o mov seguinte e fica no eboot.
+    if (g_original_options_event && matches(confirm, confirm_code)) {
+        if (auto* thunk = static_cast<u8*>(VirtualAlloc(nullptr, 4096, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE))) {
+            const size_t prologue = confirm_code.size() - 1;
+            std::memcpy(thunk, confirm_code.data(), prologue);
+            absolute_jump(thunk + prologue, elf.base_address() + confirm + prologue);
+            DWORD old = 0;
+            if (VirtualProtect(thunk, 4096, PAGE_EXECUTE_READ, &old)) {
+                FlushInstructionCache(GetCurrentProcess(), thunk, prologue + 12);
+                g_native_get_child = reinterpret_cast<NativeGetChild>(elf.base() + 0xb74cf0);
+                g_native_set_text = reinterpret_cast<NativeSetText>(elf.base() + 0xb816a0);
+                g_native_get_focus = reinterpret_cast<NativeGetFocus>(elf.base() + 0xb7fef0);
+                g_native_confirm = reinterpret_cast<NativeConfirm>(thunk);
+                absolute_jump(elf.base() + confirm, reinterpret_cast<u64>(ConfirmNativeOptions));
+                std::fill(elf.base() + confirm + 12, elf.base() + confirm + prologue, 0x90);
+            } else {
+                VirtualFree(thunk, 0, MEM_RELEASE);
+            }
+        }
+    }
+    // O menu de pausa usa a lista do motor legado, com callbacks separados do menu inicial.
+    constexpr u64 legacy_line = 0x1957580;
+    constexpr u64 legacy_update = 0x1955680;
+    constexpr std::array<u8, 41> legacy_line_code{
+        0x69,0x00,0xff,0x00,0x00,0x00,0x89,0xc1,0xc1,0xf9,0x1f,0xc1,0xe9,0x18,0x01,0xc1,
+        0xb8,0x08,0x08,0x00,0x00,0xc4,0xe2,0x78,0xf7,0xd1,0x48,0x8d,0xb5,0xd0,0xfe,0xff,
+        0xff,0x4c,0x89,0xff,0xe8,0x77,0xa7,0x1f,0xff};
+    constexpr std::array<u8, 13> legacy_update_code{
+        0x55,0x48,0x89,0xe5,0x41,0x57,0x41,0x56,0x41,0x55,0x41,0x54,0x53};
+    if (matches(legacy_line, legacy_line_code) && matches(legacy_update, legacy_update_code)) {
+        if (auto* thunk = static_cast<u8*>(VirtualAlloc(nullptr, 4096, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE))) {
+            const auto prologue = legacy_update_code.size();
+            std::memcpy(thunk, legacy_update_code.data(), prologue);
+            absolute_jump(thunk + prologue, elf.base_address() + legacy_update + prologue);
+            DWORD old = 0;
+            if (VirtualProtect(thunk, 4096, PAGE_EXECUTE_READ, &old)) {
+                FlushInstructionCache(GetCurrentProcess(), thunk, prologue + 12);
+                g_legacy_options_update = reinterpret_cast<LegacyOptionsUpdate>(thunk);
+                g_legacy_menu_line = reinterpret_cast<LegacyMenuLine>(elf.base() + 0xb51d20);
+                absolute_jump(elf.base() + legacy_update, reinterpret_cast<u64>(UpdateLegacyOptions));
+                elf.base()[legacy_update + 12] = 0x90;
+
+                // RAX aponta para a opacidade. O restante prepara a chamada da linha original e da nova.
+                std::array<u8, legacy_line_code.size()> code;
+                code.fill(0x90);
+                constexpr u8 args[]{0x48,0x89,0xc2,0x48,0x8d,0xb5,0xd0,0xfe,0xff,0xff,0x4c,0x89,0xff,0x48,0xb8};
+                std::copy(std::begin(args), std::end(args), code.begin());
+                const auto callback = reinterpret_cast<u64>(DrawLegacyGraphics);
+                std::memcpy(code.data() + sizeof(args), &callback, sizeof(callback));
+                code[23] = 0xff;
+                code[24] = 0xd0;
+                std::memcpy(elf.base() + legacy_line, code.data(), code.size());
+            } else {
+                VirtualFree(thunk, 0, MEM_RELEASE);
+            }
+        }
+    }
+    // Eventos nativos emitidos pelo menu de pausa. O historico temporal nao atravessa a pausa.
+    constexpr std::array<u8, 18> pause_call{0x48,0x8d,0x3d,0xe1,0x8f,0x64,0x01,0x31,0xf6,0x31,0xd2,0x31,0xc9,0xe8,0xde,0xf0,0xb1,0xfe};
+    constexpr std::array<u8, 18> resume_call{0x48,0x8d,0x3d,0x71,0x89,0x64,0x01,0x31,0xf6,0x31,0xd2,0x31,0xc9,0xe8,0x3e,0xea,0xb1,0xfe};
+    if (g_original_options_event && matches(0x19a3c10, pause_call) && matches(0x19a42b0, resume_call)) {
+        g_guest_pause_events[0] = elf.base() + 0x2fecc28;
+        g_guest_pause_events[1] = elf.base() + 0x2fecbf8;
+        for (int paused : {0, 1}) {
+            // mov edi,paused; mov rax,funcao; call rax
+            std::array<u8, 18> code{0xbf,static_cast<u8>(paused),0,0,0,0x48,0xb8};
+            const auto callback = reinterpret_cast<u64>(NativePauseEvent);
+            std::memcpy(code.data() + 7, &callback, sizeof(callback));
+            code[15] = 0xff;
+            code[16] = 0xd0;
+            code[17] = 0x90;
+            std::memcpy(elf.base() + (paused ? 0x19a3c10 : 0x19a42b0), code.data(), code.size());
+        }
+    }
+    constexpr std::array<u8, 20> disable_dof_code{
+        0x48, 0x8d, 0x05, 0x7c, 0x06, 0x73, 0x01, 0x48, 0x8b, 0x00,
+        0xc7, 0x80, 0xc0, 0x0d, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00};
+    if (matches(0x1a43dfd, disable_dof_code)) {
+        g_guest_graphics_config = reinterpret_cast<u8**>(elf.base() + 0x3174480);
+    }
+
+    // Os calculos de cull e de fade do cenario usam o mesmo produto dos dois campos m_farClipDistance.
+    struct SceneSite { u64 offset; std::array<u8, 9> bytes; };
+    constexpr SceneSite sites[]{
+        {0x6719df, {0xc4, 0xc1, 0x7a, 0x59, 0x87, 0x08, 0x01, 0x00, 0x00}},
+        {0x671a13, {0xc4, 0xc1, 0x7a, 0x59, 0x87, 0x08, 0x01, 0x00, 0x00}},
+        {0x673f90, {0xc4, 0xc1, 0x7a, 0x59, 0x87, 0x08, 0x01, 0x00, 0x00}},
+        {0x67486a, {0xc4, 0xc1, 0x7a, 0x59, 0x85, 0x08, 0x01, 0x00, 0x00}},
+    };
+    if (std::ranges::all_of(sites, [&matches](const SceneSite& site) { return matches(site.offset, site.bytes); })) {
+        constexpr size_t kThunkBytes = 40;
+        const auto near_base = elf.base_address() + loader::ElfPieLoader::kReserveSize;
+        u8* page = nullptr;
+        for (u64 gap = 0; !page && gap < 0x400000; gap += 0x10000) {
+            page = static_cast<u8*>(VirtualAlloc(reinterpret_cast<void*>(near_base + gap), 4096,
+                                                MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
+        }
+        if (page) {
+            const auto write_jump = [](u8* at, const u8* dest) {
+                at[0] = 0xe9;
+                const auto delta = static_cast<s32>(reinterpret_cast<s64>(dest) - reinterpret_cast<s64>(at + 5));
+                std::memcpy(at + 1, &delta, sizeof(delta));
+            };
+            for (size_t i = 0; i < std::size(sites); ++i) {
+                const auto& site = sites[i];
+                auto* thunk = page + i * kThunkBytes;
+                std::memcpy(thunk, site.bytes.data(), site.bytes.size());
+                // Preserva rax e as flags. XMM0 e a distancia calculada pela instrucao original.
+                constexpr std::array<u8, 16> scale{0x50, 0x48, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0,
+                                                   0xc5, 0xfa, 0x59, 0x00, 0x58};
+                auto* extra = thunk + site.bytes.size();
+                std::memcpy(extra, scale.data(), scale.size());
+                const auto factor = reinterpret_cast<u64>(&g_scene_distance);
+                std::memcpy(extra + 3, &factor, sizeof(factor));
+                write_jump(extra + scale.size(), elf.base() + site.offset + site.bytes.size());
+            }
+            DWORD old = 0;
+            if (VirtualProtect(page, 4096, PAGE_EXECUTE_READ, &old)) {
+                FlushInstructionCache(GetCurrentProcess(), page, 4096);
+                for (size_t i = 0; i < std::size(sites); ++i) {
+                    auto* at = elf.base() + sites[i].offset;
+                    write_jump(at, page + i * kThunkBytes);
+                    std::fill(at + 5, at + sites[i].bytes.size(), 0x90);
+                }
+                g_scene_distance_supported = true;
+            } else {
+                VirtualFree(page, 0, MEM_RELEASE);
+            }
+        }
+    }
+    std::printf("[GRAPHICS] native options=%d dof=%d scene distance=%d\n",
+                g_native_confirm != nullptr, g_guest_graphics_config != nullptr, g_scene_distance_supported);
+}
+
+void TickGraphicsSettings() {
+    if (!g_guest_graphics_config) return;
+    static int* applied = nullptr;
+    static int original = 0;
+    const auto config = *g_guest_graphics_config;
+    auto* mode = config ? reinterpret_cast<int*>(config + 0xdc0) : nullptr;
+    if (g_disable_dof.load(std::memory_order_relaxed)) {
+        if (mode && (mode != applied || *mode != 2)) {
+            original = *mode;
+            *mode = 2; // Mesmo modo "dof_disable" do jogo.
+            applied = mode;
+        }
+    } else if (applied) {
+        if (mode == applied && *mode == 2) *mode = original;
+        applied = nullptr;
+    }
+}
+
 void SetWindowResolution(u32 width, u32 height) {
     g_window_width = width;
     g_window_height = height;
@@ -489,7 +809,7 @@ static void ApplyAndSaveVideoSettings() {
     const int r = g_menu_items[kMenuRes].selected;
     if (r >= 0 && r < 7) {
         WriteLauncherIni(L"resolucao", kResStr[r]);
-        SetWindowResolution(kResW[r], kResH[r]);
+        if (kResW[r] != g_window_width || kResH[r] != g_window_height) SetWindowResolution(kResW[r], kResH[r]);
     }
 
     // Target upscale resolution (applies live!)
@@ -520,19 +840,25 @@ static void ApplyAndSaveVideoSettings() {
     if (aa >= 0 && aa < 5) {
         WriteLauncherIni(L"antialiasing", kAaStr[aa]);
     }
+    const bool use_xess = up == 5 || aa == 4;
+    const int temporal = aa == 2 ? 3 : aa == 3 ? 4 : up >= 2 && up <= 4 ? up : 0;
     render::VulkanRenderer::Instance().SetUpscaler(up == 1 ? 1 : 0, 0.25f);
     render::SetAntiAliasing(aa == 1 ? 1 : 0);
-    if (up == 5) {
+    if (use_xess) {
         render::SetXessUpscaler(true, aa == 4);
-    } else if (up >= 2 && up <= 4) {
-        render::SetTemporalUpscaler(up, aa == 2 || aa == 3);
-    } else if (aa == 4) {
-        render::SetXessUpscaler(true, true);
-    } else if (aa == 2 || aa == 3) {
-        render::SetTemporalUpscaler(aa == 3 ? 4 : 3, true);
     } else {
-        render::SetTemporalUpscaler(0, false);
         render::SetXessUpscaler(false, false);
+        render::SetTemporalUpscaler(temporal, aa == 2 || aa == 3);
+    }
+
+    if (g_guest_graphics_config) {
+        g_disable_dof = g_menu_items[kMenuDepthOfField].selected != 0;
+        WriteLauncherIni(L"profundidade_campo", g_disable_dof ? L"0" : L"1");
+    }
+    if (g_scene_distance_supported) {
+        const int index = g_menu_items[kMenuSceneDistance].selected;
+        g_scene_distance = kSceneDistances[index];
+        WriteLauncherIni(L"distancia_cenario", std::to_wstring(index).c_str());
     }
 
     // Display mode
@@ -548,15 +874,25 @@ static void ApplyAndSaveVideoSettings() {
     if (f >= 0 && f < 4) {
         WriteLauncherIni(L"fps", kFpsStr[f]);
         WriteLauncherIni(L"fps60", f == 0 ? L"0" : f == 1 ? L"1" : L"2");
-        SetForce60Hz(f != 0);
-        SetUnlockedFps(f >= 2);
-        render::VulkanRenderer::Instance().SetUnlockedPresent(f >= 2);
-        render::VulkanRenderer::Instance().SetNoVsync(f == 3);
-        render::VulkanRenderer::Instance().RequestSwapchainRebuild(); // the present mode is picked with the swapchain
+        auto& renderer = render::VulkanRenderer::Instance();
+        if (g_force_60hz != (f != 0) || g_unlocked_fps != (f >= 2) || renderer.NoVsync() != (f == 3)) {
+            SetForce60Hz(f != 0);
+            SetUnlockedFps(f >= 2);
+            renderer.SetUnlockedPresent(f >= 2);
+            renderer.SetNoVsync(f == 3);
+            renderer.RequestSwapchainRebuild();
+        }
     }
 
     // FPS counter
     SetStatsOverlay(g_menu_items[kMenuFpsCounter].selected == 1);
+
+    g_save_needs_xess_restart = (up == 5 || aa == 4) && !render::XessAvailable();
+    g_save_needs_resolution_restart = g_save_needs_resolution_restart || r != g_graphics_saved[kMenuRes] ||
+                                      rs != g_graphics_saved[kMenuRenderScale];
+    for (size_t i = 0; i < g_graphics_saved.size(); ++i) g_graphics_saved[i] = g_menu_items[i].selected.load();
+    g_save_confirm_timer = 90;
+    if (g_graphics_from_options) return;
 
     // Controller icons
     static const char* const kIconsAnsi[] = {"auto", "ps4", "xboxone", "wiiu", "keyboard"};
@@ -609,8 +945,6 @@ static void ApplyAndSaveVideoSettings() {
         }
     }
 
-    g_save_needs_xess_restart = (up == 5 || aa == 4) && !render::XessAvailable();
-    g_save_confirm_timer = 90;
 }
 
 static void InitMenuDefaults() {
@@ -627,6 +961,9 @@ static void InitMenuDefaults() {
         g_menu_items[kMenuUpscaler].options = {"DESLIGADO", "FSR 1.0", "FSR 2", "FSR 3", "FSR 4", "INTEL XESS 3.0"};
         g_menu_items[kMenuAA].label = "ANTI-ALIASING";
         g_menu_items[kMenuAA].options = {"DESLIGADO", "TAA X16", "FSR 3 AA", "FSR 4 AA", "XESS NATIVE AA"};
+        g_menu_items[kMenuDepthOfField].label = "PROFUNDIDADE DE CAMPO";
+        g_menu_items[kMenuDepthOfField].options = {"PADRAO DO JOGO", "DESLIGADA"};
+        g_menu_items[kMenuSceneDistance].label = "DISTANCIA DO CENARIO";
         g_menu_items[kMenuDisplayMode].label = "MODO DE TELA";
         g_menu_items[kMenuDisplayMode].options = {"TELA CHEIA", "JANELA"};
         g_menu_items[kMenuFps].label = "TAXA DE QUADROS";
@@ -648,11 +985,8 @@ static void InitMenuDefaults() {
         g_menu_items[kMenuMpJoin].label = "ENTRAR NA SALA (F3)";
         g_menu_items[kMenuMpJoin].options = {"< APERTE ENTER >"};
     }
-    wchar_t exe[MAX_PATH];
-    if (GetModuleFileNameW(nullptr, exe, MAX_PATH)) {
-        std::filesystem::path root = std::filesystem::path(exe).parent_path();
-        if (root.filename() == L"build") root = root.parent_path();
-        std::filesystem::path ini = root / L"launcher.ini";
+    const auto ini = GetLauncherIniPath();
+    if (!ini.empty()) {
         wchar_t buf[64]{};
 
         GetPrivateProfileStringW(L"launcher", L"resolucao", L"1920x1080", buf, 64, ini.wstring().c_str());
@@ -727,12 +1061,16 @@ static void InitMenuDefaults() {
     render::GetTemporalUpscaler(&major, &native);
     bool xess_on = false, xess_native = false;
     render::GetXessUpscaler(&xess_on, &xess_native);
-    if (xess_on && !xess_native) g_menu_items[kMenuUpscaler].selected = 5;
-    else if (major >= 2 && major <= 4 && !native) g_menu_items[kMenuUpscaler].selected = major;
+    g_menu_items[kMenuUpscaler].selected = xess_on && !xess_native ? 5
+        : major >= 2 && major <= 4 && !native ? major : render::VulkanRenderer::Instance().SpatialUpscaler();
     g_menu_items[kMenuAA].selected = xess_native ? 4 : native ? (major == 4 ? 3 : 2) : render::GetAntiAliasing() == 1 ? 1 : 0;
     g_menu_items[kMenuFps].selected = !g_unlocked_fps.load() ? (g_force_60hz.load() ? 1 : 0)
                                                                : (render::VulkanRenderer::Instance().NoVsync() ? 3 : 2);
     g_menu_items[kMenuFpsCounter].selected = g_stats_overlay.load() ? 1 : 0;
+    g_menu_items[kMenuDepthOfField].selected = g_disable_dof.load() ? 1 : 0;
+    const auto dist = std::ranges::find(kSceneDistances, g_scene_distance.load());
+    g_menu_items[kMenuSceneDistance].selected = dist == kSceneDistances.end() ? 0 : static_cast<int>(dist - kSceneDistances.begin());
+    for (size_t i = 0; i < g_graphics_saved.size(); ++i) g_graphics_saved[i] = g_menu_items[i].selected.load();
 }
 
 } // namespace
@@ -800,12 +1138,23 @@ static void PreviewCurrentTrophySound() {
     }
 }
 
+static int VideoMenuItemCount() {
+    return g_graphics_from_options.load() ? kMenuFpsCounter + 1 : kMenuCount;
+}
+
 static void StepVideoMenuOption(int delta) {
+    if ((g_menu_selected == kMenuDepthOfField && !g_guest_graphics_config) ||
+        (g_menu_selected == kMenuSceneDistance && !g_scene_distance_supported)) return;
     if (g_menu_selected < 0 || g_menu_selected >= static_cast<int>(g_menu_items.size())) return;
     auto& item = g_menu_items[g_menu_selected];
     const int count = static_cast<int>(item.options.size());
     if (count <= 0) return;
     item.selected = ((item.selected + delta) % count + count) % count;
+    // O mesmo quadro so pode passar por um AA temporal.
+    if (g_menu_selected == kMenuUpscaler && item.selected >= 2) g_menu_items[kMenuAA].selected = 0;
+    if (g_menu_selected == kMenuAA && (item.selected >= 2 || (item.selected == 1 && g_menu_items[kMenuUpscaler].selected >= 2))) {
+        g_menu_items[kMenuUpscaler].selected = 0;
+    }
     if (g_menu_selected == kMenuPopupStyle) {
         if (item.selected >= 0 && item.selected < hle::trophy_popup::kStyleCount) {
             hle::trophy::TrophyManager::Instance().SetPopupStyle(hle::trophy_popup::kStyleKeys[item.selected]);
@@ -1564,8 +1913,25 @@ void HandleMpRoomMenuController(u32 pressed) {
     }
 }
 
+namespace {
+bool OpenGraphicsFromOptions() {
+    if (!NativeOptionsVisible() || g_video_menu_open.load() || g_image_menu_open.load() ||
+        g_logs_overlay_open.load() || g_achievements_overlay_open.load() || g_mp_panel_open.load()) return false;
+    InitMenuDefaults();
+    for (size_t i = 0; i < g_graphics_saved.size(); ++i) g_menu_items[i].selected = g_graphics_saved[i].load();
+    g_menu_selected = kMenuRes;
+    g_save_confirm_timer = 0;
+    g_graphics_from_options = true;
+    g_native_wait_confirm_release = true;
+    g_video_menu_open = true;
+    log::Tagged("VIDEO-MENU", "open from native options");
+    return true;
+}
+} // namespace
+
 void ToggleVideoSettingsMenu() {
     InitMenuDefaults();
+    g_graphics_from_options = false;
     const bool next = !g_video_menu_open.load();
     if (next) {
         CloseImageMenuInternal();
@@ -1583,6 +1949,10 @@ bool IsVideoSettingsMenuOpen() {
 
 void HandleVideoMenuController(u32 pressed) {
     if (!g_video_menu_open) return;
+    if (g_graphics_from_options && g_native_wait_confirm_release) {
+        if (pressed & 0x4000) pressed &= ~0x4000u;
+        else g_native_wait_confirm_release = false;
+    }
     static auto last_nav = std::chrono::steady_clock::now();
     const auto now = std::chrono::steady_clock::now();
     if (std::chrono::duration<float, std::milli>(now - last_nav).count() < 160.0f) {
@@ -1590,14 +1960,14 @@ void HandleVideoMenuController(u32 pressed) {
     }
     // kUp = 0x10, kRight = 0x20, kDown = 0x40, kLeft = 0x80
     // kL1 = 0x400 (LB), kR1 = 0x800 (RB), kCross = 0x4000, kCircle = 0x2000
-    if (pressed & (0x400 | 0x800)) { // LB / RB -> Aba Imagem [F5]
+    if (!g_graphics_from_options && (pressed & (0x400 | 0x800))) { // LB / RB -> Aba Imagem [F5]
         SwitchVideoImageTab(true);
         last_nav = now;
     } else if (pressed & 0x10) { // Up
-        g_menu_selected = (g_menu_selected - 1 + static_cast<int>(g_menu_items.size())) % g_menu_items.size();
+        g_menu_selected = (g_menu_selected - 1 + VideoMenuItemCount()) % VideoMenuItemCount();
         last_nav = now;
     } else if (pressed & 0x40) { // Down
-        g_menu_selected = (g_menu_selected + 1) % g_menu_items.size();
+        g_menu_selected = (g_menu_selected + 1) % VideoMenuItemCount();
         last_nav = now;
     } else if (pressed & 0x80) { // Left
         StepVideoMenuOption(-1);
@@ -2128,11 +2498,11 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
         if (g_video_menu_open.load()) {
             const bool fresh = !(lparam & (1 << 30));
             if (wparam == VK_UP) {
-                g_menu_selected = (g_menu_selected - 1 + static_cast<int>(g_menu_items.size())) % g_menu_items.size();
+                g_menu_selected = (g_menu_selected - 1 + VideoMenuItemCount()) % VideoMenuItemCount();
                 return 0;
             }
             if (wparam == VK_DOWN) {
-                g_menu_selected = (g_menu_selected + 1) % g_menu_items.size();
+                g_menu_selected = (g_menu_selected + 1) % VideoMenuItemCount();
                 return 0;
             }
             if (wparam == VK_LEFT) {
@@ -2143,7 +2513,7 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
                 StepVideoMenuOption(1);
                 return 0;
             }
-            if (wparam == VK_TAB && fresh) {
+            if (wparam == VK_TAB && fresh && !g_graphics_from_options) {
                 SwitchVideoImageTab(true);
                 return 0;
             }
@@ -2232,8 +2602,9 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
         TerminateProcess(GetCurrentProcess(), 0);
         return 0;
     default:
-        return DefWindowProcA(hwnd, msg, wparam, lparam);
+        break;
     }
+    return DefWindowProcA(hwnd, msg, wparam, lparam);
 }
 
 bool g_check_modules = false; // --check-modules
@@ -2561,6 +2932,14 @@ int GetBlankFrequency() {
 
 void InitVideoDefaults() {
     InitMenuDefaults();
+}
+
+bool RegisteredBufferSize(u64 address, u32* width, u32* height) {
+    std::lock_guard lock(g_mutex);
+    if (!address || std::ranges::find(g_buffers, reinterpret_cast<void*>(address)) == g_buffers.end()) return false;
+    *width = g_width;
+    *height = g_height;
+    return true;
 }
 
 bool IsSrgbDisplayBuffer(u64 address) {
@@ -3495,6 +3874,139 @@ void SetStatsOverlay(bool enabled) {
     }
 }
 
+namespace {
+
+constexpr u64 kGraphicsFontTexture = 0x4c444e75466f6e74;
+
+bool DrawNativeGraphicsPage(OverlayCanvas& canvas) {
+    auto& renderer = render::VulkanRenderer::Instance();
+    struct FontAsset {
+        nu_font::NuFont font;
+        std::vector<u8> file;
+        FontAsset() {
+            const auto path = GetLauncherIniPath().parent_path() / L"assets" / L"launcher" / L"font.ft2";
+            std::ifstream in(path, std::ios::binary);
+            file.assign(std::istreambuf_iterator<char>(in), {});
+            if (!nu_font::Parse(file, &font)) file.clear();
+        }
+    };
+    static const FontAsset asset;
+    if (asset.file.empty()) return false;
+    const auto& font = asset.font;
+    if (!renderer.HasTexture(kGraphicsFontTexture)) {
+        render::TextureData texture{};
+        texture.width = font.width;
+        texture.height = font.height;
+        texture.format = render::TextureData::kBc3;
+        texture.data = asset.file.data() + font.blocks;
+        texture.bytes = static_cast<u64>(font.width) * font.height;
+        if (!renderer.UploadTexture(kGraphicsFontTexture, texture)) return false;
+    }
+
+    struct Vertex { float x, y, z, u, v; u32 tint; };
+    static std::vector<Vertex> letters;
+    letters.clear();
+    const bool pt = lang::Pt();
+    const float scale = std::min(canvas.w / 1920.0f, canvas.h / 1080.0f);
+    const float cx = canvas.w * 0.5f, cy = canvas.h * 0.5f;
+    const float left = cx - 472.0f * scale;
+    const float right = cx + 472.0f * scale;
+    const u32 yellow = Rgba(255, 196, 20), selected = Rgba(244, 244, 244);
+    const auto text = [&](const std::string& value, float x, float y, float height, u32 color, int align) {
+        const auto wide = Widen(value);
+        const float ratio = height / font.line;
+        const auto glyph_for = [&](wchar_t ch) -> const nu_font::NuFont::Glyph* {
+            const auto it = font.chars.find(ch);
+            return it == font.chars.end() ? nullptr : &font.glyphs[it->second];
+        };
+        const float space = height * 0.22f;
+        if (align) {
+            float width = 0;
+            for (const auto ch : wide) {
+                const auto glyph = glyph_for(ch);
+                width += glyph ? (glyph->w + 1) * ratio : space;
+            }
+            x -= align == 1 ? width * 0.5f : width;
+        }
+        for (const auto ch : wide) {
+            const auto glyph = glyph_for(ch);
+            if (!glyph) {
+                x += space;
+                continue;
+            }
+            const float u0 = glyph->x / font.width, v0 = glyph->y / font.height;
+            const float u1 = (glyph->x + glyph->w) / font.width, v1 = (glyph->y + font.line) / font.height;
+            const float end_x = x + glyph->w * ratio;
+            const auto vertex = [&](float px, float py, float u, float v) {
+                return Vertex{2.0f * px / canvas.w - 1.0f, 1.0f - 2.0f * py / canvas.h, 0, u, v, color};
+            };
+            const auto tl = vertex(x, y, u0, v0), tr = vertex(end_x, y, u1, v0);
+            const auto bl = vertex(x, y + height, u0, v1), br = vertex(end_x, y + height, u1, v1);
+            letters.insert(letters.end(), {tl, tr, br, tl, br, bl});
+            x = end_x + ratio;
+        }
+    };
+    text(pt ? "Gráficos" : "Graphics", cx, cy - 353 * scale, 58 * scale, yellow, 1);
+    const char* const upscalers[]{pt ? "Sem ampliação" : "No upscaling", "FSR 1", "FSR 2", "FSR 3", "FSR 4", "XeSS"};
+    u32 render_w = 0, render_h = 0;
+    renderer.GetCurrentRenderResolution(&render_w, &render_h);
+    const auto status = std::to_string(render_w) + " x " + std::to_string(render_h) + "  |  " +
+                        upscalers[std::clamp(renderer.ActiveUpscaler(), 0, 5)];
+    text(status, cx, cy - 287 * scale, 29 * scale, selected, 1);
+    const char* const labels_pt[] = {"Resolução base", "Resolução alvo", "Escala interna", "Upscaler", "Antisserrilhado",
+        "Profundidade de campo", "Distância do cenário", "Modo de tela", "Taxa de quadros", "Contador de FPS"};
+    const char* const labels_en[] = {"Base resolution", "Target resolution", "Render scale", "Upscaler", "Anti-aliasing",
+        "Depth of field", "Scene distance", "Display mode", "Frame rate", "FPS counter"};
+    static_assert(std::size(labels_pt) == kMenuFpsCounter + 1 && std::size(labels_en) == kMenuFpsCounter + 1);
+    float y = cy - 241.0f * scale;
+    for (int i = 0; i <= kMenuFpsCounter; ++i) {
+        const u32 color = i == g_menu_selected ? selected : yellow;
+        const auto& item = g_menu_items[i];
+        const bool available = (i != kMenuDepthOfField || g_guest_graphics_config) &&
+                               (i != kMenuSceneDistance || g_scene_distance_supported);
+        const std::string value = available ? "< " + item.options[item.selected] + " >"
+                                            : (pt ? "Indisponível" : "Unavailable");
+        text(pt ? labels_pt[i] : labels_en[i], left, y, 39.0f * scale, color, 0);
+        text(value, right, y, 39.0f * scale, color, 2);
+        y += 51.0f * scale;
+    }
+    if (g_save_confirm_timer > 0) {
+        --g_save_confirm_timer;
+        text(g_save_needs_resolution_restart ? (pt ? "Salvo. Reinicie para mudar a resolução interna."
+                                                    : "Saved. Restart to change the internal resolution.")
+                                           : (pt ? "Salvo." : "Saved."),
+             cx, cy + 313.0f * scale, 36.0f * scale, selected, 1);
+    } else {
+        text(pt ? "Confirmar: aplicar     Voltar: fechar" : "Confirm: apply     Back: close",
+             cx, cy + 313.0f * scale, 34.0f * scale, selected, 1);
+    }
+
+    const auto submit = [&](const void* data, u32 count, u32 stride, u32 color, bool textured) {
+        render::DrawCall draw;
+        draw.vertex_data = data;
+        draw.vertex_count = count;
+        draw.stride = stride;
+        draw.has_color = true;
+        draw.color_offset = color;
+        draw.viewport[2] = draw.target_size[0] = canvas.w;
+        draw.viewport[3] = draw.target_size[1] = canvas.h;
+        draw.mvp[0] = draw.mvp[5] = draw.mvp[10] = draw.mvp[15] = 1.0f;
+        if (textured) {
+            draw.uv_format = render::DrawCall::kUvFloat2;
+            draw.uv_offset = offsetof(Vertex, u);
+            draw.texture_key = kGraphicsFontTexture;
+        }
+        return renderer.QueueDraw(draw);
+    };
+    canvas.Rect(0, 0, canvas.w, canvas.h, Rgba(10, 15, 22));
+    const bool background = submit(canvas.out.data(), static_cast<u32>(canvas.out.size()), sizeof(LoadingVertex),
+                                   offsetof(LoadingVertex, rgba), false);
+    const bool content = submit(letters.data(), static_cast<u32>(letters.size()), sizeof(Vertex), offsetof(Vertex, tint), true);
+    canvas.out.clear();
+    return background && content;
+}
+} // namespace
+
 void QueueStatsOverlay() {
     constexpr int kFrames = 150;
     static float frame_ms[kFrames] = {};
@@ -3569,6 +4081,7 @@ void QueueStatsOverlay() {
     static std::vector<LoadingVertex> vertices;
     vertices.clear();
     OverlayCanvas c{vertices, static_cast<float>(client.right), static_cast<float>(client.bottom)};
+    if (g_video_menu_open.load() && g_graphics_from_options.load() && DrawNativeGraphicsPage(c)) return;
     const float p = client.bottom >= 1400 ? 3.0f : 2.0f; // tamanho do pixel da fonte
 
     // 4.0: o nome de cada jogador do multiplayer em cima do personagem dele
@@ -3700,7 +4213,8 @@ void QueueStatsOverlay() {
         float scale_ui = client.bottom >= 1400 ? 1.5f : (client.bottom >= 1000 ? 1.0f : 0.75f);
         scale_ui = std::min(scale_ui, std::min(client.right / 820.0f, client.bottom / 700.0f));
         float box_w = 780.0f * scale_ui;
-        float box_h = 668.0f * scale_ui;
+        const bool native_graphics = g_graphics_from_options.load();
+        float box_h = (native_graphics ? 560.0f : 668.0f) * scale_ui;
         float box_x0 = (client.right - box_w) / 2.0f;
         float box_y0 = (client.bottom - box_h) / 2.0f;
         float box_x1 = box_x0 + box_w;
@@ -3708,9 +4222,10 @@ void QueueStatsOverlay() {
 
         c.Rect(box_x0 - 4.0f, box_y0 - 4.0f, box_x1 + 4.0f, box_y1 + 4.0f, kBorder);
         c.Rect(box_x0, box_y0, box_x1, box_y1, kBg);
-        draw_tabs(box_x0, box_y0, box_w, scale_ui, false);
+        if (!native_graphics) draw_tabs(box_x0, box_y0, box_w, scale_ui, false);
 
-        const std::string title = lang::Pt() ? "CONFIGURACOES DE VIDEO" : "VIDEO SETTINGS";
+        const std::string title = native_graphics ? (lang::Pt() ? "GRAFICOS" : "GRAPHICS")
+                                                   : (lang::Pt() ? "CONFIGURACOES DE VIDEO" : "VIDEO SETTINGS");
         float font_title = 2.65f * scale_ui;
         c.Write(title, box_x0 + (box_w - TextWidth(title, font_title)) / 2.0f, box_y0 + 44.0f * scale_ui, font_title, kTitleYellow);
 
@@ -3719,8 +4234,10 @@ void QueueStatsOverlay() {
         render::VulkanRenderer::Instance().GetTargetUpscaleResolution(&tw, &th);
         const std::string tgt_txt = (tw && th) ? (std::to_string(tw) + "X" + std::to_string(th))
                                                : (std::to_string(client.right) + "X" + std::to_string(client.bottom));
-        const std::string res_info = (lang::Pt() ? "RENDER INTERNO: " : "INTERNAL RENDER: ") + std::to_string(rw) + "X" +
-                                     std::to_string(rh) + (lang::Pt() ? "  ->  ALVO: " : "  ->  TARGET: ") + tgt_txt;
+        const char* const upscalers[]{"BILINEAR", "FSR 1", "FSR 2", "FSR 3", "FSR 4", "XESS"};
+        const int active = std::clamp(render::VulkanRenderer::Instance().ActiveUpscaler(), 0, 5);
+        const std::string res_info = std::to_string(rw) + "X" + std::to_string(rh) +
+                                     (lang::Pt() ? "  ->  ALVO " : "  ->  TARGET ") + tgt_txt + "  |  " + upscalers[active];
         float font_info = 1.55f * scale_ui;
         c.Write(res_info, box_x0 + (box_w - TextWidth(res_info, font_info)) / 2.0f, box_y0 + 70.0f * scale_ui, font_info, kCyan);
 
@@ -3728,19 +4245,22 @@ void QueueStatsOverlay() {
 
         float row_y = box_y0 + 104.0f * scale_ui;
         float font_item = 2.25f * scale_ui;
-        for (size_t i = 0; i < g_menu_items.size(); ++i) {
+        for (int i = 0; i < VideoMenuItemCount(); ++i) {
             const auto& item = g_menu_items[i];
-            const bool is_sel = (static_cast<int>(i) == g_menu_selected);
+            const bool is_sel = i == g_menu_selected;
             if (is_sel) {
                 c.Rect(box_x0 + 16.0f * scale_ui, row_y - 3.0f * scale_ui, box_x1 - 16.0f * scale_ui, row_y + 24.0f * scale_ui, kHiBg);
             }
             c.Write(is_sel ? ("> " + item.label) : ("  " + item.label), box_x0 + 24.0f * scale_ui, row_y, font_item, is_sel ? kTitleYellow : kWhite);
 
-            std::string val_str = "< " + item.options[item.selected] + " >";
+            const bool supported = (i != kMenuDepthOfField || g_guest_graphics_config) &&
+                                   (i != kMenuSceneDistance || g_scene_distance_supported);
+            const std::string val_str = supported ? "< " + item.options[item.selected] + " >"
+                                                   : (lang::Pt() ? "INDISPONIVEL" : "UNAVAILABLE");
             float val_w = TextWidth(val_str, font_item);
             c.Write(val_str, box_x1 - val_w - 28.0f * scale_ui, row_y, font_item, is_sel ? kCyan : kGray);
 
-            row_y += 35.0f * scale_ui;
+            row_y += (native_graphics ? 37.0f : 29.0f) * scale_ui;
         }
 
         c.Rect(box_x0 + 20.0f * scale_ui, box_y1 - 54.0f * scale_ui, box_x1 - 20.0f * scale_ui, box_y1 - 52.0f * scale_ui, kGray);
@@ -3749,10 +4269,15 @@ void QueueStatsOverlay() {
             const std::string saved_msg =
                 g_save_needs_xess_restart
                     ? (lang::Pt() ? "SALVO! REINICIE PARA ATIVAR O XESS!" : "SAVED! RESTART TO ENABLE XESS!")
+                    : g_save_needs_resolution_restart
+                    ? (lang::Pt() ? "SALVO! REINICIE PARA A RESOLUCAO INTERNA" : "SAVED! RESTART FOR INTERNAL RESOLUTION")
                     : (lang::Pt() ? "CONFIGURACOES SALVAS!" : "SETTINGS SAVED!");
             c.Write(saved_msg, box_x0 + (box_w - TextWidth(saved_msg, font_item)) / 2.0f, box_y1 - 36.0f * scale_ui, font_item, kBorder);
         } else {
-            const std::string footer = (g_menu_selected == kMenuTrophySound)
+            const std::string footer = native_graphics
+                ? (lang::Pt() ? "[SETAS] ALTERAR  [A / ENTER] APLICAR  [B / ESC] VOLTAR"
+                              : "[ARROWS] CHANGE  [A / ENTER] APPLY  [B / ESC] BACK")
+                : (g_menu_selected == kMenuTrophySound)
                 ? (lang::Pt() ? "[ESQ/DIR] OUVIR PREVIA  [ENTER] REPETIR E SALVAR  [TAB] IMAGEM  [F1/ESC] SAIR"
                               : "[LEFT/RIGHT] PREVIEW SOUND  [ENTER] REPLAY & SAVE  [TAB] IMAGE  [F1/ESC] CLOSE")
                 : (lang::Pt() ? "[CIMA/BAIXO] NAVEGAR  [ESQ/DIR] ALTERAR  [TAB] IMAGEM  [ENTER] SALVAR  [F1/ESC] SAIR"

@@ -12,6 +12,7 @@
 #define _UNICODE
 #include "ui.h"
 #include "../../src/common/game_region.h"
+#include "../../src/common/nu_font.h"
 #include "../../src/common/toypad_process.h"
 #include "../../src/common/trophy_sound_player.h"
 #include "../../src/hle/trophy_defs.h"
@@ -429,6 +430,8 @@ void ApplyEnvFromIni() {
         SetEnvironmentVariableW(name.c_str(), value.empty() ? nullptr : value.c_str());
     }
 }
+
+void LoadGraphicsSettings();
 
 void SaveSettings() {
     if (g_self_test) return;
@@ -1912,6 +1915,7 @@ void SyncLegoToypadState() {
     // e restaura a janela do launcher (o launcher NAO fecha, volta para a tela).
     if (g_saw_game_running && !game_running) {
         g_saw_game_running = false;
+        LoadGraphicsSettings(); // o menu de video do jogo salva no mesmo INI
         g_toypad_opened_for_game = false;
         g_toypad_api_restored = false;
         if (toypad_proc::CloseAll() > 0) {
@@ -2359,33 +2363,13 @@ void OpenTransfer() {
 // Big-endian. "TNFN" em +8; a altura da linha (float) 20 bytes antes da 1a tabela; "ROTV" + quantidade + (x, y, largura)
 // em float por letra; "ROTV" + quantidade + (caractere, letra) em u16; em 4 + (u32 do inicio) uma DDS DXT5 com as letras
 // brancas de contorno preto, cada uma em (x, y, largura, altura da linha) com o contorno dentro.
-struct LegoFont {
-    struct Glyph {
-        float x, y, w;
-    };
-    std::vector<Glyph> glyphs;
-    std::map<wchar_t, int> chars;
-    float line = 0;
-    int width = 0, height = 0;
-    std::vector<uint32_t> argb; // a folha decodificada (ARGB)
+struct LegoFont : nu_font::NuFont {
+    std::vector<uint32_t> argb;
 };
 
 enum Tint { kTintWhite, kTintYellow, kTintDim, kTintCount };
 std::unique_ptr<LegoFont> g_lego;
 std::unique_ptr<Gdiplus::Bitmap> g_lego_atlas[kTintCount];
-
-uint32_t Be32(const std::vector<BYTE>& d, size_t at) {
-    return (uint32_t(d[at]) << 24) | (uint32_t(d[at + 1]) << 16) | (uint32_t(d[at + 2]) << 8) | d[at + 3];
-}
-float BeFloat(const std::vector<BYTE>& d, size_t at) {
-    const uint32_t bits = Be32(d, at);
-    float value;
-    std::memcpy(&value, &bits, 4);
-    return value;
-}
-uint32_t Le32(const std::vector<BYTE>& d, size_t at) {
-    return d[at] | (uint32_t(d[at + 1]) << 8) | (uint32_t(d[at + 2]) << 16) | (uint32_t(d[at + 3]) << 24);
-}
 
 void DecodeDxt5(const BYTE* src, int w, int h, uint32_t* out) {
     for (int by = 0; by < h / 4; ++by) {
@@ -2423,43 +2407,10 @@ void DecodeDxt5(const BYTE* src, int w, int h, uint32_t* out) {
 }
 
 // false se nao for uma NuFont que o launcher entende (o launcher segue com Segoe UI).
-bool ParseLegoFont(const std::vector<BYTE>& d, LegoFont* font) {
-    if (d.size() < 0x60 || std::memcmp(d.data() + 8, "TNFN", 4) != 0) {
-        return false;
-    }
-    size_t r1 = 0x10;
-    while (r1 + 8 <= d.size() && std::memcmp(d.data() + r1, "ROTV", 4) != 0) ++r1;
-    if (r1 + 8 > d.size() || r1 < 0x24) {
-        return false;
-    }
-    const uint32_t n1 = Be32(d, r1 + 4);
-    const size_t r2 = r1 + 8 + size_t(n1) * 12;
-    if (n1 == 0 || n1 > 65536 || r2 + 8 > d.size() || std::memcmp(d.data() + r2, "ROTV", 4) != 0) {
-        return false;
-    }
-    const uint32_t n2 = Be32(d, r2 + 4);
-    const size_t dds = 4 + size_t(Be32(d, 0));
-    if (r2 + 8 + size_t(n2) * 4 > d.size() || dds + 128 > d.size() || std::memcmp(d.data() + dds, "DDS ", 4) != 0 ||
-        std::memcmp(d.data() + dds + 84, "DXT5", 4) != 0) {
-        return false;
-    }
-    font->line = BeFloat(d, r1 - 0x14);
-    font->height = int(Le32(d, dds + 12));
-    font->width = int(Le32(d, dds + 16));
-    if (!(font->line > 4 && font->line < 1024) || font->width < 4 || font->height < 4 || font->width > 8192 || font->height > 8192 ||
-        dds + 128 + size_t(font->width) * font->height > d.size()) {
-        return false;
-    }
-    for (uint32_t i = 0; i < n1; ++i) {
-        font->glyphs.push_back({BeFloat(d, r1 + 8 + i * 12), BeFloat(d, r1 + 12 + i * 12), BeFloat(d, r1 + 16 + i * 12)});
-    }
-    for (uint32_t i = 0; i < n2; ++i) {
-        const wchar_t c = wchar_t((d[r2 + 8 + i * 4] << 8) | d[r2 + 9 + i * 4]);
-        const int g = (d[r2 + 10 + i * 4] << 8) | d[r2 + 11 + i * 4];
-        if (c > 32 && g < int(n1)) font->chars[c] = g;
-    }
+bool ParseLegoFont(const std::vector<BYTE>& data, LegoFont* font) {
+    if (!nu_font::Parse(data, font)) return false;
     font->argb.resize(size_t(font->width) * font->height);
-    DecodeDxt5(d.data() + dds + 128, font->width, font->height, font->argb.data());
+    DecodeDxt5(data.data() + font->blocks, font->width, font->height, font->argb.data());
     return true;
 }
 
@@ -3668,7 +3619,38 @@ void PadKey(WORD vk) {
 }
 
 
+void LoadGraphicsSettings() {
+    g_opt_fps = ReadIni(L"fps60", L"1") == L"1";
+    g_fps_value = ReadIni(L"fps", g_opt_fps ? L"60" : L"30"); // 1.9.1 (sem a chave nova: a do 60 FPS antigo)
+    if (std::find(std::begin(kFpsModes), std::end(kFpsModes), g_fps_value) == std::end(kFpsModes)) {
+        g_fps_value = L"60";
+    }
+    g_upscaler_value = ReadIni(L"upscaler", L"fsr1");
+    if (std::find(std::begin(kUpscalers), std::end(kUpscalers), g_upscaler_value) == std::end(kUpscalers)) {
+        g_upscaler_value = L"fsr1";
+    }
+    g_target_res_value = ReadIni(L"resolucao_alvo", L"auto");
+    if (std::find(std::begin(kTargetResolutions), std::end(kTargetResolutions), g_target_res_value) == std::end(kTargetResolutions)) {
+        g_target_res_value = L"auto";
+    }
+    g_aa_value = ReadIni(L"antialiasing", L"off");
+    if (std::find(std::begin(kAntiAliasing), std::end(kAntiAliasing), g_aa_value) == std::end(kAntiAliasing)) {
+        g_aa_value = L"off";
+    }
+    g_scale_value = ReadIni(L"escala", L"100");
+    if (std::find(std::begin(kRenderScales), std::end(kRenderScales), g_scale_value) == std::end(kRenderScales)) {
+        g_scale_value = L"100";
+    }
+    g_opt_fullscreen = ReadIni(L"telacheia", L"0") == L"1";
+    g_opt_overlay = ReadIni(L"contador", L"0") == L"1"; // Fase 65
+    g_res_value = ReadIni(L"resolucao", L"1920x1080");
+    if (std::find(std::begin(kResolutions), std::end(kResolutions), g_res_value) == std::end(kResolutions)) {
+        g_res_value = L"1920x1080";
+    }
+}
+
 void LoadSettings() {
+    LoadGraphicsSettings();
     std::wstring game = ReadIni(L"jogo");
     std::wstring dlc = ReadIni(L"dlcs", L"\x01");
     if (dlc == L"\x01") { // primeira vez: a pasta de DLCs do shadPS4, se existir
@@ -3691,35 +3673,12 @@ void LoadSettings() {
         }
     }
     g_dlc_dir = CleanPath(dlc);
-    g_opt_fps = ReadIni(L"fps60", L"1") == L"1";
-    g_fps_value = ReadIni(L"fps", g_opt_fps ? L"60" : L"30"); // 1.9.1 (sem a chave nova: a do 60 FPS antigo)
-    if (std::find(std::begin(kFpsModes), std::end(kFpsModes), g_fps_value) == std::end(kFpsModes)) {
-        g_fps_value = L"60";
-    }
-    g_upscaler_value = ReadIni(L"upscaler", L"fsr1");
-    if (std::find(std::begin(kUpscalers), std::end(kUpscalers), g_upscaler_value) == std::end(kUpscalers)) {
-        g_upscaler_value = L"fsr1";
-    }
-    g_target_res_value = ReadIni(L"resolucao_alvo", L"auto");
-    if (std::find(std::begin(kTargetResolutions), std::end(kTargetResolutions), g_target_res_value) == std::end(kTargetResolutions)) {
-        g_target_res_value = L"auto";
-    }
-    g_aa_value = ReadIni(L"antialiasing", L"off");
-    if (std::find(std::begin(kAntiAliasing), std::end(kAntiAliasing), g_aa_value) == std::end(kAntiAliasing)) {
-        g_aa_value = L"off";
-    }
     g_aspect_value = ReadIni(L"proporcao", L"encher");
     if (std::find(std::begin(kAspectModes), std::end(kAspectModes), g_aspect_value) == std::end(kAspectModes)) {
         g_aspect_value = L"encher";
     }
-    g_scale_value = ReadIni(L"escala", L"100");
-    if (std::find(std::begin(kRenderScales), std::end(kRenderScales), g_scale_value) == std::end(kRenderScales)) {
-        g_scale_value = L"100";
-    }
     g_opt_console = ReadIni(L"console", L"0") == L"1";
-    g_opt_fullscreen = ReadIni(L"telacheia", L"0") == L"1";
     g_opt_skip = ReadIni(L"pularcenas", L"0") == L"1";
-    g_opt_overlay = ReadIni(L"contador", L"0") == L"1"; // Fase 65
     g_opt_toypad = ReadIni(L"toypad_auto", L"0") == L"1";
     g_opt_mp = ReadIni(L"multiplayer", L"0") == L"1"; // 4.0
     g_mp_server = ReadIni(L"mp_servidor", kDefaultMpServer);
@@ -3743,10 +3702,6 @@ void LoadSettings() {
     g_icons_value = CurrentIcons().code;
     g_gpl_value = ReadIni(L"gpl", L"auto"); // Fase 74
     g_gpl_value = CurrentGpl().code;
-    g_res_value = ReadIni(L"resolucao", L"1920x1080");
-    if (std::find(std::begin(kResolutions), std::end(kResolutions), g_res_value) == std::end(kResolutions)) {
-        g_res_value = L"1920x1080";
-    }
     g_lang_value = ReadIni(L"idioma", L"en");
     g_lang_value = CurrentLanguage().code;
     LoadArt(game);
@@ -3845,12 +3800,14 @@ int SelfTest(const fs::path& report) {
         for (int i = 0; i < 4; ++i) blob[i] = BYTE((dds - 4) >> (24 - 8 * i));
         std::vector<BYTE> header(128, 0);
         std::memcpy(header.data(), "DDS ", 4);
-        header[12] = 4;  // altura
+        header[12] = 8;  // altura
         header[16] = 8;  // largura
         std::memcpy(header.data() + 84, "DXT5", 4);
         blob.insert(blob.end(), header.begin(), header.end());
         const BYTE white[16] = {255, 255, 0, 0, 0, 0, 0, 0, 0xFF, 0xFF, 0xFF, 0xFF, 0, 0, 0, 0};
         const BYTE clear[16] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
+        blob.insert(blob.end(), std::begin(white), std::end(white));
+        blob.insert(blob.end(), std::begin(clear), std::end(clear));
         blob.insert(blob.end(), std::begin(white), std::end(white));
         blob.insert(blob.end(), std::begin(clear), std::end(clear));
         LegoFont font;
@@ -3859,7 +3816,7 @@ int SelfTest(const fs::path& report) {
         if (parsed) {
             check(font.glyphs.size() == 2 && font.chars.count(L'B') && font.chars[L'B'] == 1 && font.glyphs[1].x == 4 && font.glyphs[1].w == 3,
                   "game font glyph table");
-            check(font.line == 8.0f && font.width == 8 && font.height == 4, "game font sheet size");
+            check(font.line == 8.0f && font.width == 8 && font.height == 8, "game font sheet size");
             check(font.argb[0] == 0xFFFFFFFF && (font.argb[4] >> 24) == 0, "game font DXT5 decode");
         }
         blob[9] = 'X';

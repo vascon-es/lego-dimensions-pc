@@ -1,6 +1,10 @@
 #pragma once
 
+#include <filesystem>
+
 #include "common/types.h"
+
+namespace loader { class ElfPieLoader; }
 
 // Interface interna do VideoOut para o GnmDriver (o eboot nao importa sceVideoOutSubmitFlip
 // nem sceVideoOutGetFlipStatus: os flips chegam por sceGnmSubmitAndFlipCommandBuffers).
@@ -36,6 +40,7 @@ u64 BufferAddress(int buffer_index);
 // 0x80002200)? O jogo desenha nele como UNORM, mas a saida de video o trata como sRGB: o alvo tem
 // de ser sRGB para a escrita final ganhar a curva de gama (e assim que o shadPS4 faz).
 bool IsSrgbDisplayBuffer(u64 address);
+bool RegisteredBufferSize(u64 address, u32* width, u32* height);
 // Fase 28 (--fps60): ignora o sceVideoOutSetFlipRate(1) do jogo e conclui um flip a cada VSync de 60 Hz.
 void SetForce60Hz(bool enabled);
 void SetUnlockedFps(bool enabled);
@@ -73,6 +78,9 @@ void QueueStatsOverlay();
 
 // Menu de configuracoes de video dentro do jogo (F1 ou L3+R3; 2.0.2: era F2)
 void SetWindowResolution(u32 width, u32 height);
+void SetGraphicsIniRoot(const std::filesystem::path& root);
+void InstallNativeGraphicsMenu(const loader::ElfPieLoader& elf);
+void TickGraphicsSettings();
 void ToggleVideoSettingsMenu();
 bool IsVideoSettingsMenuOpen();
 void HandleVideoMenuController(u32 pressed_buttons);

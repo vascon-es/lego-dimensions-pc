@@ -971,6 +971,9 @@ int SelfTest() {
                     shown);
         check("Vulkan: instance + Win32 surface + device + swapchain 1280x720 B8G8R8A8 FIFO, 3 frames cleared and presented",
               init && shown == 3 && renderer.Describe().find("1280x720 B8G8R8A8_UNORM") != std::string::npos);
+        if (init && renderer.GameShadersSupported()) {
+            check("Vulkan: occlusion counts a visible triangle and rejects a triangle behind it", renderer.SelftestDepthSamples());
+        }
         renderer.Shutdown();
         if (hwnd) {
             DestroyWindow(hwnd);
@@ -1202,6 +1205,7 @@ int main(int argc, char** argv) {
     }
 
     const std::filesystem::path root = FindRoot(argc, argv);
+    hle::videoout::SetGraphicsIniRoot(root);
 
     // Carrega resolucao e tela cheia do launcher.ini como padrao se nao informados na linha de comando
     {
@@ -1795,6 +1799,7 @@ int main(int argc, char** argv) {
                                                                     : "WARNING: different eboot, skip mod not applied");
     }
     if (!selftest) {
+        hle::videoout::InstallNativeGraphicsMenu(elf);
         hle::anomaly::Install(elf.base()); // Fase 67: carregador de mods Anomaly (connorh315), se houver pacotes de mod
         if (const char* pass = std::getenv("LD_MP_PASS"); pass && g_mp_config.password.empty()) g_mp_config.password = pass;
         runtime::multiplayer::Configure(g_mp_config); // Fase 79: sem --mp-server/--mp-room nao faz nada

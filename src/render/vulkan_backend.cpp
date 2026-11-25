@@ -2,6 +2,7 @@
 #include "render/fsr1_spv.h" // 1.9.1: AMD FidelityFX FSR 1, TAA e entradas dos upscalers (SPIR-V gerado)
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <atomic>
 #include <cstdio>
@@ -85,7 +86,8 @@ std::atomic<u64> g_validation_errors{0}, g_validation_warnings{0};
     X(vkCmdCopyBufferToImage) X(vkQueueWaitIdle) X(vkResetDescriptorPool) X(vkCmdCopyImageToBuffer) X(vkCmdClearAttachments) X(vkCmdCopyImage) \
     X(vkCmdSetCullMode) X(vkCmdSetFrontFace) X(vkCmdSetDepthTestEnable) X(vkCmdSetDepthWriteEnable) X(vkCmdSetDepthCompareOp)    \
     X(vkCmdSetStencilTestEnable) X(vkCmdSetStencilOp) \
-    X(vkCreateQueryPool) X(vkDestroyQueryPool) X(vkCmdResetQueryPool) X(vkCmdWriteTimestamp) X(vkGetQueryPoolResults)
+    X(vkCreateQueryPool) X(vkDestroyQueryPool) X(vkCmdResetQueryPool) X(vkCmdWriteTimestamp) X(vkGetQueryPoolResults) \
+    X(vkCmdBeginQuery) X(vkCmdEndQuery)
 
 #define DECLARE(name) PFN_##name name = nullptr;
 struct Functions {
@@ -128,6 +130,9 @@ struct FixedState {
     VkBool32 stencil_test = VK_FALSE;
     VkStencilOpState front_ops{}, back_ops{};
 };
+
+constexpr u32 kDepthSampleQueries = 2048;
+constexpr u64 kConservativeDepthSamples = 0x2ffffff;
 
 struct State {
     std::mutex mutex;
@@ -243,7 +248,20 @@ struct State {
     // Fase 75: tempo de GPU de cada quadro (timestamp no comeco e no fim do command buffer do frame). A espera
     // "frame anterior" do [QUADRO-LENTO] dominava os quadros lentos de um jogador (RX 9070 XT, 5 h): este numero
     // diz se a GPU demorou mesmo naquele quadro. LD_GPU_TIME=0 desliga.
+    bool native_menu_raster = false;
+    bool native_boot_raster = true; // as telas de licenca usam coordenadas 2D do PS4
     VkQueryPool timestamps = VK_NULL_HANDLE;
+    VkQueryPool depth_samples = VK_NULL_HANDLE;
+    bool precise_depth_samples = false;
+    struct DepthDump {
+        size_t position; // entre draws na fila, entre consultas depois de gravar o frame
+        u64 address;
+        VulkanRenderer::DepthSampleSink sink;
+        u32 unmeasured = 0;
+    };
+    std::vector<DepthDump> queued_depth_dumps, submitted_depth_dumps;
+    u32 submitted_depth_queries = 0;
+    u64 depth_sample_counter = 0;
     double timestamp_period_ns = 0;
     bool timestamps_written = false;
     std::atomic<double> last_gpu_ms{0};
@@ -369,6 +387,7 @@ struct State {
         bool depth_write; // o pipeline grava profundidade (z_enable e z_write do jogo)
         bool stencil_write;       // o teste de estencil esta ligado e alguma operacao altera o valor
         bool clear_stencil;
+        bool count_depth_samples;
         u32 clear_stencil_value;
         u32 stencil_ref[2];       // DB_STENCILREFMASK da frente e de tras
         bool stencil_op_value[2]; // a referencia do Vulkan e o valor de operacao (ha REPLACE_OP)
@@ -803,6 +822,8 @@ bool CreateDevice() {
     want.features.independentBlend = have.features.independentBlend;
     want.features.shaderImageGatherExtended = have.features.shaderImageGatherExtended; // textureGather com offsets (sombras)
     want.features.sampleRateShading = have.features.sampleRateShading;                 // modulos que leem gl_SampleID / interpolam por amostra
+    want.features.occlusionQueryPrecise = have.features.occlusionQueryPrecise;
+    g.precise_depth_samples = have.features.occlusionQueryPrecise;
     info.pNext = &want;
     if (g.game_shaders) {
         want.features.shaderInt16 = want.features.shaderInt64 = want.features.depthClamp = VK_TRUE;
@@ -1134,6 +1155,12 @@ bool CreateFrameObjects() {
         } else {
             g.timestamps = VK_NULL_HANDLE;
         }
+    }
+    VkQueryPoolCreateInfo depth_query{VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
+    depth_query.queryType = VK_QUERY_TYPE_OCCLUSION;
+    depth_query.queryCount = kDepthSampleQueries;
+    if (vk.vkCreateQueryPool(g.device, &depth_query, nullptr, &g.depth_samples) != VK_SUCCESS) {
+        g.depth_samples = VK_NULL_HANDLE;
     }
     VkSemaphoreCreateInfo semaphore{VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO};
     VkFenceCreateInfo fence{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
@@ -2719,6 +2746,7 @@ float g_target_scale_x = 1.0f, g_target_scale_y = 1.0f;
 // em 16:10 / 4:3. Sem o cameras.tsv nao da para achar a camera: fica o 16:9 com barras.
 float g_camera_scale_x = 1.0f, g_camera_scale_y = 1.0f;
 bool g_fill_screen = false;
+std::atomic<bool> g_game_menu_paused{false};
 
 bool ScreenFamilyTarget(u32 width, u32 height) {
     // 1080 / 540 / 270 / 135 de altura (a cadeia de brilho segue ate 16, mas esses ficam como estao), paisagem.
@@ -2735,8 +2763,10 @@ State::RenderTarget* GetTarget(const GameDraw::Target& wanted, bool depth) {
     if (!wanted.address || !wanted.width || !wanted.height || wanted.width > 8192 || wanted.height > 8192 || format == VK_FORMAT_UNDEFINED) {
         return nullptr;
     }
+    const bool scaled = !g.native_boot_raster && !g.native_menu_raster && (g_target_scale_x != 1.0f || g_target_scale_y != 1.0f) &&
+                        ScreenFamilyTarget(wanted.width, wanted.height);
     const u64 key = wanted.address ^ (static_cast<u64>(wanted.width) << 44) ^ (static_cast<u64>(wanted.height) << 30) ^
-                    (static_cast<u64>(format) << 52) ^ (depth ? 1ull << 63 : 0);
+                    (static_cast<u64>(format) << 52) ^ (depth ? 1ull << 63 : 0) ^ (scaled ? 1ull << 62 : 0);
     if (const auto found = g.targets.find(key); found != g.targets.end()) {
         if (State::RenderTarget*& latest = g.target_by_address[wanted.address]; latest != &found->second) {
             latest = &found->second;
@@ -2754,7 +2784,6 @@ State::RenderTarget* GetTarget(const GameDraw::Target& wanted, bool depth) {
     target.width = wanted.width;
     target.height = wanted.height;
     if (g_target_scale_x != 1.0f || g_target_scale_y != 1.0f) {
-        const bool scaled = ScreenFamilyTarget(wanted.width, wanted.height);
         if (scaled) {
             target.width = std::clamp<u32>(static_cast<u32>(wanted.width * g_target_scale_x + 0.5f), 1u, 16384u);
             target.height = std::clamp<u32>(static_cast<u32>(wanted.height * g_target_scale_y + 0.5f), 1u, 16384u);
@@ -3883,41 +3912,34 @@ void WaitFramePipelines() {
     const auto start = std::chrono::steady_clock::now();
     double budget = std::clamp(g_sync_budget_ms - g_frame_wait_spent_ms, 0.0, 16.0); // ate 1 frame
     g_frame_wait_spent_ms = 0;
-    if (g_burst_wait_ms > budget) {
-        std::unordered_set<u64> pending;
-        {
-            const TimedLock lock(g.mutex);
-            for (const auto& draw : g.queue_game) {
-                if (!draw.pipeline && draw.pipeline_key && !g.game_pipelines.count(draw.pipeline_key)) {
-                    pending.insert(draw.pipeline_key);
-                }
-            }
-        }
-        if (pending.size() >= g_burst_threshold) {
-            budget = g_burst_wait_ms;
-            const TimedLock lock(g.mutex);
-            ++g_sync_stats.burst_frames;
-        }
-    }
-    const auto deadline = start + std::chrono::microseconds(static_cast<long long>(budget * 1000.0));
+    bool first = true;
     bool waited = false;
     for (;;) {
-        u32 missing = 0;
-        u64 seen = 0;
+        // Le a geracao antes da busca. A notificacao pode chegar entre a busca e o wait.
+        const u64 seen = g_pipelines_delivered.load();
         {
             const TimedLock lock(g.mutex);
-            for (const auto& draw : g.queue_game) {
-                if (!draw.pipeline && draw.pipeline_key && !g.game_pipelines.count(draw.pipeline_key)) {
-                    ++missing;
+            const auto missing = [](const auto& draw) {
+                return !draw.pipeline && draw.pipeline_key && !g.game_pipelines.contains(draw.pipeline_key);
+            };
+            if (std::ranges::none_of(g.queue_game, missing)) break;
+            if (first && g_burst_wait_ms > budget) {
+                std::unordered_set<u64> pending;
+                for (const auto& draw : g.queue_game) {
+                    if (missing(draw)) pending.insert(draw.pipeline_key);
+                    if (pending.size() >= g_burst_threshold) {
+                        budget = g_burst_wait_ms;
+                        ++g_sync_stats.burst_frames;
+                        break;
+                    }
                 }
             }
         }
-        if (!missing || std::chrono::steady_clock::now() >= deadline) {
-            break;
-        }
+        first = false;
+        const auto deadline = start + std::chrono::microseconds(static_cast<long long>(budget * 1000.0));
+        if (std::chrono::steady_clock::now() >= deadline) break;
         waited = true;
         std::unique_lock done_lock(g_pipeline_done_mutex);
-        seen = g_pipelines_delivered.load();
         g_pipeline_done_cv.wait_until(done_lock, deadline, [&] { return g_pipelines_delivered.load() != seen; });
     }
     if (waited) {
@@ -4133,6 +4155,14 @@ void DestroyAll() {
         g.pipeline_layout = VK_NULL_HANDLE;
         g.vertex_shader = g.fragment_shader = VK_NULL_HANDLE;
         DestroySwapchainObjects();
+        if (g.depth_samples) vk.vkDestroyQueryPool(g.device, g.depth_samples, nullptr);
+        g.depth_samples = VK_NULL_HANDLE;
+        g.queued_depth_dumps.clear();
+        g.submitted_depth_dumps.clear();
+        g.submitted_depth_queries = 0;
+        g.depth_sample_counter = 0;
+        g.native_boot_raster = true;
+        g.native_menu_raster = false;
         if (g.in_flight) vk.vkDestroyFence(g.device, g.in_flight, nullptr);
         if (g.image_available) vk.vkDestroySemaphore(g.device, g.image_available, nullptr);
         if (g.acquire_fence) vk.vkDestroyFence(g.device, g.acquire_fence, nullptr);
@@ -4388,11 +4418,18 @@ void EvictForgottenTextures() {
         return;
     }
     const u32 kForgottenFrames = test_limit ? 120 : 1800; // ~30 s a 60 quadros/s
+    // Quando nada pode ser descartado, evita varrer milhares de texturas de novo a cada quadro.
+    static u32 last_empty_scan = 0;
+    if (!test_limit && last_empty_scan && g.frame_serial - last_empty_scan < 8) return;
     std::vector<std::pair<u32, u64>> candidates; // (ultimo uso, chave)
     for (const auto& [key, texture] : g.textures) {
         if (key && texture.last_used + kForgottenFrames < g.frame_serial) {
             candidates.emplace_back(texture.last_used, key);
         }
+    }
+    if (candidates.empty()) {
+        last_empty_scan = g.frame_serial;
+        return;
     }
     const size_t count = std::min<size_t>(candidates.size(), 64);
     std::partial_sort(candidates.begin(), candidates.begin() + count, candidates.end());
@@ -4414,6 +4451,7 @@ void EvictForgottenTextures() {
 // resolucao de render), a ampliacao bilinear vira EASU (para uma imagem intermediaria do tamanho da saida) + RCAS (nitidez,
 // direto na janela). SPIR-V em fsr1_spv.h (tools/shaders/gerar_fsr1.py).
 namespace {
+std::atomic<int> g_active_upscaler{0};
 std::atomic<int> g_upscaler{0};       // 0 = bilinear, 1 = FSR 1
 std::atomic<float> g_fsr_sharpness{0.25f}; // em "stops" (0 = maxima)
 
@@ -4839,6 +4877,8 @@ struct FrameTemporal {
 float g_prev_p22 = 0.0f, g_prev_p32 = 0.0f;
 double g_previous_camera[16]{};
 bool g_have_previous_camera = false;
+u64 g_previous_camera_frame = 0;
+u32 g_previous_depth_w = 0, g_previous_depth_h = 0;
 
 // 2.0: copia da profundidade da CENA. Depois de desenhar o cenario o jogo limpa o buffer de profundidade para o HUD 3D
 // (rostos, pecas): no fim do quadro ele so tem o HUD, e o TAA / FSR reprojetavam tudo como se fosse ceu - certo parado,
@@ -4959,8 +4999,10 @@ void UpdateFrameTemporal() {
     }
     g_frame_temporal = FrameTemporal{};
     if (!have) {
+        g_have_previous_camera = false;
         return;
     }
+    const bool adjacent_camera = g_have_previous_camera && g_previous_camera_frame + 1 == g.frame_serial;
     {
         std::lock_guard lock(g_view_mutex);
         std::memcpy(g_view_proj, camera.m, sizeof(g_view_proj));
@@ -4975,7 +5017,7 @@ void UpdateFrameTemporal() {
         g_frame_temporal.p32 = m[14] - m[15] * p22;
         g_frame_temporal.prev_p22 = g_prev_p22;
         g_frame_temporal.prev_p32 = g_prev_p32;
-        g_frame_temporal.prev_camera = g_have_previous_camera;
+        g_frame_temporal.prev_camera = adjacent_camera;
         g_prev_p22 = g_frame_temporal.p22;
         g_prev_p32 = g_frame_temporal.p32;
     }
@@ -5012,13 +5054,18 @@ void UpdateFrameTemporal() {
         TransitionTarget(found->second, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
     }
     g_depth_snap.valid = false;
+    if (g.native_boot_raster && g_frame_temporal.depth && camera.draws >= 24) {
+        // As logos tambem usam uma camera, mas tem poucos desenhos. A cena 3D tem profundidade e varios objetos.
+        g.native_boot_raster = false;
+    }
     const float p11 = std::sqrt(camera.m[1] * camera.m[1] + camera.m[5] * camera.m[5] + camera.m[9] * camera.m[9]);
     g_frame_temporal.fov_y = p11 > 0.0f ? 2.0f * std::atan(1.0f / p11) : 0.0f;
     double now[16], inverse[16];
     for (int i = 0; i < 16; ++i) {
         now[i] = camera.m[i];
     }
-    if (g_frame_temporal.depth && g_have_previous_camera && Invert4(now, inverse)) {
+    if (g_frame_temporal.depth && adjacent_camera && g_previous_depth_w == g_frame_temporal.depth_w &&
+        g_previous_depth_h == g_frame_temporal.depth_h && Invert4(now, inverse)) {
         // vetor-linha (o jogo faz posicao * matriz): recorte anterior = ndc * inverse(atual) * anterior
         for (int r = 0; r < 4; ++r) {
             for (int c = 0; c < 4; ++c) {
@@ -5032,7 +5079,10 @@ void UpdateFrameTemporal() {
         g_frame_temporal.reprojected = true;
     }
     std::memcpy(g_previous_camera, now, sizeof(now));
-    g_have_previous_camera = true;
+    g_have_previous_camera = g_frame_temporal.depth != nullptr;
+    g_previous_depth_w = g_frame_temporal.depth_w;
+    g_previous_depth_h = g_frame_temporal.depth_h;
+    g_previous_camera_frame = g.frame_serial;
 }
 
 // Deslocamento do proximo quadro (Halton 2 / 3) em pixels do render e em NDC (o que o hle soma na projecao). Mesma
@@ -5276,7 +5326,7 @@ struct FfxState {
     ffxContext context = nullptr;
     VkDeviceContext device{};
     u32 render_w = 0, render_h = 0, out_w = 0, out_h = 0;
-    int wanted = 0;
+    int wanted = 0, actual_major = 0;
     std::string version;
     std::vector<std::pair<u64, std::string>> versions;
     OwnImage color, motion, depth[2], reactive, output;
@@ -5287,6 +5337,7 @@ struct FfxState {
     VkDescriptorSet inputs_set = VK_NULL_HANDLE, present_set = VK_NULL_HANDLE;
     std::chrono::steady_clock::time_point last{};
     bool reset = true;
+    u32 last_level = 0;
 } g_ffx;
 
 void FfxMessage(uint32_t type, const wchar_t* message) {
@@ -5425,6 +5476,7 @@ bool EnsureFfxContext(u32 render_w, u32 render_h, u32 out_w, u32 out_h) {
     g_ffx.version = pick->second;
     g_ffx.reset = true;
     const int chosen_major = FfxMajor(pick->second);
+    g_ffx.actual_major = chosen_major;
     g_ffx.needs_reactive = chosen_major <= 3;
     ffxQueryDescUpscaleGetResourceRequirements req{};
     req.header.type = FFX_API_QUERY_DESC_TYPE_UPSCALE_GET_RESOURCE_REQUIREMENTS;
@@ -5582,8 +5634,12 @@ bool PrepareTemporalInputs(State::RenderTarget* shown, bool reset_history, u32* 
 
 // FSR 2 / 3 / 4: imagem do jogo (render) -> saida (out_w x out_h). Devolve a saida para a janela, ou falso.
 bool FfxPass(State::RenderTarget* shown, u32 out_w, u32 out_h, VkImageView* out_view, VkDescriptorSet* out_set) {
+    const FrameTemporal& frame = g_frame_temporal;
     if (!g_ffx_wanted.load(std::memory_order_relaxed) || !shown || !out_w || !out_h ||
+        g_game_menu_paused.load(std::memory_order_relaxed) || !frame.depth ||
         (!g_ffx_native.load(std::memory_order_relaxed) && out_w <= shown->width && out_h <= shown->height)) {
+        // Nao reutiliza o historico de outra tela ou de um quadro sem profundidade valida.
+        g_ffx.reset = true;
         return false;
     }
     if (out_w < shown->width || out_h < shown->height) {
@@ -5599,18 +5655,22 @@ bool FfxPass(State::RenderTarget* shown, u32 out_w, u32 out_h, VkImageView* out_
     }
     // 1. entradas (cor, movimento, profundidade) numa passagem
     u32 now_depth = 0;
+    const u32 level = g_current_level.load(std::memory_order_relaxed);
+    g_ffx.reset |= level != g_ffx.last_level;
     if (!PrepareTemporalInputs(shown, g_ffx.reset, &now_depth)) {
+        g_ffx.reset = true;
         return false;
     }
-    const FrameTemporal& frame = g_frame_temporal;
+    g_ffx.last_level = level;
     static const bool show_reactive = std::getenv("LD_SHOW_REACTIVE") != nullptr;
-    static const bool force_reactive = [] {
+    static const bool fsr4_reactive = [] {
         const char* env = std::getenv("LD_FSR4_REACTIVE");
-        return env && env[0] == '1';
+        return !env || env[0] != '0';
     }();
-    // 2.0: o FSR 4 (4.1.2) nao precisa da mascara sintetica, mas passar FfxApiResource{} nulo causa page fault (0xbeefdeadb000) na GPU;
-    // limpar a imagem valida para 0.0 mantem o descritor valido sem interferir na heuristica ML do FSR 4.
-    if (!g_ffx.needs_reactive && !show_reactive && !force_reactive) {
+    // O port reprojeta a camera, mas nao tem vetores proprios dos objetos.
+    // A mascara marca as mudancas de profundidade que esses vetores nao descrevem.
+    const bool use_reactive = g_ffx.needs_reactive || show_reactive || (g_ffx.actual_major == 4 && fsr4_reactive);
+    if (!use_reactive) {
         MoveOwnImage(g_ffx.reactive, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
         const VkClearColorValue zero{};
         const VkImageSubresourceRange range{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
@@ -5644,7 +5704,7 @@ bool FfxPass(State::RenderTarget* shown, u32 out_w, u32 out_h, VkImageView* out_
     dispatch.renderSize = {shown->width, shown->height};
     dispatch.upscaleSize = {out_w, out_h};
     // 2.0: sem nitidez extra no FSR AA (mesmo tamanho): ela amplificava o tremor de sombras e texturas finas. Ampliando, leve.
-    dispatch.enableSharpening = out_w > shown->width;
+    dispatch.enableSharpening = g_ffx.actual_major < 4 && out_w > shown->width;
     dispatch.sharpness = 0.2f;
     dispatch.frameTimeDelta = std::clamp(delta, 1.0f, 100.0f);
     dispatch.preExposure = 1.0f;
@@ -5657,7 +5717,7 @@ bool FfxPass(State::RenderTarget* shown, u32 out_w, u32 out_h, VkImageView* out_
     dispatch.viewSpaceToMetersFactor = 1.0f;
     dispatch.flags = FFX_UPSCALE_FLAG_NON_LINEAR_COLOR_SRGB;
     const ffxReturnCode_t result = g_ffx.fn.Dispatch(&g_ffx.context, &dispatch.header);
-    g_ffx.reset = false;
+    g_ffx.reset = result != FFX_API_RETURN_OK;
     // o upscaler devolve os recursos nos estados informados
     if (result != FFX_API_RETURN_OK) {
         static u32 logged = 0;
@@ -5682,7 +5742,7 @@ bool FfxPass(State::RenderTarget* shown, u32 out_w, u32 out_h, VkImageView* out_
     return true;
 }
 
-std::atomic<u32> g_upscale_target_w{0}, g_upscale_target_h{0};
+std::atomic<u64> g_upscale_target{0};
 std::atomic<u32> g_render_actual_w{1920}, g_render_actual_h{1080};
 
 struct XessRuntime {
@@ -6083,6 +6143,54 @@ struct ColorGradePush {
 };
 static_assert(sizeof(ColorGradePush) == 64);
 
+OwnImage g_spatial_output;
+VkDescriptorSet g_spatial_present_set = VK_NULL_HANDLE;
+
+// O RCAS le um pixel por texel. Quando o alvo e diferente da janela, finalize o FSR no proprio alvo.
+bool FsrOutput(VkImageView* view, VkDescriptorSet* set) {
+    const auto width = g_fsr.width, height = g_fsr.height;
+    const bool update_set = !g_spatial_present_set || width != g_spatial_output.width || height != g_spatial_output.height;
+    if (!g_fsr.rcas_rt || !EnsureOwnImage(g_spatial_output, width, height, VK_FORMAT_R8G8B8A8_UNORM,
+                         VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT)) return false;
+    if (!g_spatial_present_set) {
+        VkDescriptorSetAllocateInfo alloc{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+        alloc.descriptorPool = g.descriptor_pool;
+        alloc.descriptorSetCount = 1;
+        alloc.pSetLayouts = &g.set_layout;
+        if (vk.vkAllocateDescriptorSets(g.device, &alloc, &g_spatial_present_set) != VK_SUCCESS) return false;
+    }
+    Transition(g.command, g_spatial_output.image, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_UNDEFINED,
+               VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+    VkRenderingAttachmentInfo color{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
+    color.imageView = g_spatial_output.view;
+    color.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+    color.loadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+    color.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+    VkRenderingInfo rendering{VK_STRUCTURE_TYPE_RENDERING_INFO};
+    rendering.renderArea = {{0, 0}, {width, height}};
+    rendering.layerCount = 1;
+    rendering.colorAttachmentCount = 1;
+    rendering.pColorAttachments = &color;
+    vk.vkCmdBeginRendering(g.command, &rendering);
+    FsrRcasDraw(0, 0, static_cast<float>(width), static_cast<float>(height), g_fsr.rcas_rt);
+    vk.vkCmdEndRendering(g.command);
+    Transition(g.command, g_spatial_output.image, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+               VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+    if (update_set) {
+        VkDescriptorImageInfo image{g.sampler, g_spatial_output.view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
+        VkWriteDescriptorSet write{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+        write.dstSet = g_spatial_present_set;
+        write.dstBinding = 0;
+        write.descriptorCount = 1;
+        write.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        write.pImageInfo = &image;
+        vk.vkUpdateDescriptorSets(g.device, 1, &write, 0, nullptr);
+    }
+    *view = g_spatial_output.view;
+    *set = g_spatial_present_set;
+    return true;
+}
+
 struct ColorGradeState {
     bool tried = false, ok = false;
     VkShaderModule vert = VK_NULL_HANDLE, fs = VK_NULL_HANDLE;
@@ -6189,6 +6297,9 @@ void DestroyPostPipelines() {
         return;
     }
     DestroyOwnImage(g_grade.rt);
+    DestroyOwnImage(g_spatial_output);
+    g_spatial_present_set = VK_NULL_HANDLE;
+    g_active_upscaler = 0;
     if (g_grade.pipeline) vk.vkDestroyPipeline(g.device, g_grade.pipeline, nullptr);
     if (g_grade.layout) vk.vkDestroyPipelineLayout(g.device, g_grade.layout, nullptr);
     if (g_grade.fs) vk.vkDestroyShaderModule(g.device, g_grade.fs, nullptr);
@@ -6211,6 +6322,36 @@ void DestroyPostPipelines() {
     if (g_fsr.image) vk.vkDestroyImage(g.device, g_fsr.image, nullptr);
     if (g_fsr.memory) vk.vkFreeMemory(g.device, g_fsr.memory, nullptr);
     g_fsr = FsrState{};
+}
+// A fence usada para reciclar o frame tambem cobre os resultados de oclusao.
+void PublishDepthSampleDumps() {
+    if (g.submitted_depth_dumps.empty()) return;
+    std::array<u64, kDepthSampleQueries> samples;
+    const u32 count = g.submitted_depth_queries;
+    const bool ready = count == 0 ||
+        vk.vkGetQueryPoolResults(g.device, g.depth_samples, 0, count, count * sizeof(u64), samples.data(),
+                                 sizeof(u64), VK_QUERY_RESULT_64_BIT) == VK_SUCCESS;
+    static bool reported = false;
+    if (ready && count && !reported) {
+        reported = true;
+        const auto hidden = std::count(samples.begin(), samples.begin() + count, 0);
+        std::printf("[OCCLUSION] %u intervalos medidos pelo Vulkan, %zu sem amostras visiveis\n",
+                    count, static_cast<size_t>(hidden));
+    }
+    size_t query = 0;
+    u32 unmeasured = 0;
+    for (const auto& dump : g.submitted_depth_dumps) {
+        while (query < dump.position) {
+            const u64 value = ready ? samples[query] : 1;
+            g.depth_sample_counter += ready && g.precise_depth_samples ? value : (value ? kConservativeDepthSamples : 0);
+            ++query;
+        }
+        g.depth_sample_counter += kConservativeDepthSamples * (dump.unmeasured - unmeasured);
+        unmeasured = dump.unmeasured;
+        dump.sink(dump.address, g.depth_sample_counter);
+    }
+    g.submitted_depth_dumps.clear();
+    g.submitted_depth_queries = 0;
 }
 } // namespace
 
@@ -6275,6 +6416,7 @@ bool VulkanRenderer::DrawFrame(u64 display_address) {
         NoteGpuTimeout();
         return skip(false);
     }
+    PublishDepthSampleDumps();
     lap(2);
     GrabFlush(); // DIAGNOSTICO (LD_GRAB_TRIGGER)
     g.hang_timeouts = 0;
@@ -6373,6 +6515,9 @@ bool VulkanRenderer::DrawFrame(u64 display_address) {
         vk.vkCmdResetQueryPool(g.command, g.timestamps, 0, 2);
         vk.vkCmdWriteTimestamp(g.command, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, g.timestamps, 0);
     }
+    if (!g.queued_depth_dumps.empty()) {
+        vk.vkCmdResetQueryPool(g.command, g.depth_samples, 0, kDepthSampleQueries);
+    }
     vk.vkResetDescriptorPool(g.device, g.frame_pool, 0); // o frame anterior ja terminou (fence)
     const u32 upload_half = g.frame_half; // Fase 59: metade do staging que este frame envia
     RecordFrameUploads(g.command); // Fase 39: texturas criadas / reescritas desde o ultimo frame
@@ -6389,8 +6534,25 @@ bool VulkanRenderer::DrawFrame(u64 display_address) {
     VkExtent2D area{};
     VkPipeline bound = VK_NULL_HANDLE;
     u32 passes = 0;
+    size_t next_dump = 0;
+    u32 depth_queries = 0, unmeasured = 0;
+    bool depth_query_open = false;
+    auto end_depth_query = [&] {
+        if (!depth_query_open) return;
+        vk.vkCmdEndQuery(g.command, g.depth_samples, depth_queries++);
+        depth_query_open = false;
+    };
+    auto record_depth_dumps = [&](size_t position) {
+        while (next_dump < g.queued_depth_dumps.size() && g.queued_depth_dumps[next_dump].position == position) {
+            end_depth_query();
+            auto& dump = g.queued_depth_dumps[next_dump++];
+            dump.position = depth_queries;
+            dump.unmeasured = unmeasured;
+        }
+    };
     auto end_pass = [&] {
         if (open) {
+            end_depth_query();
             vk.vkCmdEndRendering(g.command);
             open = false;
         }
@@ -6399,6 +6561,7 @@ bool VulkanRenderer::DrawFrame(u64 display_address) {
         target.copy_fresh = false;
     }
     ++g.frame_serial;
+    g.native_menu_raster = g_game_menu_paused.load(std::memory_order_relaxed);
     g.previous_draws.swap(g.frame_draws);
     g.frame_draws.clear();
     g.hang_reported = false;
@@ -6409,11 +6572,12 @@ bool VulkanRenderer::DrawFrame(u64 display_address) {
     // (viewport, scissor, constantes de blend, mascaras e referencia do estencil), entao o valor vale de um
     // draw para o outro; so o que muda e gravado (eram 9 chamadas ao driver por draw). Zera a cada passe.
     struct DynamicCache {
-        bool valid = false, stencil = false;
+        bool valid = false, stencil = false, fixed_valid = false;
         VkViewport viewport{};
         VkRect2D scissor{};
         float blend[4]{};
         u32 stencil_values[6]{};
+        FixedState fixed{};
     } dynamic;
     // 2.0: profundidade da cena guardada antes da limpeza do HUD (TAA / FSR). So com um deles ligado.
     const u64 scene_depth =
@@ -6424,6 +6588,9 @@ bool VulkanRenderer::DrawFrame(u64 display_address) {
     u32 scene_depth_draws = 0;
     bool scene_depth_saved = false;
     for (const State::QueuedGame& draw : g.queue_game) {
+        record_depth_dumps(queue_index);
+        const bool count_samples = next_dump < g.queued_depth_dumps.size() && draw.count_depth_samples;
+        if (!count_samples) end_depth_query();
         ++queue_index;
         if (scene_depth && !scene_depth_saved && draw.pipeline && !draw.pending_images && draw.depth &&
             draw.depth->address == scene_depth) {
@@ -6439,6 +6606,7 @@ bool VulkanRenderer::DrawFrame(u64 display_address) {
             }
         }
         if (!draw.pipeline || draw.pending_images) {
+            unmeasured += count_samples;
             continue; // Fase 45: pipeline ainda compilando ou textura ainda sendo lida
         }
         // Fase 26: os passes diferidos de luz (sol, nevoa) AMOSTRAM o buffer de profundidade com ele
@@ -6478,6 +6646,7 @@ bool VulkanRenderer::DrawFrame(u64 display_address) {
         }
         if (feedback) { // amostra um alvo em que nada foi desenhado ainda (ou a copia nao pode ser criada)
             ++g.feedback_skipped;
+            unmeasured += count_samples;
             continue;
         }
         // Fase 32: tira a copia do alvo antes do draw que o amostra e grava nele ao mesmo tempo.
@@ -6586,6 +6755,7 @@ bool VulkanRenderer::DrawFrame(u64 display_address) {
         if (draw.pipeline != bound) {
             vk.vkCmdBindPipeline(g.command, VK_PIPELINE_BIND_POINT_GRAPHICS, draw.pipeline);
             bound = draw.pipeline;
+            dynamic.fixed_valid = false;
         }
         // 1.9.1: alvo criado em outra resolucao (g_target_scale_*): viewport e scissor do jogo (em pixels de 1080p) escalados
         VkViewport viewport = draw.viewport;
@@ -6662,19 +6832,27 @@ bool VulkanRenderer::DrawFrame(u64 display_address) {
         dynamic.valid = true;
         if (g.gpl) { // Fase 41: o que os pipelines ligados deixam dinamico (os monoliticos ignoram)
             const FixedState& f = draw.fixed;
-            vk.vkCmdSetCullMode(g.command, f.cull);
-            vk.vkCmdSetFrontFace(g.command, f.front);
-            if (g.set_depth_clamp) {
+            const FixedState& last = dynamic.fixed;
+            const bool fresh = !dynamic.fixed_valid;
+            if (fresh || f.cull != last.cull) vk.vkCmdSetCullMode(g.command, f.cull);
+            if (fresh || f.front != last.front) vk.vkCmdSetFrontFace(g.command, f.front);
+            if (g.set_depth_clamp && (fresh || f.clamp != last.clamp)) {
                 g.set_depth_clamp(g.command, f.clamp);
             }
-            vk.vkCmdSetDepthTestEnable(g.command, f.depth_test);
-            vk.vkCmdSetDepthWriteEnable(g.command, f.depth_write);
-            vk.vkCmdSetDepthCompareOp(g.command, f.depth_compare);
-            vk.vkCmdSetStencilTestEnable(g.command, f.stencil_test);
-            vk.vkCmdSetStencilOp(g.command, VK_STENCIL_FACE_FRONT_BIT, f.front_ops.failOp, f.front_ops.passOp, f.front_ops.depthFailOp,
-                                 f.front_ops.compareOp);
-            vk.vkCmdSetStencilOp(g.command, VK_STENCIL_FACE_BACK_BIT, f.back_ops.failOp, f.back_ops.passOp, f.back_ops.depthFailOp,
-                                 f.back_ops.compareOp);
+            if (fresh || f.depth_test != last.depth_test) vk.vkCmdSetDepthTestEnable(g.command, f.depth_test);
+            if (fresh || f.depth_write != last.depth_write) vk.vkCmdSetDepthWriteEnable(g.command, f.depth_write);
+            if (fresh || f.depth_compare != last.depth_compare) vk.vkCmdSetDepthCompareOp(g.command, f.depth_compare);
+            if (fresh || f.stencil_test != last.stencil_test) vk.vkCmdSetStencilTestEnable(g.command, f.stencil_test);
+            const auto set_stencil = [&](VkStencilFaceFlags face, const VkStencilOpState& ops, const VkStencilOpState& prev) {
+                if (fresh || ops.failOp != prev.failOp || ops.passOp != prev.passOp ||
+                    ops.depthFailOp != prev.depthFailOp || ops.compareOp != prev.compareOp) {
+                    vk.vkCmdSetStencilOp(g.command, face, ops.failOp, ops.passOp, ops.depthFailOp, ops.compareOp);
+                }
+            };
+            set_stencil(VK_STENCIL_FACE_FRONT_BIT, f.front_ops, last.front_ops);
+            set_stencil(VK_STENCIL_FACE_BACK_BIT, f.back_ops, last.back_ops);
+            dynamic.fixed = f;
+            dynamic.fixed_valid = true;
         }
         VkDescriptorSetAllocateInfo allocate{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
         allocate.descriptorPool = g.frame_pool;
@@ -6682,6 +6860,7 @@ bool VulkanRenderer::DrawFrame(u64 display_address) {
         allocate.pSetLayouts = &draw.pair->set_layout;
         VkDescriptorSet set = VK_NULL_HANDLE;
         if (vk.vkAllocateDescriptorSets(g.device, &allocate, &set) != VK_SUCCESS) {
+            unmeasured += count_samples;
             continue;
         }
         VkDescriptorBufferInfo buffer_infos[24];
@@ -6789,6 +6968,15 @@ bool VulkanRenderer::DrawFrame(u64 display_address) {
             g.frame_draws.push_back(info);
             g.write_marker(g.command, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, g.markers.buffer, 0, marker);
         }
+        if (count_samples && !depth_query_open) {
+            if (depth_queries < kDepthSampleQueries) {
+                vk.vkCmdBeginQuery(g.command, g.depth_samples, depth_queries,
+                                   g.precise_depth_samples ? VK_QUERY_CONTROL_PRECISE_BIT : 0);
+                depth_query_open = true;
+            } else {
+                ++unmeasured;
+            }
+        }
         if (draw.indexed) {
             vk.vkCmdBindIndexBuffer(g.command, draw.index_static ? g.statics.buffer : g.indices.buffer, draw.index_offset, draw.index_type);
             vk.vkCmdDrawIndexed(g.command, draw.count, draw.instance_count, 0, draw.base_vertex, 0);
@@ -6799,6 +6987,7 @@ bool VulkanRenderer::DrawFrame(u64 display_address) {
             g.write_marker(g.command, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, g.markers.buffer, 4, marker);
         }
     }
+    record_depth_dumps(queue_index);
     end_pass();
 
     TailMarker(1);
@@ -6905,8 +7094,8 @@ bool VulkanRenderer::DrawFrame(u64 display_address) {
     }
     UpdateFrameTemporal();
     u32 upscale_w = static_cast<u32>(out_w), upscale_h = static_cast<u32>(out_h);
-    const u32 target_w = g_upscale_target_w.load(std::memory_order_relaxed);
-    const u32 target_h = g_upscale_target_h.load(std::memory_order_relaxed);
+    const u64 target = g_upscale_target.load(std::memory_order_relaxed);
+    const u32 target_w = static_cast<u32>(target >> 32), target_h = static_cast<u32>(target);
     if (target_w && target_h && shown && shown->width && shown->height) {
         const float img_aspect = static_cast<float>(shown->width) / shown->height;
         const float tgt_aspect = static_cast<float>(target_w) / target_h;
@@ -6944,18 +7133,17 @@ bool VulkanRenderer::DrawFrame(u64 display_address) {
         grab_window = true;
         --g_grab.active;
     }
-    // 1.9.1: FSR 1 quando a imagem do jogo e menor que a area dela na janela (EASU aqui, RCAS na passagem da janela)
     bool fsr = shown && present_pipeline && !ffx && !xess &&
-               FsrEasuPass(present_view, shown->width, shown->height, static_cast<u32>(out_w), static_cast<u32>(out_h));
-    // TAA sem ampliacao (imagem do tamanho da area dela): so a nitidez do RCAS, para compensar a suavidade do TAA
-    if (false && !fsr && taa && static_cast<u32>(out_w) == shown->width && static_cast<u32>(out_h) == shown->height && EnsureFsr()) {
-        // 2.0: desligado - a nitidez do RCAS sobre o TAA amplificava o tremor de sombras e texturas finas
-        PointRcas(present_view);
-        fsr = true;
+               FsrEasuPass(present_view, shown->width, shown->height, upscale_w, upscale_h);
+    bool spatial_output = false;
+    if (fsr && (upscale_w != static_cast<u32>(out_w) || upscale_h != static_cast<u32>(out_h))) {
+        spatial_output = FsrOutput(&present_view, &present_set);
+        fsr = false; // Com um alvo separado, a janela recebe a imagem pronta.
     }
+    g_active_upscaler.store(ffx ? g_ffx.actual_major : xess ? 5 : fsr || spatial_output ? 1 : 0, std::memory_order_relaxed);
     // imagem maior que a area na janela (resolucao acima do monitor): reducao com filtro de area em vez do bilinear
-    const u32 present_w = ffx ? g_ffx.output.width : xess ? g_xess.output.width : shown ? shown->width : 0;
-    const u32 present_h = ffx ? g_ffx.output.height : xess ? g_xess.output.height : shown ? shown->height : 0;
+    const u32 present_w = ffx ? g_ffx.output.width : xess ? g_xess.output.width : spatial_output ? upscale_w : shown ? shown->width : 0;
+    const u32 present_h = ffx ? g_ffx.output.height : xess ? g_xess.output.height : spatial_output ? upscale_h : shown ? shown->height : 0;
     const bool down = !fsr && present_pipeline && (present_w > out_w * 1.01f || present_h > out_h * 1.01f) && EnsureDown();
     const ImageColorSettings grade_cfg = GetImageColorSettings();
     VkImageView grade_view = present_view;
@@ -7117,6 +7305,7 @@ bool VulkanRenderer::DrawFrame(u64 display_address) {
         g.immediate_since_frame = 0; // Fase 54e
     }
     if (result != VK_SUCCESS) {
+        g.queued_depth_dumps.clear();
         Fail("vkQueueSubmit", result);
         std::printf("[VULKAN] ERROR: vkQueueSubmit for frame %u failed: %s\n", g.frame_serial, g.error.c_str()); // Fase 54b
         if (result == VK_ERROR_DEVICE_LOST && !g.device_lost) { // Fase 54c: relatorio na hora
@@ -7126,6 +7315,8 @@ bool VulkanRenderer::DrawFrame(u64 display_address) {
         }
         return skip(false);
     }
+    g.submitted_depth_dumps.swap(g.queued_depth_dumps);
+    g.submitted_depth_queries = depth_queries;
     if (g.static_reset) {
         // O buffer estatico encheu: espera este frame terminar de le-lo e recomeca do zero. A
         // geracao avanca, e quem guardou posicoes (o cache do GnmDriver) as descarta.
@@ -7534,6 +7725,62 @@ bool VulkanRenderer::RegisterGamePair(u64 key, const GamePairLayout& layout) {
     return true;
 }
 
+bool VulkanRenderer::QueueDepthSampleDump(u64 address, DepthSampleSink sink) {
+    const TimedLock lock(g.mutex);
+    if (!g.active || !g.game_shaders || !g.depth_samples || g.queued_depth_dumps.size() >= 2 * kMaxDrawsPerFrame) return false;
+    g.queued_depth_dumps.push_back({g.queue_game.size(), address, sink});
+    return true;
+}
+
+bool VulkanRenderer::SelftestDepthSamples() {
+    // Um triangulo grava Z; o mesmo triangulo atras dele deve retornar zero.
+    SpirvBuilder fragment;
+    fragment.Op(17, {1});
+    fragment.Op(14, {0, 1});
+    fragment.OpString(15, {4, 3}, "main", {});
+    fragment.Op(16, {3, 7}); // OriginUpperLeft
+    fragment.Op(19, {1});
+    fragment.Op(33, {2, 1});
+    fragment.Op(54, {1, 3, 0, 2});
+    fragment.Op(248, {4});
+    fragment.Op(253, {});
+    fragment.Op(56, {});
+    GameDraw draw;
+    draw.pair = 0x5a50415353;
+    if (!RegisterGamePair(draw.pair, {BuildVertexShader(), fragment.Finish(5), {}})) return false;
+
+    struct Vertex {
+        float position[4], color[4], uv[4];
+    };
+    Vertex vertices[3]{{{-0.8f, -0.8f, 0.25f, 1}}, {{0.8f, -0.8f, 0.25f, 1}}, {{0, 0.8f, 0.25f, 1}}};
+    draw.bindings[0] = {vertices, sizeof(Vertex), sizeof(vertices)};
+    draw.binding_count = 1;
+    draw.vertex_count = 3;
+    draw.attribute_count = 3;
+    for (u32 i = 0; i < draw.attribute_count; ++i) draw.attributes[i] = {i, GameDraw::kF32x4, 16 * i, 0};
+    const float identity_and_tint[20]{1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 1, 1, 1, 1};
+    std::memcpy(draw.push, identity_and_tint, sizeof(identity_and_tint));
+    draw.has_depth = true;
+    draw.depth = {0x800000, 64, 64, GameDraw::kTargetDepth32F};
+    draw.depth_control = 0x16; // teste LESS e escrita
+    draw.viewport[2] = draw.viewport[3] = 64;
+    draw.scissor[2] = draw.scissor[3] = 64;
+    draw.clear_depth = true;
+    if (!QueueGameDraw(draw)) return false;
+
+    static std::array<u64, 3> results;
+    results.fill(~0ull);
+    const auto record = +[](u64 index, u64 value) { results[index] = value; };
+    if (!QueueDepthSampleDump(0, record)) return false;
+    draw.clear_depth = false;
+    draw.count_depth_samples = true;
+    if (!QueueGameDraw(draw) || !QueueDepthSampleDump(1, record)) return false;
+    for (auto& vertex : vertices) vertex.position[2] = 0.75f;
+    if (!QueueGameDraw(draw) || !QueueDepthSampleDump(2, record)) return false;
+
+    return DrawFrame() && DrawFrame() && results[1] != ~0ull && results[1] > results[0] && results[2] == results[1];
+}
+
 bool VulkanRenderer::QueueGameDraw(const GameDraw& draw) {
     const TimedLock lock(g.mutex);
     if (!g.active || !g.game_shaders || g.queue_game.size() >= kMaxDrawsPerFrame || draw.attribute_count > 16 || draw.binding_count > 8 ||
@@ -7558,6 +7805,7 @@ bool VulkanRenderer::QueueGameDraw(const GameDraw& draw) {
     } rollback;
     queued.pair = &pair->second;
     queued.pair_key = draw.pair;
+    queued.count_depth_samples = draw.count_depth_samples;
     // ---- alvos ----
     for (u32 i = 0; i < draw.color_count; ++i) {
         queued.colors[i] = GetTarget(draw.colors[i], false);
@@ -8635,9 +8883,16 @@ void VulkanRenderer::SetPrewarmPredicted(bool enabled) {
 // proporcao, o maior 16:9 que cabe nela (a imagem do jogo continua 16:9).
 u32 g_render_out_w = 1920, g_render_out_h = 1080, g_render_scale_pct = 100;
 
+bool GameMenuPaused() {
+    return g_game_menu_paused.load(std::memory_order_relaxed);
+}
+
+void SetGameMenuPaused(bool paused) {
+    g_game_menu_paused = paused;
+}
+
 void VulkanRenderer::SetTargetUpscaleResolution(u32 width, u32 height) {
-    g_upscale_target_w = width;
-    g_upscale_target_h = height;
+    g_upscale_target = (static_cast<u64>(width) << 32) | height;
     if (width && height) {
         std::printf("[RENDER] target upscale resolution: %ux%u\n", width, height);
     } else {
@@ -8646,13 +8901,22 @@ void VulkanRenderer::SetTargetUpscaleResolution(u32 width, u32 height) {
 }
 
 void VulkanRenderer::GetTargetUpscaleResolution(u32* width, u32* height) const {
-    if (width) *width = g_upscale_target_w.load(std::memory_order_relaxed);
-    if (height) *height = g_upscale_target_h.load(std::memory_order_relaxed);
+    const u64 target = g_upscale_target.load(std::memory_order_relaxed);
+    if (width) *width = static_cast<u32>(target >> 32);
+    if (height) *height = static_cast<u32>(target);
 }
 
 void VulkanRenderer::GetCurrentRenderResolution(u32* width, u32* height) const {
     if (width) *width = g_render_actual_w.load(std::memory_order_relaxed);
     if (height) *height = g_render_actual_h.load(std::memory_order_relaxed);
+}
+
+int VulkanRenderer::SpatialUpscaler() const {
+    return g_upscaler.load(std::memory_order_relaxed);
+}
+
+int VulkanRenderer::ActiveUpscaler() const {
+    return g_active_upscaler.load(std::memory_order_relaxed);
 }
 
 void VulkanRenderer::SetUpscaler(int mode, float sharpness) {
@@ -8748,6 +9012,8 @@ void TemporalJitter(float* x, float* y) {
 }
 
 void SetTemporalUpscaler(int major, bool native) {
+    const TimedLock lock(g.mutex);
+    if (g_ffx_wanted == major && g_ffx_native == native) return;
     if (major) {
         g_xess_wanted = false;
         g_xess_native = false;
@@ -8763,6 +9029,8 @@ void SetTemporalUpscaler(int major, bool native) {
 }
 
 void SetXessUpscaler(bool enabled, bool native) {
+    const TimedLock lock(g.mutex);
+    if (g_xess_wanted == enabled && g_xess_native == native) return;
     if (enabled) {
         g_ffx_wanted = 0;
         g_ffx_native = false;

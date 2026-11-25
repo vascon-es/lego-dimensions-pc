@@ -213,6 +213,7 @@ struct GameDraw {
     bool has_depth = false;
     Target depth{};
     bool clear_depth = false; // DB_RENDER_CONTROL.depth_clear_enable: limpa antes do draw
+    bool count_depth_samples = false; // DB_COUNT_CONTROL permite incrementar ZPASS
     float clear_depth_value = 1.0f;
     u32 blend[8] = {};      // CB_BLENDn_CONTROL cru
     u32 color_mask = 0xF;   // CB_TARGET_MASK (4 bits por alvo)
@@ -251,6 +252,9 @@ public:
     // Fase 59: texturas esquecidas (sem uso ha ~30 s) descartadas para caber na memoria.
     u64 TexturesEvicted() const;
     bool QueueGameDraw(const GameDraw& draw);
+    using DepthSampleSink = void (*)(u64 address, u64 samples);
+    bool QueueDepthSampleDump(u64 address, DepthSampleSink sink);
+    bool SelftestDepthSamples();
     u64 GameDraws() const;
     u32 GamePairs() const;
     u32 GamePipelines() const;
@@ -368,6 +372,8 @@ public:
     void SetUnlockedPresent(bool enabled);               // 1.9.1: FPS desbloqueado (MAILBOX ou VSync)
     void SetNoVsync(bool enabled);                       // 1.9.1: sem VSync (IMMEDIATE, pode rasgar)
     bool NoVsync() const;
+    int SpatialUpscaler() const;
+    int ActiveUpscaler() const; // 0: nenhum, 1: FSR 1, 2/3/4: FSR temporal, 5: XeSS
     void SetUpscaler(int mode, float sharpness);         // 1.9.1: 0 = bilinear, 1 = AMD FidelityFX FSR 1
     void SetFillScreen(bool enabled);                    // 1.9.1: tela de outra proporcao = imagem inteira (camera Hor+ / Vert-)
     void PredictedStats(u32* built, u32* failed) const; // Fase 77: receitas cujo par de shaders nao foi registrado (fora do pacote AOT)
@@ -435,6 +441,8 @@ void SetAntiAliasing(int mode);
 int GetAntiAliasing();
 void GetTemporalUpscaler(int* major, bool* native);
 // 1.9.1: AMD FSR 2 / 3 / 4 (versao maior; 9 = a mais nova; 0 = desligado). native = FSR AA (sem ampliar).
+bool GameMenuPaused();
+void SetGameMenuPaused(bool paused);
 void SetTemporalUpscaler(int major, bool native);
 // Intel XeSS 3.0.2 (Vulkan): native = XeSS AA sem ampliar.
 void SetXessUpscaler(bool enabled, bool native);

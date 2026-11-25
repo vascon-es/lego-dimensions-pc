@@ -695,6 +695,7 @@ HLE_IMPL(int, scePadReadState, int handle, PadData* data, u64 guest_rbp) {
         ReadKeyboard(in);
     }
     ReadScript(in);
+    videoout::TickGraphicsSettings();
 
     // Menu de Configuracoes de Video / Imagem (L3 + R3 no controle)
     static bool s_menu_combo_held = false;
@@ -708,8 +709,13 @@ HLE_IMPL(int, scePadReadState, int handle, PadData* data, u64 guest_rbp) {
     }
     s_menu_combo_held = menu_combo_now;
 
+    // A tecla que fecha o painel so volta ao jogo depois de solta.
+    static u32 video_released = 0;
+    video_released &= in.buttons;
+    in.buttons &= ~video_released;
     if (videoout::IsVideoSettingsMenuOpen()) {
         videoout::HandleVideoMenuController(in.buttons);
+        if (!videoout::IsVideoSettingsMenuOpen()) video_released |= in.buttons;
         in.buttons = 0;
         in.l2 = 0;
         in.r2 = 0;

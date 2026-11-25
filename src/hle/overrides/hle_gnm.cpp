@@ -75,6 +75,7 @@ u32 g_logged_labels = 0;
 // Fase 81: EVENT_WRITE por tipo de evento (body[0] & 0x3F) e consultas de oclusao respondidas.
 std::array<u64, 64> g_event_type_count{};
 u64 g_occlusion_dumps = 0, g_occlusion_refused = 0;
+std::atomic<u64> g_occlusion_resolved{0};
 u64 g_pixel_counter = 0;
 // Janela para o monitor de "draws por frame": uma mudanca brusca indica troca de tela.
 u64 g_window_draws = 0, g_window_frames = 0, g_window_packets = 0;
@@ -4240,6 +4241,7 @@ struct TargetSize {
     u32 width, height;
 };
 std::map<std::tuple<u64, u32, u32>, TargetSize> g_target_sizes;
+std::map<std::tuple<u64, u32, u32>, TargetSize> g_display_target_sizes;
 
 // Fase 21.5: quando o jogo usa um alvo como textura, o T# traz o tamanho exato (o registrador
 // do alvo so traz o tamanho arredondado para o tile: 480 de largura vira 512). Uma imagem maior
@@ -4253,6 +4255,17 @@ void NoteTargetHint(u64 address, u32 width, u32 height) {
 
 TargetSize DecideTargetSize(u64 address, u32 raw_pitch, u32 raw_slice, u32 padded_width, u32 padded_height) {
     const auto key = std::make_tuple(address, raw_pitch, raw_slice);
+    if (const auto display = g_display_target_sizes.find(key); display != g_display_target_sizes.end()) return display->second;
+    if (!g_target_sizes.contains(key)) {
+        TargetSize display{};
+        if (videoout::RegisteredBufferSize(address, &display.width, &display.height) &&
+            display.width <= padded_width && display.height <= padded_height &&
+            display.width * 2 > padded_width && display.height * 2 > padded_height) {
+            // O registro do VideoOut define a superficie, mesmo se um passe desenhar apenas um retangulo.
+            g_display_target_sizes.emplace(key, display);
+            return display;
+        }
+    }
     if (const auto hint = g_target_hints.find(address);
         hint != g_target_hints.end() && hint->second.width <= padded_width && hint->second.height <= padded_height &&
         (hint->second.width * 2 > padded_width || padded_width <= 128) && (hint->second.height * 2 > padded_height || padded_height <= 64)) {
@@ -4445,6 +4458,7 @@ void SubmitDrawToVulkan(u32 opcode, const u32* body, u32 body_dwords) {
         ++draw.color_count;
     }
     draw.depth_control = g_ctx_track[0x200];
+    draw.count_depth_samples = !(g_ctx_track[0x001] & 1); // DB_COUNT_CONTROL.zpass_increment_disable
     const bool depth_clear = g_ctx_track[0x000] & 1; // DB_RENDER_CONTROL.depth_clear_enable
     const u32 z_format = g_ctx_track[0x010] & 3;      // DB_Z_INFO.format: 1 = Z16, 3 = Z32F
     // Fase 34: estencil (DB_STENCIL_INFO.format != 0). Um draw so com teste de estencil tambem precisa
@@ -4514,19 +4528,32 @@ void SubmitDrawToVulkan(u32 opcode, const u32* body, u32 body_dwords) {
                         offset[3], offset[4], g_ctx_track[0x010]);
         }
     }
-    auto corner = [](u32 value, s32* x, s32* y) {
-        *x = value & 0x7FFF;
-        *y = (value >> 16) & 0x7FFF;
-    };
-    s32 ax, ay, bx, by, cx, cy, dx, dy;
-    corner(g_ctx_track[0x00C], &ax, &ay); // PA_SC_SCREEN_SCISSOR
-    corner(g_ctx_track[0x00D], &bx, &by);
-    corner(g_ctx_track[0x090], &cx, &cy); // PA_SC_GENERIC_SCISSOR
-    corner(g_ctx_track[0x091], &dx, &dy);
-    draw.scissor[0] = std::max(ax, cx);
-    draw.scissor[1] = std::max(ay, cy);
-    draw.scissor[2] = std::min(bx ? bx : 16384, dx ? dx : 16384);
-    draw.scissor[3] = std::min(by ? by : 16384, dy ? dy : 16384);
+    // A GPU cruza o retangulo da tela, o da janela e o generico. Os dois ultimos
+    // usam PA_SC_WINDOW_OFFSET quando seu uso esta habilitado.
+    const u32 window_offset = g_ctx_track[0x080];
+    const bool offset_enabled = !(g_ctx_track[0x081] & (1u << 31));
+    const s32 offset[] = {offset_enabled ? static_cast<s16>(window_offset) : 0,
+                          offset_enabled ? static_cast<s16>(window_offset >> 16) : 0};
+    const bool viewport_scissor = (g_ctx_track[0x292] & 2u) != 0;
+    for (u32 axis = 0; axis < 2; ++axis) {
+        const u32 shift = 16 * axis;
+        const auto coord = [&](u32 reg) { return static_cast<s32>((g_ctx_track[reg] >> shift) & 0x7fff); };
+        const auto limit = [&](u32 reg, s32 delta) { return g_ctx_track[reg] ? coord(reg) + delta : 16384; };
+        const s32 screen_start = static_cast<s16>(g_ctx_track[0x00c] >> shift);
+        const s32 screen_end = g_ctx_track[0x00d] ? static_cast<s16>(g_ctx_track[0x00d] >> shift) : 16384;
+        s32 begin = std::max({0, screen_start, coord(0x081) + offset[axis], coord(0x090) + offset[axis]});
+        s32 end = std::min({screen_end, limit(0x082, offset[axis]), limit(0x091, offset[axis])});
+        if (viewport_scissor) {
+            begin = std::max(begin, coord(0x094));
+            end = std::min(end, limit(0x095, 0));
+        }
+        draw.scissor[axis] = begin;
+        draw.scissor[2 + axis] = std::max(begin, end);
+    }
+    if (g_ctx_track[0x205] & (1u << 16)) { // PA_SU_SC_MODE_CNTL.VTX_WINDOW_OFFSET_ENABLE
+        draw.viewport[0] += static_cast<s16>(window_offset);
+        draw.viewport[1] += static_cast<s16>(window_offset >> 16);
+    }
     // Fase 25: alvo minusculo (a luminancia media da cena acaba num 2x1) -> o conteudo volta para a
     // memoria do jogo no frame seguinte, para o caso de a CPU ler a exposicao dali.
     if (draw.color_count == 1 && !draw.has_depth && std::fabs(draw.viewport[2]) * std::fabs(draw.viewport[3]) <= 16.0f) {
@@ -4698,6 +4725,19 @@ void SubmitDrawToVulkan(u32 opcode, const u32* body, u32 body_dwords) {
         }
     }
     draw.pair = info->key;
+    // Captura e reapresentacao do fundo da pausa. Sao passagens de tela inteira.
+    // Os recortes dos desenhos 3D anteriores nao valem para a imagem congelada.
+    const bool pause_restore = info->vs_hash == 0xb2cebd0538da715dull && info->ps_hash == 0xa70a8febf394563full && count == 4;
+    const bool pause_capture = info->vs_hash == 0x834ccaf7c7acc619ull && info->ps_hash == 0x4bbbd101f432007dull && count == 3;
+    const bool fullscreen = draw.color_count == 1 && draw.viewport[0] == 0.0f &&
+                            std::min(draw.viewport[1], draw.viewport[1] + draw.viewport[3]) == 0.0f &&
+                            draw.viewport[2] == draw.colors[0].width &&
+                            std::abs(draw.viewport[3]) == draw.colors[0].height;
+    if ((pause_restore || pause_capture) && !index_address && fullscreen && render::GameMenuPaused()) {
+        draw.scissor[0] = draw.scissor[1] = 0;
+        draw.scissor[2] = draw.colors[0].width;
+        draw.scissor[3] = draw.colors[0].height;
+    }
 
     // ---- indices e quantidade de vertices ----
     static thread_local std::vector<u8> index_copy, vertex_arena;
@@ -5388,12 +5428,30 @@ inline bool Overlaps(const u8* a, u64 na, const u8* b, u64 nb) {
 }
 
 // Fase 81: LD_OCCLUSION=0 volta ao comportamento antigo (nada escrito), para comparar.
-bool OcclusionQueriesVisible() {
+bool OcclusionQueriesEnabled() {
     static const bool on = [] {
         const char* v = std::getenv("LD_OCCLUSION");
         return !(v && v[0] == '0');
     }();
     return on;
+}
+
+void WriteDepthSampleDump(u64 address, u64 samples) {
+    constexpr u64 kValid = 1ull << 63;
+    constexpr u32 kRenderBackends = 8;
+    if (!Writable(address, kRenderBackends * 16)) return;
+    auto* results = reinterpret_cast<u64*>(address);
+    for (u32 i = kRenderBackends; i-- > 0;) {
+        // Os oito DBs somam o acumulado, sem multiplicar o resultado do Vulkan.
+        std::atomic_ref<u64>(results[i * 2]).store(kValid | ((samples + i) / kRenderBackends), std::memory_order_release);
+    }
+}
+
+void ResolveDepthSampleDump(u64 address, u64 samples) {
+    WriteDepthSampleDump(address, samples);
+    if (g_occlusion_resolved.fetch_add(1, std::memory_order_relaxed) == 0) {
+        log::Raw("[OCCLUSION] resultados de profundidade do Vulkan ativos");
+    }
 }
 
 void ProcessCommandBuffer(const u32* cmd, u64 size_bytes, u64 release_event) {
@@ -5438,27 +5496,20 @@ void ProcessCommandBuffer(const u32* cmd, u64 size_bytes, u64 release_event) {
 
         switch (opcode) {
         case kOpEventWrite:
-            // Fase 81: consultas de oclusao (ZPASS_DONE + PIXEL_PIPE_STAT_DUMP). O jogo pergunta a GPU
-            // quantos pixels de um objeto passaram no teste de profundidade e so mostra / deixa usar
-            // marcadores (setas verdes), brilhos e reflexos de luz quando o resultado diz "visivel".
-            // Antes nada era escrito e tudo ficava "escondido". Como o shadPS4: cada leitura soma um
-            // passo grande ao contador, entao (fim - inicio) sempre da "visivel"; bit 63 = resultado valido.
+            // Os snapshots ZPASS_DONE e PIXEL_PIPE_STAT_DUMP cercam os draws de oclusao.
             if (body_dwords >= 1) {
                 const u32 ev_type = body[0] & 0x3F;
                 const u32 ev_index = (body[0] >> 8) & 0xF;
                 ++g_event_type_count[ev_type];
-                if (ev_index == 1 && (ev_type == 57 || ev_type == 21) && body_dwords >= 3 && OcclusionQueriesVisible()) {
+                if (ev_index == 1 && (ev_type == 57 || ev_type == 21) && body_dwords >= 3 && OcclusionQueriesEnabled()) {
                     const u64 address = (body[1] & ~7u) | (static_cast<u64>(body[2] & 0xFFFF) << 32);
                     constexpr u32 kRenderBackends = 8; // PS4 base: 8 pares de contadores, 16 bytes cada
                     if (Writable(address, kRenderBackends * 16)) {
-                        u64* results = reinterpret_cast<u64*>(address);
-                        for (u32 i = 0; i < kRenderBackends; ++i) {
-                            results[i * 2] = g_pixel_counter | 0x8000000000000000ULL;
-                        }
-                        g_pixel_counter += 0x2FFFFFFULL;
-                        if (++g_occlusion_dumps == 1) {
-                            log::Call("PM4", 0, "Phase 81: game uses occlusion queries (event type %u, results at 0x%" PRIx64
-                                      "); answering 'visible'", ev_type, address);
+                        ++g_occlusion_dumps;
+                        if (!g_vulkan_draws.load(std::memory_order_relaxed) || !g_game_shaders.load(std::memory_order_relaxed) ||
+                            !render::VulkanRenderer::Instance().QueueDepthSampleDump(address, ResolveDepthSampleDump)) {
+                            WriteDepthSampleDump(address, kRenderBackends * g_pixel_counter);
+                            g_pixel_counter += 0x2ffffffULL;
                         }
                     } else {
                         ++g_occlusion_refused;
@@ -5586,14 +5637,14 @@ void ProcessCommandBuffer(const u32* cmd, u64 size_bytes, u64 release_event) {
                 }
             }
             break;
-        case 0x69: // SET_CONTEXT_REG: viewport, blend, mascara de cor...
-            for (u32 i = 1; i < body_dwords; ++i) {
-                const u32 reg = (body[0] & 0xFFFF) + i - 1;
-                if (reg < g_ctx_track.size()) {
-                    g_ctx_track[reg] = body[i];
-                }
+        case 0x69: { // SET_CONTEXT_REG: viewport, blend, mascara de cor...
+            const size_t start = body[0] & 0xffff;
+            if (start < g_ctx_track.size()) {
+                const size_t registers = std::min<size_t>(body_dwords - 1, g_ctx_track.size() - start);
+                std::memcpy(g_ctx_track.data() + start, body + 1, registers * sizeof(u32));
             }
             break;
+        }
         case 0x79: // SET_UCONFIG_REG: 0x242 = VGT_PRIMITIVE_TYPE
             if (body_dwords >= 2 && (body[0] & 0xFFFF) == 0x242) {
                 g_prim_track = body[1];
@@ -6728,7 +6779,10 @@ void RunFrameEnd(u32 buffer_index) {
         DrainTextureResults(8.0); // Fase 39: o envio agora e so uma copia para o staging do frame
         end_lap(3);
         videoout::QueueStatsOverlay(); // Fase 65: contador de FPS / info por cima do quadro
-        renderer.DrawFrame(videoout::BufferAddress(static_cast<int>(buffer_index)));
+        {
+            const RegionCacheScope cache;
+            renderer.DrawFrame(videoout::BufferAddress(static_cast<int>(buffer_index)));
+        }
         end_lap(4);
         double df[7];
         renderer.LastDrawFrameTimes(df);
@@ -7378,8 +7432,8 @@ void PrintStats() {
         }
         WriteUiShaderPairs();
     }
-    std::printf("  Phase 81: occlusion query dumps answered %" PRIu64 " (refused %" PRIu64 ") | EVENT_WRITE types:",
-                g_occlusion_dumps, g_occlusion_refused);
+    std::printf("  Occlusion dumps %" PRIu64 " (Vulkan %" PRIu64 ", refused %" PRIu64 ") | EVENT_WRITE types:",
+                g_occlusion_dumps, g_occlusion_resolved.load(std::memory_order_relaxed), g_occlusion_refused);
     for (u32 i = 0; i < 64; ++i) {
         if (g_event_type_count[i]) {
             std::printf(" %u=%" PRIu64, i, g_event_type_count[i]);
