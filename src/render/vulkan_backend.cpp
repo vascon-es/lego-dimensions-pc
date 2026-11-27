@@ -3902,9 +3902,9 @@ u64 g_draws_late_texture = 0;
 // --pipeline-burst-wait permite esperar mais em diagnósticos de objetos faltando.
 double g_burst_wait_ms = 0.0;
 
-void WaitFramePipelines() {
+void WaitFramePipelines(double minimum_budget_ms = 0.0) {
     const auto start = std::chrono::steady_clock::now();
-    double budget = std::clamp(g_sync_budget_ms - g_frame_wait_spent_ms, 0.0, 16.0); // ate 1 frame
+    double budget = std::max(minimum_budget_ms, std::clamp(g_sync_budget_ms - g_frame_wait_spent_ms, 0.0, 16.0));
     g_frame_wait_spent_ms = 0;
     std::unordered_set<u64> pending;
     {
@@ -7770,6 +7770,8 @@ bool VulkanRenderer::SelftestDepthSamples() {
     for (auto& vertex : vertices) vertex.position[2] = 0.75f;
     if (!QueueGameDraw(draw) || !QueueDepthSampleDump(2, record)) return false;
 
+    // Mede a oclusão dos três desenhos mesmo com o cache frio e a compilação em segundo plano.
+    WaitFramePipelines(1000.0);
     return DrawFrame() && DrawFrame() && results[1] != ~0ull && results[1] > results[0] && results[2] == results[1];
 }
 
