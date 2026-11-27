@@ -392,7 +392,7 @@ bool g_pad_blocked = false;
 u32 g_pad_held_mask = 0;
 
 bool PadFocusGate() {
-    const bool allowed = g_background_pad || !videoout::WindowHandle() || videoout::WindowHasFocus();
+    const bool allowed = !videoout::ToypadOwnsInput() && (g_background_pad || !videoout::WindowHandle() || videoout::WindowHasFocus());
     if (allowed != g_pad_blocked) {
         return allowed; // sem mudanca (liberado e nao bloqueado, ou fora de foco e ja bloqueado)
     }
@@ -691,7 +691,7 @@ HLE_IMPL(int, scePadReadState, int handle, PadData* data, u64 guest_rbp) {
     if (PadMoved(in) && g_last_device.exchange(0) != 0) {
         log::Tagged("PAD", "t=%.1fs controller in use", Seconds());
     }
-    if (g_keyboard_player.load() == 0) {
+    if (pad_allowed && g_keyboard_player.load() == 0) {
         ReadKeyboard(in);
     }
     ReadScript(in);

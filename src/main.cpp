@@ -853,17 +853,24 @@ int SelfTest() {
         tp::RemoveIndex(5);
         check("Toy Pad: second copy of same tag gets new UID and remains same character", dup_ok && again && second_id == ids[0]);
 
-        // Test portal state persistence (save and restore)
-        const std::filesystem::path test_portal = std::filesystem::temp_directory_path() / "test_portal.json";
-        tp::Uid test_uid{4, 10, 20, 30, 40, 50, 60};
-        tp::LoadTag(1, 0, tp::BuildTag(test_uid, 42), std::string());
+        // Reabre os slots do catálogo, inclusive duas figuras na mesma zona e um veículo.
+        const auto test_portal = std::filesystem::temp_directory_path() /
+                                 ("lego_dimensions_portal_" + std::to_string(GetCurrentProcessId()) + ".json");
+        tp::LoadTag(2, 1, tp::BuildTag(uids[0], 42), {});
+        tp::LoadTag(2, 4, tp::BuildTag(uids[1], 77), {});
+        tp::LoadTag(3, 6, tp::BuildTag(uids[2], 1000), {});
         tp::SavePortalState(test_portal);
-        tp::RemoveIndex(0);
+        for (int slot : {1, 4, 6}) tp::RemoveIndex(slot);
         check("portal persistence: figures cleared", tp::PresentEvents().empty());
         tp::LoadPortalState(test_portal);
-        const auto restored = tp::PresentEvents();
-        bool persist_ok = restored.size() == 1;
-        tp::RemoveIndex(0);
+        const auto restored = tp::Slots();
+        const bool persist_ok = tp::PresentEvents().size() == 3 && restored[1].pad == 2 && restored[1].id == 42 &&
+                                restored[4].pad == 2 && restored[4].id == 77 && restored[6].pad == 3 && restored[6].id == 1000;
+        for (int slot : {1, 4, 6}) tp::RemoveIndex(slot);
+        tp::SavePortalState(test_portal);
+        tp::LoadTag(2, 1, tp::BuildTag(uids[0], 42), {});
+        tp::LoadPortalState(test_portal);
+        check("portal persistence: an empty Toy Pad stays empty", tp::PresentEvents().empty());
         std::error_code ec_tp;
         std::filesystem::remove(test_portal, ec_tp);
         check("portal persistence: slot state saved and restored accurately", persist_ok);

@@ -20,6 +20,7 @@ if %ERRORLEVEL% equ 0 (
     set "CC=cl.exe"
 )
 %CC% %FLAGS% "%~dp0launcher.cpp" /Fo"%OUT%\launcher.obj" /Fe"%OUT%\LegoDimensionsLauncher.exe" /link /SUBSYSTEM:WINDOWS /MANIFEST:EMBED "%OUT%\app.res" || exit /b 1
+%CC% %FLAGS% "%~dp0toypad_catalog.cpp" /Fo"%OUT%\toypad_catalog.obj" /Fe"%OUT%\LegoToypadCatalog.exe" /link /SUBSYSTEM:WINDOWS /MANIFEST:EMBED "%OUT%\app.res" || exit /b 1
 %CC% %FLAGS% "%~dp0transfer.cpp" /Fo"%OUT%\transfer.obj" /Fe"%OUT%\LD_PC_Transfer.exe" /link /SUBSYSTEM:WINDOWS /MANIFEST:EMBED "%OUT%\app.res" || exit /b 1
 %CC% %FLAGS% "%~dp0installer.cpp" /Fo"%OUT%\installer.obj" /Fe"%OUT%\installer_stub.exe" /link /SUBSYSTEM:WINDOWS /MANIFEST:EMBED "%OUT%\app.res" || exit /b 1
-echo OK: %OUT%\LegoDimensionsLauncher.exe, LD_PC_Transfer.exe e installer_stub.exe
+echo OK: %OUT%\LegoDimensionsLauncher.exe, LegoToypadCatalog.exe, LD_PC_Transfer.exe e installer_stub.exe

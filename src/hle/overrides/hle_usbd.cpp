@@ -479,6 +479,7 @@ void PortalWatcher() {
             continue;
         }
         const std::string json((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+        in.close(); // PlaceFigure e RemoveFigure podem substituir o arquivo no Windows.
         for (int pad = 1; pad <= toypad::kPadCount; ++pad) {
             const PadConfig wanted = ParsePad(json, pad);
             PadConfig& applied = g_applied[pad - 1];

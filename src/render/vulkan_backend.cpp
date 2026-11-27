@@ -3912,32 +3912,30 @@ void WaitFramePipelines() {
     const auto start = std::chrono::steady_clock::now();
     double budget = std::clamp(g_sync_budget_ms - g_frame_wait_spent_ms, 0.0, 16.0); // ate 1 frame
     g_frame_wait_spent_ms = 0;
-    bool first = true;
+    std::unordered_set<u64> pending;
+    {
+        const TimedLock lock(g.mutex);
+        for (const auto& draw : g.queue_game) {
+            if (!draw.pipeline && draw.pipeline_key && !g.game_pipelines.contains(draw.pipeline_key)) {
+                pending.insert(draw.pipeline_key);
+            }
+        }
+        if (!pending.empty() && g_burst_wait_ms > budget && pending.size() >= g_burst_threshold) {
+            budget = g_burst_wait_ms;
+            ++g_sync_stats.burst_frames;
+        }
+    }
+    const auto deadline = start + std::chrono::microseconds(static_cast<long long>(budget * 1000.0));
     bool waited = false;
-    for (;;) {
+    while (!pending.empty() && std::chrono::steady_clock::now() < deadline) {
         // Le a geracao antes da busca. A notificacao pode chegar entre a busca e o wait.
         const u64 seen = g_pipelines_delivered.load();
         {
             const TimedLock lock(g.mutex);
-            const auto missing = [](const auto& draw) {
-                return !draw.pipeline && draw.pipeline_key && !g.game_pipelines.contains(draw.pipeline_key);
-            };
-            if (std::ranges::none_of(g.queue_game, missing)) break;
-            if (first && g_burst_wait_ms > budget) {
-                std::unordered_set<u64> pending;
-                for (const auto& draw : g.queue_game) {
-                    if (missing(draw)) pending.insert(draw.pipeline_key);
-                    if (pending.size() >= g_burst_threshold) {
-                        budget = g_burst_wait_ms;
-                        ++g_sync_stats.burst_frames;
-                        break;
-                    }
-                }
-            }
+            // Varios draws compartilham o mesmo pipeline. Reconsulta so os que o frame ainda espera.
+            std::erase_if(pending, [](u64 key) { return g.game_pipelines.contains(key); });
         }
-        first = false;
-        const auto deadline = start + std::chrono::microseconds(static_cast<long long>(budget * 1000.0));
-        if (std::chrono::steady_clock::now() >= deadline) break;
+        if (pending.empty() || std::chrono::steady_clock::now() >= deadline) break;
         waited = true;
         std::unique_lock done_lock(g_pipeline_done_mutex);
         g_pipeline_done_cv.wait_until(done_lock, deadline, [&] { return g_pipelines_delivered.load() != seen; });

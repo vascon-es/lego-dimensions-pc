@@ -50,6 +50,7 @@
 
 #include <intrin.h>
 
+#include "common/toypad_catalog_protocol.h"
 #include "hle/overrides/hle_equeue.h"
 #include "hle/overrides/hle_filesystem.h"
 #include "hle/overrides/hle_override.h"
@@ -123,6 +124,7 @@ std::deque<PendingFlip> g_pending;
 FlipStatus g_status{};
 std::atomic<u64> g_flip_count{0};
 std::atomic<HWND> g_hwnd{nullptr};
+std::atomic<HWND> g_toypad_input_window{nullptr};
 const auto g_epoch = std::chrono::steady_clock::now();
 
 u64 NowMicros() {
@@ -2254,6 +2256,17 @@ namespace {
 
 LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
     switch (msg) {
+    case toypad_catalog::kOpenRequest: {
+        const HWND panel = reinterpret_cast<HWND>(wparam);
+        if (panel && panel == FindWindowW(toypad_catalog::kWindowClass, nullptr)) {
+            DWORD pid = 0;
+            GetWindowThreadProcessId(panel, &pid);
+            if (pid && !g_fullscreen && GetForegroundWindow() == hwnd) AllowSetForegroundWindow(pid);
+            g_toypad_input_window.store(panel, std::memory_order_relaxed);
+            PostMessageW(panel, toypad_catalog::kShowMessage, reinterpret_cast<WPARAM>(hwnd), g_fullscreen ? 1 : 0);
+        }
+        return 0;
+    }
     case WM_TIMER: {
         char title[224], warm[64];
         gnm::WarmupStatus(warm, sizeof(warm)); // Fase 36: "Compilando shaders: X / Y" enquanto aquece
@@ -2320,6 +2333,7 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
         return 0;
     }
     case WM_CHAR: // Fase 83: texto do chat (painel da rede ou chat direto da tecla C)
+        if (g_fullscreen && ToypadOwnsInput()) return 0;
         if (g_mp_chat_typing && (g_mp_panel_open.load() || runtime::multiplayer::Enabled())) {
             const char c = MpFoldChar(static_cast<unsigned char>(wparam));
             if (g_mp_chat_skip_c && (c == 'c' || c == 'C')) {
@@ -2332,6 +2346,12 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
         }
         break;
     case WM_KEYDOWN:
+        if (g_fullscreen && ToypadOwnsInput()) {
+            // O Toy Pad fica sobre o jogo em tela cheia sem tomar o foco do Windows.
+            const HWND panel = g_toypad_input_window.load(std::memory_order_relaxed);
+            if (panel) PostMessageW(panel, msg, wparam, lparam);
+            return 0;
+        }
         // 4.5: escrevendo no chat - painel F4 aberto ou a barra do chat direto (tecla C): as teclas sao do texto
         if (g_mp_chat_typing && (g_mp_panel_open.load() || runtime::multiplayer::Enabled())) {
             if (wparam == VK_RETURN) {
@@ -5203,6 +5223,14 @@ void* WindowHandle() {
 bool WindowHasFocus() {
     const HWND hwnd = g_hwnd.load();
     return hwnd && GetForegroundWindow() == hwnd;
+}
+
+bool ToypadOwnsInput() {
+    HWND panel = g_toypad_input_window.load(std::memory_order_relaxed);
+    if (!panel) return false;
+    if (const HWND game = g_hwnd.load(); game && GetPropW(panel, toypad_catalog::kInputOwnerProperty) == game) return true;
+    if (!IsWindow(panel)) g_toypad_input_window.compare_exchange_strong(panel, nullptr, std::memory_order_relaxed);
+    return false;
 }
 
 } // namespace hle::videoout

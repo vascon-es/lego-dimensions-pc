@@ -57,6 +57,8 @@ std::optional<Packet> LoadTag(int pad, int index, const TagData& tag, const std:
 std::optional<Packet> RemoveIndex(int index);
 std::vector<Packet> MoveIndex(int new_pad, int new_index, int old_index); // remocao + colocacao
 std::vector<Packet> PresentEvents();                                      // "colocada" de tudo o que esta no portal
+struct SlotInfo { int pad; u32 id; };
+std::array<SlotInfo, kSlotCount> Slots();
 // Id do personagem / veiculo guardado numa tag (0 se nao der para ler).
 u32 TagCharacterId(const TagData& tag);
 // Fase 60: estado dos LEDs no formato v2 do GET_LED (o do listener do Cemu "Remote Toypad", que o app

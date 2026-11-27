@@ -26,6 +26,7 @@
 #include <vector>
 
 #include "hle/overrides/hle_toypad.h"
+#include "common/toypad_catalog_protocol.h"
 
 #pragma comment(lib, "ws2_32.lib")
 
@@ -47,6 +48,24 @@ bool RecvAll(SOCKET s, void* buffer, int length) {
             return false;
         }
         done += n;
+    }
+    return true;
+}
+
+bool SendSnapshot(SOCKET s) {
+    static_assert(toypad_catalog::kSlots == toypad::kSlotCount);
+    toypad_catalog::Snapshot snapshot{'T', 1};
+    const auto slots = toypad::Slots();
+    for (int i = 0; i < toypad::kSlotCount; ++i) {
+        auto* out = snapshot.data() + 2 + i * 5;
+        out[0] = static_cast<u8>(slots[i].pad);
+        toypad_catalog::WriteId(out + 1, slots[i].id);
+    }
+    for (int offset = 0; offset < static_cast<int>(snapshot.size());) {
+        const int n = send(s, reinterpret_cast<const char*>(snapshot.data()) + offset,
+                           static_cast<int>(snapshot.size()) - offset, 0);
+        if (n <= 0) return false;
+        offset += n;
     }
     return true;
 }
@@ -73,6 +92,7 @@ bool HandleCommand(SOCKET s) {
     }
     const u8 cmd = header[0], pad = header[1], index = header[2];
     ++g_requests;
+    if (cmd == toypad_catalog::kSnapshot) return SendSnapshot(s);
     if (cmd == 4) { // GET_LED
         u8 snapshot[toypad::kLedSnapshotBytes];
         toypad::LedSnapshot(snapshot);
@@ -85,6 +105,23 @@ bool HandleCommand(SOCKET s) {
     }
     TakeToypadExternalControl();
     switch (cmd) {
+    case toypad_catalog::kSelect: {
+        u8 bytes[4];
+        if (!RecvAll(s, bytes, sizeof(bytes))) return false;
+        const u32 id = toypad_catalog::ReadId(bytes);
+        if (id > 65535) return false;
+        const auto before = toypad::Slots()[index];
+        if (before.id == id && (id == 0 || before.pad == pad)) return true;
+        if (const auto removed = toypad::RemoveIndex(index)) {
+            Announce({*removed});
+            if (id) std::this_thread::sleep_for(kPickupDelay);
+        }
+        if (id) {
+            const toypad::Uid uid{4, 0x4c, 0x50, index, static_cast<u8>(id), static_cast<u8>(id >> 8), 0x80};
+            if (const auto added = toypad::LoadTag(pad, index, toypad::BuildTag(uid, id), {})) Announce({*added});
+        }
+        break;
+    }
     case 1: { // LOAD
         toypad::TagData tag{};
         u8 length_bytes[2];

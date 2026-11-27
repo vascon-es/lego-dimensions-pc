@@ -2047,7 +2047,6 @@ int TextureThreadCount() {
 // um teto) enquanto as threads leem e destilam em paralelo. Antes o draw sumia por alguns frames
 // (pop-in: 1157 draws em 2 minutos de Vorton).
 bool g_tex_wait_frame = true;
-double g_tex_wait_cap_ms = 50.0;
 u64 g_tex_pending_key = 0;                   // chave da ultima textura que EnsureGuestTexture deixou pendente
 std::unordered_set<u64> g_tex_frame_waiting; // texturas pendentes de draws deste frame (thread de render)
 u64 g_tex_wait_frames = 0, g_tex_wait_textures = 0;
@@ -2322,13 +2321,14 @@ double WaitFrameTextures() {
     const auto start = std::chrono::steady_clock::now();
     static const double wait_ms = [] {
         const char* env = std::getenv("LD_TEX_WAIT_MS");
-        return env ? std::max(0.0, std::atof(env)) : 12.0;
+        const double value = env ? std::atof(env) : 2.5;
+        return std::isfinite(value) ? std::clamp(value, 0.0, 50.0) : 2.5;
     }();
-    const double cap_ms = g_tex_wait_cap_ms != 50.0 ? g_tex_wait_cap_ms : wait_ms;
-    const auto deadline = start + std::chrono::microseconds(static_cast<long long>(cap_ms * 1000.0));
+    const auto deadline = start + std::chrono::microseconds(static_cast<long long>(wait_ms * 1000.0));
     g_tex_wait_textures += g_tex_frame_waiting.size();
-    for (;;) {
-        DrainTextureResults(1e9);
+    while (std::chrono::steady_clock::now() < deadline) {
+        const double remaining = std::chrono::duration<double, std::milli>(deadline - std::chrono::steady_clock::now()).count();
+        DrainTextureResults(remaining);
         for (auto it = g_tex_frame_waiting.begin(); it != g_tex_frame_waiting.end();) {
             it = (renderer.HasTexture(*it) && !g_tex_replacing.count(*it)) || g_tex_failed.count(*it) ? g_tex_frame_waiting.erase(it)
                                                                                                      : std::next(it);
@@ -2336,22 +2336,8 @@ double WaitFrameTextures() {
         if (g_tex_frame_waiting.empty() || std::chrono::steady_clock::now() >= deadline) {
             break;
         }
-        if (g_tex_parallel) { // Fase 59: em vez de so esperar, a thread de render destila tambem
-            TextureJob job;
-            bool got = false;
-            {
-                std::lock_guard lock(g_tex_mutex);
-                if (!g_tex_jobs.empty()) {
-                    job = std::move(g_tex_jobs.front());
-                    g_tex_jobs.pop_front();
-                    got = true;
-                }
-            }
-            if (got) {
-                RunTextureJob(job);
-                continue;
-            }
-        }
+        // Um trabalho inteiro de leitura e destilacao pode ultrapassar o teto.
+        // Os workers continuam a prepara-lo enquanto a renderizacao segue.
         std::unique_lock lock(g_tex_mutex);
         g_tex_done_cv.wait_until(lock, deadline, [] { return !g_tex_done.empty(); });
     }
@@ -2368,7 +2354,7 @@ double WaitFrameTextures() {
 void DrainTextureResults(double budget_ms) {
     const auto start = std::chrono::steady_clock::now();
     auto& renderer = render::VulkanRenderer::Instance();
-    for (;;) {
+    while (std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count() < budget_ms) {
         TextureJob job;
         {
             std::lock_guard lock(g_tex_mutex);
@@ -2397,9 +2383,6 @@ void DrainTextureResults(double budget_ms) {
             g_tex_failed.insert(job.key);
         }
         g_tex_requested.erase(job.key);
-        if (std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count() >= budget_ms) {
-            return;
-        }
     }
 }
 
@@ -6774,9 +6757,10 @@ void RunFrameEnd(u32 buffer_index) {
         end_lap(0);
         renderer.WaitPreviousFrame();
         end_lap(1);
-        renderer.NoteFrameWait(WaitFrameTextures()); // Fase 45: texturas pendentes dos draws deste frame
+        const double texture_wait = WaitFrameTextures(); // texturas pendentes dos draws deste frame
+        renderer.NoteFrameWait(texture_wait);
         end_lap(2);
-        DrainTextureResults(8.0); // Fase 39: o envio agora e so uma copia para o staging do frame
+        DrainTextureResults(std::max(0.0, 2.5 - texture_wait));
         end_lap(3);
         videoout::QueueStatsOverlay(); // Fase 65: contador de FPS / info por cima do quadro
         {

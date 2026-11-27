@@ -11,9 +11,11 @@
 #define UNICODE
 #define _UNICODE
 #include "ui.h"
+#include "pad_hid.h"
 #include "../../src/common/game_region.h"
 #include "../../src/common/nu_font.h"
 #include "../../src/common/toypad_process.h"
+#include "../../src/common/toypad_catalog_protocol.h"
 #include "../../src/common/trophy_sound_player.h"
 #include "../../src/hle/trophy_defs.h"
 #include "../../src/hle/trophy_trp.h" // 3.0: icones das conquistas do jogo do jogador
@@ -26,8 +28,6 @@
 
 #include <tlhelp32.h>
 #include <xinput.h>
-#include <hidsdi.h>
-#include <setupapi.h>
 #include <winhttp.h>
 #include <bcrypt.h>
 
@@ -42,7 +42,9 @@
 #include <fstream>
 #include <functional>
 #include <memory>
+#include <sstream>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <vector>
 
@@ -51,8 +53,6 @@
 #pragma comment(lib, "shell32.lib")
 #pragma comment(lib, "gdi32.lib")
 #pragma comment(lib, "user32.lib")
-#pragma comment(lib, "hid.lib")
-#pragma comment(lib, "setupapi.lib")
 #pragma comment(lib, "winhttp.lib")
 #pragma comment(lib, "winmm.lib")
 #pragma comment(lib, "bcrypt.lib")
@@ -177,6 +177,7 @@ struct Status {
 // As pastas e as opcoes (launcher.ini)
 std::wstring g_game_dir, g_patch_dir, g_dlc_dir;
 bool g_opt_fps = true, g_opt_console = false, g_opt_fullscreen = false, g_opt_skip = false, g_opt_overlay = false, g_opt_toypad = false;
+bool g_toypad_catalog = false;
 // 4.0 (Fase 79): multiplayer online. Desligado por padrao: sem isso o jogo nao recebe nenhuma opcao --mp-*.
 bool g_opt_mp = false;
 void WakeMpServer(); // 4.0 (abaixo)
@@ -313,8 +314,10 @@ int CountDlcs(const fs::path& dir) {
     if (dir.empty() || !fs::is_directory(dir, ec)) {
         return 0;
     }
-    for (fs::directory_iterator it(dir, ec), end; !ec && it != end; it.increment(ec)) {
-        n += fs::is_regular_file(it->path() / L"sce_sys" / L"param.sfo", ec);
+    for (fs::directory_iterator it(dir, fs::directory_options::skip_permission_denied, ec), end;
+         !ec && it != end; it.increment(ec)) {
+        std::error_code status_ec;
+        n += fs::is_regular_file(it->path() / L"sce_sys" / L"param.sfo", status_ec);
     }
     return n;
 }
@@ -454,6 +457,7 @@ void SaveSettings() {
     WriteIni(L"pularcenas", g_opt_skip ? L"1" : L"0");
     WriteIni(L"contador", g_opt_overlay ? L"1" : L"0"); // Fase 65
     WriteIni(L"toypad_auto", g_opt_toypad ? L"1" : L"0");
+    WriteIni(L"toypad_interface", g_toypad_catalog ? L"catalogo" : L"classico");
     WriteIni(L"multiplayer", g_opt_mp ? L"1" : L"0"); // 4.0
     WriteIni(L"mp_servidor", g_mp_server);
     WriteIni(L"mp_sala", g_mp_room);
@@ -1156,8 +1160,16 @@ std::string WideToUtf8(const std::wstring& text) {
 std::vector<std::wstring> ReadPlayerNames() {
     std::vector<std::wstring> names(kPlayers);
     std::ifstream in(g_root / L"jogadores.txt", std::ios::binary);
+    // Todo o arquivo normal cabe em poucas centenas de bytes. Arquivos indevidos nao
+    // podem alocar uma linha arbitrariamente grande ao entrar nas Configuracoes.
+    char bytes[4096];
+    in.read(bytes, sizeof(bytes));
+    std::string_view lines(bytes, static_cast<size_t>(in.gcount()));
     std::string line;
-    for (int i = 0; i < kPlayers && std::getline(in, line); ++i) {
+    for (int i = 0; i < kPlayers && !lines.empty(); ++i) {
+        const size_t end = lines.find('\n');
+        line = lines.substr(0, end);
+        lines.remove_prefix(end == std::string_view::npos ? lines.size() : end + 1);
         if (i == 0 && line.rfind("\xEF\xBB\xBF", 0) == 0) {
             line.erase(0, 3); // BOM do Bloco de Notas
         }
@@ -1751,8 +1763,10 @@ fs::path FindLegoToypadExe() {
         }
     }
     for (fs::directory_iterator it(g_root / L"tools", ec), end; !ec && it != end; it.increment(ec)) {
-        if (it->is_regular_file(ec)) {
+        std::error_code status_ec;
+        if (it->is_regular_file(status_ec)) {
             const std::wstring name = it->path().filename().wstring();
+            if (_wcsicmp(name.c_str(), L"LegoToypadCatalog.exe") == 0) continue;
             if (name.rfind(L"LegoToypad", 0) == 0 && name.size() >= 4 && name.substr(name.size() - 4) == L".exe") {
                 return it->path();
             }
@@ -1762,6 +1776,31 @@ fs::path FindLegoToypadExe() {
 }
 
 void LaunchLegoToypad(bool notify_if_running) {
+    if (g_toypad_catalog) {
+        if (HWND panel = FindWindowW(toypad_catalog::kWindowClass, nullptr)) {
+            if (notify_if_running) PostMessageW(panel, toypad_catalog::kShowMessage, 0, 0);
+            return;
+        }
+        if (toypad_proc::IsRunning()) {
+            if (notify_if_running) MessageBoxW(g_main,
+                ui::T(L"Feche o Toy Pad clássico antes de abrir o catálogo.", L"Close the classic Toy Pad before opening the catalog."),
+                L"Toy Pad", MB_ICONINFORMATION);
+            return;
+        }
+        const fs::path catalog = g_root / L"tools" / L"LegoToypadCatalog.exe";
+        std::wstring command = Quote(catalog.wstring());
+        if (!notify_if_running) command += L" --background";
+        STARTUPINFOW si{sizeof(si)};
+        PROCESS_INFORMATION pi{};
+        if (CreateProcessW(catalog.c_str(), command.data(), nullptr, nullptr, FALSE, 0, nullptr, g_root.c_str(), &si, &pi)) {
+            CloseHandle(pi.hThread);
+            CloseHandle(pi.hProcess);
+            AppendLog(ui::T(L"Catálogo do Toy Pad disponível em Select ou Ctrl+L.", L"Toy Pad catalog available on Back or Ctrl+L."));
+        } else {
+            AppendLog(ui::T(L"Não foi possível abrir o catálogo do Toy Pad.", L"Could not open the Toy Pad catalog."));
+        }
+        return;
+    }
     if (toypad_proc::IsRunning()) {
         if (notify_if_running) {
             MessageBoxW(g_main, ui::T(L"O LegoToypad já está em execução.", L"LegoToypad is already running."), L"LEGO Dimensions PC", MB_ICONINFORMATION);
@@ -1932,6 +1971,7 @@ void SyncLegoToypadState() {
         g_toypad_api_restored = false;
         return;
     }
+    if (toypad_proc::IsExeRunning(L"LegoToypadCatalog.exe")) return; // o catalogo le o estado direto do jogo
 
     const std::string state = ToypadHttpGet(8765, L"/api/state");
     if (state.empty()) return;
@@ -2025,11 +2065,16 @@ int GetUnlockedTrophiesCount() {
     }
     // Fallback: parse XML
     const auto xml_path = g_root / L"assets" / L"trophy" / L"NPWR07423_00.xml";
-    std::ifstream xml(xml_path);
-    if (xml) {
+    std::error_code ec;
+    const auto size = fs::file_size(xml_path, ec);
+    if (!ec && size <= 1024 * 1024) {
+        std::ifstream xml(xml_path, std::ios::binary);
+        std::string contents(static_cast<size_t>(size), '\0');
+        if (!xml.read(contents.data(), static_cast<std::streamsize>(contents.size()))) return 0;
+        std::istringstream rows(std::move(contents));
         std::string line;
         int unlocked = 0;
-        while (std::getline(xml, line)) {
+        while (unlocked < 78 && std::getline(rows, line)) {
             if (line.find("<trophy id=\"") != std::string::npos && line.find("unlockstate=\"true\"") != std::string::npos) {
                 unlocked++;
             }
@@ -2417,8 +2462,13 @@ bool ParseLegoFont(const std::vector<BYTE>& data, LegoFont* font) {
 void LoadLegoFont() {
     g_lego.reset();
     for (auto& atlas : g_lego_atlas) atlas.reset();
-    std::ifstream in(g_root / L"assets" / L"launcher" / L"font.ft2", std::ios::binary);
-    const std::vector<BYTE> data((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+    const auto path = g_root / L"assets" / L"launcher" / L"font.ft2";
+    std::error_code ec;
+    const auto size = fs::file_size(path, ec);
+    if (ec || size > 4 * 1024 * 1024) return;
+    std::ifstream in(path, std::ios::binary);
+    std::vector<BYTE> data(static_cast<size_t>(size));
+    if (!in.read(reinterpret_cast<char*>(data.data()), static_cast<std::streamsize>(data.size()))) return;
     auto font = std::make_unique<LegoFont>();
     if (!ParseLegoFont(data, font.get())) {
         return;
@@ -2579,11 +2629,13 @@ std::vector<std::wstring> ReadPlayerNames();
 std::vector<std::wstring> SaveFolders() {
     std::vector<std::wstring> folders{L"savedata0"};
     std::error_code ec;
-    for (fs::directory_iterator it(g_root / L"assets", ec), end; !ec && it != end; it.increment(ec)) {
+    for (fs::directory_iterator it(g_root / L"assets", fs::directory_options::skip_permission_denied, ec), end;
+         !ec && it != end; it.increment(ec)) {
         const std::wstring name = it->path().filename().wstring();
+        std::error_code status_ec;
         if (name.rfind(L"savedata", 0) == 0 && name != L"savedata0" && name.find(L"teste") == std::wstring::npos &&
             name.find(L"bench") == std::wstring::npos && name.find(L"backup") == std::wstring::npos &&
-            fs::is_directory(it->path() / L"Slot00", ec)) {
+            fs::is_directory(it->path() / L"Slot00", status_ec)) {
             folders.push_back(name);
         }
     }
@@ -2591,10 +2643,34 @@ std::vector<std::wstring> SaveFolders() {
 }
 
 std::wstring SaveFolderLabel(const std::wstring& folder) {
-    if (folder == L"savedata0") return ui::T(L"Os seus", L"Your saves");
+    if (folder.size() <= 8 || folder.rfind(L"savedata", 0) != 0 || folder == L"savedata0")
+        return ui::T(L"Os seus", L"Your saves");
     std::wstring label = folder.substr(8);
     while (!label.empty() && (label.front() == L'_' || label.front() == L'-')) label.erase(label.begin());
     return label == L"100" ? std::wstring(L"Save 100%") : label;
+}
+
+struct SettingsData {
+    std::vector<std::wstring> saves{L"savedata0"};
+    std::wstring player_names;
+    int dlcs = 0;
+    int trophies = 0;
+};
+
+SettingsData g_settings_data;
+
+void RefreshSettingsData() {
+    if (g_self_test) return;
+    SettingsData data;
+    data.saves = SaveFolders();
+    data.dlcs = CountDlcs(g_dlc_dir);
+    data.trophies = GetUnlockedTrophiesCount();
+    for (const auto& name : ReadPlayerNames()) {
+        if (name.empty()) continue;
+        if (!data.player_names.empty()) data.player_names += L", ";
+        data.player_names += name;
+    }
+    g_settings_data = std::move(data);
 }
 
 std::vector<Row> Rows() {
@@ -2612,12 +2688,12 @@ std::vector<Row> Rows() {
     rows.push_back({kTabFiles, RowKind::kFolder, ui::T(L"Pasta da atualização", L"Update folder"),
                     ui::T(L"Só se a 1.24 estiver separada (CUSA01176-patch).", L"Only if the 1.24 update is separate (CUSA01176-patch)."),
                     g_patch_dir.empty() ? ui::T(L"Nenhuma / junto do jogo", L"None / included in the game") : g_patch_dir, [](int) { BrowsePatch(); }});
-    const int dlcs = CountDlcs(g_dlc_dir);
+    const int dlcs = g_settings_data.dlcs;
     rows.push_back({kTabFiles, RowKind::kFolder, ui::T(L"Pasta das DLCs", L"DLC folder"),
                     dlcs ? std::to_wstring(dlcs) + ui::T(L" DLCs encontradas. Enter: escolher.", L" DLCs found. Enter: choose.")
                          : ui::T(L"Uma subpasta por DLC (formato addcont do shadPS4).", L"One subfolder per DLC (shadPS4 addcont layout)."),
                     g_dlc_dir.empty() ? ui::T(L"Nenhuma", L"None") : g_dlc_dir, [](int) { BrowseDlc(); }});
-    if (const auto folders = SaveFolders(); folders.size() > 1) {
+    if (const auto& folders = g_settings_data.saves; folders.size() > 1) {
         rows.push_back({kTabFiles, RowKind::kChoice, L"Saves",
                         ui::T(L"Outra pasta em assets\\ (ex. um save 100%). A dos seus saves n\u00e3o muda.",
                               L"Another folder in assets\\ (e.g. a 100% save). Your own saves stay as they are."),
@@ -2733,7 +2809,17 @@ std::vector<Row> Rows() {
                     ui::T(L"Qualquer cutscene pode ser pulada, mesmo sem 100%.", L"Any cutscene can be skipped, even without 100%."), OnOff(g_opt_skip),
                     toggle(g_opt_skip)});
     rows.push_back({kTabGame, RowKind::kChoice, ui::T(L"Abrir o LegoToypad com o jogo", L"Start LegoToypad with the game"),
-                    ui::T(L"O portal na tela (tools\\LegoToypad.exe).", L"The on-screen portal (tools\\LegoToypad.exe)."), OnOff(g_opt_toypad), toggle(g_opt_toypad)});
+                    ui::T(L"Abre a interface escolhida abaixo.", L"Starts the interface selected below."), OnOff(g_opt_toypad), toggle(g_opt_toypad)});
+    rows.push_back({kTabGame, RowKind::kChoice, ui::T(L"Interface do Toy Pad", L"Toy Pad interface"),
+                    ui::T(L"No catálogo, Select ou Ctrl+L nas partidas.", L"In catalog mode, press Back or Ctrl+L in game."),
+                    g_toypad_catalog ? ui::T(L"Catálogo", L"Catalog") : ui::T(L"Clássica", L"Classic"), [](int) {
+                        g_toypad_catalog = !g_toypad_catalog;
+                        if (!g_toypad_catalog) {
+                            if (HWND panel = FindWindowW(toypad_catalog::kWindowClass, nullptr))
+                                PostMessageW(panel, WM_CLOSE, 0, 0);
+                        }
+                        SaveSettings();
+                    }});
     rows.push_back({kTabGame, RowKind::kChoice, ui::T(L"Multiplayer online (alfa)", L"Online multiplayer (alpha)"),
                     ui::T(L"Amigos da mesma sala aparecem no seu jogo. Desligado: nada muda.",
                           L"Friends in the same room show up in your game. Off: nothing changes."),
@@ -2745,15 +2831,12 @@ std::vector<Row> Rows() {
     rows.push_back({kTabGame, RowKind::kAction, ui::T(L"Sala do multiplayer", L"Multiplayer room"),
                     ui::T(L"Código da sala, seu nome e o servidor. Enter: editar.", L"Room code, your name and the server. Enter: edit."),
                     g_mp_room.empty() ? ui::T(L"Nenhuma", L"None") : g_mp_room, [](int) { OpenMpDialog(); }});
-    std::wstring names;
-    for (const std::wstring& name : ReadPlayerNames()) {
-        if (!name.empty()) names += (names.empty() ? L"" : L", ") + name;
-    }
+    const auto& names = g_settings_data.player_names;
     rows.push_back({kTabGame, RowKind::kAction, ui::T(L"Apelidos dos jogadores", L"Player nicknames"),
                     ui::T(L"O nome no lugar de Player1, Player2... Enter: editar.", L"The name shown instead of Player1, Player2... Enter: edit."),
                     names.empty() ? ui::T(L"Padrão", L"Default") : names, [](int) { OpenNamesDialog(); }});
     // Conquistas
-    const int unlocked_cnt = GetUnlockedTrophiesCount();
+    const int unlocked_cnt = g_settings_data.trophies;
     const int pct_cnt = (unlocked_cnt * 100) / 78;
     std::wstring progress_str = std::to_wstring(unlocked_cnt) + L" / 78 (" + std::to_wstring(pct_cnt) + L"%)";
     rows.push_back({kTabTrophies, RowKind::kAction, ui::T(L"Progresso geral", L"Overall progress"),
@@ -3122,19 +3205,20 @@ void Paint(Gdiplus::Graphics& g, int width, int height) {
             if (rows[i].tab == g_tab) tab_rows.push_back(i);
         }
         const float row_spacing = tab_rows.size() > 5 ? (280.0f / float(tab_rows.size())) : 58.0f;
+        const bool compact = row_spacing < 40.0f;
         float ry = kBar + 176;
         for (size_t idx : tab_rows) {
             const Row& row = rows[idx];
             const int id = kHotRow0 + int(idx);
             const bool lit = g_focus == id || g_hover == id || g_hover == kHotLeft0 + int(idx) || g_hover == kHotRight0 + int(idx);
-            LegoText(g, row.label, float(S(left + 8 + (lit ? 4 : 0))), float(S(ry + 2)), 24.0f, kTintWhite);
-            PlainText(g, row.hint, U(left + 10, ry + 28, 470, 18), 11.5f, ui::kMuted);
+            LegoText(g, row.label, float(S(left + 8 + (lit ? 4 : 0))), float(S(ry + 2)), compact ? 21.0f : 24.0f, kTintWhite);
+            PlainText(g, row.hint, U(left + 10, ry + (compact ? 22 : 28), 470, compact ? 13 : 18), 11.5f, ui::kMuted);
             g_spots.push_back({U(left - 10, ry - 4, 812, std::min(54.0f, row_spacing)), id});
             if (row.kind == RowKind::kChoice) {
                 const float vw = LegoTextWidth(g, row.value, 22.0f) / ui::g_scale;
                 LegoText(g, row.value, float(S(727 - vw / 2)), float(S(ry + 9)), 22.0f, kTintYellow);
                 for (int side = 0; side < 2; ++side) {
-                    const Gdiplus::RectF arrow = U(side ? 830 : 594, ry + 6, 30, 34);
+                    const Gdiplus::RectF arrow = U(side ? 830 : 594, ry + 4, 30, std::min(34.0f, row_spacing - 8));
                     const bool hot = g_hover == (side ? kHotRight0 : kHotLeft0) + int(idx);
                     Gdiplus::SolidBrush brush(ui::C(hot || lit ? ui::kAccent : ui::kMuted));
                     const float cx = arrow.X + arrow.Width / 2, cy = arrow.Y + arrow.Height / 2, r = float(S(6));
@@ -3413,6 +3497,7 @@ void LeaveSettings() {
 void Activate(int id) {
     if (!Enabled(id)) {
         if (id == kHotPlay && !g_busy) { // sem o jogo: vai direto escolher a pasta
+            RefreshSettingsData();
             g_screen = Screen::kSettings;
             g_tab = kTabFiles;
             g_focus = kHotRow0;
@@ -3431,6 +3516,7 @@ void Activate(int id) {
         const std::vector<Row> rows = Rows();
         if (index < int(rows.size())) {
             rows[index].change(id >= kHotRight0 ? 1 : id >= kHotLeft0 ? -1 : 0);
+            if (rows[index].tab == kTabFiles || rows[index].kind == RowKind::kAction) RefreshSettingsData();
             g_focus = kHotRow0 + index;
         }
         Redraw();
@@ -3444,6 +3530,7 @@ void Activate(int id) {
     case kHotShaders: AskShaders(); break;
     case kHotPrepare: AskPrepare(); break;
     case kHotSettings:
+        RefreshSettingsData();
         g_screen = Screen::kSettings;
         g_focus = kHotTabs;
         g_lang_at_start = g_lang_value;
@@ -3466,6 +3553,7 @@ void Cycle(int step) {
         const std::vector<Row> rows = Rows();
         if (index < int(rows.size()) && rows[index].kind == RowKind::kChoice) {
             rows[index].change(step);
+            if (rows[index].tab == kTabFiles) RefreshSettingsData();
         }
     }
     Redraw();
@@ -3496,7 +3584,7 @@ ULONGLONG g_pad_repeat_at = 0;
 using XInputGetStateFn = DWORD(WINAPI*)(DWORD, XINPUT_STATE*);
 XInputGetStateFn g_xinput_get_state = nullptr;
 
-void SonyPadThread();
+std::atomic<XINPUT_GAMEPAD> g_sony_pad{};
 
 void LoadXInput() {
     for (const wchar_t* dll : {L"xinput1_4.dll", L"xinput1_3.dll", L"xinput9_1_0.dll"}) {
@@ -3507,107 +3595,7 @@ void LoadXInput() {
             }
         }
     }
-    std::thread(SonyPadThread).detach();
-}
-
-// DualShock 4 / DualSense: o relatorio de entrada lido numa thread, convertido para os bits do XInput.
-std::atomic<WORD> g_sony_buttons{0};
-std::atomic<SHORT> g_sony_lx{0}, g_sony_ly{0};
-
-HANDLE OpenSonyPad(bool* dualsense, DWORD* report_bytes) {
-    GUID hid_guid;
-    HidD_GetHidGuid(&hid_guid);
-    HDEVINFO devices = SetupDiGetClassDevsW(&hid_guid, nullptr, nullptr, DIGCF_PRESENT | DIGCF_DEVICEINTERFACE);
-    if (devices == INVALID_HANDLE_VALUE) {
-        return INVALID_HANDLE_VALUE;
-    }
-    HANDLE found = INVALID_HANDLE_VALUE;
-    SP_DEVICE_INTERFACE_DATA iface{sizeof(iface)};
-    for (DWORD i = 0; found == INVALID_HANDLE_VALUE && SetupDiEnumDeviceInterfaces(devices, nullptr, &hid_guid, i, &iface); ++i) {
-        DWORD size = 0;
-        SetupDiGetDeviceInterfaceDetailW(devices, &iface, nullptr, 0, &size, nullptr);
-        std::vector<BYTE> storage(size);
-        auto* detail = reinterpret_cast<SP_DEVICE_INTERFACE_DETAIL_DATA_W*>(storage.data());
-        detail->cbSize = sizeof(SP_DEVICE_INTERFACE_DETAIL_DATA_W);
-        if (!SetupDiGetDeviceInterfaceDetailW(devices, &iface, detail, size, nullptr, nullptr)) {
-            continue;
-        }
-        HANDLE device = CreateFileW(detail->DevicePath, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING, 0, nullptr);
-        if (device == INVALID_HANDLE_VALUE) {
-            continue;
-        }
-        HIDD_ATTRIBUTES attributes{sizeof(attributes)};
-        const USHORT pid = HidD_GetAttributes(device, &attributes) && attributes.VendorID == 0x054C ? attributes.ProductID : 0;
-        PHIDP_PREPARSED_DATA preparsed = nullptr;
-        HIDP_CAPS caps{};
-        const bool gamepad = pid && HidD_GetPreparsedData(device, &preparsed) && HidP_GetCaps(preparsed, &caps) == HIDP_STATUS_SUCCESS &&
-                             caps.UsagePage == 0x01 && caps.Usage == 0x05;
-        if (preparsed) {
-            HidD_FreePreparsedData(preparsed);
-        }
-        // DualShock 4 (1a e 2a versao, adaptador sem fio), DualSense e DualSense Edge
-        if (gamepad && (pid == 0x05C4 || pid == 0x09CC || pid == 0x0BA0 || pid == 0x0CE6 || pid == 0x0DF2)) {
-            *dualsense = pid == 0x0CE6 || pid == 0x0DF2;
-            *report_bytes = caps.InputReportByteLength;
-            found = device;
-        } else {
-            CloseHandle(device);
-        }
-    }
-    SetupDiDestroyDeviceInfoList(devices);
-    return found;
-}
-
-// USB: 0x01 (DualSense: botoes no byte 8; DualShock 4 e o relatorio simples do Bluetooth: byte 5).
-// Bluetooth completo: 0x11 do DualShock 4 (+2 bytes) e 0x31 do DualSense (+1 byte).
-void ParseSonyReport(const BYTE* r, DWORD n, bool dualsense) {
-    size_t stick = 0, buttons = 0;
-    if (r[0] == 0x01 && n >= 10) {
-        stick = 1;
-        buttons = dualsense && n >= 64 ? 8 : 5;
-    } else if (r[0] == 0x11 && !dualsense && n >= 10) {
-        stick = 3;
-        buttons = 7;
-    } else if (r[0] == 0x31 && dualsense && n >= 12) {
-        stick = 2;
-        buttons = 9;
-    } else {
-        return;
-    }
-    static const WORD kHat[8] = {XINPUT_GAMEPAD_DPAD_UP, XINPUT_GAMEPAD_DPAD_UP | XINPUT_GAMEPAD_DPAD_RIGHT, XINPUT_GAMEPAD_DPAD_RIGHT,
-                                 XINPUT_GAMEPAD_DPAD_DOWN | XINPUT_GAMEPAD_DPAD_RIGHT, XINPUT_GAMEPAD_DPAD_DOWN,
-                                 XINPUT_GAMEPAD_DPAD_DOWN | XINPUT_GAMEPAD_DPAD_LEFT, XINPUT_GAMEPAD_DPAD_LEFT,
-                                 XINPUT_GAMEPAD_DPAD_UP | XINPUT_GAMEPAD_DPAD_LEFT};
-    const BYTE face = r[buttons];
-    WORD out = (face & 0x0F) < 8 ? kHat[face & 0x0F] : 0;
-    if (face & 0x20) out |= XINPUT_GAMEPAD_A;     // cruz
-    if (face & 0x40) out |= XINPUT_GAMEPAD_B;     // circulo
-    if (r[buttons + 1] & 0x20) out |= XINPUT_GAMEPAD_START; // options
-    if (r[buttons + 1] & 0x01) out |= XINPUT_GAMEPAD_LEFT_SHOULDER;  // L1: aba anterior nas Configuracoes
-    if (r[buttons + 1] & 0x02) out |= XINPUT_GAMEPAD_RIGHT_SHOULDER; // R1: proxima aba
-    g_sony_buttons = out;
-    g_sony_lx = static_cast<SHORT>((r[stick] - 128) * 256);
-    g_sony_ly = static_cast<SHORT>((128 - r[stick + 1]) * 256); // no HID o Y cresce para baixo
-}
-
-void SonyPadThread() {
-    for (;;) {
-        bool dualsense = false;
-        DWORD bytes = 0;
-        HANDLE device = OpenSonyPad(&dualsense, &bytes);
-        if (device == INVALID_HANDLE_VALUE) {
-            Sleep(2000);
-            continue;
-        }
-        std::vector<BYTE> report(std::max<DWORD>(bytes, 64));
-        DWORD got = 0;
-        while (ReadFile(device, report.data(), static_cast<DWORD>(report.size()), &got, nullptr)) {
-            ParseSonyReport(report.data(), got, dualsense);
-        }
-        CloseHandle(device); // desconectou
-        g_sony_buttons = 0;
-        g_sony_lx = g_sony_ly = 0;
-    }
+    std::thread(pad_hid::Read, &g_sony_pad).detach();
 }
 
 void PadKey(WORD vk) {
@@ -3680,6 +3668,7 @@ void LoadSettings() {
     g_opt_console = ReadIni(L"console", L"0") == L"1";
     g_opt_skip = ReadIni(L"pularcenas", L"0") == L"1";
     g_opt_toypad = ReadIni(L"toypad_auto", L"0") == L"1";
+    g_toypad_catalog = ReadIni(L"toypad_interface", L"classico") == L"catalogo";
     g_opt_mp = ReadIni(L"multiplayer", L"0") == L"1"; // 4.0
     g_mp_server = ReadIni(L"mp_servidor", kDefaultMpServer);
     if (g_mp_server.empty()) g_mp_server = kDefaultMpServer;
@@ -3711,8 +3700,9 @@ void LoadSettings() {
 }
 
 void PollPad() {
-    WORD buttons = g_sony_buttons;
-    SHORT lx = g_sony_lx, ly = g_sony_ly;
+    const auto sony = g_sony_pad.load(std::memory_order_relaxed);
+    WORD buttons = sony.wButtons;
+    SHORT lx = sony.sThumbLX, ly = sony.sThumbLY;
     for (DWORD user = 0; g_xinput_get_state && user < 4; ++user) {
         XINPUT_STATE state{};
         if (g_xinput_get_state(user, &state) == ERROR_SUCCESS) {
@@ -3780,6 +3770,8 @@ int SelfTest(const fs::path& report) {
     check(ui::LogText(L"INSTALADO Example")==L"INSTALLED Example","mod protocol display translation");
     check(ui::LogText(L"C:\\Mods\\ERRO folder")==L"C:\\Mods\\ERRO folder","path changed by log translation");
     check(Utf8ToWide("Example \xC3\xA9")==L"Example \u00e9","UTF-8 disabled-mod name round trip");
+    check(SaveFolderLabel(L"") == SaveFolderLabel(L"savedata0") &&
+          SaveFolderLabel(L"?") == SaveFolderLabel(L"savedata0"), "invalid save label fallback");
     // a fonte do jogo: uma NuFont pequena montada aqui (2 letras, folha DXT5 de 8x4 com um bloco branco e um vazio)
     {
         std::vector<BYTE> blob(0x40, 0);
@@ -3977,7 +3969,8 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         const int hit = HitTest(GET_X_LPARAM(lp), GET_Y_LPARAM(lp));
         g_pad_used = false;
         if (hit != kHotNone && hit != kHotClose && hit != kHotMinimize && !(hit >= kHotLeft0 && hit < kHotRight0 + 100)) {
-            if (std::find(FocusOrder().begin(), FocusOrder().end(), hit) != FocusOrder().end()) g_focus = hit;
+            const auto order = FocusOrder();
+            if (std::find(order.begin(), order.end(), hit) != order.end()) g_focus = hit;
         }
         if (hit != kHotNone) Activate(hit);
         return 0;

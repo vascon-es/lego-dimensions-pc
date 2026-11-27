@@ -68,6 +68,8 @@ def stage():
     R = lambda *p: os.path.join(ROOT, *p)  # noqa: E731
     # programas
     copy(R('tools', 'dist', 'build', 'LegoDimensionsLauncher.exe'), S('LegoDimensionsLauncher.exe'))
+    copy(R('tools', 'dist', 'build', 'LegoToypadCatalog.exe'), S('tools', 'LegoToypadCatalog.exe'))
+    copy(R('tools', 'dist', 'LICENSE-LegoToypad.txt'), S('tools', 'LICENSE-LegoToypad.txt'))
     copy(R('tools', 'dist', 'build', 'LD_PC_Transfer.exe'), S('LD_PC_Transfer.exe'))  # Fase 63: conversor de saves
     # o port: o build mais novo entre build\ e build_dist\ (este ultimo e compilado por tools/dist/build_jogo_dist.bat
     # quando o build\ esta em uso pelo jogo aberto)
@@ -106,6 +108,8 @@ def stage():
     copy(R('tools', 'setup', 'ld_transfer.py'), S('tools', 'setup', 'ld_transfer.py'))  # Fase 63: LD PC Transfer
     copy(R('tools', 'setup', 'mods.py'), S('tools', 'setup', 'mods.py'))  # Fase 64: carregador de mods
     copy(R('tools', 'setup', 'launcher_art.py'), S('tools', 'setup', 'launcher_art.py'))  # 1.8.7: a fonte do jogo para o launcher
+    copy(R('tools', 'setup', 'toypad_catalog.py'), S('tools', 'setup', 'toypad_catalog.py'))
+    copy(R('tools', 'setup', 'toypad_portraits.tsv'), S('tools', 'setup', 'toypad_portraits.tsv'))
     copy(R('tools', 'setup', 'prever_pipelines.py'), S('tools', 'setup', 'prever_pipelines.py'))  # 1.8.9: receitas previstas (preparar.py --prever)
     # 7-Zip 26.03 (LGPL + restricao do unRAR; License.txt vai junto): abre os .rar v6 / dicionario grande que o tar.exe
     # do Windows nao abre. Copia oficial em tools\7zip, no repositorio.
@@ -126,8 +130,7 @@ def stage():
             copy(os.path.join(PYTHON, f), S('tools', 'python', f))
     copy_tree(os.path.join(PYTHON, 'DLLs'), S('tools', 'python', 'DLLs'), skip_files=PY_SKIP_FILES)
     copy_tree(os.path.join(PYTHON, 'Lib'), S('tools', 'python', 'Lib'), skip_dirs=PY_SKIP_DIRS)
-    # dados do port (sem nada do jogo)
-    copy(R('assets', 'portal.json'), S('assets', 'portal.json'))
+    # O primeiro boot cria portal.json. O pacote não deve sobrescrever as posições salvas.
     # Fase 71: receitas de pipeline. A base distribuida = a base anterior + o que a pasta de desenvolvimento aprendeu
     # (sem repetidos); o pipeline_states.txt do jogador nao vai no pacote (o port cria o dele, so com o que faltar).
     spec = importlib.util.spec_from_file_location('pipeline_states', R('tools', 'pipeline_states.py'))

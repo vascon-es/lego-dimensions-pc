@@ -53,5 +53,6 @@ jobs:
             build/lego_dimensions.exe
             build/pkg_extractor.exe
             tools/dist/build/LegoDimensionsLauncher.exe
+            tools/dist/build/LegoToypadCatalog.exe
             tools/dist/build/LD_PC_Transfer.exe
             tools/dist/build/installer_stub.exe

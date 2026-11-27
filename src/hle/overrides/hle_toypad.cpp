@@ -10,6 +10,8 @@
 #include <string>
 #include <vector>
 
+#include <windows.h>
+
 #include "hle/hle_log.h"
 
 namespace hle::toypad {
@@ -51,7 +53,9 @@ void SavePortalStateLocked(const std::filesystem::path& path = {}) {
     }
     std::error_code ec;
     std::filesystem::create_directories(target.parent_path(), ec);
-    std::ofstream out(target, std::ios::trunc);
+    auto temp = target;
+    temp += L"." + std::to_wstring(GetCurrentProcessId()) + L".tmp";
+    std::ofstream out(temp, std::ios::trunc);
     if (!out) {
         return;
     }
@@ -113,6 +117,30 @@ void SavePortalStateLocked(const std::filesystem::path& path = {}) {
     }
     out << "\n  ]\n";
     out << "}\n";
+    out.close();
+    // O boot deve ver o último estado inteiro, mesmo se o jogo fechar durante a gravação.
+    if (!out || !MoveFileExW(temp.c_str(), target.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+        std::filesystem::remove(temp, ec);
+        log::Tagged("PORTAL", "Could not save the portal state");
+    }
+}
+
+size_t FindMatchingDelimiter(const std::string& json, size_t start, char open, char close) {
+    if (start == std::string::npos) return start;
+    int depth = 0;
+    bool quoted = false;
+    for (size_t i = start; i < json.size(); ++i) {
+        const char ch = json[i];
+        if (quoted && ch == '\\') {
+            ++i;
+        } else if (ch == '"') {
+            quoted = !quoted;
+        } else if (!quoted) {
+            if (ch == open) ++depth;
+            if (ch == close && --depth == 0) return i;
+        }
+    }
+    return std::string::npos;
 }
 // Fase 60: estado dos LEDs de cada zona (0 = centro, 1 = esquerda, 2 = direita), como no listener do Cemu
 // "Remote Toypad" que o app LegoToypad le: o app anima piscadas e fades sozinho a partir deste estado.
@@ -528,6 +556,15 @@ std::vector<Packet> MoveIndex(int new_pad, int new_index, int old_index) {
     return events;
 }
 
+std::array<SlotInfo, kSlotCount> Slots() {
+    std::lock_guard lock(g_mutex);
+    std::array<SlotInfo, kSlotCount> result{};
+    for (int i = 0; i < kSlotCount; ++i) {
+        if (g_figures[i].present) result[i] = {g_figures[i].pad, g_figures[i].id};
+    }
+    return result;
+}
+
 std::vector<Packet> PresentEvents() {
     std::lock_guard lock(g_mutex);
     std::vector<Packet> events;
@@ -738,13 +775,13 @@ void LoadPortalState(const std::filesystem::path& path) {
     size_t slots_pos = json.find("\"slots\"");
     if (slots_pos != std::string::npos) {
         size_t arr_open = json.find('[', slots_pos);
-        size_t arr_close = json.find(']', arr_open);
+        size_t arr_close = FindMatchingDelimiter(json, arr_open, '[', ']');
         if (arr_open != std::string::npos && arr_close != std::string::npos) {
             size_t pos = arr_open + 1;
             while (pos < arr_close) {
                 size_t obj_open = json.find('{', pos);
                 if (obj_open == std::string::npos || obj_open >= arr_close) break;
-                size_t obj_close = json.find('}', obj_open);
+                size_t obj_close = FindMatchingDelimiter(json, obj_open, '{', '}');
                 if (obj_close == std::string::npos || obj_close > arr_close) break;
 
                 std::string obj = json.substr(obj_open, obj_close - obj_open + 1);
@@ -800,7 +837,7 @@ void LoadPortalState(const std::filesystem::path& path) {
                     }
                 }
 
-                if (idx >= 0 && idx < kSlotCount && pad >= 1 && pad <= kPadCount) {
+                if (idx >= 0 && idx < kSlotCount && pad >= 1 && pad <= kPadCount && id >= 0) {
                     Figure& f = g_figures[idx];
                     f.present = true;
                     f.pad = pad;
