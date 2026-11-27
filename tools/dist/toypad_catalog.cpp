@@ -6,6 +6,7 @@
 #include <windowsx.h>
 #include <shellapi.h>
 #include <commdlg.h>
+#include <mmsystem.h>
 #include <xinput.h>
 
 #include <algorithm>
@@ -32,6 +33,7 @@
 #pragma comment(lib, "user32.lib")
 #pragma comment(lib, "gdi32.lib")
 #pragma comment(lib, "comdlg32.lib")
+#pragma comment(lib, "winmm.lib")
 
 namespace {
 namespace fs = std::filesystem;
@@ -40,13 +42,24 @@ using Gdiplus::Graphics;
 using Gdiplus::RectF;
 using Bytes = std::vector<std::uint8_t>;
 
-constexpr int kWidth = 964, kHeight = 642, kColumns = 12, kPage = 84;
+constexpr int kWidth = 964, kHeight = 642, kColumns = 12;
 constexpr float kGridX = 35, kGridY = 145, kGridWidth = kWidth - 2 * kGridX, kGridHeight = 378;
+constexpr float kVehicleRow = 58.0f;
+constexpr int kRosterTile = 192;
+constexpr ULONGLONG kScrollMs = 165;
 constexpr COLORREF kFocus = RGB(255, 214, 104), kQuiet = RGB(219, 229, 238);
 constexpr float kRise = 62;
 constexpr ULONGLONG kRiseMs = 560;
 constexpr DWORD kWindowStyle = WS_POPUP | WS_SYSMENU;
-constexpr int kAppearanceRows = 4, kTransparencyRow = 2, kMaxTransparency = 100;
+constexpr int kAppearanceRows = 5, kTransparencyRow = 2, kTextBackdropRow = 3, kMaxTransparency = 100;
+constexpr float kAppearanceTop = 196.0f, kAppearanceStep = 60.0f;
+constexpr ULONGLONG kCatalogRiseMs = 340, kTabSlideMs = 260;
+
+enum class Glyph { Cross, Circle, Square, Triangle, L1, R1 };
+struct Artwork {
+    std::unique_ptr<Gdiplus::Bitmap> roster;
+    std::array<std::unique_ptr<Gdiplus::Bitmap>, 2> buttons;
+};
 
 // Geometria de kPadCells do LegoToypad (MIT), com a margem da tela de referência.
 struct PadPosition { float x, y, w, h; int zone; };
@@ -138,6 +151,7 @@ struct Catalog {
     bool vehicles = false, loaded = false, extraction_error = false, browsing = false, command_in_flight = false;
     bool appearance = false, choosing_image = false;
     bool nonactivating = false;
+    bool text_backdrop = false;
     int appearance_item = 0, theme = 0, transparency = kMaxTransparency;
     std::wstring background_path;
     std::wstring background_error;
@@ -147,11 +161,21 @@ struct Catalog {
     std::array<std::unique_ptr<Gdiplus::Bitmap>, wire::kSlots> original_pads;
     ULONGLONG started = 0, next_query = 0, repeat = 0;
     ULONGLONG open_after = 0;
+    ULONGLONG panel_opened = 0;
     ULONGLONG catalog_opened = 0;
+    ULONGLONG tab_started = 0;
+    ULONGLONG scroll_started = 0;
+    int previous_selected = 0;
+    float scroll = 0, scroll_from = 0, scroll_target = 0, previous_scroll = 0;
     std::uint32_t previous = 0;
     int previous_dir = 0;
     std::vector<Figure> figures;
     std::vector<size_t> list;
+    std::vector<size_t> previous_list;
+    Artwork art;
+    std::future<Artwork> art_loading;
+    std::array<std::vector<std::unique_ptr<Gdiplus::Bitmap>>, 2> grid_rows;
+    float grid_scale = 0.0f;
     PortalReply portal;
     std::future<PortalReply> request;
     std::optional<Bytes> action;
@@ -160,8 +184,11 @@ struct Catalog {
 } g;
 
 using GetPad = DWORD (WINAPI*)(DWORD, XINPUT_STATE*);
+using GetPadKey = DWORD (WINAPI*)(DWORD, DWORD, XINPUT_KEYSTROKE*);
 GetPad g_get_pad = nullptr;
+GetPadKey g_get_pad_key = nullptr;
 std::atomic<XINPUT_GAMEPAD> g_sony_pad{};
+std::atomic<bool> g_sony_back{};
 std::array<ULONGLONG, XUSER_MAX_COUNT> g_pad_retry{};
 
 std::wstring Wide(const std::string& text) {
@@ -178,10 +205,15 @@ std::wstring Quote(const std::wstring& value) {
     return L"\"" + value + std::wstring(trailing, L'\\') + L"\"";
 }
 
-void RefreshList() {
-    g.list.clear();
+std::vector<size_t> CatalogList(bool vehicles) {
+    std::vector<size_t> list;
     for (size_t i = 0; i < g.figures.size(); ++i)
-        if ((g.figures[i].id >= 1000) == g.vehicles) g.list.push_back(i);
+        if ((g.figures[i].id >= 1000) == vehicles) list.push_back(i);
+    return list;
+}
+
+void RefreshList() {
+    g.list = CatalogList(g.vehicles);
     g.selected = 0;
 }
 
@@ -212,6 +244,9 @@ bool ReadCatalog() {
     }
     if (figures.empty() || !fs::is_directory(g.cache / Wide(version), ec)) return false;
     const auto selected_id = g.list.empty() ? 0 : g.figures[g.list[g.selected]].id;
+    g.previous_list.clear();
+    g.tab_started = 0;
+    g.grid_rows = {};
     g.figures = std::move(figures);
     g.images = g.cache / Wide(version);
     RefreshList();
@@ -246,6 +281,46 @@ void ReadOriginalSkin() {
     };
     for (int i = 0; i < wire::kSlots; ++i) g.original_pads[i] = LoadSkinImage(pads[i]);
     g.backdrop.reset();
+}
+
+Artwork ReadArtwork(const fs::path& root) {
+    Artwork art;
+    // A cópia de renderização contém a célula inteira, inclusive o que passa do aro.
+    Gdiplus::Bitmap source((root / L"tools/setup/toypad_roster.png").c_str());
+    if (source.GetLastStatus() == Gdiplus::Ok && source.GetWidth() >= 5120 && source.GetHeight() >= 4264) {
+        art.roster = std::make_unique<Gdiplus::Bitmap>(10 * kRosterTile, 8 * kRosterTile, PixelFormat32bppPARGB);
+        Graphics paint(art.roster.get());
+        paint.SetInterpolationMode(Gdiplus::InterpolationModeHighQualityBicubic);
+        paint.DrawImage(&source, Gdiplus::Rect(0, 0, 10 * kRosterTile, 8 * kRosterTile),
+                        0, 168, 5120, 4096, Gdiplus::UnitPixel);
+    }
+    constexpr int side = 608;
+    const auto folder = root / L"assets/buttons";
+    const auto load_buttons = [&](const wchar_t* name) -> std::unique_ptr<Gdiplus::Bitmap> {
+        std::ifstream in(folder / name, std::ios::binary);
+        std::vector<BYTE> pixels(side * side * 4);
+        if (!in.read(reinterpret_cast<char*>(pixels.data()), pixels.size())) return {};
+        auto sheet = std::make_unique<Gdiplus::Bitmap>(side, side, PixelFormat32bppARGB);
+        Gdiplus::Rect bounds(0, 0, side, side);
+        Gdiplus::BitmapData locked{};
+        if (sheet->LockBits(&bounds, Gdiplus::ImageLockModeWrite, PixelFormat32bppARGB, &locked) != Gdiplus::Ok) return {};
+        for (int y = 0; y < side; ++y) {
+            auto* dest = static_cast<BYTE*>(locked.Scan0) + static_cast<std::ptrdiff_t>(y) * locked.Stride;
+            for (int x = 0; x < side * 4; x += 4) {
+                const auto* rgba = pixels.data() + y * side * 4 + x;
+                dest[x] = rgba[2];
+                dest[x + 1] = rgba[1];
+                dest[x + 2] = rgba[0];
+                dest[x + 3] = rgba[3];
+            }
+        }
+        sheet->UnlockBits(&locked);
+        return sheet;
+    };
+    art.buttons[0] = load_buttons(L"ps4.rgba");
+    art.buttons[1] = load_buttons(L"xboxone.rgba");
+    if (!art.buttons[1]) art.buttons[1] = load_buttons(L"360.rgba");
+    return art;
 }
 
 void PreparePortraits() {
@@ -378,6 +453,41 @@ void MapSlots() {
 
 bool ReadyToChange() { return g.portal.connected && !g.action && !g.command_in_flight; }
 
+void NavSound() {
+    struct Wave {
+        char riff[4]{'R','I','F','F'};
+        DWORD size = 36 + 704 * sizeof(short);
+        char wave[8]{'W','A','V','E','f','m','t',' '};
+        DWORD format_size = 16;
+        WORD pcm = 1, channels = 1;
+        DWORD rate = 22050, bytes_per_second = 44100;
+        WORD align = 2, bits = 16;
+        char data[4]{'d','a','t','a'};
+        DWORD data_size = 704 * sizeof(short);
+        std::array<short, 704> samples{};
+    };
+    static const auto tick = [] {
+        Wave wave;
+        for (size_t i = 0; i < wave.samples.size(); ++i) {
+            const double envelope = std::min(1.0, i / 35.0) * std::exp(-7.0 * i / wave.samples.size());
+            wave.samples[i] = static_cast<short>(2600.0 * envelope * std::sin(.19 * i));
+        }
+        return wave;
+    }();
+    PlaySoundW(reinterpret_cast<LPCWSTR>(&tick), nullptr, SND_ASYNC | SND_MEMORY | SND_NODEFAULT);
+}
+
+ULONGLONG AnimationNow() {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+
+float Ease(ULONGLONG start, ULONGLONG duration, ULONGLONG now = AnimationNow()) {
+    if (now < start) return 0.0f;
+    if (!start || now - start >= duration) return 1.0f;
+    const float t = static_cast<float>(now - start) / duration;
+    return t * t * (3.0f - 2.0f * t);
+}
+
 void SetFigure(int slot, int zone, std::uint32_t id) {
     Bytes command{wire::kSelect, static_cast<std::uint8_t>(zone), static_cast<std::uint8_t>(slot), 0, 0, 0, 0, 0, 0};
     wire::WriteId(command.data() + 5, id);
@@ -411,17 +521,45 @@ void FocusPosition(int dx, int dy) {
             result = i;
         }
     }
-    g.position = result;
+    if (g.position != result) {
+        g.position = result;
+        NavSound();
+    }
+}
+
+void FocusFigure(int index) {
+    if (g.list.empty()) return;
+    const int selected = std::clamp(index, 0, static_cast<int>(g.list.size()) - 1);
+    if (selected != g.selected) NavSound();
+    g.selected = selected;
+    if (!g.vehicles) return;
+    const float top = (selected / kColumns) * kVehicleRow;
+    const float bottom = top + kVehicleRow;
+    const int rows = (static_cast<int>(g.list.size()) + kColumns - 1) / kColumns;
+    const float nearest = std::clamp(g.scroll_target, bottom - kGridHeight + 12.0f, top);
+    const float target = std::clamp(nearest, 0.0f, std::max(0.0f, rows * kVehicleRow - kGridHeight));
+    if (g.scroll_target != target) {
+        g.scroll_from = g.scroll;
+        g.scroll_target = target;
+        g.scroll_started = AnimationNow();
+    }
 }
 
 void Select(int amount) {
-    if (!g.list.empty()) g.selected = std::clamp(g.selected + amount, 0, static_cast<int>(g.list.size()) - 1);
+    FocusFigure(g.selected + amount);
 }
 
 void Page(bool vehicles) {
     if (!g.browsing || g.vehicles == vehicles) return;
+    g.previous_list = g.list;
+    g.previous_selected = g.selected;
+    g.previous_scroll = g.scroll;
     g.vehicles = vehicles;
     RefreshList();
+    g.scroll = g.scroll_target = 0;
+    g.scroll_started = 0;
+    g.tab_started = AnimationNow();
+    NavSound();
 }
 
 // Foco adaptado do LegoToypad de harrysof. Ver LICENSE-LegoToypad.txt (MIT).
@@ -465,7 +603,7 @@ void SetInputOwnership(bool active) {
 }
 
 void StartRise() {
-    g.started = GetTickCount64();
+    g.started = AnimationNow();
     SetWindowPos(g.window, nullptr, g.placement.left, g.placement.top + ui::S(kRise), g.placement.right, g.placement.bottom,
                  SWP_NOZORDER | SWP_NOACTIVATE);
 }
@@ -482,8 +620,8 @@ void Confirm() {
     const int zone = kPositions[g.position].zone;
     if (g.move_from >= 0) {
         const int source = SlotPad(g.move_from);
-        if (ReadyToChange() && source && (g.move_from != slot || source != zone)) {
-            g.action = Bytes{wire::kMove, static_cast<std::uint8_t>(zone), static_cast<std::uint8_t>(slot),
+        if (ReadyToChange() && source) {
+            g.action = Bytes{wire::kSwap, static_cast<std::uint8_t>(zone), static_cast<std::uint8_t>(slot),
                              static_cast<std::uint8_t>(source), static_cast<std::uint8_t>(g.move_from)};
         }
         g.move_from = -1;
@@ -494,7 +632,12 @@ void Confirm() {
     g.browsing = true;
     g.vehicles = false;
     RefreshList();
-    g.catalog_opened = GetTickCount64();
+    g.scroll = g.scroll_target = 0;
+    g.scroll_started = 0;
+    g.tab_started = 0;
+    g.previous_list.clear();
+    g.catalog_opened = AnimationNow();
+    NavSound();
 }
 
 void RenderWindow();
@@ -546,6 +689,7 @@ void ShowPanel() {
     g.next_query = 0;
     SetInputOwnership(true);
     StartRise();
+    g.panel_opened = GetTickCount64();
     if (g.nonactivating || (g.game_window && (GetWindowLongPtrW(g.game_window, GWL_EXSTYLE) & WS_EX_TOPMOST)))
         SetWindowPos(g.window, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
     RenderWindow();
@@ -566,6 +710,14 @@ void RequestPanel(bool from_launcher = false) {
             return;
         }
     }
+    ShowPanel();
+}
+
+void OpenForGame(HWND game, bool fullscreen = false) {
+    if (IsWindowVisible(g.window) || !IsGameWindow(game) || GetForegroundWindow() != game) return;
+    g.game_window = game;
+    g.nonactivating = fullscreen || GameCoversMonitor(game);
+    PostMessageW(game, wire::kOpenRequest, reinterpret_cast<WPARAM>(g.window), 0);
     ShowPanel();
 }
 
@@ -602,7 +754,7 @@ RectF Rect(float x, float y, float w, float h) {
 }
 
 void Label(Graphics& paint, const std::wstring& value, float x, float y, float width,
-           float size = 15, COLORREF color = ui::kText, bool bold = false, bool center = false) {
+           float size = 15, COLORREF color = ui::kText, bool bold = false, bool center = false, BYTE alpha = 255) {
     Gdiplus::FontFamily family(L"Segoe UI");
     Gdiplus::Font font(&family, static_cast<float>(ui::S(size)), bold ? Gdiplus::FontStyleBold : Gdiplus::FontStyleRegular,
                        Gdiplus::UnitPixel);
@@ -610,11 +762,46 @@ void Label(Graphics& paint, const std::wstring& value, float x, float y, float w
     format.SetFormatFlags(Gdiplus::StringFormatFlagsNoWrap);
     format.SetTrimming(Gdiplus::StringTrimmingEllipsisCharacter);
     if (center) format.SetAlignment(Gdiplus::StringAlignmentCenter);
-    Gdiplus::SolidBrush shadow(Gdiplus::Color(245, 5, 9, 14));
-    Gdiplus::SolidBrush brush(ui::C(color));
+    const auto bounds = Rect(x, y, width, size + 8);
+    if (g.text_backdrop && g.transparency >= 65 && !value.empty()) {
+        RectF measured;
+        paint.MeasureString(value.c_str(), -1, &font, bounds, &format, &measured);
+        Gdiplus::SolidBrush readable(Gdiplus::Color(static_cast<BYTE>(220 * alpha / 255), 8, 14, 25));
+        measured.Inflate(static_cast<float>(ui::S(4)), static_cast<float>(ui::S(1)));
+        paint.FillRectangle(&readable, measured);
+    }
+    Gdiplus::SolidBrush shadow(Gdiplus::Color(static_cast<BYTE>(245 * alpha / 255), 5, 9, 14));
+    Gdiplus::SolidBrush brush(ui::C(color, alpha));
     paint.DrawString(value.c_str(), -1, &font, Rect(x + 1, y + 2, width, size + 8), &format, &shadow);
-    paint.DrawString(value.c_str(), -1, &font, Rect(x, y, width, size + 8),
-                     &format, &brush);
+    paint.DrawString(value.c_str(), -1, &font, bounds, &format, &brush);
+}
+
+void ButtonHint(Graphics& paint, Glyph glyph, const wchar_t* key, const wchar_t* caption,
+                float x, float y, float width) {
+    static const Gdiplus::Rect cells[] = {
+        {487, 479, 108, 108}, {487, 369, 108, 108}, {249, 491, 107, 108},
+        {372, 247, 108, 107}, {0, 494, 125, 75}, {372, 0, 124, 75},
+    };
+    constexpr const wchar_t* fallback[][6] = {{L"×", L"○", L"□", L"△", L"L1", L"R1"},
+                                              {L"A", L"B", L"X", L"Y", L"LB", L"RB"}};
+    const auto index = static_cast<size_t>(glyph);
+    const auto& src = cells[index];
+    for (int i = 0; i < 2; ++i) {
+        if (g.art.buttons[i]) {
+            const auto button = Rect(x + i * 24, y, 22, 22);
+            const float ratio = static_cast<float>(src.Height) / src.Width;
+            const RectF dest(button.X, button.Y + button.Height * (1 - ratio) * .5f, button.Width, button.Height * ratio);
+            paint.DrawImage(g.art.buttons[i].get(), dest, static_cast<float>(src.X), static_cast<float>(src.Y),
+                            static_cast<float>(src.Width), static_cast<float>(src.Height), Gdiplus::UnitPixel);
+        } else {
+            Label(paint, fallback[i][index], x + i * 24, y + 2, 22, 13, kQuiet, true, true);
+        }
+    }
+    const float key_width = wcslen(key) > 1 ? 39.0f : 22.0f;
+    Gdiplus::SolidBrush key_fill(Gdiplus::Color(205, 22, 28, 45));
+    paint.FillRectangle(&key_fill, Rect(x + 50, y + 2, key_width, 18));
+    Label(paint, key, x + 50, y + 2, key_width, 12, kQuiet, true, true);
+    Label(paint, caption, x + 56 + key_width, y + 2, width - 56 - key_width, 15, kQuiet, true);
 }
 
 void ClickArea(Graphics& paint, float x, float y, float w, float h) {
@@ -648,6 +835,7 @@ void ReadAppearance() {
     if (index < std::size(kThemes)) g.theme = static_cast<int>(index);
     const auto transparency = GetPrivateProfileIntW(L"Aparencia", L"Transparencia", kMaxTransparency, ini.c_str());
     if (transparency <= kMaxTransparency) g.transparency = static_cast<int>(transparency);
+    g.text_backdrop = GetPrivateProfileIntW(L"Aparencia", L"FundoDosTextos", 0, ini.c_str()) == 1;
     wchar_t path[32768]{};
     if (GetPrivateProfileStringW(L"Aparencia", L"Imagem", L"", path, static_cast<DWORD>(std::size(path)), ini.c_str()))
         LoadBackground(path);
@@ -658,7 +846,8 @@ void SaveAppearance() {
     EnsureCatalogIni(ini);
     if (!WritePrivateProfileStringW(L"Aparencia", L"Tema", std::to_wstring(g.theme).c_str(), ini.c_str()) ||
         !WritePrivateProfileStringW(L"Aparencia", L"Imagem", g.background_path.empty() ? L"" : g.background_path.c_str(), ini.c_str()) ||
-        !WritePrivateProfileStringW(L"Aparencia", L"Transparencia", std::to_wstring(g.transparency).c_str(), ini.c_str())) {
+        !WritePrivateProfileStringW(L"Aparencia", L"Transparencia", std::to_wstring(g.transparency).c_str(), ini.c_str()) ||
+        !WritePrivateProfileStringW(L"Aparencia", L"FundoDosTextos", g.text_backdrop ? L"1" : L"0", ini.c_str())) {
         g.background_error = ui::T(L"Não foi possível salvar a aparência.", L"Could not save the appearance.");
     }
 }
@@ -704,6 +893,11 @@ void AppearanceAction(int index) {
         SaveAppearance();
     } else if (index == kTransparencyRow) {
         ChangeTransparency(g.transparency == kMaxTransparency ? -kMaxTransparency / 5 : 1);
+    } else if (index == kTextBackdropRow) {
+        g.text_backdrop = !g.text_backdrop;
+        g.grid_rows = {};
+        g.background_error.clear();
+        SaveAppearance();
     } else {
         g.appearance = false;
     }
@@ -713,6 +907,11 @@ void OpenAppearance() {
     g.appearance = true;
     g.appearance_item = 0;
     g.background_error.clear();
+}
+
+void ChangeAppearanceItem(int amount) {
+    g.appearance_item = (g.appearance_item + amount + kAppearanceRows) % kAppearanceRows;
+    NavSound();
 }
 
 void PaintBackdrop(Graphics& paint) {
@@ -801,16 +1000,46 @@ Gdiplus::Rect PortraitBounds(Gdiplus::Bitmap& icon) {
     return right > left && bottom > top ? Gdiplus::Rect(left, top, right - left, bottom - top) : full;
 }
 
-void Portrait(Graphics& paint, Figure& figure, float x, float y, float diameter, COLORREF color, bool selected, bool map) {
+void DrawSprite(Graphics& paint, Gdiplus::Bitmap& image, const RectF& dest, const Gdiplus::Rect& src, BYTE alpha) {
+    if (alpha == 255) {
+        paint.DrawImage(&image, dest, static_cast<float>(src.X), static_cast<float>(src.Y),
+                        static_cast<float>(src.Width), static_cast<float>(src.Height), Gdiplus::UnitPixel);
+        return;
+    }
+    const Gdiplus::ColorMatrix opacity = {{
+        {1, 0, 0, 0, 0}, {0, 1, 0, 0, 0}, {0, 0, 1, 0, 0}, {0, 0, 0, alpha / 255.0f, 0}, {0, 0, 0, 0, 1}
+    }};
+    Gdiplus::ImageAttributes attributes;
+    attributes.SetColorMatrix(&opacity);
+    paint.DrawImage(&image, dest, static_cast<float>(src.X), static_cast<float>(src.Y),
+                    static_cast<float>(src.Width), static_cast<float>(src.Height), Gdiplus::UnitPixel, &attributes);
+}
+
+void Portrait(Graphics& paint, Figure& figure, float x, float y, float diameter, COLORREF color, bool selected, bool map,
+              BYTE alpha = 255) {
+    const auto id = figure.id;
+    if (!map && g.art.roster && id >= 1 && id <= 77 && id != 58 && id != 73) {
+        const int index = static_cast<int>(id) - 1 - (id > 58) - (id > 73);
+        constexpr float ring_fraction = 472.0f / 512.0f;
+        const float tile = diameter / ring_fraction, margin = (tile - diameter) * .5f;
+        if (selected) {
+            Gdiplus::Pen focus(ui::C(kFocus, alpha), static_cast<float>(ui::S(2.0f)));
+            paint.DrawEllipse(&focus, Rect(x - 3, y - 3, diameter + 6, diameter + 6));
+        }
+        DrawSprite(paint, *g.art.roster, Rect(x - margin, y - margin, tile, tile),
+                   {index % 10 * kRosterTile, index / 10 * kRosterTile, kRosterTile, kRosterTile}, alpha);
+        return;
+    }
+    const auto opacity = [alpha](int base) { return static_cast<BYTE>(base * alpha / 255); };
     const auto ring = Rect(x, y, diameter, diameter);
     if (!map) {
-        Gdiplus::SolidBrush fill(Gdiplus::Color(178, 8, 16, 29));
+        Gdiplus::SolidBrush fill(Gdiplus::Color(opacity(178), 8, 16, 29));
         paint.FillEllipse(&fill, ring);
     }
-    Gdiplus::LinearGradientBrush gloss(ring, Gdiplus::Color(40, 255, 255, 255),
+    Gdiplus::LinearGradientBrush gloss(ring, Gdiplus::Color(opacity(40), 255, 255, 255),
                                      Gdiplus::Color(0, 255, 255, 255), Gdiplus::LinearGradientModeForwardDiagonal);
     paint.FillEllipse(&gloss, ring);
-    Gdiplus::Pen rim(ui::C(color, selected ? 255 : 170), static_cast<float>(ui::S(selected ? 2.5f : map ? 2.0f : 1.0f)));
+    Gdiplus::Pen rim(ui::C(color, opacity(selected ? 255 : 170)), static_cast<float>(ui::S(selected ? 2.5f : map ? 2.0f : 1.0f)));
     paint.DrawEllipse(&rim, ring);
 
     if (!figure.tried) {
@@ -822,7 +1051,7 @@ void Portrait(Graphics& paint, Figure& figure, float x, float y, float diameter,
         }
     }
     if (!figure.icon) {
-        Label(paint, figure.name.substr(0, 2), x, y + diameter * .23f, diameter, diameter * .33f, kFocus, true, true);
+        Label(paint, figure.name.substr(0, 2), x, y + diameter * .23f, diameter, diameter * .33f, kFocus, true, true, alpha);
         return;
     }
     // Chapéus, orelhas, coroas e laços que ultrapassam o aro na referência.
@@ -858,25 +1087,23 @@ void Portrait(Graphics& paint, Figure& figure, float x, float y, float diameter,
     const float draw_y = overhang ? y + diameter * 1.025f - h : y + (diameter - h) * .5f;
     const auto state = paint.Save();
     paint.SetClip(&mask, Gdiplus::CombineModeIntersect);
-    paint.DrawImage(figure.icon.get(), Rect(x + (diameter - w) * .5f, draw_y, w, h),
-                    static_cast<float>(src.X), static_cast<float>(src.Y), width, height, Gdiplus::UnitPixel);
+    DrawSprite(paint, *figure.icon, Rect(x + (diameter - w) * .5f, draw_y, w, h), src, alpha);
     paint.Restore(state);
 }
 
 struct FigureGrid {
     int columns = kColumns;
-    int first = 0, count = 0, rows = 0;
+    int count = 0, rows = 0;
+    float scroll = 0;
     float cell_w = 0, cell_h = 0, diameter = 0;
 
-    FigureGrid() {
-        const int total = static_cast<int>(g.list.size());
-        first = g.vehicles ? g.selected / kPage * kPage : 0;
-        count = g.vehicles ? std::min(kPage, total - first) : total;
+    FigureGrid(bool vehicles = g.vehicles, int total = static_cast<int>(g.list.size()), float offset = g.scroll)
+        : count(total), scroll(vehicles ? offset : 0) {
         // A grade de personagens cresce com o elenco, mantendo todos na mesma tela.
-        while (!g.vehicles && count > columns * (columns / 2 + 1)) ++columns;
+        while (!vehicles && count > columns * (columns / 2 + 1)) ++columns;
         rows = (count + columns - 1) / columns;
         cell_w = kGridWidth / columns;
-        cell_h = kGridHeight / std::max(rows, 1);
+        cell_h = vehicles ? kVehicleRow : kGridHeight / std::max(rows, 1);
         diameter = std::min(46.0f, std::min(cell_w, cell_h) - 7);
     }
 
@@ -887,12 +1114,13 @@ struct FigureGrid {
 
     int Hit(float x, float y) const {
         if (!count || x < kGridX || y < kGridY || y >= kGridY + kGridHeight) return -1;
-        const int row = static_cast<int>((y - kGridY) / cell_h);
+        const int row = static_cast<int>((y - kGridY + scroll) / cell_h);
+        if (row >= rows) return -1;
         const float left = Left(row);
         if (x < left) return -1;
         const int column = static_cast<int>((x - left) / cell_w);
         const int item = row * columns + column;
-        return column < columns && item < count ? first + item : -1;
+        return column < columns && item < count ? item : -1;
     }
 };
 
@@ -967,17 +1195,10 @@ void PaintPadMap(Graphics& paint) {
     } else {
         Label(paint, L"By Harrysof", 811, 70, 108, 20, ui::kText, true);
     }
-    if (g.original_settings) {
-        const float width = 40.0f * g.original_settings->GetWidth() / g.original_settings->GetHeight();
-        const float text_x = 919 - width;
-        Card(paint, text_x - 52, 570, 44, 44, false, RGB(130, 140, 160));
-        Label(paint, L"S", text_x - 52, 578, 44, 20, ui::kText, false, true);
-        paint.DrawImage(g.original_settings.get(), Rect(text_x, 572, width, 40));
-    } else {
-        Label(paint, L"S · Settings", 777, 577, 142, 20, ui::kText, true, true);
-    }
-    Label(paint, ui::T(L"□ / X / M · mover      L1 / LB / Del · retirar",
-                       L"□ / X / M · move      L1 / LB / Del · remove"), 59, 584, 480, 15, kQuiet, true);
+    ClickArea(paint, 742, 567, 184, 49);
+    ButtonHint(paint, Glyph::Triangle, L"S", L"Settings", 749, 580, 176);
+    ButtonHint(paint, Glyph::Square, L"M", ui::T(L"Mover", L"Move"), 59, 580, 155);
+    ButtonHint(paint, Glyph::L1, L"Del", ui::T(L"Retirar", L"Remove"), 223, 580, 166);
 }
 
 void PaintAppearance(Graphics& paint) {
@@ -987,10 +1208,13 @@ void PaintAppearance(Graphics& paint) {
         : ui::T(L"Trocar tema · ", L"Cycle theme · ") + std::wstring(ui::T(theme.pt, theme.en));
     const auto transparency = ui::T(L"Transparência do fundo · ", L"Background transparency · ") +
                               std::to_wstring(g.transparency) + L"%";
+    const std::wstring readability = g.text_backdrop
+        ? ui::T(L"Fundo dos textos · Ligado", L"Text backing · On")
+        : ui::T(L"Fundo dos textos · Desligado", L"Text backing · Off");
     const std::array<std::wstring, kAppearanceRows> options{
-        ui::T(L"Escolher imagem…", L"Choose image…"), mode, transparency, ui::T(L"Voltar", L"Back")};
+        ui::T(L"Escolher imagem…", L"Choose image…"), mode, transparency, readability, ui::T(L"Voltar", L"Back")};
     for (int i = 0; i < static_cast<int>(options.size()); ++i) {
-        const float y = 218.0f + i * 69;
+        const float y = kAppearanceTop + i * kAppearanceStep;
         const bool focused = g.appearance_item == i;
         Card(paint, 288, y, 390, 53, focused);
         Label(paint, options[i], 303, y + 13, 360, 19, focused ? kFocus : kQuiet, true, true);
@@ -1000,10 +1224,101 @@ void PaintAppearance(Graphics& paint) {
         }
     }
     if (!g.background_error.empty()) Label(paint, g.background_error, 183, 504, 600, 15, kQuiet, true, true);
-    Label(paint, ui::T(L"← / → · transparência      A / Enter · escolher      B / Esc · voltar",
-                       L"← / → · transparency      A / Enter · select      B / Esc · back"),
-          210, 559, 546, 15, kQuiet, false, true);
+    ButtonHint(paint, Glyph::Cross, L"Enter", ui::T(L"Escolher", L"Select"), 308, 559, 180);
+    ButtonHint(paint, Glyph::Circle, L"Esc", ui::T(L"Voltar", L"Back"), 505, 559, 165);
     Label(paint, L"harrysof · João Pedro Favoni", 42, 603, 390, 13, kQuiet);
+}
+
+float CatalogOffsetY(ULONGLONG now = AnimationNow()) {
+    return 58.0f * (1.0f - Ease(g.catalog_opened, kCatalogRiseMs, now));
+}
+
+constexpr float kGridRowPadding = 4.0f;
+
+Gdiplus::Bitmap* GridRow(bool vehicles, const FigureGrid& grid, const std::vector<size_t>& list, int row) {
+    if (g.grid_scale != ui::g_scale) {
+        g.grid_rows = {};
+        g.grid_scale = ui::g_scale;
+    }
+    auto& rows = g.grid_rows[vehicles ? 1 : 0];
+    if (rows.size() != static_cast<size_t>(grid.rows)) rows.resize(grid.rows);
+    auto& image = rows[row];
+    if (image) return image.get();
+    auto layer = std::make_unique<Gdiplus::Bitmap>(ui::S(kWidth), ui::S(grid.cell_h + 2 * kGridRowPadding),
+                                                   PixelFormat32bppPARGB);
+    if (layer->GetLastStatus() != Gdiplus::Ok) return nullptr;
+    {
+        Graphics raster(layer.get());
+        raster.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
+        raster.SetTextRenderingHint(Gdiplus::TextRenderingHintAntiAliasGridFit);
+        raster.SetInterpolationMode(Gdiplus::InterpolationModeHighQualityBilinear);
+        const int first = row * grid.columns, end = std::min(first + grid.columns, grid.count);
+        const float left = grid.Left(row);
+        for (int i = first; i < end; ++i) {
+            auto& figure = g.figures[list[i]];
+            const float x = left + (i - first + .5f) * grid.cell_w - grid.diameter * .5f;
+            const float y = kGridRowPadding + (grid.cell_h - grid.diameter) * .5f;
+            Portrait(raster, figure, x, y, grid.diameter, figure.color, false, false);
+        }
+    }
+    image = std::move(layer);
+    return image.get();
+}
+
+void WarmGridRow() {
+    if (g.art_loading.valid() || !g.loaded) return;
+    for (const bool vehicles : {false, true}) {
+        auto& cached = g.grid_rows[vehicles ? 1 : 0];
+        if (g.grid_scale == ui::g_scale && !cached.empty() &&
+            std::all_of(cached.begin(), cached.end(), [](const auto& row) { return row != nullptr; })) continue;
+        const auto list = CatalogList(vehicles);
+        const FigureGrid grid(vehicles, static_cast<int>(list.size()), 0);
+        for (int row = 0; row < grid.rows; ++row) {
+            if (g.grid_scale != ui::g_scale || row >= static_cast<int>(cached.size()) || !cached[row]) {
+                GridRow(vehicles, grid, list, row);
+                return;
+            }
+        }
+    }
+}
+
+float VehicleRowOpacity(float pixels_below, bool more_below) {
+    if (!more_below) return 1.0f;
+    // A borda mostra a próxima fileira e atenua discretamente a que vem antes.
+    return std::clamp(.22f + pixels_below / (1.65f * kVehicleRow), .22f, 1.0f);
+}
+
+void PaintBrowseList(Graphics& paint, const std::vector<size_t>& list, bool vehicles, int selected, float scroll, BYTE alpha) {
+    const FigureGrid grid(vehicles, static_cast<int>(list.size()), scroll);
+    if (!grid.count || alpha == 0) return;
+    auto& current = g.figures[list[selected]];
+    constexpr float center = kWidth * .5f;
+    Portrait(paint, current, center - 40, 16, 80, kFocus, true, false, alpha);
+    Label(paint, current.name, 242, 101, 482, 25, kFocus, true, true, alpha);
+    const auto state = paint.Save();
+    if (vehicles) paint.SetClip(Rect(kGridX - 3, kGridY, kGridWidth + 6, kGridHeight), Gdiplus::CombineModeIntersect);
+    paint.SetInterpolationMode(Gdiplus::InterpolationModeBilinear);
+    const int first_row = vehicles ? std::max(0, static_cast<int>(scroll / grid.cell_h) - 1) : 0;
+    const bool more_below = vehicles && grid.rows * grid.cell_h - scroll > kGridHeight + 1.0f;
+    for (int row = first_row; row < grid.rows; ++row) {
+        const float y = kGridY + (row + .5f) * grid.cell_h - grid.scroll;
+        if (vehicles && y - grid.cell_h * .5f >= kGridY + kGridHeight) break;
+        if (vehicles && y + grid.cell_h * .5f < kGridY) continue;
+        const auto row_alpha = static_cast<BYTE>(alpha * VehicleRowOpacity(kGridY + kGridHeight - y, more_below));
+        if (auto* image = GridRow(vehicles, grid, list, row)) {
+            const int width = static_cast<int>(image->GetWidth()), height = static_cast<int>(image->GetHeight());
+            const auto top = static_cast<float>(ui::S(y - grid.cell_h * .5f - kGridRowPadding));
+            DrawSprite(paint, *image, {0, top, static_cast<float>(width), static_cast<float>(height)},
+                       {0, 0, width, height}, row_alpha);
+        }
+        if (row == selected / grid.columns) {
+            const float x = grid.Left(row) + (selected % grid.columns + .5f) * grid.cell_w;
+            const float diameter = grid.diameter + 5.0f;
+            Gdiplus::Pen focus(ui::C(kFocus, row_alpha), static_cast<float>(ui::S(2.0f)));
+            paint.DrawEllipse(&focus, Rect(x - diameter * .5f, y - diameter * .5f, diameter, diameter));
+        }
+    }
+    paint.Restore(state);
 }
 
 void Paint(Graphics& paint) {
@@ -1022,53 +1337,51 @@ void Paint(Graphics& paint) {
         PaintPadMap(paint);
         return;
     }
+    const auto content = paint.Save();
+    paint.TranslateTransform(0, static_cast<float>(ui::S(CatalogOffsetY())));
     if (!g.portal.connected)
         Label(paint, ui::T(L"Aguardando o jogo", L"Waiting for the game"), 764, 69, 163, 14, kQuiet, false, true);
     else if (g.command_in_flight || g.action)
         Label(paint, ui::T(L"Atualizando portal…", L"Updating portal…"), 764, 69, 163, 14, kQuiet, false, true);
     Card(paint, 764, 30, 163, 33, false);
-    Label(paint, ui::T(L"Y / S · Aparência", L"Y / S · Appearance"), 764, 36, 163, 15, kQuiet, true, true);
+    ButtonHint(paint, Glyph::Triangle, L"S", L"Settings", 773, 35, 149);
     ClickArea(paint, 32, 25, 200, 30);
     ClickArea(paint, 32, 58, 113, 29);
     ClickArea(paint, 148, 58, 144, 29);
     Label(paint, ui::T(L"‹ Toy Pad", L"‹ Toy Pad"), 33, 27, 200, 18, kQuiet, true);
     Label(paint, ui::T(L"Personagens", L"Characters"), 33, 61, 113, 16, g.vehicles ? kQuiet : kFocus, true);
     Label(paint, ui::T(L"Veículos e itens", L"Vehicles & items"), 151, 61, 150, 16, g.vehicles ? kFocus : kQuiet, true);
-    Label(paint, L"R1 / RB · Tab", 33, 88, 155, 12, kQuiet);
+    ButtonHint(paint, Glyph::R1, L"Tab", ui::T(L"Alternar", L"Switch"), 33, 88, 174);
 
-    const FigureGrid grid;
-    if (grid.count == 0) {
+    if (g.list.empty()) {
         const auto text = g.loaded ? ui::T(L"Nenhum item encontrado.", L"No items found.")
             : g.extraction_error ? ui::T(L"Falha ao preparar os retratos. Reabra o Toy Pad.", L"Portrait setup failed. Reopen the Toy Pad.")
             : ui::T(L"Baixando os retratos do LegoToypad…", L"Downloading LegoToypad portraits…");
         Label(paint, text, 80, 282, kWidth - 160, 19, kQuiet, true, true);
     } else {
-        auto& figure = g.figures[g.list[g.selected]];
-        constexpr float center = kWidth * .5f;
-        Portrait(paint, figure, center - 40, 16, 80, kFocus, true, false);
-        Label(paint, figure.name, 242, 101, 482, 25, kFocus, true, true);
-    }
-    for (int i = 0; i < grid.count; ++i) {
-        const int row = i / grid.columns, column = i % grid.columns;
-        const float center_x = grid.Left(row) + (column + .5f) * grid.cell_w;
-        const float center_y = kGridY + (row + .5f) * grid.cell_h;
-        const bool active = grid.first + i == g.selected;
-        const float diameter = grid.diameter + (active ? 4.0f : 0.0f);
-        const float x = center_x - diameter * .5f, y = center_y - diameter * .5f;
-        auto& figure = g.figures[g.list[grid.first + i]];
-        Portrait(paint, figure, x, y, diameter, active ? kFocus : figure.color, active, false);
-    }
-    if (g.vehicles && g.list.size() > kPage) {
-        ClickArea(paint, 421, 522, 124, 25);
-        Label(paint, L"‹     " + std::to_wstring(grid.first / kPage + 1) + L" / " +
-              std::to_wstring((g.list.size() + kPage - 1) / kPage) + L"     ›", 421, 521, 124, 15, kQuiet, true, true);
+        const float t = g.previous_list.empty() ? 1.0f : Ease(g.tab_started, kTabSlideMs);
+        const float direction = g.vehicles ? 1.0f : -1.0f;
+        if (t < 1.0f) {
+            const auto outgoing = paint.Save();
+            paint.SetClip(Rect(0, 0, kWidth, kGridY + kGridHeight), Gdiplus::CombineModeIntersect);
+            paint.TranslateTransform(static_cast<float>(ui::S(-direction * kWidth * t)), 0);
+            PaintBrowseList(paint, g.previous_list, !g.vehicles, g.previous_selected, g.previous_scroll,
+                            255);
+            paint.Restore(outgoing);
+        }
+        const auto incoming = paint.Save();
+        if (t < 1.0f) paint.SetClip(Rect(0, 0, kWidth, kGridY + kGridHeight), Gdiplus::CombineModeIntersect);
+        paint.TranslateTransform(static_cast<float>(ui::S(direction * kWidth * (1 - t))), 0);
+        PaintBrowseList(paint, g.list, g.vehicles, g.selected, g.scroll, 255);
+        paint.Restore(incoming);
     }
 
     Label(paint, std::wstring(ZoneName(g.zone)) + L" · " + std::to_wstring(g.position + 1),
           35, 565, 315, 17, kQuiet, true);
     ClickArea(paint, 690, 559, 175, 31);
-    Label(paint, ui::T(L"A / Enter · Colocar", L"A / Enter · Place"), 690, 565, 175, 16, kFocus, true);
-    Label(paint, ui::T(L"B / Esc · voltar", L"B / Esc · back"), 807, 592, 121, 13, kQuiet, false, true);
+    ButtonHint(paint, Glyph::Cross, L"Enter", ui::T(L"Colocar", L"Place"), 690, 565, 175);
+    ButtonHint(paint, Glyph::Circle, L"Esc", ui::T(L"Voltar", L"Back"), 780, 594, 145);
+    paint.Restore(content);
 }
 
 void RenderWindow() {
@@ -1089,7 +1402,13 @@ void RenderWindow() {
 void Poll() {
     HideOutOfGame();
     const auto now = GetTickCount64();
+    const auto animation_now = AnimationNow();
     if (g.open_after && now >= g.open_after) ShowPanel();
+    if (g.art_loading.valid() && g.art_loading.wait_for(std::chrono::seconds(0)) == std::future_status::ready) {
+        g.art = g.art_loading.get();
+        g.grid_rows = {};
+        InvalidateRect(g.window, nullptr, FALSE);
+    }
     if (g.extraction && WaitForSingleObject(g.extraction, 0) == WAIT_OBJECT_0) {
         DWORD code = 1;
         GetExitCodeProcess(g.extraction, &code);
@@ -1117,12 +1436,19 @@ void Poll() {
         g.next_query = now + 750;
     }
     XINPUT_GAMEPAD pad = g_sony_pad.load(std::memory_order_relaxed);
+    bool back_tapped = g_sony_back.exchange(false, std::memory_order_relaxed);
     for (DWORD i = 0; g_get_pad && i < XUSER_MAX_COUNT; ++i) {
         if (now < g_pad_retry[i]) continue;
         XINPUT_STATE state{};
         if (g_get_pad(i, &state) != ERROR_SUCCESS) {
-            g_pad_retry[i] = now + 1000;
+            g_pad_retry[i] = now + 250;
             continue;
+        }
+        for (int remaining = 16; g_get_pad_key && remaining > 0; --remaining) {
+            XINPUT_KEYSTROKE key{};
+            if (g_get_pad_key(i, 0, &key) != ERROR_SUCCESS) break;
+            if (key.VirtualKey == VK_PAD_BACK && (key.Flags & (XINPUT_KEYSTROKE_KEYDOWN | XINPUT_KEYSTROKE_REPEAT)) ==
+                                                     XINPUT_KEYSTROKE_KEYDOWN) back_tapped = true;
         }
         pad.wButtons |= state.Gamepad.wButtons;
         pad.bLeftTrigger = std::max(pad.bLeftTrigger, state.Gamepad.bLeftTrigger);
@@ -1134,22 +1460,40 @@ void Poll() {
         break;
     }
     const WORD buttons = pad.wButtons;
-    const auto pressed = buttons & ~g.previous;
+    WORD pressed = static_cast<WORD>(buttons & ~g.previous);
+    if (back_tapped) pressed |= XINPUT_GAMEPAD_BACK;
     g.previous = buttons;
     const HWND foreground = GetForegroundWindow();
     if (!IsWindowVisible(g.window) || IsIconic(g.window)) {
-        if ((pressed & XINPUT_GAMEPAD_BACK) && IsGameWindow(foreground)) RequestPanel();
+        if ((pressed & XINPUT_GAMEPAD_BACK) && !g.open_after && IsGameWindow(foreground)) RequestPanel();
+        else if (!g.open_after) WarmGridRow();
         return;
     }
     if (g.started) {
-        const float t = std::min(1.0f, static_cast<float>(now - g.started) / kRiseMs);
-        const float distance = 1.0f - t * t * (3.0f - 2.0f * t);
+        const float distance = 1.0f - Ease(g.started, kRiseMs, animation_now);
         SetWindowPos(g.window, nullptr, g.placement.left, g.placement.top + ui::S(kRise * distance),
                      0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
-        if (t == 1.0f) g.started = 0;
+        if (distance == 0.0f) g.started = 0;
+    }
+    if (g.browsing && !g.appearance) {
+        bool redraw = animation_now - g.catalog_opened <= kCatalogRiseMs + 32;
+        if (g.tab_started) {
+            if (Ease(g.tab_started, kTabSlideMs, animation_now) == 1.0f) {
+                g.tab_started = 0;
+                g.previous_list.clear();
+            }
+            redraw = true;
+        }
+        if (g.scroll_started) {
+            const float t = Ease(g.scroll_started, kScrollMs, animation_now);
+            g.scroll = std::lerp(g.scroll_from, g.scroll_target, t);
+            if (t == 1.0f) g.scroll_started = 0;
+            redraw = true;
+        }
+        if (redraw) InvalidateRect(g.window, nullptr, FALSE);
     }
     if (g.choosing_image || (foreground != g.window && (!g.game_window || foreground != g.game_window))) return;
-    if (pressed & XINPUT_GAMEPAD_BACK) { HidePanel(); return; }
+    if ((pressed & XINPUT_GAMEPAD_BACK) && now - g.panel_opened >= 250) { HidePanel(); return; }
     if (pressed & XINPUT_GAMEPAD_B) { Back(); InvalidateRect(g.window, nullptr, FALSE); return; }
     if (pressed & XINPUT_GAMEPAD_Y) {
         if (g.appearance) Back(); else OpenAppearance();
@@ -1167,7 +1511,7 @@ void Poll() {
         : (buttons & XINPUT_GAMEPAD_DPAD_RIGHT) || pad.sThumbLX > 17000 ? 1 : 0;
     if (dir && (dir != g.previous_dir || now >= g.repeat)) {
         const int dx = std::abs(dir) == 1 ? dir : 0, dy = std::abs(dir) == 2 ? dir / 2 : 0;
-        if (g.appearance && dy) g.appearance_item = (g.appearance_item + dy + kAppearanceRows) % kAppearanceRows;
+        if (g.appearance && dy) ChangeAppearanceItem(dy);
         else if (g.appearance && g.appearance_item == kTransparencyRow && dx) ChangeTransparency(dx);
         else if (g.browsing && !g.appearance) Select(dx + dy * FigureGrid{}.columns);
         else if (!g.appearance) FocusPosition(dx, dy);
@@ -1179,10 +1523,14 @@ void Poll() {
         if (g.appearance) AppearanceAction(g.appearance_item); else Confirm();
     }
     if (pressed) InvalidateRect(g.window, nullptr, FALSE);
+    else if (!g.browsing && !g.appearance) WarmGridRow();
 }
 
 LRESULT CALLBACK Window(HWND hwnd, UINT message, WPARAM wp, LPARAM lp) {
     switch (message) {
+    case wire::kControllerOpen:
+        OpenForGame(reinterpret_cast<HWND>(wp), lp != 0);
+        return 0;
     case wire::kShowMessage:
         if (!wp) RequestPanel(true);
         else if (g.open_after && reinterpret_cast<HWND>(wp) == g.game_window) {
@@ -1221,8 +1569,8 @@ LRESULT CALLBACK Window(HWND hwnd, UINT message, WPARAM wp, LPARAM lp) {
         if (g.appearance) {
             switch (wp) {
             case VK_ESCAPE: case 'S': Back(); break;
-            case VK_UP: g.appearance_item = (g.appearance_item + kAppearanceRows - 1) % kAppearanceRows; break;
-            case VK_DOWN: g.appearance_item = (g.appearance_item + 1) % kAppearanceRows; break;
+            case VK_UP: ChangeAppearanceItem(-1); break;
+            case VK_DOWN: ChangeAppearanceItem(1); break;
             case VK_LEFT: if (g.appearance_item == kTransparencyRow) ChangeTransparency(-1); break;
             case VK_RIGHT: if (g.appearance_item == kTransparencyRow) ChangeTransparency(1); break;
             case VK_RETURN: if (!(lp & (1LL << 30))) AppearanceAction(g.appearance_item); break;
@@ -1238,26 +1586,33 @@ LRESULT CALLBACK Window(HWND hwnd, UINT message, WPARAM wp, LPARAM lp) {
         case VK_RIGHT: if (g.browsing) Select(1); else FocusPosition(1, 0); break;
         case VK_UP: if (g.browsing) Select(-FigureGrid{}.columns); else FocusPosition(0, -1); break;
         case VK_DOWN: if (g.browsing) Select(FigureGrid{}.columns); else FocusPosition(0, 1); break;
-        case VK_PRIOR: if (g.browsing && g.vehicles) Select(-kPage); break;
-        case VK_NEXT: if (g.browsing && g.vehicles) Select(kPage); break;
+        case VK_PRIOR: if (g.browsing && g.vehicles) Select(-kColumns * 6); break;
+        case VK_NEXT: if (g.browsing && g.vehicles) Select(kColumns * 6); break;
         case VK_RETURN: if (!(lp & (1LL << 30))) Confirm(); break;
         case VK_DELETE: ClearPosition(); break;
         case 'M': PickUp(); break;
-        default: if (!g.browsing && wp >= '1' && wp <= '7') g.position = static_cast<int>(wp - '1'); break;
+        default:
+            if (!g.browsing && wp >= '1' && wp <= '7' && g.position != static_cast<int>(wp - '1')) {
+                g.position = static_cast<int>(wp - '1');
+                NavSound();
+            }
+            break;
         }
         InvalidateRect(hwnd, nullptr, FALSE);
         return 0;
     case WM_LBUTTONDOWN:
     case WM_LBUTTONDBLCLK: {
-        const float x = GET_X_LPARAM(lp) / ui::g_scale, y = GET_Y_LPARAM(lp) / ui::g_scale;
-        if (x >= 927 && y >= 8 && y < 43) {
+        const float x = GET_X_LPARAM(lp) / ui::g_scale;
+        const float mouse_y = GET_Y_LPARAM(lp) / ui::g_scale;
+        const float y = mouse_y - (g.browsing && !g.appearance ? CatalogOffsetY() : 0.0f);
+        if (x >= 927 && mouse_y >= 8 && mouse_y < 43) {
             if (message == WM_LBUTTONDOWN) HidePanel();
             return 0;
         }
         if (g.appearance) {
             if (message == WM_LBUTTONDOWN && x >= 288 && x < 678) {
                 for (int i = 0; i < kAppearanceRows; ++i) {
-                    const float top = 218.0f + i * 69;
+                    const float top = kAppearanceTop + i * kAppearanceStep;
                     if (y >= top && y < top + 53) {
                         g.appearance_item = i;
                         if (i == kTransparencyRow) {
@@ -1270,19 +1625,19 @@ LRESULT CALLBACK Window(HWND hwnd, UINT message, WPARAM wp, LPARAM lp) {
                     }
                 }
             }
-        } else if (!g.browsing && x >= 773 && x < 925 && y >= 566 && y < 618) {
+        } else if (!g.browsing && x >= 742 && x < 926 && y >= 566 && y < 618) {
             if (message == WM_LBUTTONDOWN) OpenAppearance();
         } else if (g.browsing && x >= 764 && x < 927 && y >= 30 && y < 63) {
             if (message == WM_LBUTTONDOWN) OpenAppearance();
         } else if (g.browsing) {
-            if (message == WM_LBUTTONDBLCLK && GetTickCount64() - g.catalog_opened < GetDoubleClickTime()) return 0;
+            if (message == WM_LBUTTONDBLCLK && AnimationNow() - g.catalog_opened < GetDoubleClickTime()) return 0;
             if (y >= 25 && y < 55 && x >= 32 && x < 232) Back();
             if (y >= 58 && y < 87 && x >= 32 && x < 292) Page(x >= 148);
-            if (const int item = FigureGrid{}.Hit(x, y); item >= 0) {
-                g.selected = item;
+            const float offset_x = (g.vehicles ? 1.0f : -1.0f) * kWidth * (1.0f - Ease(g.tab_started, kTabSlideMs));
+            if (const int item = FigureGrid{}.Hit(x - offset_x, y); item >= 0) {
+                FocusFigure(item);
                 if (message == WM_LBUTTONDBLCLK) Confirm();
             }
-            if (g.vehicles && y >= 522 && y < 546 && x >= 421 && x < 545) Select(x < 483 ? -kPage : kPage);
             if (y >= 559 && y < 590 && x >= 690 && x < 865) Confirm();
         } else if (message == WM_LBUTTONDOWN) {
             for (int p = 0; p < wire::kSlots; ++p) {
@@ -1347,9 +1702,16 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
     if (!argv) return 1;
     g.root = fs::absolute(fs::path(argv[0])).parent_path().parent_path();
     bool hidden = false;
+    HWND open_for_game = nullptr;
     for (int i = 1; i < argc; ++i) {
         const std::wstring option = argv[i];
         if (option == L"--background") hidden = true;
+        else if (option == L"--open-for-game" && i + 1 < argc) {
+            wchar_t* end = nullptr;
+            const auto value = std::wcstoull(argv[++i], &end, 10);
+            if (!*end && value) open_for_game = reinterpret_cast<HWND>(static_cast<std::uintptr_t>(value));
+            hidden = true;
+        }
         else if (option == L"--port" && i + 1 < argc) {
             wchar_t* end = nullptr;
             const long port = std::wcstol(argv[++i], &end, 10);
@@ -1357,8 +1719,20 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
         }
     }
     LocalFree(argv);
-    if (const HWND existing = FindWindowW(wire::kWindowClass, nullptr)) {
-        if (!hidden) PostMessageW(existing, wire::kShowMessage, 0, 0);
+    const HANDLE mutex = CreateMutexW(nullptr, FALSE, L"Local\\LegoDimensionsToypadCatalog.Instance");
+    const bool already_running = mutex && GetLastError() == ERROR_ALREADY_EXISTS;
+    const std::unique_ptr<void, decltype(&CloseHandle)> instance_lock(mutex, CloseHandle);
+    if (HWND existing = FindWindowW(wire::kWindowClass, nullptr); existing || already_running) {
+        if (hidden && !open_for_game) return 0;
+        const auto deadline = GetTickCount64() + 2000;
+        while (!existing && GetTickCount64() < deadline) {
+            Sleep(20);
+            existing = FindWindowW(wire::kWindowClass, nullptr);
+        }
+        if (existing && open_for_game)
+            PostMessageW(existing, wire::kControllerOpen, reinterpret_cast<WPARAM>(open_for_game), 0);
+        else if (existing)
+            PostMessageW(existing, wire::kShowMessage, 0, 0);
         return 0;
     }
     g.cache = g.root / L"assets/toypad_catalog";
@@ -1372,7 +1746,10 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
     if (WSAStartup(MAKEWORD(2, 2), &sockets)) return 1;
     HMODULE xinput = LoadLibraryW(L"xinput1_4.dll");
     if (!xinput) xinput = LoadLibraryW(L"xinput9_1_0.dll");
-    if (xinput) g_get_pad = reinterpret_cast<GetPad>(GetProcAddress(xinput, "XInputGetState"));
+    if (xinput) {
+        g_get_pad = reinterpret_cast<GetPad>(GetProcAddress(xinput, "XInputGetState"));
+        g_get_pad_key = reinterpret_cast<GetPadKey>(GetProcAddress(xinput, "XInputGetKeystroke"));
+    }
     g.placement = g.desktop = ui::FitWindow(kWidth, kHeight, kWindowStyle);
     g.desktop_scale = ui::g_scale;
     if (!g.surface.Init(ui::S(kWidth), ui::S(kHeight))) { WSACleanup(); return 1; }
@@ -1390,10 +1767,12 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
     if (!g.window) { WSACleanup(); return 1; }
     const HWINEVENTHOOK foreground_hook = SetWinEventHook(EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_FOREGROUND,
                                                          nullptr, ForegroundChanged, 0, 0, WINEVENT_OUTOFCONTEXT);
-    std::thread(pad_hid::Read, &g_sony_pad).detach();
+    std::thread(pad_hid::Read, &g_sony_pad, &g_sony_back).detach();
     RegisterHotKey(g.window, 1, MOD_CONTROL | MOD_NOREPEAT, 'L');
     SetTimer(g.window, 1, 16, nullptr);
-    if (!hidden) RequestPanel(true);
+    g.art_loading = std::async(std::launch::async, ReadArtwork, g.root);
+    if (open_for_game) OpenForGame(open_for_game);
+    else if (!hidden) RequestPanel(true);
     MSG msg{};
     while (GetMessageW(&msg, nullptr, 0, 0) > 0) {
         TranslateMessage(&msg);

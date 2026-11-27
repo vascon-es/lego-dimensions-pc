@@ -866,6 +866,16 @@ int SelfTest() {
         const auto restored = tp::Slots();
         const bool persist_ok = tp::PresentEvents().size() == 3 && restored[1].pad == 2 && restored[1].id == 42 &&
                                 restored[4].pad == 2 && restored[4].id == 77 && restored[6].pad == 3 && restored[6].id == 1000;
+        const auto swap = tp::MoveIndex(3, 6, 1, true);
+        const auto swapped = tp::Slots();
+        const bool swap_ok = swap.size() == 4 && swap[0][5] == 1 && swap[1][5] == 1 &&
+                             swap[2][5] == 0 && swap[2][4] == 6 && swap[3][5] == 0 && swap[3][4] == 1 &&
+                             swapped[1].pad == 2 && swapped[1].id == 1000 && swapped[6].pad == 3 && swapped[6].id == 42;
+        check("Toy Pad catalog: occupied slots exchange both tags", swap_ok);
+        const auto reseat = tp::MoveIndex(3, 6, 6, true);
+        check("Toy Pad catalog: same slot emits a removal and insertion with the same UID",
+              reseat.size() == 2 && reseat[0][5] == 1 && reseat[1][5] == 0 &&
+                  reseat[0][4] == 6 && reseat[1][4] == 6 && std::memcmp(reseat[0].data() + 6, reseat[1].data() + 6, 7) == 0);
         for (int slot : {1, 4, 6}) tp::RemoveIndex(slot);
         tp::SavePortalState(test_portal);
         tp::LoadTag(2, 1, tp::BuildTag(uids[0], 42), {});
@@ -1264,7 +1274,7 @@ int main(int argc, char** argv) {
     bool live_compiler = true;
     bool shader_warmup = true;
     bool sync_shaders = true;   // Fase 38
-    double sync_budget_ms = 50; // Fase 38
+    double sync_budget_ms = 4; // Espera curta pelos pipelines já em compilação.
     bool sync_textures = true;     // Fase 39
     bool texture_wait = true;      // Fase 45: espera das texturas pendentes no fim do frame
     std::filesystem::path addcont_dir; // Fase 46
@@ -1500,7 +1510,7 @@ int main(int argc, char** argv) {
         } else if (!std::strcmp(argv[i], "--no-sync-shaders")) {
             sync_shaders = false; // Fase 38: pares e pipelines novos so em segundo plano (draw de fora ate chegarem)
         } else if (!std::strcmp(argv[i], "--sync-budget") && i + 1 < argc) {
-            sync_budget_ms = std::atof(argv[++i]); // ms por frame para criar pipelines na hora
+            sync_budget_ms = std::atof(argv[++i]); // ms por frame para esperar pipelines em segundo plano
         } else if (!std::strcmp(argv[i], "--pipeline-burst-wait") && i + 1 < argc) {
             render::VulkanRenderer::Instance().SetPipelineBurstWait(std::atof(argv[++i])); // Fase 55: 0 desliga
         } else if (!std::strcmp(argv[i], "--live-sync-budget") && i + 1 < argc) {
@@ -1739,6 +1749,7 @@ int main(int argc, char** argv) {
         hle::StartPortalWatcher(portal_file);
         std::printf("portal     : %s  (reread every 500 ms)\n", hle::fs::PathText(portal_file).c_str());
         hle::StartToypadListener(toypad_port);
+        hle::videoout::ConfigureToypadCatalog(root, toypad_port);
     }
     hle::videoout::SetWindowEnabled(window && !selftest);
     hle::SetStubLogger(&hle::log::StubLogger);

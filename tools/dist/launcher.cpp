@@ -3595,7 +3595,7 @@ void LoadXInput() {
             }
         }
     }
-    std::thread(pad_hid::Read, &g_sony_pad).detach();
+    std::thread(pad_hid::Read, &g_sony_pad, nullptr).detach();
 }
 
 void PadKey(WORD vk) {

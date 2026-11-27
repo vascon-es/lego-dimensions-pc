@@ -7,12 +7,13 @@ namespace toypad_catalog {
 
 constexpr int kSlots = 7;
 constexpr int kPort = 9191;
-constexpr std::uint8_t kMove = 3, kSnapshot = 5, kSelect = 6;
+constexpr std::uint8_t kMove = 3, kSnapshot = 5, kSelect = 6, kSwap = 7;
 constexpr wchar_t kWindowClass[] = L"LegoDimensionsToypadCatalog";
 constexpr wchar_t kGameWindowClass[] = L"LegoDimensionsPcWindow";
 constexpr wchar_t kInputOwnerProperty[] = L"LegoDimensionsToypadCatalog.InputTarget";
 constexpr unsigned kShowMessage = 0x8000 + 73;
 constexpr unsigned kOpenRequest = 0x8000 + 74;
+constexpr unsigned kControllerOpen = 0x8000 + 75;
 
 using Header = std::array<std::uint8_t, 5>;
 using Snapshot = std::array<std::uint8_t, 2 + kSlots * 5>;

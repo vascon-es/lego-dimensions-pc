@@ -3546,7 +3546,7 @@ std::atomic<bool> g_async_pipelines{true};
 std::atomic<u64> g_pipelines_async{0};
 // Fase 38: criacao sincrona com orcamento por frame (so a thread de render mexe, com g.mutex)
 bool g_sync_pipelines = true;
-double g_sync_budget_ms = 50.0;
+double g_sync_budget_ms = 4.0;
 double g_sync_frame_ms = 0;
 bool g_sync_frame_any = false;
 VulkanRenderer::SyncPipelineStats g_sync_stats;
@@ -3899,14 +3899,8 @@ VkPipeline GetGamePipeline(const GameDraw& draw, const State::GamePair& pair, St
 double g_frame_wait_spent_ms = 0; // Fase 45: espera por texturas deste frame (thread de render)
 u64 g_draws_late_texture = 0;
 
-// Fase 55: frame com muitos pipelines novos ao mesmo tempo (comeco de cutscene ou de area: 90 de uma
-// vez na cutscene do Mestre Chen). Com o teto normal de 50 ms o frame saia sem esses objetos por quase
-// 1 s: a pele das cabecas, que e outro material, sumia e ficava so o rosto. Nesses frames a espera vai
-// ate g_burst_wait_ms: um engasgo curto no corte, no lugar de objetos faltando.
-// Fase 56: limiar 1 e teto 400 ms: o frame nao sai sem objetos (a 1a vez vira um engasgo no corte, sem
-// pop-in). Os pipelines urgentes saem sem otimizacao (Fase 56), o que encurta esse engasgo.
-double g_burst_wait_ms = 16.0; // Teto de 1 frame (16 ms) para compilar sem pop-in preto
-u32 g_burst_threshold = 1;
+// --pipeline-burst-wait permite esperar mais em diagnósticos de objetos faltando.
+double g_burst_wait_ms = 0.0;
 
 void WaitFramePipelines() {
     const auto start = std::chrono::steady_clock::now();
@@ -3920,7 +3914,7 @@ void WaitFramePipelines() {
                 pending.insert(draw.pipeline_key);
             }
         }
-        if (!pending.empty() && g_burst_wait_ms > budget && pending.size() >= g_burst_threshold) {
+        if (!pending.empty() && g_burst_wait_ms > budget) {
             budget = g_burst_wait_ms;
             ++g_sync_stats.burst_frames;
         }

@@ -536,7 +536,7 @@ std::optional<Packet> RemoveIndex(int index) {
     return FigureEvent(figure.pad, index, true, figure.uid);
 }
 
-std::vector<Packet> MoveIndex(int new_pad, int new_index, int old_index) {
+std::vector<Packet> MoveIndex(int new_pad, int new_index, int old_index, bool swap_occupied) {
     std::lock_guard lock(g_mutex);
     std::vector<Packet> events;
     if (new_pad < 1 || new_pad > kPadCount || new_index < 0 || new_index >= kSlotCount || old_index < 0 || old_index >= kSlotCount ||
@@ -544,14 +544,22 @@ std::vector<Packet> MoveIndex(int new_pad, int new_index, int old_index) {
         return events;
     }
     Figure moved = g_figures[old_index];
+    const int old_pad = moved.pad;
+    Figure displaced;
     events.push_back(FigureEvent(moved.pad, old_index, true, moved.uid));
     g_figures[old_index].present = false;
     if (new_index != old_index && g_figures[new_index].present) { // destino ocupado: sai o que estava la
         events.push_back(FigureEvent(g_figures[new_index].pad, new_index, true, g_figures[new_index].uid));
+        if (swap_occupied) displaced = std::move(g_figures[new_index]);
     }
     moved.pad = new_pad;
-    g_figures[new_index] = moved;
     events.push_back(FigureEvent(new_pad, new_index, false, moved.uid));
+    g_figures[new_index] = std::move(moved);
+    if (displaced.present) {
+        displaced.pad = old_pad;
+        events.push_back(FigureEvent(old_pad, old_index, false, displaced.uid));
+        g_figures[old_index] = std::move(displaced);
+    }
     SavePortalStateLocked();
     return events;
 }

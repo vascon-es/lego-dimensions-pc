@@ -694,6 +694,11 @@ HLE_IMPL(int, scePadReadState, int handle, PadData* data, u64 guest_rbp) {
     if (pad_allowed && g_keyboard_player.load() == 0) {
         ReadKeyboard(in);
     }
+    static std::atomic<bool> catalog_button_held{false};
+    const bool catalog_button = (in.buttons & kTouchPad) != 0;
+    if (!catalog_button_held.exchange(catalog_button) && catalog_button && videoout::RequestToypadCatalog()) {
+        in.buttons &= ~kTouchPad;
+    }
     ReadScript(in);
     videoout::TickGraphicsSettings();
 

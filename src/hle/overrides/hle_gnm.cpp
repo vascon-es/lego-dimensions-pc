@@ -114,7 +114,7 @@ std::mutex g_file_mutex;
 std::condition_variable g_file_cv, g_file_idle_cv;
 std::deque<FileWrite> g_file_jobs;
 bool g_file_started = false; // com g_file_mutex
-bool g_file_busy = false;
+u64 g_file_enqueued = 0, g_file_completed = 0; // com g_file_mutex
 std::atomic<u64> g_file_writes{0};
 
 void FileWriterLoop() {
@@ -124,7 +124,6 @@ void FileWriterLoop() {
             std::unique_lock lock(g_file_mutex);
             g_file_cv.wait(lock, [] { return !g_file_jobs.empty(); });
             batch.swap(g_file_jobs);
-            g_file_busy = true;
         }
         std::FILE* open = nullptr; // acrescimos seguidos no mesmo arquivo: abre uma vez so
         std::filesystem::path open_path;
@@ -162,7 +161,7 @@ void FileWriterLoop() {
         }
         {
             std::lock_guard lock(g_file_mutex);
-            g_file_busy = false;
+            g_file_completed += batch.size();
         }
         g_file_idle_cv.notify_all();
     }
@@ -176,13 +175,15 @@ void WriteFileAsync(FileWrite job) {
             std::thread(FileWriterLoop).detach(); // o processo sai sem esperar; o relatorio final chama FlushFileWrites
         }
         g_file_jobs.push_back(std::move(job));
+        ++g_file_enqueued;
     }
     g_file_cv.notify_one();
 }
 
 void FlushFileWrites() {
     std::unique_lock lock(g_file_mutex);
-    g_file_idle_cv.wait_for(lock, std::chrono::seconds(10), [] { return g_file_jobs.empty() && !g_file_busy; });
+    const u64 target = g_file_enqueued;
+    g_file_idle_cv.wait_for(lock, std::chrono::seconds(10), [target] { return g_file_completed >= target; });
 }
 
 std::string Format(const char* format, ...) {
@@ -3394,15 +3395,13 @@ struct LiveSnapshot {
     PairJob job;
 };
 std::mutex g_pair_mutex;
-std::condition_variable g_pair_cv;
+std::condition_variable g_pair_cv, g_live_cv;
 std::deque<PairJob> g_pair_jobs;
 std::vector<PairDone> g_pair_done;
-std::vector<LiveSnapshot> g_live_snapshots;
+std::deque<LiveSnapshot> g_live_snapshots;
 std::filesystem::path g_live_tool, g_live_root, g_live_shader_dir;
 std::atomic<bool> g_pair_async{true};
-// Fase 38: par que existe em disco (ou no pacote AOT) e carregado NA HORA, na thread de render; so o
-// que nao existe vai para o recompilador ao vivo, em segundo plano. --no-sync-shaders volta ao modo
-// da Fase 29 (tudo em segundo plano, draws de fora enquanto isso).
+// O caminho síncrono de pares do pacote AOT fica disponível com --pair-budget.
 std::atomic<bool> g_sync_pairs{true};
 // O projeto fica num HD: ler um par do disco custa um seek (10 a 30 ms, mais de 100 ms com o jogo
 // lendo os .DAT ao mesmo tempo). Por isso so e carregado na hora o par que nao precisa do disco:
@@ -3429,7 +3428,7 @@ u64 g_ready_memory_mb = 0;
 // Fase 41: carregar um par agora inclui o driver compilar as bibliotecas de pipeline dos dois
 // shaders (~1 ms com o cache do driver quente, 20 a 60 ms frio). Orcamento por frame: passou, o par
 // vai para a thread de pares e o draw espera alguns frames, em vez de travar a tela.
-double g_pair_budget_ms = 16.0;
+double g_pair_budget_ms = 0.0;
 double g_pair_frame_ms = 0; // so a thread de render
 u64 g_sync_pairs_over_budget = 0;
 
@@ -3612,7 +3611,7 @@ bool StartLiveServer(const std::filesystem::path& shader_dir, const std::filesys
     startup.hStdOutput = child_out;
     startup.hStdError = child_out;
     PROCESS_INFORMATION process{};
-    const bool ok = CreateProcessW(nullptr, command.data(), nullptr, nullptr, TRUE, CREATE_NO_WINDOW, nullptr,
+    const bool ok = CreateProcessW(nullptr, command.data(), nullptr, nullptr, TRUE, CREATE_NO_WINDOW | BELOW_NORMAL_PRIORITY_CLASS, nullptr,
                                    g_live_root.c_str(), &startup, &process);
     CloseHandle(child_in);
     CloseHandle(child_out);
@@ -3665,6 +3664,8 @@ bool ServeLiveRequest(const std::filesystem::path& list) {
 }
 
 void RunLiveCompiler(const std::vector<LiveSnapshot>& batch) {
+    // O recompilador lê o código e os índices que o extrator grava em segundo plano.
+    if (!batch.empty()) FlushFileWrites();
     std::lock_guard tool_lock(g_live_tool_mutex);
     const std::filesystem::path shader_dir = g_live_shader_dir;
     const std::filesystem::path spv_dir = render::GameSpirvDirectory();
@@ -3722,54 +3723,66 @@ void RunLiveCompiler(const std::vector<LiveSnapshot>& batch) {
                 static_cast<unsigned long long>(ms), code);
 }
 
-// Fase 41: duas threads (carregar um par agora inclui o driver compilar as bibliotecas de pipeline; com
-// quatro, a CPU de 6 nucleos fica disputada e o jogo perde quadros);
-// so a primeira roda o recompilador ao vivo, que usa um arquivo de lote fixo.
-void PairWorker(int index) {
+void PairWorker() {
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
     for (;;) {
         PairJob job;
-        bool have = false;
-        std::vector<LiveSnapshot> batch;
         {
             std::unique_lock lock(g_pair_mutex);
-            g_pair_cv.wait_for(lock, std::chrono::milliseconds(50), [] { return !g_pair_jobs.empty(); }); // Fase 56: era 400 ms
-            if (!g_pair_jobs.empty()) {
-                job = g_pair_jobs.front();
-                g_pair_jobs.pop_front();
-                have = true;
-            } else if (index == 0) {
-                batch.swap(g_live_snapshots); // juntou por ate 400 ms: uma execucao da ferramenta para todos
+            g_pair_cv.wait(lock, [] { return !g_pair_jobs.empty(); });
+            job = g_pair_jobs.front();
+            g_pair_jobs.pop_front();
+        }
+        PairDone done;
+        done.job = job;
+        done.result.canon_signature = job.canon;
+        done.result.vformats = job.vformats;
+        done.result.vformat_count = job.vformat_count;
+        LoadGamePair(job.vs_hash, job.ps_hash, job.signature, job.cntl.data(), &done.result);
+        std::lock_guard lock(g_pair_mutex);
+        g_pair_done.push_back(std::move(done));
+    }
+}
+
+void EnsurePairWorkers() {
+    static std::once_flag once;
+    std::call_once(once, [] {
+        for (int i = 0; i < 2; ++i) {
+            std::thread(PairWorker).detach();
+        }
+    });
+}
+
+void LiveCompilerWorker() {
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+    RunLiveCompiler({});
+    // Lotes curtos entregam os primeiros materiais enquanto o restante da cena ainda compila.
+    constexpr size_t kBatchSize = 4;
+    std::vector<LiveSnapshot> batch;
+    batch.reserve(kBatchSize);
+    for (;;) {
+        {
+            std::unique_lock lock(g_pair_mutex);
+            g_live_cv.wait(lock, [] { return !g_live_snapshots.empty(); });
+            while (batch.size() < kBatchSize && !g_live_snapshots.empty()) {
+                batch.push_back(std::move(g_live_snapshots.front()));
+                g_live_snapshots.pop_front();
             }
         }
-        if (have && !job.target) {
-            continue;
-        }
-        if (have) {
-            PairDone done;
-            done.job = job;
-            done.result.canon_signature = job.canon;
-            done.result.vformats = job.vformats;
-            done.result.vformat_count = job.vformat_count;
-            LoadGamePair(job.vs_hash, job.ps_hash, job.signature, job.cntl.data(), &done.result);
-            std::lock_guard lock(g_pair_mutex);
-            g_pair_done.push_back(std::move(done));
-        } else if (!batch.empty()) {
-            RunLiveCompiler(batch);
+        RunLiveCompiler(batch);
+        {
             std::lock_guard lock(g_pair_mutex);
             for (const LiveSnapshot& snapshot : batch) {
                 g_pair_jobs.push_back(snapshot.job);
             }
         }
+        g_pair_cv.notify_all();
+        batch.clear();
     }
 }
 
 void QueuePairJob(const PairJob& job) {
-    static std::once_flag once;
-    std::call_once(once, [] {
-        for (int i = 0; i < 2; ++i) {
-            std::thread(PairWorker, i).detach();
-        }
-    });
+    EnsurePairWorkers();
     {
         std::lock_guard lock(g_pair_mutex);
         g_pair_jobs.push_back(job);
@@ -4640,7 +4653,7 @@ void SubmitDrawToVulkan(u32 opcode, const u32* body, u32 body_dwords) {
     if (!info->usable) {
         if (info->want_snapshot) {
             info->want_snapshot = false;
-            if (!LiveCompileNow(vs_address, ps_address, signature, info)) { // Fase 56: na hora, se couber no frame
+            if (!LiveCompileNow(vs_address, ps_address, signature, info)) {
                 QueueLiveSnapshot(vs_address, ps_address, signature, info);
             }
         }
@@ -4698,10 +4711,8 @@ void SubmitDrawToVulkan(u32 opcode, const u32* body, u32 body_dwords) {
             info->usable = false;
             info->aot = false;
             info->why = "AOT pack: wrong predicted texture type (recompiling live)";
-            if (!LiveCompileNow(vs_address, ps_address, signature, info)) { // Fase 56: na hora, se couber no frame
-                if (!g_live_tool.empty()) {
-                    QueueLiveSnapshot(vs_address, ps_address, signature, info);
-                }
+            if (!LiveCompileNow(vs_address, ps_address, signature, info)) {
+                QueueLiveSnapshot(vs_address, ps_address, signature, info);
                 ++stats.game_no_pair;
                 return;
             }
@@ -6061,6 +6072,7 @@ std::string SnapshotText(const PairSnapshot& snapshot) {
 
 // Fase 29: par sem SPIR-V em disco -> retrato do primeiro draw para o recompilador ao vivo.
 void QueueLiveSnapshot(u64 vs_address, u64 ps_address, u64 signature, GamePairInfo* info) {
+    if (g_live_tool.empty() || info->pending) return;
     const auto snapshot = g_ui_pair_snapshots.find({vs_address, ps_address, signature});
     if (snapshot == g_ui_pair_snapshots.end()) {
         return;
@@ -6075,16 +6087,15 @@ void QueueLiveSnapshot(u64 vs_address, u64 ps_address, u64 signature, GamePairIn
     info->pending = true;
     info->why = "being recompiled in background";
     ++g_pairs_live_requested;
-    QueuePairJob({}); // garante a thread; o trabalho vazio e descartado abaixo
-    std::lock_guard lock(g_pair_mutex);
-    g_live_snapshots.push_back(std::move(live));
+    {
+        std::lock_guard lock(g_pair_mutex);
+        g_live_snapshots.push_back(std::move(live));
+    }
+    g_live_cv.notify_one();
 }
 
-// Fase 56: par que nao existe (nem em disco nem no pacote AOT, ou o pacote errou o tipo de textura):
-// traduz AGORA, na thread de render, e o draw entra neste mesmo frame. Antes ia para segundo plano e o
-// objeto ficava de fora por 0,6 a 0,8 s (retrato -> lote de 400 ms -> ferramenta -> carga -> proximo
-// Submit). Orcamento por frame: passou, volta ao segundo plano.
-double g_live_sync_budget_ms = 400.0; // --live-sync-budget (0 = so em segundo plano)
+// --live-sync-budget permite traduzir no mesmo frame em diagnósticos.
+double g_live_sync_budget_ms = 0.0;
 double g_live_sync_frame_ms = 0;      // so a thread de render
 u64 g_live_sync_pairs = 0;
 
@@ -7906,12 +7917,8 @@ void SetLiveCompiler(const std::filesystem::path& tool, const std::filesystem::p
         g_live_root = root;
         g_live_shader_dir = shader_dir;
         log::Tagged("SHADER-LIVE", "live recompiler: %s", tool.string().c_str());
-        // Fase 56: uma execucao vazia na abertura poe o executavel e o indice de shaders no cache do
-        // Windows (o D: e um HD): a 1a traducao na hora levava 1,8 s, as seguintes 0,1 a 0,3 s.
-        std::thread([] {
-            SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
-            RunLiveCompiler({});
-        }).detach();
+        EnsurePairWorkers();
+        std::thread(LiveCompilerWorker).detach();
     } else {
         g_live_tool.clear();
         if (!tool.empty()) {

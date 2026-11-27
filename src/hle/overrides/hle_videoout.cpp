@@ -125,6 +125,8 @@ FlipStatus g_status{};
 std::atomic<u64> g_flip_count{0};
 std::atomic<HWND> g_hwnd{nullptr};
 std::atomic<HWND> g_toypad_input_window{nullptr};
+std::filesystem::path g_toypad_catalog_path;
+int g_toypad_catalog_port = toypad_catalog::kPort;
 const auto g_epoch = std::chrono::steady_clock::now();
 
 u64 NowMicros() {
@@ -2256,6 +2258,33 @@ namespace {
 
 LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
     switch (msg) {
+    case toypad_catalog::kControllerOpen: {
+        if (GetForegroundWindow() != hwnd) return 0;
+        if (const HWND panel = FindWindowW(toypad_catalog::kWindowClass, nullptr)) {
+            DWORD pid = 0;
+            GetWindowThreadProcessId(panel, &pid);
+            if (pid && !g_fullscreen) AllowSetForegroundWindow(pid);
+            g_toypad_input_window.store(panel, std::memory_order_relaxed);
+            PostMessageW(panel, toypad_catalog::kControllerOpen, reinterpret_cast<WPARAM>(hwnd), g_fullscreen ? 1 : 0);
+        } else if (!g_toypad_catalog_path.empty()) {
+            static ULONGLONG retry_at = 0;
+            const auto now = GetTickCount64();
+            if (now < retry_at) return 0;
+            std::wstring command = L"\"" + g_toypad_catalog_path.wstring() + L"\" --open-for-game " +
+                                   std::to_wstring(reinterpret_cast<std::uintptr_t>(hwnd)) +
+                                   L" --port " + std::to_wstring(g_toypad_catalog_port);
+            STARTUPINFOW startup{sizeof(startup)};
+            PROCESS_INFORMATION process{};
+            if (CreateProcessW(g_toypad_catalog_path.c_str(), command.data(), nullptr, nullptr, FALSE, 0,
+                               nullptr, nullptr, &startup, &process)) {
+                retry_at = now + 1500;
+                if (!g_fullscreen) AllowSetForegroundWindow(process.dwProcessId);
+                CloseHandle(process.hThread);
+                CloseHandle(process.hProcess);
+            }
+        }
+        return 0;
+    }
     case toypad_catalog::kOpenRequest: {
         const HWND panel = reinterpret_cast<HWND>(wparam);
         if (panel && panel == FindWindowW(toypad_catalog::kWindowClass, nullptr)) {
@@ -2346,6 +2375,7 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
         }
         break;
     case WM_KEYDOWN:
+        if (wparam == VK_TAB && !(lparam & (1LL << 30)) && !ToypadOwnsInput() && RequestToypadCatalog()) return 0;
         if (g_fullscreen && ToypadOwnsInput()) {
             // O Toy Pad fica sobre o jogo em tela cheia sem tomar o foco do Windows.
             const HWND panel = g_toypad_input_window.load(std::memory_order_relaxed);
@@ -5231,6 +5261,23 @@ bool ToypadOwnsInput() {
     if (const HWND game = g_hwnd.load(); game && GetPropW(panel, toypad_catalog::kInputOwnerProperty) == game) return true;
     if (!IsWindow(panel)) g_toypad_input_window.compare_exchange_strong(panel, nullptr, std::memory_order_relaxed);
     return false;
+}
+
+void ConfigureToypadCatalog(const std::filesystem::path& root, int port) {
+    wchar_t mode[16]{};
+    GetPrivateProfileStringW(L"launcher", L"toypad_interface", L"", mode, std::size(mode), (root / L"launcher.ini").c_str());
+    if (port > 0 && std::wcscmp(mode, L"catalogo") == 0) {
+        g_toypad_catalog_path = root / L"tools" / L"LegoToypadCatalog.exe";
+        g_toypad_catalog_port = port;
+    }
+}
+
+bool RequestToypadCatalog() {
+    const HWND game = g_hwnd.load();
+    if (!game || GetForegroundWindow() != game) return false;
+    const HWND panel = FindWindowW(toypad_catalog::kWindowClass, nullptr);
+    if (panel ? IsWindowVisible(panel) : g_toypad_catalog_path.empty()) return false;
+    return PostMessageW(game, toypad_catalog::kControllerOpen, 0, 0) != FALSE;
 }
 
 } // namespace hle::videoout

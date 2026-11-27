@@ -110,6 +110,7 @@ def stage():
     copy(R('tools', 'setup', 'launcher_art.py'), S('tools', 'setup', 'launcher_art.py'))  # 1.8.7: a fonte do jogo para o launcher
     copy(R('tools', 'setup', 'toypad_catalog.py'), S('tools', 'setup', 'toypad_catalog.py'))
     copy(R('tools', 'setup', 'toypad_portraits.tsv'), S('tools', 'setup', 'toypad_portraits.tsv'))
+    copy(R('tools', 'setup', 'toypad_roster.png'), S('tools', 'setup', 'toypad_roster.png'))
     copy(R('tools', 'setup', 'prever_pipelines.py'), S('tools', 'setup', 'prever_pipelines.py'))  # 1.8.9: receitas previstas (preparar.py --prever)
     # 7-Zip 26.03 (LGPL + restricao do unRAR; License.txt vai junto): abre os .rar v6 / dicionario grande que o tar.exe
     # do Windows nao abre. Copia oficial em tools\7zip, no repositorio.

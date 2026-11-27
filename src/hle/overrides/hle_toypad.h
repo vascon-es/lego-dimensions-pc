@@ -55,7 +55,7 @@ void LoadPortalState(const std::filesystem::path& path = {});
 // de fora (dump de 180 bytes). `path` nao vazio = arquivo que recebe as escritas do jogo.
 std::optional<Packet> LoadTag(int pad, int index, const TagData& tag, const std::string& path, u32* character_id = nullptr);
 std::optional<Packet> RemoveIndex(int index);
-std::vector<Packet> MoveIndex(int new_pad, int new_index, int old_index); // remocao + colocacao
+std::vector<Packet> MoveIndex(int new_pad, int new_index, int old_index, bool swap_occupied = false);
 std::vector<Packet> PresentEvents();                                      // "colocada" de tudo o que esta no portal
 struct SlotInfo { int pad; u32 id; };
 std::array<SlotInfo, kSlotCount> Slots();

@@ -92,20 +92,24 @@ inline bool Parse(const BYTE* report, DWORD size, bool dualsense, XINPUT_GAMEPAD
     return true;
 }
 
-inline void Read(std::atomic<XINPUT_GAMEPAD>* state) {
+inline void Read(std::atomic<XINPUT_GAMEPAD>* state, std::atomic<bool>* back_pressed) {
     for (;;) {
         bool dualsense = false;
         DWORD bytes = 0;
         HANDLE device = Open(&dualsense, &bytes);
         if (device == INVALID_HANDLE_VALUE) {
-            Sleep(2000);
+            Sleep(350);
             continue;
         }
         std::vector<BYTE> report(std::max<DWORD>(bytes, 64));
         DWORD got = 0;
         while (ReadFile(device, report.data(), static_cast<DWORD>(report.size()), &got, nullptr)) {
             XINPUT_GAMEPAD pad{};
-            if (Parse(report.data(), got, dualsense, &pad)) state->store(pad, std::memory_order_relaxed);
+            if (Parse(report.data(), got, dualsense, &pad)) {
+                const auto previous = state->exchange(pad, std::memory_order_relaxed);
+                if (back_pressed && (pad.wButtons & XINPUT_GAMEPAD_BACK) && !(previous.wButtons & XINPUT_GAMEPAD_BACK))
+                    back_pressed->store(true, std::memory_order_relaxed);
+            }
         }
         CloseHandle(device);
         state->store({}, std::memory_order_relaxed);

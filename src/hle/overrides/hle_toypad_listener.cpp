@@ -16,6 +16,7 @@
 #include <winsock2.h>
 #include <ws2tcpip.h>
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstdio>
@@ -165,22 +166,21 @@ bool HandleCommand(SOCKET s) {
         Announce(events);
         break;
     }
-    case 3: { // MOVE
+    case toypad_catalog::kMove:
+    case toypad_catalog::kSwap: {
         const u8 old_pad = header[3], old_index = header[4];
         if (old_pad < 1 || old_pad > 3 || old_index >= toypad::kSlotCount) {
             std::printf("[TOYPAD-APP] MOVE refused: source pad %u index %u\n", old_pad, old_index);
             return true;
         }
-        std::vector<toypad::Packet> events = toypad::MoveIndex(pad, index, old_index);
+        auto events = toypad::MoveIndex(pad, index, old_index, cmd == toypad_catalog::kSwap);
         std::printf("[TOYPAD-APP] MOVE %u/%u -> %u/%u%s\n", old_pad, old_index, pad, index, events.empty() ? " (empty source)" : "");
-        if (events.size() > 1) { // "removida" (e o que ocupava o destino) agora, "colocada" depois do intervalo
-            const toypad::Packet placed = events.back();
-            events.pop_back();
-            Announce(events);
+        const auto placed = std::find_if(events.begin(), events.end(), [](const auto& packet) { return packet[5] == 0; });
+        if (placed != events.begin()) {
+            Announce({events.begin(), placed});
             std::this_thread::sleep_for(kPickupDelay);
-            events = {placed};
         }
-        Announce(events);
+        Announce({placed, events.end()});
         break;
     }
     default:

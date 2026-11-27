@@ -113,6 +113,8 @@ void HandleLogsMenuController(u32 pressed_buttons);
 // true se a janela do jogo existe e esta em primeiro plano (o teclado so vale nesse caso).
 bool WindowHasFocus();
 bool ToypadOwnsInput();
+void ConfigureToypadCatalog(const std::filesystem::path& root, int port);
+bool RequestToypadCatalog();
 // HWND da janela do jogo (nullptr se nao ha janela): dona dos dialogos do port.
 void* WindowHandle();
 
