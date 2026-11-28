@@ -100,7 +100,7 @@ const wchar_t* const kFpsModes[] = {L"30", L"60", L"livre", L"livre_sem_vsync"};
 // FSR 1 = espacial; FSR 2 / 3 / 4 = temporais (AMD FFX API 4.1.2); xess = Intel XeSS 3.0.2 (Vulkan).
 const wchar_t* const kUpscalers[] = {L"off", L"fsr1", L"fsr2", L"fsr3", L"fsr4", L"xess"};
 // 1.9.1: anti-aliasing (TAA = 16 posicoes de deslocamento por quadro + nitidez RCAS)
-const wchar_t* const kAntiAliasing[] = {L"off", L"taa", L"fsraa", L"fsraa4", L"xessaa"}; // fsraa = FSR 3; fsraa4 = FSR 4; xessaa = XeSS Native AA
+const wchar_t* const kAntiAliasing[] = {L"off", L"taa", L"fsraa", L"fsraa4", L"xessaa", L"spatial"}; // fsraa = FSR 3; fsraa4 = FSR 4; xessaa = XeSS Native AA
 const wchar_t* const kTargetResolutions[] = {L"auto", L"1280x720", L"1600x900", L"1920x1080", L"2560x1080", L"2560x1440", L"3440x1440", L"3840x2160"};
 // 1.9.1: tela que nao e 16:9: imagem inteira (camera corrigida) ou 16:9 com faixas
 const wchar_t* const kAspectModes[] = {L"encher", L"16x9"};
@@ -2755,6 +2755,7 @@ std::vector<Row> Rows() {
                     : g_aa_value == L"fsraa"  ? std::wstring(L"AMD FSR 3 AA")
                     : g_aa_value == L"fsraa4" ? ui::T(L"AMD FSR 4 AA (pesado)", L"AMD FSR 4 AA (heavy)")
                     : g_aa_value == L"xessaa" ? std::wstring(L"Intel XeSS Native AA")
+                    : g_aa_value == L"spatial" ? ui::T(L"AA espacial", L"Spatial AA")
                                               : ui::T(L"Desligado", L"Off"),
                     [](int step) {
                         g_aa_value = Step(kAntiAliasing, g_aa_value, step, [](const wchar_t* r) { return std::wstring(r); });

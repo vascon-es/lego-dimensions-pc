@@ -80,7 +80,6 @@ void QueueStatsOverlay();
 void SetWindowResolution(u32 width, u32 height);
 void SetGraphicsIniRoot(const std::filesystem::path& root);
 void InstallNativeGraphicsMenu(const loader::ElfPieLoader& elf);
-void TickGraphicsSettings();
 void ToggleVideoSettingsMenu();
 bool IsVideoSettingsMenuOpen();
 void HandleVideoMenuController(u32 pressed_buttons);

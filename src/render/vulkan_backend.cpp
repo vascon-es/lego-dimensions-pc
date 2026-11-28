@@ -248,7 +248,6 @@ struct State {
     // Fase 75: tempo de GPU de cada quadro (timestamp no comeco e no fim do command buffer do frame). A espera
     // "frame anterior" do [QUADRO-LENTO] dominava os quadros lentos de um jogador (RX 9070 XT, 5 h): este numero
     // diz se a GPU demorou mesmo naquele quadro. LD_GPU_TIME=0 desliga.
-    bool native_menu_raster = false;
     bool native_boot_raster = true; // as telas de licenca usam coordenadas 2D do PS4
     VkQueryPool timestamps = VK_NULL_HANDLE;
     VkQueryPool depth_samples = VK_NULL_HANDLE;
@@ -301,6 +300,7 @@ struct State {
         VkImageView view = VK_NULL_HANDLE;     // anexo, e amostragem pelos shaders do jogo
         VkImageView raw_view = VK_NULL_HANDLE; // os bytes como estao (UNORM), para copiar a janela
         VkImageView sample_view = VK_NULL_HANDLE; // profundidade: so o aspecto de profundidade, para os shaders
+        VkImageView opaque_sample_view = VK_NULL_HANDLE; // fundo da pausa: alpha da cena ignorado
         VkDescriptorSet present_set = VK_NULL_HANDLE;
         VkFormat format = VK_FORMAT_UNDEFINED;
         u32 width = 0, height = 0;
@@ -1345,12 +1345,15 @@ std::vector<u32> BuildColorGradeFragmentShader() {
         kMain, kEntry,
         kP0, kPcRect, kP1, kPcInvBright, kP2, kPcColor, kP3, kPcRgb,
         kFc, kFcXy, kRectXy, kRectWh, kDeltaXy, kUv, kTexVal, kS0, kCCenter,
-        kSharp, kDoSharp, kLblSharp, kLblAfterSharp,
+        kSharp, kDoSharp, kFilterAA, kDoAA, kDoFilter, kLblSharp, kLblAfterSharp,
         kInvW, kInvH, kDx, kDy, kUvN, kUvS, kUvE, kUvW,
         kSn4, kSs4, kSe4, kSw4, kSn, kSs, kSe, kSw,
         kSumNs, kSumEw, kSum4, kAvg, kDiff, kSAmt, kDiffS, kCBoost,
         kMnNs, kMnEw, kMn4, kMnAll, kMnLo, kMnBound,
         kMxNs, kMxEw, kMx4, kMxAll, kMxHi, kMxBound, kCSharp,
+        kLumaN, kLumaS, kLumaE, kLumaW, kLumaMin, kLumaMax, kLumaRange, kAaStrength,
+        kLumaNS, kLumaEW, kAbsNS, kAbsEW, kAcrossY, kAcrossWeight, kAcrossNS, kAcrossEW, kEdgeAverage,
+        kAxisDelta, kAxisBlend, kAaWeight, kAaDelta, kAaBlend, kFiltered,
         kCBase, kGains, kCRgb,
         kBright, kContrast, kCMid, kCCon, kHalfBright, kV3Hb, kCBc,
         kCPos, kInvGamma, kV3Ig, kCGam,
@@ -1451,8 +1454,11 @@ std::vector<u32> BuildColorGradeFragmentShader() {
     // Optional contrast-adaptive sharpening if sharpness > 0.001
     b.Op(81, {kFloat, kSharp, kPcColor, 3});
     b.Op(186, {kBool, kDoSharp, kSharp, kF0_001}); // OpFOrdGreaterThan
+    b.Op(81, {kFloat, kFilterAA, kPcRgb, 3});
+    b.Op(186, {kBool, kDoAA, kFilterAA, kF0});
+    b.Op(166, {kBool, kDoFilter, kDoSharp, kDoAA}); // OpLogicalOr
     b.Op(247, {kLblAfterSharp, 0});                // OpSelectionMerge
-    b.Op(250, {kDoSharp, kLblSharp, kLblAfterSharp}); // OpBranchConditional
+    b.Op(250, {kDoFilter, kLblSharp, kLblAfterSharp}); // OpBranchConditional
 
     b.Op(248, {kLblSharp});
     b.Op(81, {kFloat, kInvW, kPcInvBright, 0});
@@ -1492,10 +1498,34 @@ std::vector<u32> BuildColorGradeFragmentShader() {
     b.Op(129, {kV3, kMxHi, kMxAll, kV3EdgePad});
     b.Op(12, {kV3, kMxBound, kGlsl, 37, kV3One, kMxHi}); // FMin
     b.Op(12, {kV3, kCSharp, kGlsl, 43, kCBoost, kMnBound, kMxBound}); // FClamp
+    // AA espacial: mistura os vizinhos no eixo que cruza a borda, com peso pelo contraste local.
+    b.Op(148, {kFloat, kLumaN, kSn, kV3LumaW}); // OpDot
+    b.Op(148, {kFloat, kLumaS, kSs, kV3LumaW});
+    b.Op(148, {kFloat, kLumaE, kSe, kV3LumaW});
+    b.Op(148, {kFloat, kLumaW, kSw, kV3LumaW});
+    b.Op(148, {kFloat, kLumaMin, kMnAll, kV3LumaW});
+    b.Op(148, {kFloat, kLumaMax, kMxAll, kV3LumaW});
+    b.Op(131, {kFloat, kLumaRange, kLumaMax, kLumaMin});
+    b.Op(12, {kFloat, kAaStrength, kGlsl, 49, kF0_08, kF0_25, kLumaRange}); // SmoothStep
+    b.Op(131, {kFloat, kLumaNS, kLumaN, kLumaS});
+    b.Op(131, {kFloat, kLumaEW, kLumaE, kLumaW});
+    b.Op(12, {kFloat, kAbsNS, kGlsl, 4, kLumaNS}); // FAbs
+    b.Op(12, {kFloat, kAbsEW, kGlsl, 4, kLumaEW});
+    b.Op(186, {kBool, kAcrossY, kAbsNS, kAbsEW});
+    b.Op(142, {kV3, kAcrossNS, kSumNs, kF0_5});
+    b.Op(142, {kV3, kAcrossEW, kSumEw, kF0_5});
+    b.Op(169, {kFloat, kAcrossWeight, kAcrossY, kF1, kF0}); // OpSelect
+    b.Op(131, {kV3, kAxisDelta, kAcrossNS, kAcrossEW});
+    b.Op(142, {kV3, kAxisBlend, kAxisDelta, kAcrossWeight});
+    b.Op(129, {kV3, kEdgeAverage, kAcrossEW, kAxisBlend});
+    b.Op(133, {kFloat, kAaWeight, kAaStrength, kFilterAA});
+    b.Op(131, {kV3, kAaDelta, kEdgeAverage, kCSharp});
+    b.Op(142, {kV3, kAaBlend, kAaDelta, kAaWeight});
+    b.Op(129, {kV3, kFiltered, kCSharp, kAaBlend});
     b.Op(249, {kLblAfterSharp}); // OpBranch
 
     b.Op(248, {kLblAfterSharp});
-    b.Op(245, {kV3, kCBase, kCSharp, kLblSharp, kCCenter, kEntry}); // OpPhi
+    b.Op(245, {kV3, kCBase, kFiltered, kLblSharp, kCCenter, kEntry}); // OpPhi
 
     // RGB gains (temp + tint + R/G/B combined)
     b.Op(79, {kV3, kGains, kPcRgb, kPcRgb, 0, 1, 2});
@@ -2763,7 +2793,7 @@ State::RenderTarget* GetTarget(const GameDraw::Target& wanted, bool depth) {
     if (!wanted.address || !wanted.width || !wanted.height || wanted.width > 8192 || wanted.height > 8192 || format == VK_FORMAT_UNDEFINED) {
         return nullptr;
     }
-    const bool scaled = !g.native_boot_raster && !g.native_menu_raster && (g_target_scale_x != 1.0f || g_target_scale_y != 1.0f) &&
+    const bool scaled = !g.native_boot_raster && (g_target_scale_x != 1.0f || g_target_scale_y != 1.0f) &&
                         ScreenFamilyTarget(wanted.width, wanted.height);
     const u64 key = wanted.address ^ (static_cast<u64>(wanted.width) << 44) ^ (static_cast<u64>(wanted.height) << 30) ^
                     (static_cast<u64>(format) << 52) ^ (depth ? 1ull << 63 : 0) ^ (scaled ? 1ull << 62 : 0);
@@ -4101,6 +4131,7 @@ void DestroyAll() {
         g.queue_game.clear();
         for (auto& [key, target] : g.targets) {
             if (target.sample_view) vk.vkDestroyImageView(g.device, target.sample_view, nullptr);
+            if (target.opaque_sample_view) vk.vkDestroyImageView(g.device, target.opaque_sample_view, nullptr);
             if (target.array_view) vk.vkDestroyImageView(g.device, target.array_view, nullptr);
             if (target.copy_view) vk.vkDestroyImageView(g.device, target.copy_view, nullptr);
             if (target.copy_image) vk.vkDestroyImage(g.device, target.copy_image, nullptr);
@@ -4154,7 +4185,6 @@ void DestroyAll() {
         g.submitted_depth_queries = 0;
         g.depth_sample_counter = 0;
         g.native_boot_raster = true;
-        g.native_menu_raster = false;
         if (g.in_flight) vk.vkDestroyFence(g.device, g.in_flight, nullptr);
         if (g.image_available) vk.vkDestroySemaphore(g.device, g.image_available, nullptr);
         if (g.acquire_fence) vk.vkDestroyFence(g.device, g.acquire_fence, nullptr);
@@ -4444,6 +4474,7 @@ void EvictForgottenTextures() {
 // direto na janela). SPIR-V em fsr1_spv.h (tools/shaders/gerar_fsr1.py).
 namespace {
 std::atomic<int> g_active_upscaler{0};
+std::atomic<int> g_active_aa{0};
 std::atomic<int> g_upscaler{0};       // 0 = bilinear, 1 = FSR 1
 std::atomic<float> g_fsr_sharpness{0.25f}; // em "stops" (0 = maxima)
 
@@ -4623,7 +4654,7 @@ bool EnsureFsrImage(u32 width, u32 height) {
 void PointRcas(VkImageView view);
 
 bool FsrEasuPass(VkImageView source, u32 in_w, u32 in_h, u32 out_w, u32 out_h) {
-    if (g_upscaler.load(std::memory_order_relaxed) != 1 || !out_w || !out_h || (out_w <= in_w && out_h <= in_h) || !EnsureFsr() ||
+    if (!out_w || !out_h || out_w < in_w || out_h < in_h || (out_w == in_w && out_h == in_h) || !EnsureFsr() ||
         !EnsureFsrImage(out_w, out_h)) {
         return false;
     }
@@ -4702,7 +4733,7 @@ void FsrRcasDraw(float x, float y, float w, float h, VkPipeline target_pipeline 
 // 2/3 de 16 posicoes) e esta passagem mistura a imagem do quadro com o historico, reprojetado pela profundidade da cena e
 // pelas cameras deste quadro e do anterior (taa.frag). A camera da cena e a profundidade vem dos desenhos com o buffer de
 // camera nos alvos da tela (NoteSceneCamera): a que mais desenhou no quadro.
-std::atomic<int> g_aa_mode{0}; // 0 = nenhum, 1 = TAA
+std::atomic<int> g_aa_mode{0}; // 0 = nenhum, 1 = TAA, 2 = espacial
 std::atomic<float> g_jitter_x{0.0f}, g_jitter_y{0.0f};
 std::mutex g_scene_mutex;
 struct SceneCamera {
@@ -5215,7 +5246,8 @@ bool EnsureTaaImages(u32 width, u32 height) {
 // Passagem do TAA (fora de qualquer passagem de render). Devolve a imagem resultante (view + set para a janela) ou falso
 // (TAA desligado / falhou: a janela usa a imagem do jogo como antes). Tambem escolhe o deslocamento do proximo quadro.
 bool TaaPass(State::RenderTarget* shown, VkImageView* out_view, VkDescriptorSet* out_set) {
-    if (g_aa_mode.load(std::memory_order_relaxed) != 1 || !shown || !EnsureTaa() || !EnsureTaaImages(shown->width, shown->height)) {
+    if (g_aa_mode.load(std::memory_order_relaxed) != 1 || !shown || !g_frame_temporal.depth ||
+        GameMenuPaused() || !EnsureTaa() || !EnsureTaaImages(shown->width, shown->height)) {
         g_taa.history_valid = false;
         return false;
     }
@@ -5634,11 +5666,12 @@ bool FfxPass(State::RenderTarget* shown, u32 out_w, u32 out_h, VkImageView* out_
         g_ffx.reset = true;
         return false;
     }
-    if (out_w < shown->width || out_h < shown->height) {
-        // o FSR so amplia: com a area na janela menor que a imagem (resolucao maior que o monitor), o FSR AA sai no tamanho
-        // da imagem e a janela reduz com o filtro de area (DownscaleDraw). Pedir saida menor gerava lixo piscando.
+    if (g_ffx_native.load(std::memory_order_relaxed)) {
         out_w = shown->width;
         out_h = shown->height;
+    } else if (out_w < shown->width || out_h < shown->height) {
+        g_ffx.reset = true;
+        return false;
     }
     if (!LoadFfx() || !EnsureFfxPipelines() || !EnsureFfxContext(shown->width, shown->height, out_w, out_h) ||
         !EnsureOwnImage(g_ffx.output, out_w, out_h, VK_FORMAT_R16G16B16A16_SFLOAT,
@@ -5861,13 +5894,18 @@ bool EnsureXessContext(u32 render_w, u32 render_h, u32 out_w, u32 out_h) {
 }
 
 bool XessPass(State::RenderTarget* shown, u32 out_w, u32 out_h, VkImageView* out_view, VkDescriptorSet* out_set) {
-    if (!g_xess_wanted.load(std::memory_order_relaxed) || !shown || !out_w || !out_h ||
+    if (!g_xess_wanted.load(std::memory_order_relaxed) || !shown || !out_w || !out_h || GameMenuPaused() ||
+        !g_frame_temporal.depth ||
         (!g_xess_native.load(std::memory_order_relaxed) && out_w <= shown->width && out_h <= shown->height)) {
+        g_xess.reset = true;
         return false;
     }
-    if (out_w < shown->width || out_h < shown->height) {
+    if (g_xess_native.load(std::memory_order_relaxed)) {
         out_w = shown->width;
         out_h = shown->height;
+    } else if (out_w < shown->width || out_h < shown->height) {
+        g_xess.reset = true;
+        return false;
     }
     if (!EnsureXessContext(shown->width, shown->height, out_w, out_h) ||
         !EnsureOwnImage(g_xess.output, out_w, out_h, VK_FORMAT_R16G16B16A16_SFLOAT,
@@ -5876,6 +5914,7 @@ bool XessPass(State::RenderTarget* shown, u32 out_w, u32 out_h, VkImageView* out
     }
     u32 now_depth = 0;
     if (!PrepareTemporalInputs(shown, g_xess.reset, &now_depth)) {
+        g_xess.reset = true;
         return false;
     }
     const FrameTemporal& frame = g_frame_temporal;
@@ -6131,7 +6170,7 @@ struct ColorGradePush {
     float rect[4];           // x, y, w, h
     float inv_src_bright[4]; // 1/src_w, 1/src_h, brightness, contrast
     float color_params[4];   // saturation, vibrance, inv_gamma, sharpness
-    float rgb_gain[4];       // gain_r, gain_g, gain_b, 0
+    float rgb_gain[4];       // gain_r, gain_g, gain_b, peso do AA espacial
 };
 static_assert(sizeof(ColorGradePush) == 64);
 
@@ -6227,7 +6266,8 @@ bool EnsureColorGrade() {
     return g_grade.ok;
 }
 
-void ColorGradeDraw(VkImageView view, u32 src_w, u32 src_h, float x, float y, float w, float h, const ImageColorSettings& cfg) {
+void ColorGradeDraw(VkImageView view, u32 src_w, u32 src_h, float x, float y, float w, float h,
+                    const ImageColorSettings& cfg, bool spatial_aa) {
     VkDescriptorImageInfo info{g.sampler, view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
     VkWriteDescriptorSet write{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
     write.dstSet = g_grade.set;
@@ -6262,7 +6302,7 @@ void ColorGradeDraw(VkImageView view, u32 src_w, u32 src_h, float x, float y, fl
         {std::clamp(cfg.red, 0.1f, 2.0f) * temp_r * tint_r,
          std::clamp(cfg.green, 0.1f, 2.0f) * temp_g * tint_g,
          std::clamp(cfg.blue, 0.1f, 2.0f) * temp_b * tint_b,
-         0.0f},
+         spatial_aa ? 0.55f : 0.0f},
     };
     vk.vkCmdPushConstants(g.command, g_grade.layout, VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(push), &push);
     vk.vkCmdBindDescriptorSets(g.command, VK_PIPELINE_BIND_POINT_GRAPHICS, g_grade.layout, 0, 1, &g_grade.set, 0, nullptr);
@@ -6292,6 +6332,7 @@ void DestroyPostPipelines() {
     DestroyOwnImage(g_spatial_output);
     g_spatial_present_set = VK_NULL_HANDLE;
     g_active_upscaler = 0;
+    g_active_aa = 0;
     if (g_grade.pipeline) vk.vkDestroyPipeline(g.device, g_grade.pipeline, nullptr);
     if (g_grade.layout) vk.vkDestroyPipelineLayout(g.device, g_grade.layout, nullptr);
     if (g_grade.fs) vk.vkDestroyShaderModule(g.device, g_grade.fs, nullptr);
@@ -6553,7 +6594,6 @@ bool VulkanRenderer::DrawFrame(u64 display_address) {
         target.copy_fresh = false;
     }
     ++g.frame_serial;
-    g.native_menu_raster = g_game_menu_paused.load(std::memory_order_relaxed);
     g.previous_draws.swap(g.frame_draws);
     g.frame_draws.clear();
     g.hang_reported = false;
@@ -6573,8 +6613,8 @@ bool VulkanRenderer::DrawFrame(u64 display_address) {
     } dynamic;
     // 2.0: profundidade da cena guardada antes da limpeza do HUD (TAA / FSR). So com um deles ligado.
     const u64 scene_depth =
-        (g_aa_mode.load(std::memory_order_relaxed) || g_ffx_wanted.load(std::memory_order_relaxed) ||
-         g_xess_wanted.load(std::memory_order_relaxed))
+        (!GameMenuPaused() && (g_aa_mode.load(std::memory_order_relaxed) == 1 || g_ffx_wanted.load(std::memory_order_relaxed) ||
+         g_xess_wanted.load(std::memory_order_relaxed)))
             ? PeekSceneDepth()
             : 0;
     u32 scene_depth_draws = 0;
@@ -7125,14 +7165,17 @@ bool VulkanRenderer::DrawFrame(u64 display_address) {
         grab_window = true;
         --g_grab.active;
     }
-    bool fsr = shown && present_pipeline && !ffx && !xess &&
+    const bool native_ffx = g_ffx_wanted && g_ffx_native;
+    const bool native_xess = g_xess_wanted && g_xess_native;
+    const bool allow_spatial_upscale = g_upscaler || (!GameMenuPaused() &&
+                                       ((g_ffx_wanted && !native_ffx) || (g_xess_wanted && !native_xess)));
+    bool fsr = shown && present_pipeline && allow_spatial_upscale && !ffx && !xess &&
                FsrEasuPass(present_view, shown->width, shown->height, upscale_w, upscale_h);
     bool spatial_output = false;
     if (fsr && (upscale_w != static_cast<u32>(out_w) || upscale_h != static_cast<u32>(out_h))) {
         spatial_output = FsrOutput(&present_view, &present_set);
         fsr = false; // Com um alvo separado, a janela recebe a imagem pronta.
     }
-    g_active_upscaler.store(ffx ? g_ffx.actual_major : xess ? 5 : fsr || spatial_output ? 1 : 0, std::memory_order_relaxed);
     // imagem maior que a area na janela (resolucao acima do monitor): reducao com filtro de area em vez do bilinear
     const u32 present_w = ffx ? g_ffx.output.width : xess ? g_xess.output.width : spatial_output ? upscale_w : shown ? shown->width : 0;
     const u32 present_h = ffx ? g_ffx.output.height : xess ? g_xess.output.height : spatial_output ? upscale_h : shown ? shown->height : 0;
@@ -7141,7 +7184,10 @@ bool VulkanRenderer::DrawFrame(u64 display_address) {
     VkImageView grade_view = present_view;
     u32 grade_src_w = present_w ? present_w : (shown ? shown->width : 1);
     u32 grade_src_h = present_h ? present_h : (shown ? shown->height : 1);
-    bool grade = shown && present_pipeline && IsColorGradeActive(grade_cfg) && EnsureColorGrade();
+    const int requested_aa = g_aa_mode.load(std::memory_order_relaxed);
+    const bool spatial_aa = !GameMenuPaused() && (requested_aa == 2 ||
+                            (!ffx && !xess && !taa && (requested_aa == 1 || native_ffx || native_xess)));
+    bool grade = shown && present_pipeline && (spatial_aa || IsColorGradeActive(grade_cfg)) && EnsureColorGrade();
     if (grade && ((fsr && !g_fsr.rcas_rt) || (down && !g_down.pipeline_rt))) {
         grade = false;
     }
@@ -7179,6 +7225,12 @@ bool VulkanRenderer::DrawFrame(u64 display_address) {
             grade = false;
         }
     }
+    if (shown && present_pipeline && !GameMenuPaused()) {
+        g_active_upscaler.store(ffx && !native_ffx ? g_ffx.actual_major : xess && !native_xess ? 5 : fsr || spatial_output ? 1 : 0,
+                                std::memory_order_relaxed);
+        g_active_aa.store(ffx && native_ffx ? (g_ffx.actual_major == 4 ? 3 : 2) : xess && native_xess ? 4 :
+                          taa ? 1 : spatial_aa && grade ? 5 : 0, std::memory_order_relaxed);
+    }
     Transition(g.command, g.images[image_index], VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_UNDEFINED,
                VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
     VkRenderingAttachmentInfo window{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
@@ -7204,7 +7256,7 @@ bool VulkanRenderer::DrawFrame(u64 display_address) {
     static const float kIdentity[16] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};
     const VkBuffer vertex_buffers[2] = {g.vertices.buffer, g.vertices.buffer};
     if (grade) {
-        ColorGradeDraw(grade_view, grade_src_w, grade_src_h, out_x, out_y, out_w, out_h, grade_cfg);
+        ColorGradeDraw(grade_view, grade_src_w, grade_src_h, out_x, out_y, out_w, out_h, grade_cfg, spatial_aa);
     } else if (fsr) {
         FsrRcasDraw(out_x, out_y, out_w, out_h); // 1.9.1: FSR 1 (nitidez) direto na janela
     } else if (down) {
@@ -7952,6 +8004,19 @@ bool VulkanRenderer::QueueGameDraw(const GameDraw& draw) {
                 if (image.view_type == 0) {
                     out.target = target->second;
                     out.view = target->second->sample_view ? target->second->sample_view : target->second->view;
+                    if (image.opaque_screen_snapshot && !out.target->depth && draw.color_count == 1 &&
+                        out.target->game_width == draw.colors[0].width && out.target->game_height == draw.colors[0].height) {
+                        if (!out.target->opaque_sample_view) {
+                            VkImageViewCreateInfo view{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+                            view.image = out.target->image;
+                            view.viewType = VK_IMAGE_VIEW_TYPE_2D;
+                            view.format = out.target->format;
+                            view.components.a = VK_COMPONENT_SWIZZLE_ONE;
+                            view.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+                            vk.vkCreateImageView(g.device, &view, nullptr, &out.target->opaque_sample_view);
+                        }
+                        if (out.target->opaque_sample_view) out.view = out.target->opaque_sample_view;
+                    }
                     textured = true;
                 } else if (image.view_type == 2 && TargetArrayView(target->second)) {
                     out.target = target->second;
@@ -8913,6 +8978,10 @@ int VulkanRenderer::ActiveUpscaler() const {
     return g_active_upscaler.load(std::memory_order_relaxed);
 }
 
+int VulkanRenderer::ActiveAntiAliasing() const {
+    return g_active_aa.load(std::memory_order_relaxed);
+}
+
 void VulkanRenderer::SetUpscaler(int mode, float sharpness) {
     g_upscaler = mode;
     g_fsr_sharpness = sharpness;
@@ -9001,8 +9070,9 @@ bool SceneViewProjection(float m[16], float rect[4], float extent[2]) {
 }
 
 void TemporalJitter(float* x, float* y) {
-    *x = g_jitter_x.load(std::memory_order_relaxed);
-    *y = g_jitter_y.load(std::memory_order_relaxed);
+    const bool paused = GameMenuPaused();
+    *x = paused ? 0.0f : g_jitter_x.load(std::memory_order_relaxed);
+    *y = paused ? 0.0f : g_jitter_y.load(std::memory_order_relaxed);
 }
 
 void SetTemporalUpscaler(int major, bool native) {
@@ -9068,7 +9138,7 @@ void GetTemporalUpscaler(int* major, bool* native) {
 
 void SetAntiAliasing(int mode) {
     g_aa_mode = mode;
-    std::printf("[RENDER] anti-aliasing: %s\n", mode == 1 ? "TAA (16 jitter positions)" : "off");
+    std::printf("[RENDER] anti-aliasing: %s\n", mode == 1 ? "TAA (16 jitter positions)" : mode == 2 ? "spatial" : "off");
 }
 
 bool IsScreenTarget(u32 width, u32 height) {

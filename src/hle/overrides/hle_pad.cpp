@@ -700,7 +700,6 @@ HLE_IMPL(int, scePadReadState, int handle, PadData* data, u64 guest_rbp) {
         in.buttons &= ~kTouchPad;
     }
     ReadScript(in);
-    videoout::TickGraphicsSettings();
 
     // Menu de Configuracoes de Video / Imagem (L3 + R3 no controle)
     static bool s_menu_combo_held = false;

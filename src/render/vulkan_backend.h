@@ -169,6 +169,7 @@ struct GameDraw {
         u64 target_address; // senao: alvo de render do jogo com este endereco (0 = nenhum)
         u32 view_type;      // o que o shader declara: 0 = 2D, 1 = cubo, 2 = array 2D, 3 = 3D
         bool pending;       // Fase 45: textura ainda sendo lida; o DrawFrame resolve (ou deixa o draw de fora)
+        bool opaque_screen_snapshot = false;
     };
     struct Sampler {
         u32 binding;
@@ -374,6 +375,7 @@ public:
     bool NoVsync() const;
     int SpatialUpscaler() const;
     int ActiveUpscaler() const; // 0: nenhum, 1: FSR 1, 2/3/4: FSR temporal, 5: XeSS
+    int ActiveAntiAliasing() const; // 0: nenhum, 1: TAA, 2/3: FSR AA, 4: XeSS AA, 5: espacial
     void SetUpscaler(int mode, float sharpness);         // 1.9.1: 0 = bilinear, 1 = AMD FidelityFX FSR 1
     void SetFillScreen(bool enabled);                    // 1.9.1: tela de outra proporcao = imagem inteira (camera Hor+ / Vert-)
     void PredictedStats(u32* built, u32* failed) const; // Fase 77: receitas cujo par de shaders nao foi registrado (fora do pacote AOT)

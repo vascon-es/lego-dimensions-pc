@@ -169,12 +169,16 @@ u8* g_native_options_screen = nullptr;
 size_t g_native_graphics_slot = 0;
 std::atomic<bool> g_native_wait_confirm_release{false};
 bool OpenGraphicsFromOptions();
-u8** g_guest_graphics_config = nullptr;
+bool g_dof_supported = false;
 std::atomic<bool> g_disable_dof{false};
 std::atomic<float> g_scene_distance{1.0f};
+std::atomic<float> g_props_distance_squared{1.0f};
+static_assert(std::atomic<bool>::is_always_lock_free && sizeof(g_disable_dof) == 1);
 static_assert(std::atomic<float>::is_always_lock_free);
 bool g_scene_distance_supported = false;
-constexpr std::array<float, 3> kSceneDistances{1.0f, 0.85f, 0.70f};
+bool g_props_distance_supported = false;
+constexpr std::array<float, 6> kSceneDistances{1.0f, 0.85f, 0.70f, 1.25f, 1.50f, 2.0f};
+constexpr std::array<float, 4> kPropDistanceSquared{1.0f, 1.25f * 1.25f, 1.50f * 1.50f, 4.0f};
 
 bool NativeOptionsVisible() {
     const u64 last = g_options_last_render.load(std::memory_order_relaxed);
@@ -319,9 +323,12 @@ enum MenuIdx {
     kMenuAA,
     kMenuDepthOfField,
     kMenuSceneDistance,
+    kMenuPropsDistance,
     kMenuDisplayMode,
     kMenuFps,
     kMenuFpsCounter,
+    kMenuGamma,
+    kMenuSharpness,
     kMenuIcons,
     kMenuTrophySound,
     kMenuResetTrophies,
@@ -338,12 +345,15 @@ static std::array<MenuItem, kMenuCount> g_menu_items{{
     {"TARGET UPSCALE RES", {"AUTO (WINDOW)", "1280X720", "1600X900", "1920X1080", "2560X1080", "2560X1440", "3440X1440", "3840X2160"}, 0},
     {"RENDER SCALE (RESTART)", {"50%", "67%", "75%", "85%", "100%", "125%", "150%", "200%"}, 4},
     {"UPSCALER", {"OFF", "FSR 1.0", "FSR 2", "FSR 3", "FSR 4", "INTEL XESS 3.0"}, 1},
-    {"ANTI-ALIASING", {"OFF", "TAA X16", "FSR 3 AA", "FSR 4 AA", "XESS NATIVE AA"}, 0},
+    {"ANTI-ALIASING", {"OFF", "TAA X16", "FSR 3 AA", "FSR 4 AA", "XESS NATIVE AA", "SPATIAL AA"}, 0},
     {"DEPTH OF FIELD", {"GAME DEFAULT", "OFF"}, 0},
-    {"SCENE DISTANCE", {"100%", "85%", "70%"}, 0},
+    {"VEGETATION DISTANCE", {"100%", "85%", "70%", "125%", "150%", "200%"}, 0},
+    {"PROP DISTANCE", {"100%", "125%", "150%", "200%"}, 0},
     {"DISPLAY MODE", {"FULLSCREEN", "WINDOWED"}, 0},
     {"FRAME RATE (RESTART)", {"30 FPS", "60 FPS", "UNLOCKED", "UNLOCKED NO VSYNC"}, 1},
     {"FPS COUNTER (F10)", {"OFF", "ON"}, 0},
+    {"GAMMA", {}, 100},
+    {"SHARPNESS", {}, 0},
     {"CONTROLLER ICONS", {"AUTO", "PS4", "XBOX", "SWITCH", "KEYBOARD"}, 0},
     {"TROPHY SOUND", {"AUTO (POPUP STYLE)", "PLAYSTATION", "XBOX", "STEAM", "OFF"}, 0}, // 3.0: auto = o som do console do pop-up
     {"RESET TROPHIES", {"< PRESS ENTER >", "TROPHIES RESET!"}, 0},
@@ -352,7 +362,7 @@ static std::array<MenuItem, kMenuCount> g_menu_items{{
     {"MULTIPLAYER ROOM (F4)", {"< PRESS ENTER >"}, 0},
     {"JOIN/CONFIG ROOM (F3)", {"< PRESS ENTER >"}, 0}
 }};
-std::array<std::atomic<int>, kMenuFpsCounter + 1> g_graphics_saved{};
+std::array<std::atomic<int>, kMenuSharpness + 1> g_graphics_saved{};
 
 static std::filesystem::path GetLauncherIniPath() {
     if (!g_launcher_ini_path.empty()) return g_launcher_ini_path;
@@ -586,6 +596,8 @@ void SetGraphicsIniRoot(const std::filesystem::path& root) {
     g_disable_dof = GetPrivateProfileIntW(L"launcher", L"profundidade_campo", 1, ini.c_str()) == 0;
     const int distance = GetPrivateProfileIntW(L"launcher", L"distancia_cenario", 0, ini.c_str());
     g_scene_distance = kSceneDistances[std::clamp(distance, 0, static_cast<int>(kSceneDistances.size()) - 1)];
+    const auto props = GetPrivateProfileIntW(L"launcher", L"distancia_objetos", 0, ini.c_str());
+    g_props_distance_squared = kPropDistanceSquared[std::min<size_t>(props, kPropDistanceSquared.size() - 1)];
 }
 
 void InstallNativeGraphicsMenu(const loader::ElfPieLoader& elf) {
@@ -695,23 +707,30 @@ void InstallNativeGraphicsMenu(const loader::ElfPieLoader& elf) {
             std::memcpy(elf.base() + (paused ? 0x19a3c10 : 0x19a42b0), code.data(), code.size());
         }
     }
-    constexpr std::array<u8, 20> disable_dof_code{
-        0x48, 0x8d, 0x05, 0x7c, 0x06, 0x73, 0x01, 0x48, 0x8b, 0x00,
-        0xc7, 0x80, 0xc0, 0x0d, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00};
-    if (matches(0x1a43dfd, disable_dof_code)) {
-        g_guest_graphics_config = reinterpret_cast<u8**>(elf.base() + 0x3174480);
-    }
+    constexpr u64 kDofFlagsRead = 0x6dede5;
+    constexpr std::array<u8, 19> dof_code{0x49, 0x8b, 0x44, 0x24, 0x08, 0xa8, 0x08, 0x0f, 0x84, 0x90, 0x01, 0, 0,
+        0x41, 0x80, 0x7c, 0x24, 0x18, 0};
+    const bool patch_dof = matches(kDofFlagsRead, dof_code);
 
-    // Os calculos de cull e de fade do cenario usam o mesmo produto dos dois campos m_farClipDistance.
-    struct SceneSite { u64 offset; std::array<u8, 9> bytes; };
+    // A vegetacao usa m_farClipDistance. Objetos interativos usam o limite ao quadrado de special_draw_distance.
+    struct SceneSite { u64 offset; std::array<u8, 9> bytes; size_t size = 9; };
     constexpr SceneSite sites[]{
         {0x6719df, {0xc4, 0xc1, 0x7a, 0x59, 0x87, 0x08, 0x01, 0x00, 0x00}},
         {0x671a13, {0xc4, 0xc1, 0x7a, 0x59, 0x87, 0x08, 0x01, 0x00, 0x00}},
         {0x673f90, {0xc4, 0xc1, 0x7a, 0x59, 0x87, 0x08, 0x01, 0x00, 0x00}},
         {0x67486a, {0xc4, 0xc1, 0x7a, 0x59, 0x85, 0x08, 0x01, 0x00, 0x00}},
     };
-    if (std::ranges::all_of(sites, [&matches](const SceneSite& site) { return matches(site.offset, site.bytes); })) {
-        constexpr size_t kThunkBytes = 40;
+    constexpr SceneSite props_sites[]{
+        {0x7b2d07, {0xc5, 0xfa, 0x10, 0x83, 0x70, 0x01, 0, 0}, 8},
+        {0x7b2d8c, {0xc5, 0xfa, 0x10, 0x83, 0x70, 0x01, 0, 0}, 8},
+    };
+    const auto match_site = [&matches](const SceneSite& site) {
+        return matches(site.offset, std::span(site.bytes).first(site.size));
+    };
+    const bool patch_distance = std::ranges::all_of(sites, match_site);
+    const bool patch_props = std::ranges::all_of(props_sites, match_site);
+    if (patch_dof || patch_distance || patch_props) {
+        constexpr size_t kThunkBytes = 48;
         const auto near_base = elf.base_address() + loader::ElfPieLoader::kReserveSize;
         u8* page = nullptr;
         for (u64 gap = 0; !page && gap < 0x400000; gap += 0x10000) {
@@ -724,53 +743,65 @@ void InstallNativeGraphicsMenu(const loader::ElfPieLoader& elf) {
                 const auto delta = static_cast<s32>(reinterpret_cast<s64>(dest) - reinterpret_cast<s64>(at + 5));
                 std::memcpy(at + 1, &delta, sizeof(delta));
             };
-            for (size_t i = 0; i < std::size(sites); ++i) {
-                const auto& site = sites[i];
-                auto* thunk = page + i * kThunkBytes;
-                std::memcpy(thunk, site.bytes.data(), site.bytes.size());
+            const auto make_scale_thunk = [&](u8* thunk, const SceneSite& site, const std::atomic<float>* scale_factor) {
+                std::memcpy(thunk, site.bytes.data(), site.size);
                 // Preserva rax e as flags. XMM0 e a distancia calculada pela instrucao original.
                 constexpr std::array<u8, 16> scale{0x50, 0x48, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0,
                                                    0xc5, 0xfa, 0x59, 0x00, 0x58};
-                auto* extra = thunk + site.bytes.size();
+                auto* extra = thunk + site.size;
                 std::memcpy(extra, scale.data(), scale.size());
-                const auto factor = reinterpret_cast<u64>(&g_scene_distance);
+                const auto factor = reinterpret_cast<u64>(scale_factor);
                 std::memcpy(extra + 3, &factor, sizeof(factor));
-                write_jump(extra + scale.size(), elf.base() + site.offset + site.bytes.size());
+                write_jump(extra + scale.size(), elf.base() + site.offset + site.size);
+            };
+            auto* props_thunks = page + std::size(sites) * kThunkBytes;
+            for (size_t i = 0; patch_distance && i < std::size(sites); ++i) {
+                make_scale_thunk(page + i * kThunkBytes, sites[i], &g_scene_distance);
+            }
+            for (size_t i = 0; patch_props && i < std::size(props_sites); ++i) {
+                make_scale_thunk(props_thunks + i * kThunkBytes, props_sites[i], &g_props_distance_squared);
+            }
+            auto* dof_thunk = props_thunks + std::size(props_sites) * kThunkBytes;
+            constexpr size_t kDofLoadBytes = 5;
+            if (patch_dof) {
+                // Limpa apenas no registrador o bit que habilita ProcessDepthOfField. Assim a cadeia usa a propria
+                // rota sem desfoque e a camera continua guardando sua configuracao original.
+                std::memcpy(dof_thunk, dof_code.data(), kDofLoadBytes);
+                constexpr std::array<u8, 21> select{0x51, 0x48, 0xb9, 0, 0, 0, 0, 0, 0, 0, 0,
+                    0x80, 0x39, 0x00, 0x74, 0x04, 0x48, 0x83, 0xe0, 0xf7, 0x59};
+                auto* extra = dof_thunk + kDofLoadBytes;
+                std::memcpy(extra, select.data(), select.size());
+                const auto disabled = reinterpret_cast<u64>(&g_disable_dof);
+                std::memcpy(extra + 3, &disabled, sizeof(disabled));
+                write_jump(extra + select.size(), elf.base() + kDofFlagsRead + kDofLoadBytes);
             }
             DWORD old = 0;
             if (VirtualProtect(page, 4096, PAGE_EXECUTE_READ, &old)) {
                 FlushInstructionCache(GetCurrentProcess(), page, 4096);
-                for (size_t i = 0; i < std::size(sites); ++i) {
-                    auto* at = elf.base() + sites[i].offset;
-                    write_jump(at, page + i * kThunkBytes);
-                    std::fill(at + 5, at + sites[i].bytes.size(), 0x90);
+                const auto install_jump = [&](u64 offset, size_t size, const u8* thunk) {
+                    auto* at = elf.base() + offset;
+                    write_jump(at, thunk);
+                    std::fill(at + 5, at + size, 0x90);
+                };
+                for (size_t i = 0; patch_distance && i < std::size(sites); ++i) {
+                    install_jump(sites[i].offset, sites[i].size, page + i * kThunkBytes);
                 }
-                g_scene_distance_supported = true;
+                for (size_t i = 0; patch_props && i < std::size(props_sites); ++i) {
+                    install_jump(props_sites[i].offset, props_sites[i].size, props_thunks + i * kThunkBytes);
+                }
+                if (patch_dof) {
+                    install_jump(kDofFlagsRead, kDofLoadBytes, dof_thunk);
+                    g_dof_supported = true;
+                }
+                g_scene_distance_supported = patch_distance;
+                g_props_distance_supported = patch_props;
             } else {
                 VirtualFree(page, 0, MEM_RELEASE);
             }
         }
     }
-    std::printf("[GRAPHICS] native options=%d dof=%d scene distance=%d\n",
-                g_native_confirm != nullptr, g_guest_graphics_config != nullptr, g_scene_distance_supported);
-}
-
-void TickGraphicsSettings() {
-    if (!g_guest_graphics_config) return;
-    static int* applied = nullptr;
-    static int original = 0;
-    const auto config = *g_guest_graphics_config;
-    auto* mode = config ? reinterpret_cast<int*>(config + 0xdc0) : nullptr;
-    if (g_disable_dof.load(std::memory_order_relaxed)) {
-        if (mode && (mode != applied || *mode != 2)) {
-            original = *mode;
-            *mode = 2; // Mesmo modo "dof_disable" do jogo.
-            applied = mode;
-        }
-    } else if (applied) {
-        if (mode == applied && *mode == 2) *mode = original;
-        applied = nullptr;
-    }
+    std::printf("[GRAPHICS] native options=%d dof=%d scene distance=%d prop distance=%d\n",
+                g_native_confirm != nullptr, g_dof_supported, g_scene_distance_supported, g_props_distance_supported);
 }
 
 void SetWindowResolution(u32 width, u32 height) {
@@ -826,28 +857,37 @@ static void ApplyAndSaveVideoSettings() {
         render::VulkanRenderer::Instance().SetTargetUpscaleResolution(kTargetW[tr], kTargetH[tr]);
     }
 
-    // Render scale (saved for restart — base render targets are pooled per session)
-    static const wchar_t* const kScaleStr[] = {L"50", L"67", L"75", L"85", L"100", L"125", L"150", L"200"};
-    const int rs = g_menu_items[kMenuRenderScale].selected;
-    if (rs >= 0 && rs < 8) {
-        WriteLauncherIni(L"escala", kScaleStr[rs]);
-    }
-
     // Upscaler + Anti-aliasing (both apply live!)
     static const wchar_t* const kUpStr[] = {L"off", L"fsr1", L"fsr2", L"fsr3", L"fsr4", L"xess"};
-    static const wchar_t* const kAaStr[] = {L"off", L"taa", L"fsraa", L"fsraa4", L"xessaa"};
+    static const wchar_t* const kAaStr[] = {L"off", L"taa", L"fsraa", L"fsraa4", L"xessaa", L"spatial"};
     const int up = g_menu_items[kMenuUpscaler].selected;
     const int aa = g_menu_items[kMenuAA].selected;
+
+    // Os alvos internos sao alocados na inicializacao. Ao escolher um upscaler novo com
+    // escala nativa, sugere Qualidade (67%) quando a resolucao alvo nao for maior que a base.
+    static constexpr int kScales[] = {50, 67, 75, 85, 100, 125, 150, 200};
+    int rs = g_menu_items[kMenuRenderScale].selected;
+    auto& renderer = render::VulkanRenderer::Instance();
+    const u32 target_w = tr ? kTargetW[tr] : g_window_width.load();
+    const u32 target_h = tr ? kTargetH[tr] : g_window_height.load();
+    u32 render_w = 0, render_h = 0;
+    renderer.GetCurrentRenderResolution(&render_w, &render_h);
+    if (up && up != g_graphics_saved[kMenuUpscaler] && rs == 4 && rs == g_graphics_saved[kMenuRenderScale] &&
+        target_w <= render_w && target_h <= render_h) {
+        rs = 1;
+        g_menu_items[kMenuRenderScale].selected = rs;
+    }
+    WriteLauncherIni(L"escala", std::to_wstring(kScales[rs]).c_str());
     if (up >= 0 && up < 6) {
         WriteLauncherIni(L"upscaler", kUpStr[up]);
     }
-    if (aa >= 0 && aa < 5) {
+    if (aa >= 0 && aa < static_cast<int>(std::size(kAaStr))) {
         WriteLauncherIni(L"antialiasing", kAaStr[aa]);
     }
     const bool use_xess = up == 5 || aa == 4;
     const int temporal = aa == 2 ? 3 : aa == 3 ? 4 : up >= 2 && up <= 4 ? up : 0;
-    render::VulkanRenderer::Instance().SetUpscaler(up == 1 ? 1 : 0, 0.25f);
-    render::SetAntiAliasing(aa == 1 ? 1 : 0);
+    renderer.SetUpscaler(up == 1 ? 1 : 0, 0.25f);
+    render::SetAntiAliasing(aa == 1 ? 1 : aa == 5 ? 2 : 0);
     if (use_xess) {
         render::SetXessUpscaler(true, aa == 4);
     } else {
@@ -855,7 +895,7 @@ static void ApplyAndSaveVideoSettings() {
         render::SetTemporalUpscaler(temporal, aa == 2 || aa == 3);
     }
 
-    if (g_guest_graphics_config) {
+    if (g_dof_supported) {
         g_disable_dof = g_menu_items[kMenuDepthOfField].selected != 0;
         WriteLauncherIni(L"profundidade_campo", g_disable_dof ? L"0" : L"1");
     }
@@ -863,6 +903,21 @@ static void ApplyAndSaveVideoSettings() {
         const int index = g_menu_items[kMenuSceneDistance].selected;
         g_scene_distance = kSceneDistances[index];
         WriteLauncherIni(L"distancia_cenario", std::to_wstring(index).c_str());
+    }
+    if (g_props_distance_supported) {
+        const int index = g_menu_items[kMenuPropsDistance].selected;
+        g_props_distance_squared = kPropDistanceSquared[index];
+        WriteLauncherIni(L"distancia_objetos", std::to_wstring(index).c_str());
+    }
+    for (const auto& [menu, slider] : {std::pair{kMenuGamma, kImgGamma}, std::pair{kMenuSharpness, kImgSharpness}}) {
+        const int value = g_menu_items[menu].selected;
+        if (g_graphics_saved[menu] != value) {
+            const int index = slider - kImgBrightness;
+            g_img_vals[index] = value;
+            WriteLauncherIni(kImageSliders[index].ini_key, std::to_wstring(value).c_str());
+            DetectImagePreset();
+            SyncImageSettingsToRenderer();
+        }
     }
 
     // Display mode
@@ -964,16 +1019,19 @@ static void InitMenuDefaults() {
         g_menu_items[kMenuUpscaler].label = "UPSCALER";
         g_menu_items[kMenuUpscaler].options = {"DESLIGADO", "FSR 1.0", "FSR 2", "FSR 3", "FSR 4", "INTEL XESS 3.0"};
         g_menu_items[kMenuAA].label = "ANTI-ALIASING";
-        g_menu_items[kMenuAA].options = {"DESLIGADO", "TAA X16", "FSR 3 AA", "FSR 4 AA", "XESS NATIVE AA"};
+        g_menu_items[kMenuAA].options = {"DESLIGADO", "TAA X16", "FSR 3 AA", "FSR 4 AA", "XESS NATIVE AA", "AA ESPACIAL"};
         g_menu_items[kMenuDepthOfField].label = "PROFUNDIDADE DE CAMPO";
         g_menu_items[kMenuDepthOfField].options = {"PADRAO DO JOGO", "DESLIGADA"};
-        g_menu_items[kMenuSceneDistance].label = "DISTANCIA DO CENARIO";
+        g_menu_items[kMenuSceneDistance].label = "DISTANCIA DA VEGETACAO";
+        g_menu_items[kMenuPropsDistance].label = "DISTANCIA DOS OBJETOS";
         g_menu_items[kMenuDisplayMode].label = "MODO DE TELA";
         g_menu_items[kMenuDisplayMode].options = {"TELA CHEIA", "JANELA"};
         g_menu_items[kMenuFps].label = "TAXA DE QUADROS";
         g_menu_items[kMenuFps].options = {"30 FPS", "60 FPS", "ILIMITADO", "ILIMITADO SEM VSYNC"};
         g_menu_items[kMenuFpsCounter].label = "CONTADOR FPS (F10)";
         g_menu_items[kMenuFpsCounter].options = {"DESLIGADO", "LIGADO"};
+        g_menu_items[kMenuGamma].label = "GAMA";
+        g_menu_items[kMenuSharpness].label = "NITIDEZ";
         g_menu_items[kMenuIcons].label = "ICONES DE CONTROLE";
         g_menu_items[kMenuIcons].options = {"AUTO", "PS4", "XBOX", "SWITCH", "TECLADO"};
         g_menu_items[kMenuTrophySound].label = "SOM DE CONQUISTA";
@@ -1067,13 +1125,18 @@ static void InitMenuDefaults() {
     render::GetXessUpscaler(&xess_on, &xess_native);
     g_menu_items[kMenuUpscaler].selected = xess_on && !xess_native ? 5
         : major >= 2 && major <= 4 && !native ? major : render::VulkanRenderer::Instance().SpatialUpscaler();
-    g_menu_items[kMenuAA].selected = xess_native ? 4 : native ? (major == 4 ? 3 : 2) : render::GetAntiAliasing() == 1 ? 1 : 0;
+    const int aa = render::GetAntiAliasing();
+    g_menu_items[kMenuAA].selected = xess_native ? 4 : native ? (major == 4 ? 3 : 2) : aa == 1 ? 1 : aa == 2 ? 5 : 0;
     g_menu_items[kMenuFps].selected = !g_unlocked_fps.load() ? (g_force_60hz.load() ? 1 : 0)
                                                                : (render::VulkanRenderer::Instance().NoVsync() ? 3 : 2);
     g_menu_items[kMenuFpsCounter].selected = g_stats_overlay.load() ? 1 : 0;
     g_menu_items[kMenuDepthOfField].selected = g_disable_dof.load() ? 1 : 0;
     const auto dist = std::ranges::find(kSceneDistances, g_scene_distance.load());
     g_menu_items[kMenuSceneDistance].selected = dist == kSceneDistances.end() ? 0 : static_cast<int>(dist - kSceneDistances.begin());
+    const auto prop = std::ranges::find(kPropDistanceSquared, g_props_distance_squared.load());
+    g_menu_items[kMenuPropsDistance].selected = prop == kPropDistanceSquared.end() ? 0 : static_cast<int>(prop - kPropDistanceSquared.begin());
+    g_menu_items[kMenuGamma].selected = g_img_vals[kImgGamma - kImgBrightness];
+    g_menu_items[kMenuSharpness].selected = g_img_vals[kImgSharpness - kImgBrightness];
     for (size_t i = 0; i < g_graphics_saved.size(); ++i) g_graphics_saved[i] = g_menu_items[i].selected.load();
 }
 
@@ -1143,20 +1206,41 @@ static void PreviewCurrentTrophySound() {
 }
 
 static int VideoMenuItemCount() {
-    return g_graphics_from_options.load() ? kMenuFpsCounter + 1 : kMenuCount;
+    return g_graphics_from_options.load() ? kMenuSharpness + 1 : kMenuCount;
+}
+
+std::string VideoMenuValue(int index, bool pt) {
+    if ((index == kMenuDepthOfField && !g_dof_supported) || (index == kMenuSceneDistance && !g_scene_distance_supported) ||
+        (index == kMenuPropsDistance && !g_props_distance_supported)) {
+        return pt ? "Indisponível" : "Unavailable";
+    }
+    const auto& item = g_menu_items[index];
+    const std::string option = (index == kMenuGamma || index == kMenuSharpness)
+        ? std::to_string(item.selected.load()) + "%" : item.options[item.selected];
+    return "< " + option + " >";
 }
 
 static void StepVideoMenuOption(int delta) {
-    if ((g_menu_selected == kMenuDepthOfField && !g_guest_graphics_config) ||
-        (g_menu_selected == kMenuSceneDistance && !g_scene_distance_supported)) return;
+    if ((g_menu_selected == kMenuDepthOfField && !g_dof_supported) ||
+        (g_menu_selected == kMenuSceneDistance && !g_scene_distance_supported) ||
+        (g_menu_selected == kMenuPropsDistance && !g_props_distance_supported)) return;
     if (g_menu_selected < 0 || g_menu_selected >= static_cast<int>(g_menu_items.size())) return;
     auto& item = g_menu_items[g_menu_selected];
+    if (g_menu_selected == kMenuGamma || g_menu_selected == kMenuSharpness) {
+        const auto& slider = kImageSliders[(g_menu_selected == kMenuGamma ? kImgGamma : kImgSharpness) - kImgBrightness];
+        item.selected = std::clamp(item.selected.load() + delta * slider.step, slider.min_val, slider.max_val);
+        return;
+    }
     const int count = static_cast<int>(item.options.size());
     if (count <= 0) return;
     item.selected = ((item.selected + delta) % count + count) % count;
     // O mesmo quadro so pode passar por um AA temporal.
-    if (g_menu_selected == kMenuUpscaler && item.selected >= 2) g_menu_items[kMenuAA].selected = 0;
-    if (g_menu_selected == kMenuAA && (item.selected >= 2 || (item.selected == 1 && g_menu_items[kMenuUpscaler].selected >= 2))) {
+    if (g_menu_selected == kMenuUpscaler && ((item.selected >= 2 && g_menu_items[kMenuAA].selected == 1) ||
+        (item.selected > 0 && g_menu_items[kMenuAA].selected >= 2 && g_menu_items[kMenuAA].selected <= 4))) {
+        g_menu_items[kMenuAA].selected = 0;
+    }
+    if (g_menu_selected == kMenuAA && ((item.selected >= 2 && item.selected <= 4) ||
+        (item.selected == 1 && g_menu_items[kMenuUpscaler].selected >= 2))) {
         g_menu_items[kMenuUpscaler].selected = 0;
     }
     if (g_menu_selected == kMenuPopupStyle) {
@@ -4000,31 +4084,32 @@ bool DrawNativeGraphicsPage(OverlayCanvas& canvas) {
     const char* const upscalers[]{pt ? "Sem ampliação" : "No upscaling", "FSR 1", "FSR 2", "FSR 3", "FSR 4", "XeSS"};
     u32 render_w = 0, render_h = 0;
     renderer.GetCurrentRenderResolution(&render_w, &render_h);
-    const auto status = std::to_string(render_w) + " x " + std::to_string(render_h) + "  |  " +
-                        upscalers[std::clamp(renderer.ActiveUpscaler(), 0, 5)];
+    const char* const aa[]{pt ? "AA desligado" : "AA off", "TAA", "FSR 3 AA", "FSR 4 AA", "XeSS AA",
+                          pt ? "AA espacial" : "Spatial AA"};
+    const auto status = std::string(pt ? "Em jogo  " : "In game  ") + std::to_string(render_w) + " x " + std::to_string(render_h) + "  |  " +
+                        upscalers[std::clamp(renderer.ActiveUpscaler(), 0, 5)] + "  |  " +
+                        aa[std::clamp(renderer.ActiveAntiAliasing(), 0, 5)];
     text(status, cx, cy - 287 * scale, 29 * scale, selected, 1);
     const char* const labels_pt[] = {"Resolução base", "Resolução alvo", "Escala interna", "Upscaler", "Antisserrilhado",
-        "Profundidade de campo", "Distância do cenário", "Modo de tela", "Taxa de quadros", "Contador de FPS"};
+        "Profundidade de campo", "Distância da vegetação", "Distância dos objetos", "Modo de tela", "Taxa de quadros", "Contador de FPS", "Gama", "Nitidez"};
     const char* const labels_en[] = {"Base resolution", "Target resolution", "Render scale", "Upscaler", "Anti-aliasing",
-        "Depth of field", "Scene distance", "Display mode", "Frame rate", "FPS counter"};
-    static_assert(std::size(labels_pt) == kMenuFpsCounter + 1 && std::size(labels_en) == kMenuFpsCounter + 1);
+        "Depth of field", "Vegetation distance", "Prop distance", "Display mode", "Frame rate", "FPS counter", "Gamma", "Sharpness"};
+    static_assert(std::size(labels_pt) == kMenuSharpness + 1 && std::size(labels_en) == kMenuSharpness + 1);
     float y = cy - 241.0f * scale;
-    for (int i = 0; i <= kMenuFpsCounter; ++i) {
+    for (int i = 0; i <= kMenuSharpness; ++i) {
         const u32 color = i == g_menu_selected ? selected : yellow;
-        const auto& item = g_menu_items[i];
-        const bool available = (i != kMenuDepthOfField || g_guest_graphics_config) &&
-                               (i != kMenuSceneDistance || g_scene_distance_supported);
-        const std::string value = available ? "< " + item.options[item.selected] + " >"
-                                            : (pt ? "Indisponível" : "Unavailable");
+        const std::string value = VideoMenuValue(i, pt);
         text(pt ? labels_pt[i] : labels_en[i], left, y, 39.0f * scale, color, 0);
         text(value, right, y, 39.0f * scale, color, 2);
-        y += 51.0f * scale;
+        y += 42.0f * scale;
     }
     if (g_save_confirm_timer > 0) {
         --g_save_confirm_timer;
-        text(g_save_needs_resolution_restart ? (pt ? "Salvo. Reinicie para mudar a resolução interna."
+        const char* saved = g_save_needs_xess_restart ? (pt ? "Salvo. Reinicie para ativar o XeSS." : "Saved. Restart to activate XeSS.")
+            : g_save_needs_resolution_restart ? (pt ? "Salvo. Reinicie para mudar a resolução interna."
                                                     : "Saved. Restart to change the internal resolution.")
-                                           : (pt ? "Salvo." : "Saved."),
+                                              : (pt ? "Salvo." : "Saved.");
+        text(saved,
              cx, cy + 313.0f * scale, 36.0f * scale, selected, 1);
     } else {
         text(pt ? "Confirmar: aplicar     Voltar: fechar" : "Confirm: apply     Back: close",
@@ -4303,10 +4388,7 @@ void QueueStatsOverlay() {
             }
             c.Write(is_sel ? ("> " + item.label) : ("  " + item.label), box_x0 + 24.0f * scale_ui, row_y, font_item, is_sel ? kTitleYellow : kWhite);
 
-            const bool supported = (i != kMenuDepthOfField || g_guest_graphics_config) &&
-                                   (i != kMenuSceneDistance || g_scene_distance_supported);
-            const std::string val_str = supported ? "< " + item.options[item.selected] + " >"
-                                                   : (lang::Pt() ? "INDISPONIVEL" : "UNAVAILABLE");
+            const std::string val_str = VideoMenuValue(i, lang::Pt());
             float val_w = TextWidth(val_str, font_item);
             c.Write(val_str, box_x1 - val_w - 28.0f * scale_ui, row_y, font_item, is_sel ? kCyan : kGray);
 

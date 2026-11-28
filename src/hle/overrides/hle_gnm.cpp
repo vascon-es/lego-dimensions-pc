@@ -5248,6 +5248,12 @@ void SubmitDrawToVulkan(u32 opcode, const u32* body, u32 body_dwords) {
         }
     }
     LD_LAP(2);
+    if (pause_restore && !index_address && fullscreen && draw.image_count == 1 && draw.images[0].target_address &&
+        draw.images[0].target_address != draw.colors[0].address) {
+        // O alpha da cena contem mascaras dos efeitos 3D. Na copia do fundo da pausa, essas mascaras
+        // viravam retangulos e silhuetas escuras. O sombreamento do menu vem da cor do proprio quad.
+        draw.images[0].opaque_screen_snapshot = true;
+    }
     const bool queued_ok = renderer.QueueGameDraw(draw);
     LD_LAP(3);
     if (queued_ok) {

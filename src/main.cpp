@@ -1378,7 +1378,7 @@ int main(int argc, char** argv) {
             hle::SetPadBackgroundInput(true); // Fase 60: o controle vale mesmo com a janela fora de foco
         } else if (!std::strcmp(argv[i], "--aa") && i + 1 < argc) { // 1.9.1: taa | off | fsraa3 | fsraa4 | xessaa
             const char* aa = argv[++i];
-            render::SetAntiAliasing(!std::strcmp(aa, "taa") ? 1 : 0);
+            render::SetAntiAliasing(!std::strcmp(aa, "taa") ? 1 : !std::strcmp(aa, "spatial") ? 2 : 0);
             int cur_major = 0;
             bool cur_nat = false, cur_xess = false, cur_xess_nat = false;
             render::GetTemporalUpscaler(&cur_major, &cur_nat);
